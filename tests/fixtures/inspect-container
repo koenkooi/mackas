@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# Fake Apple `container` for the shim's `docker inspect` fallback test.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Apple `container inspect` works on CONTAINERS only; images need
+# `container image inspect`. The shim tries the former and falls back to the
+# latter. This models that split, keyed on INSPECT_MODE:
+#
+#   image-only : `inspect` fails, `image inspect` succeeds  (fallback fires)
+#   both-fail  : both fail                                   (double failure)
+#
+set -euo pipefail
+
+case "${1:-} ${2:-}" in
+    "image inspect")
+        if [ "${INSPECT_MODE:-}" = "both-fail" ]; then
+            echo "inspect-mock: no such image: ${3:-}" >&2
+            exit 5
+        fi
+        echo "IMAGE-INSPECT-OK:${3:-}"
+        exit 0
+        ;;
+esac
+
+case "${1:-}" in
+    inspect)
+        echo "inspect-mock: no such container: ${2:-}" >&2
+        exit 6
+        ;;
+esac
+
+# Anything else: succeed quietly (not exercised here).
+exit 0

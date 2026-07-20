@@ -1,0 +1,4618 @@
+#!/usr/bin/env bash
+#
+# mackas — run kas-container OpenEmbedded builds on macOS using
+# Apple's `container` runtime. The project to build (its git repo, branch and
+# kas config) is configuration; qualcomm-linux/meta-ai is the shipped example.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# See README.md for the full story. `--help` for usage.
+#
+# Compatible with macOS's stock bash 3.2: no associative arrays, no
+# ${var,,}, no readarray, no `local -n`.
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+# How the user actually invoked us, for copy-pasteable command hints: "./mackas"
+# from a checkout, "mackas" if on PATH, an absolute path if run that way.
+# SCRIPT_NAME stays the bare program label ("mackas: error: ...").
+SCRIPT_CMD="$0"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_VERSION="1.0.0"
+
+# kas-container release we pin to, and its expected sha256.
+KAS_CONTAINER_VERSION="5.4"
+KAS_CONTAINER_URL="https://raw.githubusercontent.com/siemens/kas/${KAS_CONTAINER_VERSION}/kas-container"
+KAS_CONTAINER_SHA256="9707355d1eba19e334e663ab9fcf6881ac323aed16ff7f4fd7e217f879a3894c"
+
+# Apple container's own volume storage root. There is no config knob for
+# this in container 1.1.0, so relocation is done by symlinking the dir.
+CONTAINER_VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
+
+# ---------------------------------------------------------------------------
+# Settings. Every name here is: default -> config file -> env -> CLI flag.
+# ---------------------------------------------------------------------------
+SETTING_NAMES="
+MACKAS_ROOT
+MACKAS_SHORT_LINK
+MACKAS_VOLUME_NAME
+MACKAS_VOLUME_SIZE_TMP
+MACKAS_VOLUME_SIZE_DL
+MACKAS_VOLUME_SIZE_SSTATE
+MACKAS_RELOCATE_VOLUMES
+KAS_IMAGE
+MACKAS_CPUS
+MACKAS_MEMORY
+MACKAS_NFS_SERVER
+MACKAS_NFS_EXPORT
+MACKAS_USE_NFS_MIRRORS
+MACKAS_NFS_MOUNT
+MACKAS_SSTATE_MIRROR_PATH
+MACKAS_DL_MIRROR_PATH
+MACKAS_USE_HTTP_MIRRORS
+MACKAS_HTTP_MIRROR_SSTATE
+MACKAS_HTTP_MIRROR_DL
+MACKAS_PROJECT_URL
+MACKAS_PROJECT_BRANCH
+MACKAS_PROJECT_DIR
+MACKAS_KAS_CONFIG
+MACKAS_SMOKETEST_TARGETS
+MACKAS_OVERHEAD
+MACKAS_OVERHEAD_INTERVAL
+MACKAS_FSTRIM_AUTO
+MACKAS_FREE_SPACE_MARGIN_GB
+MACKAS_REQUIRE_CASE_SENSITIVE
+MACKAS_WORKSPACE_SIZE
+"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+VERBOSE=0
+DRY_RUN=0
+ASSUME_YES=0
+
+
+# Set by overhead_start()/overhead_stop() around a smoketest rung. Declared here so
+# `set -u` is happy and on_interrupt() can reap the sampler on Ctrl-C.
+OVERHEAD_PID=""
+OVERHEAD_OUT=""
+
+# The `volume`/`retrieve`/`buildstats` subcommands' tails (everything after
+# the command word), captured verbatim by main()'s flag loop and handed to the
+# matching cmd_*(). Declared empty here so `${FOO_ARGS+...}` is safe under
+# `set -u` when that command never ran.
+VOLUME_ARGS=()
+RETRIEVE_ARGS=()
+BUILDSTATS_ARGS=()
+SET_ARGS=()
+GET_ARGS=()
+UNSET_ARGS=()
+
+setup_colors() {
+	if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
+		C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BLD=""; C_DIM=""; C_RST=""
+	else
+		C_RED="$(printf '\033[31m')"
+		C_GRN="$(printf '\033[32m')"
+		C_YEL="$(printf '\033[33m')"
+		C_BLU="$(printf '\033[34m')"
+		C_BLD="$(printf '\033[1m')"
+		C_DIM="$(printf '\033[2m')"
+		C_RST="$(printf '\033[0m')"
+	fi
+}
+
+info()  { printf '%s\n' "$*"; }
+warn()  { printf '%s%s%s\n' "$C_YEL" "$*" "$C_RST" >&2; }
+err()   { printf '%s%s%s\n' "$C_RED" "$*" "$C_RST" >&2; }
+vrb()   { [ "$VERBOSE" -eq 1 ] && printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST" >&2 || true; }
+
+die() {
+	err "$SCRIPT_NAME: error: $1"
+	if [ -n "${2:-}" ]; then
+		printf '%s  next: %s%s\n' "$C_BLU" "$2" "$C_RST" >&2
+	fi
+	exit 1
+}
+
+hdr() {
+	printf '\n%s%s%s\n' "$C_BLD" "$*" "$C_RST"
+}
+
+# Render $1 as a single-quoted shell word, for interpolation into a file this
+# script GENERATES (env.sh). printf %q would also work, but %q leaves an
+# ordinary path unquoted and reaches for $'...' when it does escape, and env.sh
+# is sourced by whatever shell the user runs -- zsh on a stock Mac. A plain
+# single-quoted string is understood identically by sh, bash and zsh, and is
+# inert no matter what is inside it.
+#
+# The '\'' dance is the standard one: close the quote, emit an escaped quote,
+# reopen. Values containing a newline never reach here (validate_settings
+# refuses them), which is what makes the $(...) below lossless.
+shq() {
+	printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Render a command the way a user could paste it back into a shell.
+quote_cmd() {
+	local out="" a
+	for a in "$@"; do
+		# printf %q is available in bash 3.2.
+		out="$out $(printf '%q' "$a")"
+	done
+	printf '%s' "${out# }"
+}
+
+# run CMD... — execute, or just print under --dry-run.
+run() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ %s%s\n' "$C_DIM" "$(quote_cmd "$@")" "$C_RST"
+		return 0
+	fi
+	vrb "+ $(quote_cmd "$@")"
+	"$@"
+}
+
+# run_sudo CMD... — same, but always shows the command first (even when
+# not verbose) because the user is about to be asked for a password.
+run_sudo() {
+	printf '%s  sudo: %s%s\n' "$C_BLU" "$(quote_cmd sudo "$@")" "$C_RST"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ (dry-run, not executed)%s\n' "$C_DIM" "$C_RST"
+		return 0
+	fi
+	sudo "$@"
+}
+
+confirm() {
+	local prompt="$1" reply=""
+	if [ "$DRY_RUN" -eq 1 ]; then
+		# --dry-run must show every mutating command, so answer yes and let
+		# run()/run_sudo() print rather than execute. Nothing can change.
+		printf '%s%s [dry-run: assuming yes]%s\n' "$C_DIM" "$prompt" "$C_RST"
+		return 0
+	fi
+	if [ "$ASSUME_YES" -eq 1 ]; then
+		info "$prompt [auto-yes]"
+		return 0
+	fi
+	if [ ! -t 0 ]; then
+		warn "$prompt -- not a terminal and --yes not given; declining."
+		return 1
+	fi
+	printf '%s%s [y/N] %s' "$C_BLD" "$prompt" "$C_RST"
+	read -r reply || return 1
+	case "$reply" in
+		y|Y|yes|YES) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+on_interrupt() {
+	# Reap the overhead sampler first, if a smoketest rung had one running, so we
+	# never orphan it. Best-effort; never let it get in the way of exiting.
+	if [ -n "${OVERHEAD_PID:-}" ]; then
+		kill -TERM "$OVERHEAD_PID" 2>/dev/null || true
+	fi
+	printf '\n'
+	warn "Interrupted. Nothing is left half-written that a re-run won't fix:"
+	warn "  '$SCRIPT_CMD setup' is idempotent -- just run it again."
+	# `volume move` is the one mutation this does not fully cover: its
+	# transfer-then-symlink window blocks INT/TERM itself (trap '' ...), so a
+	# Ctrl-C there lands either before the move or after the symlink, never in
+	# between. Outside that window nothing is half-written here either.
+	exit 130
+}
+trap on_interrupt INT TERM
+
+# ---------------------------------------------------------------------------
+# Check accounting
+# ---------------------------------------------------------------------------
+N_PASS=0
+N_WARN=0
+N_FAIL=0
+
+ck_pass() { N_PASS=$((N_PASS + 1)); printf '  %s[PASS]%s %s\n' "$C_GRN" "$C_RST" "$1"; }
+
+ck_warn() {
+	N_WARN=$((N_WARN + 1))
+	printf '  %s[WARN]%s %s\n' "$C_YEL" "$C_RST" "$1"
+	[ -n "${2:-}" ] && printf '         %sfix:%s %s\n' "$C_BLU" "$C_RST" "$2"
+	return 0
+}
+
+ck_fail() {
+	N_FAIL=$((N_FAIL + 1))
+	printf '  %s[FAIL]%s %s\n' "$C_RED" "$C_RST" "$1"
+	[ -n "${2:-}" ] && printf '         %sfix:%s %s\n' "$C_BLU" "$C_RST" "$2"
+	return 0
+}
+
+ck_info() { printf '  %s[info]%s %s\n' "$C_DIM" "$C_RST" "$1"; }
+
+# ---------------------------------------------------------------------------
+# Configuration resolution
+# ---------------------------------------------------------------------------
+
+# Stash whatever the environment already set, so it can be re-applied on top
+# of the config file (env beats config file).
+snapshot_env() {
+	local name
+	for name in $SETTING_NAMES; do
+		if eval "[ \"\${${name}+set}\" = set ]"; then
+			eval "__ENV_${name}=\"\${${name}}\""
+			eval "__ENV_${name}_SET=1"
+		else
+			eval "__ENV_${name}_SET=0"
+		fi
+	done
+}
+
+restore_env() {
+	local name
+	for name in $SETTING_NAMES; do
+		if eval "[ \"\${__ENV_${name}_SET}\" = 1 ]"; then
+			eval "${name}=\"\${__ENV_${name}}\""
+		fi
+	done
+}
+
+# --set NAME=VALUE overrides, collected during arg parsing and applied last so
+# that command-line flags beat the environment (and everything else).
+CLI_OVERRIDES=()
+
+is_setting_name() {
+	local needle="$1" n
+	for n in $SETTING_NAMES; do
+		[ "$n" = "$needle" ] && return 0
+	done
+	return 1
+}
+
+# die_on_misplaced_global_flag ARG CMD -- every verb-object command
+# (volume/retrieve/buildstats/set/get/unset) owns everything after its own
+# command word, captured verbatim by main() before cmd_CMD ever runs -- so
+# --config/--set typed AFTER the command word are silently never seen by the
+# code that would act on them (main()'s own arg loop, and load_config/
+# apply_cli_overrides, already ran). Falling through to a generic "unknown
+# option" would leave that invisible; this redirects to the fix instead.
+die_on_misplaced_global_flag() {
+	case "$1" in
+		--config|--config=*|--set|--set=*)
+			die "'$1' must come BEFORE '$2', not after -- it is resolved before '$2' runs" \
+				"$SCRIPT_CMD $1 ... $2 ..."
+			;;
+	esac
+}
+
+# Split on the FIRST '=' only, so values may contain '=' (as SSTATE_MIRRORS
+# entries and paths do).
+apply_cli_overrides() {
+	local kv name value
+	for kv in ${CLI_OVERRIDES+"${CLI_OVERRIDES[@]}"}; do
+		name="${kv%%=*}"
+		# shellcheck disable=SC2034  # consumed by the eval below, not directly
+		value="${kv#*=}"
+		# Assign via eval (the name is dynamic) but expand $value inside the
+		# eval body rather than interpolating it, so values containing quotes,
+		# spaces or $ are assigned literally and never re-evaluated.
+		eval "${name}=\"\$value\""
+	done
+}
+
+# Settings that get interpolated into something this script GENERATES -- the
+# shell of env.sh, or the YAML of the kas fragment.
+SETTINGS_INTERPOLATED="
+MACKAS_ROOT
+MACKAS_SHORT_LINK
+MACKAS_VOLUME_NAME
+KAS_IMAGE
+MACKAS_CPUS
+MACKAS_MEMORY
+MACKAS_NFS_MOUNT
+MACKAS_SSTATE_MIRROR_PATH
+MACKAS_DL_MIRROR_PATH
+MACKAS_HTTP_MIRROR_SSTATE
+MACKAS_HTTP_MIRROR_DL
+MACKAS_PROJECT_URL
+MACKAS_PROJECT_BRANCH
+MACKAS_PROJECT_DIR
+MACKAS_KAS_CONFIG
+"
+
+# Refuse values that cannot be quoted out of trouble in BOTH of the files we
+# generate. The generated shell is quoted with shq() and would survive any of
+# these on its own, but the generated YAML has no such escape hatch -- a value
+# lands inside a double-quoted scalar, where a literal '"' or a newline ends
+# the scalar and everything after it is parsed as YAML.
+#
+# The list is deliberately short, and what is NOT on it matters as much as
+# what is:
+#
+#   allowed: spaces, '$', "'". All three are legal in an APFS path and people
+#     really do have them -- the shipped default MACKAS_ROOT has three spaces,
+#     and /Users/o'brien is a name, not an attack. shq() renders every one of
+#     them inert, and a YAML comment or double-quoted scalar does not care.
+#   refused: '"', '`', and control characters (newline, tab, NUL...). These are
+#     legal on APFS in principle and have never appeared in a real build path
+#     in practice. Each is a way OUT of a generated file rather than a value
+#     in it: a '"' ends the bitbake assignment the HTTP mirror URL sits inside,
+#     and a newline ends the YAML line entirely, so what follows is parsed as
+#     structure.
+#
+# This runs before derive_paths(), so the derived mirror paths inherit an
+# already-checked MACKAS_ROOT and need no second pass.
+validate_settings() {
+	local n v
+	for n in $SETTINGS_INTERPOLATED; do
+		eval "v=\"\${$n}\""
+		case "$v" in
+			*'"'*|*'`'*|*[[:cntrl:]]*)
+				die "$n contains a double quote, a backtick or a control character" \
+					"remove it from $n in $(config_hint) -- $SCRIPT_NAME cannot write such a value into the env.sh and kas fragment it generates without corrupting them"
+				;;
+		esac
+	done
+
+	# MACKAS_CPUS and MACKAS_MEMORY are word-split into kas-container's
+	# --runtime-args string (see kas_runtime_args), so a SPACE in either injects
+	# extra arguments: MACKAS_MEMORY='8g -v /Users:/host' would smuggle a bind
+	# mount past every other check. A plain space is not a control character, so
+	# the loop above lets it through; pin both to their expected shapes here, as
+	# setup_volumes already does for MACKAS_VOLUME_NAME and the mirror paths.
+	case "$MACKAS_CPUS" in
+		''|*[!0-9]*)
+			die "MACKAS_CPUS='$MACKAS_CPUS' is not a positive integer" \
+				"set MACKAS_CPUS to a whole number of cores (no spaces) in $(config_hint)"
+			;;
+	esac
+	case "$MACKAS_MEMORY" in
+		''|[!0-9]*|*[!0-9gGmM]*)
+			die "MACKAS_MEMORY='$MACKAS_MEMORY' is not a size like 8g, 512m or 16" \
+				"set MACKAS_MEMORY to <digits> optionally followed by g or m (no spaces) in $(config_hint)"
+			;;
+	esac
+}
+
+host_mem_gb() {
+	local bytes
+	bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+	echo $((bytes / 1024 / 1024 / 1024))
+}
+
+host_cores() {
+	sysctl -n hw.physicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2
+}
+
+# How to make a volume that qualifies. Shared by require_mackas_root() and
+# check_target_volume() so the two never drift apart. Printed multi-line, with
+# every command a user is meant to run on its own line so it can be copied.
+root_hint() {
+	printf 'point MACKAS_ROOT (in %s) at a CASE-SENSITIVE volume with room for the caches.\n' "$(config_hint)"
+	printf 'Make one — a case-sensitive APFS volume (pick <disk> from `diskutil list`):\n'
+	printf '    diskutil apfs addVolume <disk> "Case-sensitive APFS" oe\n'
+	printf 'or a case-sensitive sparse image:\n'
+	printf '    hdiutil create -type SPARSE -fs "Case-sensitive APFS" -size 200g -volname oe ~/oe.sparseimage\n'
+	printf '    hdiutil attach ~/oe.sparseimage\n'
+}
+
+# Every command except `help`, `status` and `check` needs a root to work in.
+#
+# `status` and `check` deliberately do NOT call this: both exist to tell you
+# what is wrong with your configuration, and dying before printing that would
+# make them useless in precisely the case you reached for them.
+require_mackas_root() {
+	[ -n "$MACKAS_ROOT" ] && return 0
+	# No root configured: fall back to the current directory rather than refuse.
+	# Say something TRUE about it -- actually probe case-sensitivity here instead
+	# of assuming, since $PWD may well already be on a case-sensitive volume.
+	MACKAS_ROOT="$PWD"
+	local cs; set +e; dir_is_case_sensitive "$MACKAS_ROOT"; cs=$?; set -e
+	{
+		printf '%s%s: warning:%s MACKAS_ROOT is not set — using the current directory:\n' \
+			"$C_RED" "$SCRIPT_NAME" "$C_RST"
+		printf '    %s%s%s\n' "$C_BLD" "$MACKAS_ROOT" "$C_RST"
+		case "$cs" in
+		1)	# probed and it is case-INSENSITIVE: OE will genuinely break here
+			printf '%s%s is on a CASE-INSENSITIVE filesystem — OpenEmbedded will fail here.%s\n' \
+				"$C_RED" "$MACKAS_ROOT" "$C_RST"
+			root_hint ;;
+		0)	# probed and it IS case-sensitive: no alarm, just make it explicit
+			printf '%sprobed it: case-sensitive, good. Set MACKAS_ROOT in %s to make this the deliberate choice.%s\n' \
+				"$C_YEL" "$(config_hint)" "$C_RST" ;;
+		*)	# could not probe (e.g. not writable yet): keep the honest caveat
+			printf '%scould not verify it is case-sensitive; OpenEmbedded needs one, so a real build wants a proper root:%s\n' \
+				"$C_YEL" "$C_RST"
+			root_hint ;;
+		esac
+	} >&2
+	# Re-derive every path now that MACKAS_ROOT is set (derive_paths already ran
+	# once, with it empty).
+	derive_paths
+}
+
+set_defaults() {
+	local cores mem
+
+	# Empty here; require_mackas_root() falls back to $PWD (with a warning) for
+	# commands that need a root. There is no BAKED-IN default path on purpose:
+	# OpenEmbedded needs a case-sensitive filesystem and a stock Mac has none
+	# (the boot volume, and therefore $HOME, is case-INSENSITIVE APFS), and
+	# guessing at /Volumes/<something> only works when the user already did the
+	# setup. So the fallback is the current directory the user is standing in,
+	# announced loudly, rather than a silent guess -- and require_mackas_root()
+	# and check_target_volume() explain how to point it at a proper volume.
+	MACKAS_ROOT=""
+
+	# Why $HOME/oe and not /opt/oe:
+	#   * /opt is drwxr-xr-x root:wheel, so /opt/oe needs sudo to create --
+	#     and this script's design goal is "no sudo unless genuinely needed".
+	#   * $HOME/oe is 13 chars vs /opt/oe's 7. Both are far under the ~104
+	#     char AF_UNIX sockaddr_un limit for any realistic build path, and
+	#     both kill the spaces-in-path problem, which is the bigger win.
+	# Set MACKAS_SHORT_LINK=/opt/oe in the config if you want the extra 6 chars;
+	# `setup` will offer the sudo mkdir for you.
+	MACKAS_SHORT_LINK="$HOME/oe"
+
+	# Stem for the three ext4 volumes: ${MACKAS_VOLUME_NAME}-{tmp,dl,sstate}.
+	# kas-container word-splits --runtime-args, so the stem must not contain
+	# whitespace; setup refuses one that does.
+	MACKAS_VOLUME_NAME="oe-build"
+
+	# Three separately-sized volumes, not one. TMPDIR is the churny, throwaway
+	# one -- `clean` drops it -- while downloads and sstate are the expensive
+	# caches worth keeping across a TMPDIR wipe. They total 200G, which is the
+	# budget the SSD (an active Time Machine destination) can spare. All three
+	# are sparse: they cost ~1.2 MB each until used.
+	MACKAS_VOLUME_SIZE_TMP="120G"
+	MACKAS_VOLUME_SIZE_DL="40G"
+	MACKAS_VOLUME_SIZE_SSTATE="40G"
+
+	MACKAS_RELOCATE_VOLUMES=1
+
+	KAS_IMAGE="ghcr.io/siemens/kas/kas:${KAS_CONTAINER_VERSION}"
+
+	# Apple container defaults to cpus=4 / memory=1gb per container, which
+	# is nowhere near enough for bitbake. Leave 2 cores for the host so the
+	# Mac stays usable, and take two thirds of RAM (the OE guest is a VM;
+	# overcommitting starves the host).
+	cores="$(host_cores)"
+	MACKAS_CPUS=$((cores - 2))
+	[ "$MACKAS_CPUS" -lt 2 ] && MACKAS_CPUS=2
+
+	mem="$(host_mem_gb)"
+	MACKAS_MEMORY="$((mem * 2 / 3))g"
+	[ "$mem" -lt 6 ] && MACKAS_MEMORY="4g"
+
+	# A placeholder host, not a real one. Point these at your own mirror in the
+	# config; there is no LAN default that would mean anything on someone else's
+	# network. Mirrors are off by default, so this is only consulted once you
+	# opt in.
+	MACKAS_NFS_SERVER="linux-computer.local"
+	MACKAS_NFS_EXPORT="/build"
+	MACKAS_USE_NFS_MIRRORS=0
+	MACKAS_NFS_MOUNT=""            # derived from MACKAS_ROOT if empty
+	MACKAS_SSTATE_MIRROR_PATH=""   # derived from MACKAS_NFS_MOUNT if empty
+	MACKAS_DL_MIRROR_PATH=""       # derived from MACKAS_NFS_MOUNT if empty
+
+	# HTTP mirrors -- the recommended path (see README). These are URLs served
+	# by mirror-server/mackas-mirrord on the mirror host, which re-serves its
+	# NFS-mounted caches read-only. One process, one port, two path prefixes.
+	# The host is a placeholder; port 8100 is the mirror server's own default.
+	MACKAS_USE_HTTP_MIRRORS=0
+	MACKAS_HTTP_MIRROR_SSTATE="http://linux-computer.local:8100/sstate"
+	MACKAS_HTTP_MIRROR_DL="http://linux-computer.local:8100/downloads"
+
+	# The project to build. meta-ai is the EXAMPLE -- it is what has actually
+	# been tested end to end (bitbake bash, then tensorflow-lite) -- and it
+	# rides the ordinary defaults->config->env->--set machinery like any other
+	# setting, so pointing mackas at a different layer set is a config change,
+	# not a code change. See mackas.conf.example for how to do that.
+	#
+	#   _URL     git repo to clone
+	#   _BRANCH  branch to check out
+	#   _DIR     checkout name under work/ (also the cwd kas-container runs in)
+	#   MACKAS_KAS_CONFIG  the kas files to compose, checkout-relative and
+	#                      colon-separated, exactly as kas-container wants them.
+	#                      macos-local.yml (generated) is appended after these.
+	MACKAS_PROJECT_URL="https://github.com/qualcomm-linux/meta-ai.git"
+	MACKAS_PROJECT_BRANCH="wrynose"
+	MACKAS_PROJECT_DIR="meta-ai"
+	MACKAS_KAS_CONFIG="kas/base.yml:kas/qemuarm64.yml"
+
+	# The smoketest ladder's build rungs, space-separated bitbake targets, run
+	# in order after the universal parse-only rung. Empty by default: with no
+	# targets configured, the ladder's one build rung passes no --target at
+	# all, so kas/bitbake builds whatever default target the kas config itself
+	# names. Set your own project's targets here to exercise more than that
+	# default -- see mackas.conf.example for meta-ai's ladder as an example
+	# override, and consider "bash" as a trivial fallback target for a kas
+	# config with no sensible bare default.
+	MACKAS_SMOKETEST_TARGETS=""
+
+	# Host-side overhead sampling during `smoketest` builds. ON by default: it costs
+	# one `ps` every MACKAS_OVERHEAD_INTERVAL seconds and nothing else, and it
+	# is best-effort -- a sampler failure never fails the build. See
+	# tools/mackas-overhead and docs/testing.md for what the number means and,
+	# just as important, what it does not (a fully-cached rung does almost no VM
+	# work, so its host figure is near zero -- correct, not a bug).
+	MACKAS_OVERHEAD=1
+	MACKAS_OVERHEAD_INTERVAL=5
+
+	# Reclaim the sparse volume images around every kas run (before it starts
+	# and after it ends), so they do not ratchet up build after build. On by
+	# default; set to 0 to skip. fstrim is fast (~0.01s) and runs when nothing
+	# holds the volumes, so it neither slows nor endangers the build.
+	MACKAS_FSTRIM_AUTO=1
+
+	# OpenEmbedded needs a case-sensitive filesystem for the layer checkouts
+	# (KAS_WORK_DIR is a host bind-mount; oe-core has files that differ only by
+	# case). setup REFUSES a case-insensitive MACKAS_ROOT by default rather than
+	# build a doomed tree. Set to 0 only if you know the case-sensitive parts
+	# live elsewhere (e.g. a workspace image, below) or for tests.
+	MACKAS_REQUIRE_CASE_SENSITIVE=1
+
+	# Size of the case-sensitive APFS sparse image `setup` offers to create at
+	# work/ when the root turns out to be case-insensitive (see
+	# offer_workspace_image()). Sparse, so this is a ceiling, not real disk
+	# cost until written -- generous by default since it only holds git
+	# checkouts (oe-core, bitbake, meta-*, the project layer), nothing like
+	# TMPDIR/sstate.
+	MACKAS_WORKSPACE_SIZE="40G"
+
+	MACKAS_FREE_SPACE_MARGIN_GB=20
+}
+
+CONFIG_FILE_USED=""
+
+# Is $1 safe to source without being asked to?
+#
+# A config file is SHELL, not data: sourcing one runs whatever is in it with
+# the invoking user's privileges. "Readable" is nowhere near a good enough bar
+# for a file we go looking for on our own, so an implicit candidate must also
+# be owned by us (or by root) and be writable by nobody else. The same test is
+# applied to the containing directory, because being able to replace the file
+# is exactly as good as being able to edit it -- and a group-writable $HOME is
+# a real configuration, not a hypothetical one.
+#
+# This is deliberately NOT applied to --config or $MACKAS_CONF: those are the
+# user naming a file on purpose, and refusing them would break the legitimate
+# case of a config kept on a shared volume.
+config_file_is_safe() {
+	local f="$1" d
+	path_is_owned_and_unwritable_by_others "$f" || return 1
+	d="$(dirname "$f")"
+	path_is_owned_and_unwritable_by_others "$d" || return 1
+	return 0
+}
+
+path_is_owned_and_unwritable_by_others() {
+	local p="$1" owner mode grp oth
+	# BSD stat: %u = owner uid, %Lp = the low 3 octal permission digits.
+	owner="$(stat -f '%u' "$p" 2>/dev/null)" || return 1
+	mode="$(stat -f '%Lp' "$p" 2>/dev/null)" || return 1
+	[ "$owner" = "$(id -u)" ] || [ "$owner" = "0" ] || return 1
+	# %Lp is zero-padded to 3 digits, so group is the middle and other the last.
+	grp="${mode%?}"; grp="${grp#?}"
+	oth="${mode#??}"
+	case "$grp" in 2|3|6|7) return 1 ;; esac
+	case "$oth" in 2|3|6|7) return 1 ;; esac
+	return 0
+}
+
+load_config() {
+	local explicit="${1:-}" allow_missing="${2:-0}"
+	local candidates f
+
+	if [ -n "$explicit" ]; then
+		if [ ! -r "$explicit" ]; then
+			# set/get/unset (allow_missing=1, passed by main only for those
+			# three) may legitimately target a config file that does not
+			# exist yet -- 'set' is exactly the command that creates one,
+			# and switching between per-project configs during the day means
+			# that "yet" is a real, common state, not a typo. Every OTHER
+			# command still refuses a missing --config outright, where a
+			# stale or mistyped path is far more likely than an intentional
+			# fresh start. A file that exists but is unreadable (permissions,
+			# not absence) is refused either way -- 'set' writing there would
+			# only fail the same way moments later with a worse message.
+			if [ "$allow_missing" -eq 1 ] && [ ! -e "$explicit" ]; then
+				CONFIG_FILE_USED="$explicit"
+				return 0
+			fi
+			die "config file not readable: $explicit" \
+				"check the path passed to --config"
+		fi
+		candidates="$explicit"
+	else
+		candidates=""
+		if [ -n "${MACKAS_CONF:-}" ]; then
+			candidates="${MACKAS_CONF}"
+			# Same readability check as --config gets. Without it this lands on
+			# the `.` below and prints a raw, localized "No such file or
+			# directory" with no hint about which knob caused it.
+			if [ ! -r "$candidates" ]; then
+				if [ "$allow_missing" -eq 1 ] && [ ! -e "$candidates" ]; then
+					CONFIG_FILE_USED="$candidates"
+					return 0
+				fi
+				die "config file not readable: $candidates" \
+					"check \$MACKAS_CONF, or unset it to use the default search path"
+			fi
+		fi
+	fi
+
+	if [ -n "$candidates" ]; then
+		f="$candidates"
+		# shellcheck disable=SC1090  # user-supplied config, path known at runtime only
+		. "$f"
+		CONFIG_FILE_USED="$f"
+		return 0
+	fi
+
+	# ./mackas.conf is deliberately NOT in this list.
+	#
+	# It used to be, and it was a remote-code-execution hole with no exploit
+	# needed: cd into any untrusted tree that happened to contain a
+	# mackas.conf -- an unpacked tarball, a cloned repo, a shared download
+	# directory -- run ANY mackas command, and that file's shell ran as you.
+	# There is no way to make a cwd-relative config safe, because the whole
+	# point of it is that the directory is not yours.
+	#
+	# Per-project configs still work; they just have to be named out loud:
+	#   mackas --config ./mackas.conf status
+	# which is a request rather than an ambush.
+	for f in \
+		"$HOME/.config/mackas/config" \
+		"$HOME/.mackas.conf"
+	do
+		if [ -r "$f" ]; then
+			if ! config_file_is_safe "$f"; then
+				warn "ignoring $f: it (or its directory) is owned by someone else or writable by group/other"
+				warn "  mackas SOURCES this file as shell. To use it: chmod go-w $(printf '%q' "$f")"
+				continue
+			fi
+			# shellcheck disable=SC1090
+			. "$f"
+			CONFIG_FILE_USED="$f"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# set / get / unset -- persist (or read back) ONE setting in the config file
+# ---------------------------------------------------------------------------
+#
+# `--set NAME=VALUE` (see apply_cli_overrides) is an ephemeral, in-memory
+# override for a single invocation -- it composes with whatever OTHER command
+# runs alongside it, so it stays a flag rather than a command of its own.
+# These three are the standalone counterpart: an action in their own right,
+# so they get the verb-object shape everything else here uses (see `volume`).
+
+# The file `set`/`unset` write to: whatever config file THIS invocation
+# actually loaded (--config, $MACKAS_CONF, or the first match of the normal
+# search path), or -- nothing loaded yet, the common first-use case -- the
+# same default `load_config` would have picked had one existed.
+set_target_config_file() {
+	if [ -n "$CONFIG_FILE_USED" ]; then
+		printf '%s' "$CONFIG_FILE_USED"
+	else
+		printf '%s' "$HOME/.mackas.conf"
+	fi
+}
+
+# Rewrite (or append) a single NAME=value line in FILE, leaving every other
+# line untouched. Not sed -i: BSD sed's -i needs a (possibly empty)
+# backup-suffix argument that GNU sed parses differently, and mackas already
+# steers clear of that split elsewhere -- a temp file + mv is portable and
+# atomic either way.
+#
+# The value is written through shq(), the same single-quoting env.sh
+# generation uses, so it round-trips exactly when the file is next sourced --
+# spaces, '$' and apostrophes survive intact, matching what --set already
+# allows on the command line.
+config_write_setting() {
+	local file="$1" name="$2" value="$3" tmp mode found=0 line
+	tmp="$(mktemp "${TMPDIR:-/tmp}/mackas-conf.XXXXXX")"
+	if [ -f "$file" ]; then
+		while IFS= read -r line || [ -n "$line" ]; do
+			case "$line" in
+				"$name="*) printf '%s=%s\n' "$name" "$(shq "$value")" >>"$tmp"; found=1 ;;
+				*)         printf '%s\n' "$line" >>"$tmp" ;;
+			esac
+		done <"$file"
+	fi
+	if [ "$found" -eq 0 ]; then
+		printf '%s=%s\n' "$name" "$(shq "$value")" >>"$tmp"
+	fi
+	# Preserve an existing file's mode; a brand new one gets 600 --
+	# config_file_is_safe() only requires "not group/other-writable", but
+	# there is no reason to default to more open than that.
+	if [ -f "$file" ]; then
+		mode="$(stat -f '%Lp' "$file" 2>/dev/null || echo 600)"
+	else
+		mode="600"
+	fi
+	chmod "$mode" "$tmp"
+	run mv "$tmp" "$file"
+}
+
+# Same shape as validate_settings()'s character check, applied unconditionally
+# here rather than only to SETTINGS_INTERPOLATED: every value `set` writes
+# goes into a file that gets SOURCED as shell, so a stray '"' or backtick
+# would corrupt that file's syntax the next time it loads, not just whatever
+# mackas itself later generates from it.
+refuse_unwritable_setting_value() {
+	case "$1" in
+		*'"'*|*'`'*|*[[:cntrl:]]*)
+			die "value contains a double quote, a backtick or a control character" \
+				"$SCRIPT_CMD cannot write that into a config file it will later source as shell"
+			;;
+	esac
+}
+
+set_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD set${C_RST} -- persist one setting in the config file.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD set NAME VALUE
+
+Writes (or replaces) a single NAME=VALUE line in the config file this
+invocation would otherwise load -- $(set_target_config_file) right now.
+Unlike '--set NAME=VALUE', which only affects the ONE command it rides
+along with, this persists: every future invocation picks it up too.
+
+'$SCRIPT_CMD status' lists the valid names.
+EOF
+}
+
+get_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD get${C_RST} -- print one setting's currently resolved value.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD get NAME
+
+Resolved through the normal precedence (defaults -> config file ->
+environment -> --set), so '$SCRIPT_CMD --set NAME=VALUE get NAME' previews
+what an override would produce without running anything else.
+EOF
+}
+
+unset_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD unset${C_RST} -- remove one persisted setting from the config file.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD unset NAME
+
+Removes NAME's line from the config file this invocation would otherwise
+load -- $(set_target_config_file) right now. Fine to run on a NAME that was
+never persisted; that is a no-op, not an error.
+EOF
+}
+
+cmd_set() {
+	local args=() want_help=0 a
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|--yes)      ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" set ;;
+			# Bare 'help' means "show usage" only in NAME's position -- 'set'
+			# is the one command here with a free-text positional (VALUE), and
+			# VALUE may legitimately BE the literal string "help" (a target
+			# name, a path component). Once args already holds NAME, 'help'
+			# is data, not a request for help.
+			help) if [ "${#args[@]}" -eq 0 ]; then want_help=1; else args+=("$a"); fi ;;
+			*)             args+=("$a") ;;
+		esac
+	done
+	if [ "$want_help" -eq 1 ]; then set_usage; return 0; fi
+
+	[ "${#args[@]}" -eq 2 ] || die "'set' needs exactly NAME and VALUE, got ${#args[@]} argument(s)" \
+		"$SCRIPT_CMD set --help"
+	local name="${args[0]}" value="${args[1]}"
+	is_setting_name "$name" || die "'$name' is not a mackas setting" \
+		"$SCRIPT_CMD status lists the valid names"
+	refuse_unwritable_setting_value "$value"
+
+	local file; file="$(set_target_config_file)"
+	config_write_setting "$file" "$name" "$value"
+	did "$name=$value written to $file"
+}
+
+cmd_get() {
+	local args=() want_help=0 a
+	for a in "$@"; do
+		case "$a" in
+			# get reads and prints exactly one value; it mutates nothing, so
+			# --dry-run/-y are accepted-and-ignored rather than refused --
+			# consistent with set/unset/volume/retrieve accepting them
+			# anywhere, so a habitual '-v' after any command does not
+			# suddenly become "unknown option" on this one.
+			--dry-run)     DRY_RUN=1 ;;
+			-y|--yes)      ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help|help) want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" get ;;
+			*)              args+=("$a") ;;
+		esac
+	done
+	if [ "$want_help" -eq 1 ]; then get_usage; return 0; fi
+
+	[ "${#args[@]}" -eq 1 ] || die "'get' needs exactly one NAME, got ${#args[@]} argument(s)" \
+		"$SCRIPT_CMD get --help"
+	local name="${args[0]}"
+	is_setting_name "$name" || die "'$name' is not a mackas setting" \
+		"$SCRIPT_CMD status lists the valid names"
+	eval "printf '%s\n' \"\${$name}\""
+}
+
+cmd_unset() {
+	local args=() want_help=0 a
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|--yes)      ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help|help) want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" unset ;;
+			*)             args+=("$a") ;;
+		esac
+	done
+	if [ "$want_help" -eq 1 ]; then unset_usage; return 0; fi
+
+	[ "${#args[@]}" -eq 1 ] || die "'unset' needs exactly one NAME, got ${#args[@]} argument(s)" \
+		"$SCRIPT_CMD unset --help"
+	local name="${args[0]}"
+	is_setting_name "$name" || die "'$name' is not a mackas setting" \
+		"$SCRIPT_CMD status lists the valid names"
+
+	local file; file="$(set_target_config_file)"
+	if [ ! -f "$file" ]; then
+		info "$name is not persisted in $file -- nothing to do"
+		return 0
+	fi
+	# Same anchored "$name=" glob match config_write_setting() uses (a case
+	# pattern always matches the whole string, so this cannot false-positive
+	# on some OTHER setting whose name merely ends in the same suffix).
+	local tmp found=0 line
+	tmp="$(mktemp "${TMPDIR:-/tmp}/mackas-conf.XXXXXX")"
+	while IFS= read -r line || [ -n "$line" ]; do
+		case "$line" in
+			"$name="*) found=1 ;;
+			*)         printf '%s\n' "$line" >>"$tmp" ;;
+		esac
+	done <"$file"
+	if [ "$found" -eq 0 ]; then
+		rm -f "$tmp"
+		info "$name is not persisted in $file -- nothing to do"
+		return 0
+	fi
+	local mode; mode="$(stat -f '%Lp' "$file" 2>/dev/null || echo 600)"
+	chmod "$mode" "$tmp"
+	run mv "$tmp" "$file"
+	did "$name removed from $file"
+}
+
+# The kas files kas-container is actually given: the project's own config
+# (MACKAS_KAS_CONFIG) followed by the generated macOS fragment, composed last
+# so it wins. Every element is checkout-relative because run_kas() cd's into
+# the checkout first, and the fragment physically lives at kas/macos-local.yml
+# inside it (kas only mounts files under the repo dir).
+#
+# If MACKAS_KAS_CONFIG is empty we still hand over the fragment alone rather
+# than a leading ':' -- a colon-prefixed list is a kas parse error, not an
+# empty one.
+compose_kas_files() {
+	if [ -n "$MACKAS_KAS_CONFIG" ]; then
+		printf '%s:kas/macos-local.yml' "$MACKAS_KAS_CONFIG"
+	else
+		printf 'kas/macos-local.yml'
+	fi
+}
+
+# Values that depend on other values, resolved once everything else is final.
+#
+# This runs for EVERY command, including `help` and a `status` on a machine
+# with no config at all, so it must tolerate an unset MACKAS_ROOT rather than
+# die on one -- require_mackas_root() is what refuses, per command, and it
+# gives a far better message than a half-derived path ever could.
+derive_paths() {
+	# With no root there is nothing to hang these off. Leave them EMPTY rather
+	# than derive from "": "$MACKAS_ROOT/work" would silently become the
+	# absolute path "/work", and `status` would print a confident, wrong answer
+	# instead of a blank that reads as "unset".
+	if [ -z "$MACKAS_ROOT" ]; then
+		MACKAS_NFS_MOUNT="${MACKAS_NFS_MOUNT:-}"
+		MACKAS_SSTATE_MIRROR_PATH="${MACKAS_SSTATE_MIRROR_PATH:-}"
+		MACKAS_DL_MIRROR_PATH="${MACKAS_DL_MIRROR_PATH:-}"
+		MACKAS_BASE=""
+		MACKAS_BIN=""; MACKAS_WORK=""; MACKAS_KAS=""; MACKAS_LOGS=""
+		MACKAS_PROJECT=""; MACKAS_ENV_SH=""; MACKAS_GITCONFIG=""
+		KAS_CONTAINER_BIN=""; SHIM_DIR=""
+		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
+		KAS_FILES_ARG="$(compose_kas_files)"
+		MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
+		MACKAS_VOL_DL="${MACKAS_VOLUME_NAME}-dl"
+		MACKAS_VOL_SSTATE="${MACKAS_VOLUME_NAME}-sstate"
+		MACKAS_VOL_LEGACY="$MACKAS_VOLUME_NAME"
+		return 0
+	fi
+
+	[ -n "$MACKAS_NFS_MOUNT" ] || MACKAS_NFS_MOUNT="$MACKAS_ROOT/nfs"
+	[ -n "$MACKAS_SSTATE_MIRROR_PATH" ] || MACKAS_SSTATE_MIRROR_PATH="$MACKAS_NFS_MOUNT/angstrom-2026.06/build/sstate-cache"
+	[ -n "$MACKAS_DL_MIRROR_PATH" ] || MACKAS_DL_MIRROR_PATH="$MACKAS_NFS_MOUNT/angstrom-2026.06/build/downloads"
+
+	# MACKAS_BASE is the path everything actually runs through: the short,
+	# space-free symlink if we have one, else MACKAS_ROOT itself.
+	#
+	# The link is only adopted when it genuinely resolves to THIS MACKAS_ROOT.
+	# Merely existing is not enough, and testing for that was a real bug: [ -L ]
+	# is true for a DANGLING link and true for a STALE one still pointing at
+	# some older root, so a leftover ~/oe -> /tmp/old-root quietly became the
+	# base. Everything downstream hangs off MACKAS_BASE -- env.sh, gitconfig,
+	# the shim, the kas fragment, MACKAS_LOGS -- so that leftover link
+	# redirected the lot into a tree the user never named, up to and including
+	# `clean` doing rm -rf on the wrong logs directory.
+	#
+	# check_short_link()/setup_short_link() do validate the link, but they only
+	# run for `check` and `setup`. derive_paths runs first and for everything,
+	# so `status`, `clean`, `shell` and `smoketest` never saw that validation. It
+	# has to live here to cover them.
+	local link_target=""
+	MACKAS_BASE="$MACKAS_ROOT"
+	if [ -L "$MACKAS_SHORT_LINK" ]; then
+		link_target="$(readlink "$MACKAS_SHORT_LINK" 2>/dev/null || true)"
+		if [ "$link_target" = "$MACKAS_ROOT" ] && [ -d "$MACKAS_SHORT_LINK" ]; then
+			# -d follows the link, so this is also what rules out a dangling one.
+			MACKAS_BASE="$MACKAS_SHORT_LINK"
+		else
+			vrb "ignoring $MACKAS_SHORT_LINK -> ${link_target:-<unreadable>}: it does not resolve to MACKAS_ROOT ($MACKAS_ROOT); using MACKAS_ROOT directly ('$SCRIPT_CMD check' explains)"
+		fi
+	fi
+
+	MACKAS_BIN="$MACKAS_BASE/bin"
+	MACKAS_WORK="$MACKAS_BASE/work"
+	MACKAS_KAS="$MACKAS_BASE/kas"
+	MACKAS_LOGS="$MACKAS_BASE/logs"
+	MACKAS_PROJECT="$MACKAS_WORK/$MACKAS_PROJECT_DIR"
+	MACKAS_ENV_SH="$MACKAS_BASE/env.sh"
+	# See setup_gitconfig() for why this file exists at all.
+	MACKAS_GITCONFIG="$MACKAS_BASE/gitconfig"
+	KAS_CONTAINER_BIN="$MACKAS_BIN/kas-container"
+	SHIM_DIR="$MACKAS_BIN"
+	# kas fragment, as seen from the project checkout (kas rewrites paths
+	# under the repo dir to /repo/... inside the container, so the fragment
+	# has to physically live inside the checkout).
+	MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos.yml"
+	MACKAS_KAS_FRAGMENT_REPO="$MACKAS_PROJECT/kas/macos-local.yml"
+	KAS_FILES_ARG="$(compose_kas_files)"
+
+	# The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
+	# filesystem semantics, and none of them may be a host (APFS) directory --
+	# see kas_runtime_args() for why they are volumes rather than bind mounts.
+	MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
+	MACKAS_VOL_DL="${MACKAS_VOLUME_NAME}-dl"
+	MACKAS_VOL_SSTATE="${MACKAS_VOLUME_NAME}-sstate"
+	# The single volume mackas used to create, before the split into three.
+	# Nothing uses it any more; `check` and `status` report it so it does not
+	# sit there silently eating disk.
+	MACKAS_VOL_LEGACY="$MACKAS_VOLUME_NAME"
+
+	validate_nfs_mirror_paths
+}
+
+# kas-container WORD-SPLITS the string it gets from --runtime-args, so every
+# value that ends up inside it must be free of whitespace. setup_volumes()
+# already refuses a MACKAS_VOLUME_NAME with a space in it; the NFS mirror paths
+# go into the very same string, via `-v $path:/sstate-mirror:ro`, and nothing
+# was checking them.
+#
+# This is not a corner case waiting for a weird config. A perfectly ordinary
+# MACKAS_ROOT with a space in it -- "/Volumes/My Disk/oe" -- makes the mirror
+# paths derive from it, and turning NFS mirrors on then produces
+# "-v /Volumes/My", "Disk/oe/...", ... -- separate arguments, mounting
+# nonsense. Refuse it with an explanation rather than mount garbage.
+#
+# Only the NFS path is affected. HTTP mirrors are URLs in the kas fragment and
+# never touch --runtime-args, which is one more reason they are the
+# recommended option.
+validate_nfs_mirror_paths() {
+	[ "$MACKAS_USE_NFS_MIRRORS" = "1" ] || return 0
+	local p
+	for p in "$MACKAS_SSTATE_MIRROR_PATH" "$MACKAS_DL_MIRROR_PATH"; do
+		case "$p" in
+			"")
+				die "MACKAS_USE_NFS_MIRRORS=1 but the NFS mirror paths are empty" \
+					"set MACKAS_NFS_MOUNT in $(config_hint), or MACKAS_USE_HTTP_MIRRORS=1 instead"
+				;;
+			*[[:space:]]*)
+				die "NFS mirror path '$p' contains whitespace, which kas-container cannot be given" \
+					"set MACKAS_NFS_MOUNT to a space-free path in $(config_hint) (e.g. $MACKAS_SHORT_LINK/nfs), or use MACKAS_USE_HTTP_MIRRORS=1 instead -- HTTP mirrors need no -v mount and so have no such limit"
+				;;
+		esac
+	done
+}
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+# The one string that makes the whole tool work. See README's "The ext4
+# volumes".
+#
+# Everything here goes to kas-container's --runtime-args flag, NOT to the
+# environment, and that is not a style choice:
+#
+#   * KAS_EXTRA_RUNTIME_ARGS is NOT an environment variable. kas-container
+#     sets it to "" unconditionally before parsing its own arguments, so an
+#     exported one is discarded without a word -- and every container then
+#     runs at Apple's defaults of cpus=4/memory=1gb, which bitbake would
+#     thrash or OOM on. --runtime-args / --docker-args is the only way in.
+#
+#   * KAS_BUILD_DIR/DL_DIR/SSTATE_DIR must stay UNSET in the environment.
+#     kas-container's forward_dir() BIND-MOUNTS whatever host directory they
+#     name, so pointing them at an APFS path puts TMPDIR on virtiofs -- the
+#     one thing the ext4 volumes exist to prevent. forward_dir() returns
+#     early on an empty value, so we blank them and set the container-side
+#     paths with -e inside --runtime-args instead, next to the -v that backs
+#     each one with a real ext4 volume.
+#
+# kas-container word-splits this string, so no value in it may contain a
+# space. setup_volumes() refuses a volume name that does.
+kas_runtime_args() {
+	# Named rt_str, not args: several command parsers in this file use an
+	# ARRAY named args, and shellcheck (0.11+) tracks variable kinds file-wide,
+	# so a string with the same name trips SC2178/SC2128 as a false positive.
+	local rt_str="-c $MACKAS_CPUS -m $MACKAS_MEMORY"
+
+	rt_str="$rt_str -v $MACKAS_VOL_TMP:/build -e KAS_BUILD_DIR=/build"
+	rt_str="$rt_str -v $MACKAS_VOL_DL:/downloads -e DL_DIR=/downloads"
+	rt_str="$rt_str -v $MACKAS_VOL_SSTATE:/sstate -e SSTATE_DIR=/sstate"
+
+	if [ "$MACKAS_USE_NFS_MIRRORS" = "1" ]; then
+		rt_str="$rt_str -v $MACKAS_SSTATE_MIRROR_PATH:/sstate-mirror:ro"
+		rt_str="$rt_str -v $MACKAS_DL_MIRROR_PATH:/downloads-mirror:ro"
+	fi
+
+	printf '%s' "$rt_str"
+}
+
+# Parse "200G" / "42g" / "1024M" -> whole GiB (rounded up).
+size_to_gb() {
+	local s="$1" num unit
+	num="$(printf '%s' "$s" | sed 's/[^0-9].*$//')"
+	unit="$(printf '%s' "$s" | sed 's/^[0-9]*//' | tr '[:upper:]' '[:lower:]')"
+	[ -n "$num" ] || { echo 0; return; }
+	case "$unit" in
+		t|tb|tib) echo $((num * 1024)) ;;
+		g|gb|gib|"") echo "$num" ;;
+		m|mb|mib) echo $(( (num + 1023) / 1024 )) ;;
+		*) echo "$num" ;;
+	esac
+}
+
+# Combined GiB the three volumes can grow to. They are sparse, so this is the
+# worst case, not what they cost today -- but it is exactly what has to fit on
+# the SSD alongside Time Machine.
+total_volume_gb() {
+	echo $(( $(size_to_gb "$MACKAS_VOLUME_SIZE_TMP") \
+		+ $(size_to_gb "$MACKAS_VOLUME_SIZE_DL") \
+		+ $(size_to_gb "$MACKAS_VOLUME_SIZE_SSTATE") ))
+}
+
+# Nearest ancestor of $1 that actually exists. This is what decides whether
+# we can mkdir $1 -- NOT the filesystem mount point, which can be far above
+# it (e.g. /tmp/a/b's mount point is /System/Volumes/Data).
+nearest_existing_dir() {
+	local p="$1"
+	while [ "$p" != "/" ] && [ ! -d "$p" ]; do
+		p="$(dirname "$p")"
+	done
+	printf '%s' "$p"
+}
+
+volume_mount_point() {
+	# Longest mounted filesystem prefix of $1 (works for not-yet-existing paths).
+	local p="$1"
+	while [ "$p" != "/" ] && [ ! -d "$p" ]; do
+		p="$(dirname "$p")"
+	done
+	df -P "$p" 2>/dev/null | awk 'NR==2 {for (i=6;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}'
+}
+
+free_gb_for() {
+	local p="$1" mp
+	mp="$(volume_mount_point "$p")"
+	[ -n "$mp" ] || { echo 0; return; }
+	df -Pk "$mp" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}'
+}
+
+# Empirical case-sensitivity probe in an existing writable directory.
+# Returns 0 = case-sensitive, 1 = case-insensitive, 2 = could not test.
+dir_is_case_sensitive() {
+	local d="$1" t
+	[ -d "$d" ] && [ -w "$d" ] || return 2
+	t="$(mktemp -d "$d/.oecs.XXXXXX" 2>/dev/null)" || return 2
+	: > "$t/casetest" 2>/dev/null || { rm -rf "$t"; return 2; }
+	if [ -e "$t/CASETEST" ]; then
+		rm -rf "$t"; return 1
+	fi
+	rm -rf "$t"; return 0
+}
+
+is_time_machine_dest() {
+	local mp="$1"
+	[ -e "$mp/backup_manifest.plist" ] && return 0
+	tmutil destinationinfo 2>/dev/null | grep -qF "Mount Point   : $mp" && return 0
+	return 1
+}
+
+# Does FILE have a [safe] directory = * entry? Deliberately a grep, not a
+# full gitconfig INI parser -- it only ever needs to recognise the exact form
+# setup_gitconfig() writes (and the exact form check/setup tell a user to add
+# by hand), not arbitrary gitconfig syntax.
+has_safe_directory_star() {
+	local f="$1"
+	[ -r "$f" ] || return 1
+	grep -qE '^[[:space:]]*directory[[:space:]]*=[[:space:]]*\*[[:space:]]*$' "$f" 2>/dev/null
+}
+
+container_running() {
+	container system status >/dev/null 2>&1 || return 1
+	container system status 2>/dev/null | awk '$1=="status" {print $2}' | grep -q '^running$'
+}
+
+image_present() {
+	container image ls 2>/dev/null | awk 'NR>1 {print $1":"$2}' | grep -qxF "$1"
+}
+
+volume_exists() {
+	container volume ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qxF "$1"
+}
+
+# Remove one volume, tolerating both spellings of the subcommand and a volume
+# that was already gone. Returns non-zero if the volume is still there.
+#
+# The report has to be conditional, and it did not used to be: the old form
+# ended `|| warn "could not delete..."` and then said `did "removed volume"`
+# on the next line unconditionally. warn returns 0, so a volume that both
+# spellings failed to remove -- a busy one, typically -- was reported as
+# removed anyway, immediately after the warning saying it was not. `destroy`
+# then finished with a clean bill of health over a volume that survived.
+delete_volume() {
+	local name="$1"
+	volume_exists "$name" || return 0
+	if run container volume delete "$name" || run container volume rm "$name"; then
+		did "removed volume '$name'"
+		return 0
+	fi
+	warn "could not delete volume '$name'; remove it by hand: container volume ls"
+	return 1
+}
+
+# volume_in_use NAME -- true if a running container currently has volume NAME
+# attached.
+#
+# The one-VM rule is a hard constraint, not a nicety: an ext4 image mounted by
+# two VMs at once corrupts. `mackas retrieve` attaches oe-build-tmp to copy
+# files out, so it must refuse while a build ('smoketest' or 'shell') still holds
+# it rather than race the running kas container.
+#
+# There is no single `container` query for "who holds this volume", so this
+# lists the RUNNING containers (`container ls` shows only those; the first
+# column is the container ID) and inspects each: `container inspect`'s JSON
+# carries  "name" : "<volume>"  in the mount block, so a fixed-string match on
+# the volume name is correct. If the runtime is not up, nothing can hold it.
+#
+# The guard is UX, not the safety backstop. Virtualization.framework itself
+# REFUSES a second attach of the same ext4 image outright --
+#   VZErrorDomain Code=2 "The storage device attachment is invalid"
+# -- so a missed guard yields an ugly error, not a corrupted build. We keep the
+# guard anyway (a clear refusal beats a stack trace) and, on any query FAILURE,
+# fail CLOSED: report the volume as in use rather than let a caller attach it a
+# second time. A failing query must never read as "free" -- that would fail
+# OPEN, the one outcome the guard exists to prevent.
+volume_in_use() {
+	local name="$1" ids id listing detail
+	container_running || return 1
+	if ! listing="$(container ls 2>/dev/null)"; then
+		warn "could not query running containers; assuming volume '$name' is in use"
+		return 0
+	fi
+	ids="$(printf '%s\n' "$listing" | awk 'NR>1 {print $1}')"
+	for id in $ids; do
+		[ -n "$id" ] || continue
+		if ! detail="$(container inspect "$id" 2>/dev/null)"; then
+			warn "could not inspect container '$id'; assuming volume '$name' is in use"
+			return 0
+		fi
+		# Match the mount block's  "name" : "<volume>"  key, NOT a bare
+		# substring of the whole JSON. A plain grep -qF "$name" over the entire
+		# inspect output false-positived on the IMAGE field: a volume named
+		# "kas" "matched" ghcr.io/siemens/kas/kas:5.4 in every running
+		# container, reporting a free volume as in use. Anchoring to the mount
+		# name key still fails CLOSED on a malformed inspect (nothing matches ->
+		# the loop moves on), which is fine, but stops the false positive.
+		if printf '%s\n' "$detail" \
+			| grep -qE "\"name\"[[:space:]]*:[[:space:]]*\"$name\""; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+host_ip() {
+	# Primary IPv4 on the default route's interface.
+	local iface
+	iface="$(route -n get default 2>/dev/null | awk '/interface:/ {print $2; exit}')"
+	[ -n "$iface" ] && ipconfig getifaddr "$iface" 2>/dev/null && return 0
+	ifconfig 2>/dev/null | awk '/inet /  && $2 != "127.0.0.1" {print $2; exit}'
+}
+
+# Is $1 (dotted IPv4) inside CIDR $2? Returns 0/1. Pure bash arithmetic.
+ip_in_cidr() {
+	local ip="$1" cidr="$2" net bits ipn netn mask
+	case "$cidr" in *[!0-9./]*) return 1 ;; esac
+	net="${cidr%%/*}"
+	bits="${cidr#*/}"
+	[ "$net" = "$cidr" ] && bits=32
+	# A prefix length above 32 (or a non-numeric one) makes the mask shift by a
+	# negative amount below -- undefined, and it silently "matched" before. An
+	# IPv4 prefix is 0..32; refuse anything else rather than compute nonsense.
+	case "$bits" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$bits" -le 32 ] || return 1
+	ipn="$(ip_to_int "$ip")" || return 1
+	netn="$(ip_to_int "$net")" || return 1
+	[ "$bits" -eq 0 ] && return 0
+	mask=$(( 0xFFFFFFFF << (32 - bits) & 0xFFFFFFFF ))
+	[ $((ipn & mask)) -eq $((netn & mask)) ]
+}
+
+ip_to_int() {
+	local o1 o2 o3 o4 o
+	IFS=. read -r o1 o2 o3 o4 <<EOF
+$1
+EOF
+	# Exactly four octets, each numeric and 0..255. The old check only rejected
+	# non-digits, so "300.1.1.1" (or a three-octet "1.2.3") sailed through and
+	# produced a bogus integer that then "matched" a CIDR it had no business in.
+	for o in "$o1" "$o2" "$o3" "$o4"; do
+		case "$o" in ""|*[!0-9]*) return 1 ;; esac
+		[ "$o" -le 255 ] || return 1
+	done
+	echo $(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+}
+
+resolved_docker() {
+	command -v docker 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+
+check_host() {
+	hdr "1. Host"
+	local osver major arch
+	osver="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+	major="${osver%%.*}"
+	arch="$(uname -m)"
+
+	if [ "$major" -ge 26 ] 2>/dev/null; then
+		ck_pass "macOS $osver (>= 26)"
+	else
+		ck_fail "macOS $osver -- Apple 'container' needs macOS 26 or newer" \
+			"upgrade macOS, or run the build on a Linux host instead"
+	fi
+
+	if [ "$arch" = "arm64" ]; then
+		ck_pass "arch arm64 (Apple silicon)"
+	else
+		ck_fail "arch $arch -- Apple 'container' requires Apple silicon" \
+			"no remediation on this machine; use a Linux/arm64 or x86_64 Docker host"
+	fi
+
+	local mem cores
+	mem="$(host_mem_gb)"
+	cores="$(host_cores)"
+	ck_info "host: ${cores} physical cores, ${mem} GiB RAM"
+
+	if [ "$mem" -lt 8 ]; then
+		ck_warn "host RAM ${mem} GiB is below 8 GiB -- bitbake will thrash" \
+			"reduce MACKAS_MEMORY and BB_NUMBER_THREADS, or build elsewhere"
+	fi
+
+	local want
+	want="$(size_to_gb "$MACKAS_MEMORY")"
+	if [ "$want" -gt "$mem" ]; then
+		ck_fail "MACKAS_MEMORY=$MACKAS_MEMORY exceeds host RAM (${mem} GiB)" \
+			"set MACKAS_MEMORY to at most $((mem * 3 / 4))g in $(config_hint)"
+	elif [ "$want" -gt $((mem * 3 / 4)) ]; then
+		ck_warn "MACKAS_MEMORY=$MACKAS_MEMORY is over 75% of host RAM (${mem} GiB); the host may swap" \
+			"set MACKAS_MEMORY=$((mem * 2 / 3))g in $(config_hint)"
+	else
+		ck_pass "MACKAS_MEMORY=$MACKAS_MEMORY of ${mem} GiB host RAM"
+	fi
+
+	if [ "$MACKAS_CPUS" -gt "$cores" ]; then
+		ck_warn "MACKAS_CPUS=$MACKAS_CPUS exceeds ${cores} physical cores" \
+			"set MACKAS_CPUS=$((cores - 2)) in $(config_hint)"
+	else
+		ck_pass "MACKAS_CPUS=$MACKAS_CPUS of ${cores} physical cores (nproc inside will report $((MACKAS_CPUS + 1)))"
+	fi
+}
+
+config_hint() {
+	if [ -n "$CONFIG_FILE_USED" ]; then
+		printf '%s' "$CONFIG_FILE_USED"
+	else
+		printf '%s' "$HOME/.mackas.conf"
+	fi
+}
+
+check_container_runtime() {
+	hdr "2. Apple container runtime"
+
+	if [ -x /opt/homebrew/bin/brew ] || command -v brew >/dev/null 2>&1; then
+		ck_pass "Homebrew present"
+	else
+		# shellcheck disable=SC2016  # literal text: this is a command we print
+		# for the user to copy-paste, not one we run. $(...) must survive.
+		ck_fail "Homebrew not found" \
+			'/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+	fi
+
+	if command -v container >/dev/null 2>&1; then
+		ck_pass "$(container --version 2>&1 | head -1)"
+	else
+		ck_fail "'container' CLI not installed" "brew install container"
+		return
+	fi
+
+	if container_running; then
+		ck_pass "container system status = running"
+	else
+		ck_fail "container system is not running" "container system start"
+	fi
+
+	# The kernel has to be set once, or `container run` fails at boot. Probe it
+	# by booting a throwaway container -- but ONLY if the image is already
+	# pulled. Apple's `container run` auto-FETCHES a missing image (~1GB), and
+	# `check` promises to change nothing, so probing with an absent image would
+	# silently download the whole kas image on a fresh machine.
+	if ! image_present "$KAS_IMAGE"; then
+		ck_info "kernel not probed: $KAS_IMAGE not pulled yet (see check 8)"
+		ck_info "if 'container run' later fails to boot: container system kernel set --recommended --force"
+	elif container system status >/dev/null 2>&1 && \
+	     container run --rm "$KAS_IMAGE" true >/dev/null 2>&1; then
+		ck_pass "container kernel is usable (test container booted)"
+	else
+		ck_warn "could not boot a test container with $KAS_IMAGE" \
+			"container system kernel set --recommended --force"
+	fi
+}
+
+# Echo the path to a GNU realpath binary, or return 1. macOS's own /bin/realpath
+# is BSD (no -e, no --relative-base -- the exact flags kas-container calls), and
+# Homebrew's coreutils installs `grealpath` (g-prefixed), NOT an unprefixed
+# `realpath`. Prefer grealpath, then coreutils' gnubin, then any `realpath` on
+# PATH that turns out to be GNU. setup_shim_and_env() symlinks the result into
+# MACKAS_BIN (first on env.sh PATH) so kas-container always finds it.
+find_gnu_realpath() {
+	local c p
+	for c in grealpath "$(brew --prefix coreutils 2>/dev/null)/libexec/gnubin/realpath" realpath; do
+		case "$c" in ''|/libexec/*) continue ;; esac   # empty brew prefix
+		p="$(command -v "$c" 2>/dev/null || true)"
+		[ -n "$p" ] && [ -x "$p" ] || continue
+		if "$p" --version 2>/dev/null | head -1 | grep -q 'GNU coreutils'; then
+			printf '%s\n' "$p"
+			return 0
+		fi
+	done
+	return 1
+}
+
+check_realpath() {
+	hdr "3. GNU realpath (hard requirement of kas-container)"
+	# After setup the guaranteed answer is our own shim in MACKAS_BIN.
+	if [ -x "$SHIM_DIR/realpath" ] &&
+		"$SHIM_DIR/realpath" --version 2>/dev/null | head -1 | grep -q 'GNU coreutils'; then
+		ck_pass "GNU realpath shim installed at $SHIM_DIR/realpath"
+		return
+	fi
+	local gnu
+	if gnu="$(find_gnu_realpath)"; then
+		if "$gnu" --relative-base=/tmp /tmp/x >/dev/null 2>&1; then
+			ck_pass "GNU realpath at $gnu ('$SCRIPT_CMD setup' will shim it as $SHIM_DIR/realpath)"
+		else
+			ck_fail "$gnu is GNU coreutils but rejects --relative-base; kas-container will fail" \
+				"brew upgrade coreutils"
+		fi
+	else
+		ck_fail "no GNU realpath found -- macOS's BSD realpath lacks -e/--relative-base, so kas-container cannot run" \
+			"brew install coreutils"
+	fi
+}
+
+check_docker_shim() {
+	hdr "4. docker shim resolution (classic footgun)"
+	local d ver installed=0
+	d="$(resolved_docker)"
+
+	if [ -x "$SHIM_DIR/docker" ]; then
+		ck_pass "shim installed at $SHIM_DIR/docker"
+		installed=1
+	elif [ -x "$SCRIPT_DIR/bin/docker" ]; then
+		ck_info "shim source present at $SCRIPT_DIR/bin/docker; '$SCRIPT_CMD setup' installs it to $SHIM_DIR"
+	else
+		ck_fail "shim not found at $SCRIPT_DIR/bin/docker" \
+			"re-clone the mackas repo; the shim ships with this script"
+	fi
+
+	if [ -z "$d" ]; then
+		ck_fail "no 'docker' on PATH -- kas-container v5.4 selects its engine by finding one" \
+			"source $(printf '%q' "$MACKAS_ENV_SH")   (run '$SCRIPT_CMD setup' first if it doesn't exist)"
+		return
+	fi
+
+	ck_info "command -v docker -> $d"
+	ver="$(docker -v 2>&1 | head -1 || true)"
+	ck_info "docker -v -> $ver"
+
+	# Report the whole resolution order; this is exactly where people lose
+	# an afternoon.
+	local all
+	all="$( (type -a docker 2>/dev/null || true) | sed 's/^/           /' || true)"
+	if [ -n "$all" ]; then
+		printf '  %s[info]%s resolution order:\n%s\n' "$C_DIM" "$C_RST" "$all"
+	fi
+
+	case "$d" in
+		"$SHIM_DIR/docker"|"$SCRIPT_DIR/bin/docker")
+			ck_pass "'docker' resolves to our shim"
+			;;
+		*)
+			# Before setup runs there is nothing to put on PATH, so this is
+			# expected rather than broken. It only becomes a FAIL once the
+			# shim exists and PATH still doesn't pick it up.
+			if [ "$installed" -eq 1 ]; then
+				ck_fail "'docker' resolves to $d, NOT our shim -- kas would drive real Docker instead of Apple container" \
+					"source $(printf '%q' "$MACKAS_ENV_SH")   # puts $SHIM_DIR ahead of /usr/local/bin"
+			else
+				ck_warn "'docker' resolves to $d (the real Docker CLI); the shim isn't installed yet" \
+					"$SCRIPT_CMD setup, then: source $(printf '%q' "$MACKAS_ENV_SH")"
+			fi
+			;;
+	esac
+
+	case "$ver" in
+		Docker*) ck_pass "docker -v output starts with 'Docker' (kas-container's engine grep matches)" ;;
+		*) ck_fail "docker -v does not start with 'Docker'; kas-container will not select it" \
+			"use the shim: export PATH=\"$SHIM_DIR:\$PATH\"" ;;
+	esac
+}
+
+check_target_volume() {
+	hdr "5. Build volume: ${MACKAS_ROOT:-<not set>}"
+	if [ -z "$MACKAS_ROOT" ]; then
+		ck_warn "MACKAS_ROOT is not set; commands fall back to the current directory ($PWD)"
+		ck_info "OE needs a case-sensitive filesystem, which a stock Mac home is not; for a real build point MACKAS_ROOT at one:"
+		root_hint | sed 's/^/         /'
+		return
+	fi
+	local mp
+	mp="$(volume_mount_point "$MACKAS_ROOT")"
+	ck_info "filesystem: $mp"
+
+	if [ ! -d "$mp" ]; then
+		ck_fail "$mp is not mounted" "plug in / mount the drive, then re-run '$SCRIPT_CMD check'"
+		return
+	fi
+
+	# --- writable?
+	if [ -d "$MACKAS_ROOT" ] && [ -w "$MACKAS_ROOT" ]; then
+		ck_pass "$MACKAS_ROOT exists and is writable"
+	elif [ -d "$MACKAS_ROOT" ]; then
+		ck_fail "$MACKAS_ROOT exists but is not writable by $(id -un)" \
+			"sudo chown $(id -un):$(id -gn) $(printf '%q' "$MACKAS_ROOT")"
+	elif [ -w "$(nearest_existing_dir "$MACKAS_ROOT")" ]; then
+		ck_info "$MACKAS_ROOT does not exist yet; $(nearest_existing_dir "$MACKAS_ROOT") is writable, 'setup' will create it"
+	else
+		ck_warn "$MACKAS_ROOT does not exist and $(nearest_existing_dir "$MACKAS_ROOT") is not writable by $(id -un)" \
+			"sudo mkdir -p $(printf '%q' "$MACKAS_ROOT") && sudo chown $(id -un):$(id -gn) $(printf '%q' "$MACKAS_ROOT")   ('$SCRIPT_CMD setup' will offer to run this)"
+	fi
+
+	# --- case sensitivity, probed empirically (never by parsing diskutil)
+	local probe rc
+	probe=""
+	if [ -d "$MACKAS_ROOT" ] && [ -w "$MACKAS_ROOT" ]; then
+		probe="$MACKAS_ROOT"
+	elif [ -w "$mp" ]; then
+		probe="$mp"
+	fi
+	if [ -n "$probe" ]; then
+		set +e; dir_is_case_sensitive "$probe"; rc=$?; set -e
+		case "$rc" in
+			0) ck_pass "case-sensitive filesystem (probed by creating files in $probe)" ;;
+			1) ck_fail "case-INSENSITIVE filesystem -- OpenEmbedded will fail in confusing ways" \
+				"use a case-sensitive volume; reformat with: diskutil apfs addVolume <disk> 'Case-sensitive APFS' oe" ;;
+			*) ck_warn "could not probe case sensitivity in $probe" "re-run once $MACKAS_ROOT is writable" ;;
+		esac
+	else
+		# Can't write anywhere on it yet; fall back to diskutil and say so.
+		#
+		# `|| true` on the assignment: under set -e -o pipefail, a failing
+		# diskutil (permission issue, disk unmounted mid-check) fails the
+		# WHOLE pipeline even though awk itself never sees a problem, and an
+		# unguarded `var="$(cmd | other)"` assignment aborts check_target_
+		# volume -- and so all of `mackas check` -- right here instead of
+		# falling through to the "unknown" fs handling four lines down, which
+		# is what this is actually supposed to do.
+		local fs
+		fs="$(diskutil info "$mp" 2>/dev/null | awk -F': *' '/File System Personality/ {print $2}')" || true
+		if printf '%s' "$fs" | grep -qi 'case-sensitive'; then
+			ck_warn "cannot probe empirically (nothing writable yet); diskutil reports: $fs" \
+				"re-run '$SCRIPT_CMD check' after 'setup' creates $MACKAS_ROOT to confirm empirically"
+		else
+			ck_fail "cannot probe empirically; diskutil reports: ${fs:-unknown} -- OE needs case-sensitive" \
+				"verify with a case-sensitive volume before building"
+		fi
+	fi
+
+	# --- fstrim/discard reclaim: informational, never fatal. The three ext4
+	# volumes work regardless of this -- they just cannot SHRINK back below
+	# their peak usage on a filesystem that does not support it. mackas
+	# relocates container's volume storage (CONTAINER_VOLUMES_DIR) under
+	# MACKAS_ROOT, so every volume.img physically lives on $mp, and $mp is
+	# what Apple's Virtualization.framework actually needs hole-punch support
+	# from to advertise DISCARD to the guest -- see docs/storage.md.
+	#
+	# Measured live, not assumed: a completely fresh volume on an ExFAT
+	# MACKAS_ROOT fails 'fstrim' identically to a heavily-used one, so this
+	# tracks the filesystem, not anything mackas or a specific volume did.
+	# Detected by name, not empirically probed -- an actual probe would mean
+	# pulling the kas image and booting a VM just for `check`, which is a
+	# multi-minute cost on a cold image cache for a purely informational
+	# result. APFS is the only filesystem measured to work; anything else is
+	# flagged, not assumed broken, since it has not been measured either way.
+	# `|| true`: see the identical note on the case-sensitivity fallback's
+	# diskutil call above -- under pipefail a failing diskutil would abort
+	# check_target_volume outright instead of falling through to the
+	# "could not determine" case below.
+	local fs_disc
+	fs_disc="$(diskutil info "$mp" 2>/dev/null | awk -F': *' '/File System Personality/ {print $2}')" || true
+	case "$fs_disc" in
+		*[Aa][Pp][Ff][Ss]*)
+			ck_pass "filesystem ($fs_disc) -- 'volume fstrim' should be able to reclaim space"
+			;;
+		"")
+			ck_info "could not determine $mp's filesystem type; 'volume fstrim' reclaim unverified"
+			;;
+		*)
+			ck_warn "filesystem ($fs_disc) is not APFS -- 'volume fstrim' may not be able to reclaim space" \
+				"harmless if the volumes never need to shrink; if disk space on $mp is tight, lower MACKAS_VOLUME_SIZE_TMP/_DL/_SSTATE in $(config_hint) instead of relying on fstrim to reclaim it later"
+			;;
+	esac
+
+	# --- free space
+	local free need total
+	free="$(free_gb_for "$MACKAS_ROOT")"
+	total="$(total_volume_gb)"
+	need=$(( total + MACKAS_FREE_SPACE_MARGIN_GB ))
+	local sizes="tmp $MACKAS_VOLUME_SIZE_TMP + dl $MACKAS_VOLUME_SIZE_DL + sstate $MACKAS_VOLUME_SIZE_SSTATE = ${total} GiB"
+	if [ "$free" -ge "$need" ]; then
+		ck_pass "free space ${free} GiB >= ${need} GiB ($sizes, + ${MACKAS_FREE_SPACE_MARGIN_GB} GiB margin)"
+	else
+		ck_fail "free space ${free} GiB < ${need} GiB needed ($sizes, + ${MACKAS_FREE_SPACE_MARGIN_GB} GiB margin)" \
+			"free space on $mp, or lower MACKAS_VOLUME_SIZE_TMP/_DL/_SSTATE in $(config_hint)"
+	fi
+
+	# --- Time Machine
+	if is_time_machine_dest "$mp"; then
+		ck_warn "$mp is an ACTIVE Time Machine destination"
+		printf '         %s%s%s\n' "$C_YEL" "Time Machine and this build share ${free} GiB of free space." "$C_RST"
+		printf '         %s%s%s\n' "$C_YEL" "If the build fills the disk, backups stop working (and TM will start" "$C_RST"
+		printf '         %s%s%s\n' "$C_YEL" "thinning old snapshots to make room -- you lose backup history)." "$C_RST"
+		printf '         %sfix:%s FIXED-size ext4 volumes (%s GiB total) cap the damage, which is\n' "$C_BLU" "$C_RST" "$(total_volume_gb)"
+		printf '              why this setup uses them, and the generated kas fragment halts the\n'
+		printf '              build on low free space inside each. Alternatively point TM elsewhere:\n'
+		printf '              tmutil removedestination <ID>   # see: tmutil destinationinfo\n'
+	else
+		ck_pass "$mp is not a Time Machine destination"
+	fi
+}
+
+check_short_link() {
+	hdr "6. Short path / AF_UNIX socket limit / spaces"
+	local sock_host sock_short len_host len_short
+
+	sock_host="$MACKAS_ROOT/build/bitbake.sock"
+	sock_short="$MACKAS_SHORT_LINK/build/bitbake.sock"
+	len_host=${#sock_host}
+	len_short=${#sock_short}
+
+	ck_info "host TOPDIR socket path would be: $sock_host (${len_host} chars)"
+
+	if [ "$len_host" -gt 104 ]; then
+		ck_warn "host-side path is ${len_host} chars, over the ~104 char macOS sockaddr_un limit (kas issue #38)" \
+			"use the short symlink: MACKAS_SHORT_LINK=$MACKAS_SHORT_LINK (setup creates it)"
+	else
+		ck_pass "host-side socket path ${len_host} chars, under the ~104 char sockaddr_un limit"
+	fi
+
+	# Inside the container, TOPDIR is /build, so the socket bind actually
+	# happens in the Linux guest at /build/bitbake.sock. Say so, because it
+	# is the reason this is a WARN and not a FAIL.
+	ck_info "in-container TOPDIR is /build -> bind path is /build/bitbake.sock (19 chars); the"
+	ck_info "  104-char limit only bites if you ever run bitbake natively on the host"
+
+	case "$MACKAS_ROOT" in
+		*" "*)
+			if [ -L "$MACKAS_SHORT_LINK" ]; then
+				ck_pass "MACKAS_ROOT contains spaces, but MACKAS_SHORT_LINK=$MACKAS_SHORT_LINK exists and is used instead"
+			else
+				ck_warn "MACKAS_ROOT contains spaces ('$MACKAS_ROOT'); some OE/bitbake recipes mishandle them" \
+					"'$SCRIPT_CMD setup' creates $MACKAS_SHORT_LINK -> $MACKAS_ROOT and uses that"
+			fi
+			;;
+		*) ck_pass "MACKAS_ROOT has no spaces" ;;
+	esac
+
+	if [ -L "$MACKAS_SHORT_LINK" ]; then
+		local tgt
+		tgt="$(readlink "$MACKAS_SHORT_LINK")"
+		if [ "$tgt" = "$MACKAS_ROOT" ]; then
+			ck_pass "short link $MACKAS_SHORT_LINK -> $MACKAS_ROOT (${len_short} chars for the socket path)"
+		else
+			ck_fail "short link $MACKAS_SHORT_LINK points at '$tgt', not '$MACKAS_ROOT'" \
+				"rm $(printf '%q' "$MACKAS_SHORT_LINK") && $SCRIPT_CMD setup"
+		fi
+	elif [ -e "$MACKAS_SHORT_LINK" ]; then
+		ck_fail "$MACKAS_SHORT_LINK exists and is not a symlink" \
+			"move it aside, then run '$SCRIPT_CMD setup'"
+	else
+		ck_info "short link $MACKAS_SHORT_LINK not created yet ('$SCRIPT_CMD setup' will create it)"
+		case "$MACKAS_SHORT_LINK" in
+			/opt/*)
+				if [ ! -w "$(dirname "$MACKAS_SHORT_LINK")" ]; then
+					ck_info "  note: $(dirname "$MACKAS_SHORT_LINK") is root-owned; creating the link needs sudo"
+				fi
+				;;
+		esac
+	fi
+}
+
+check_network() {
+	hdr "7. Network"
+	# ghcr.io/v2/ answers 401 when unauthenticated -- any HTTP status back at
+	# all proves reachability, so test the status, not curl's exit code.
+	local code
+	code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://ghcr.io/v2/ 2>/dev/null)" || code="000"
+	if [ "$code" != "000" ]; then
+		ck_pass "ghcr.io reachable (HTTP $code; needed to pull $KAS_IMAGE)"
+	else
+		ck_fail "cannot reach ghcr.io" \
+			"check your network/proxy; kas-container honours http_proxy/https_proxy"
+	fi
+
+	if [ "$MACKAS_USE_HTTP_MIRRORS" = "1" ]; then
+		# A HEAD against the mirror root. mackas-mirrord serves no listing by
+		# default, so 404 is the EXPECTED healthy answer -- it proves the
+		# daemon is up and answering. 401 means it wants credentials (put them
+		# in ~/.netrc); 403 means this host is not in its --allow list. Only
+		# 000 (no answer at all) is a failure.
+		local mcode
+		# NB: on failure curl still prints '000' to stdout AND exits nonzero,
+		# so a '|| echo 000' fallback would yield '000\n000' -- which is not
+		# equal to '000' and would sail past the check as a pass. Override the
+		# variable instead of appending to it.
+		mcode="$(curl -s -o /dev/null -I -w '%{http_code}' --max-time 10 "$MACKAS_HTTP_MIRROR_SSTATE/" 2>/dev/null)" || mcode="000"
+		case "$mcode" in
+			000) ck_fail "HTTP sstate mirror $MACKAS_HTTP_MIRROR_SSTATE not answering" \
+					"start mackas-mirrord on the mirror host (see mirror-server/ and README.md), or set MACKAS_USE_HTTP_MIRRORS=0 in $(config_hint)" ;;
+			401) ck_info "HTTP sstate mirror answers 401 (auth required); put the credentials in ~/.netrc and export NETRC_FILE" ;;
+			403) ck_info "HTTP sstate mirror answers 403; this host's IP is probably not in the daemon's --allow list" ;;
+			*)   ck_pass "HTTP sstate mirror reachable ($MACKAS_HTTP_MIRROR_SSTATE, HTTP $mcode)" ;;
+		esac
+	fi
+
+	if [ "$MACKAS_USE_NFS_MIRRORS" != "1" ]; then
+		if [ "$MACKAS_USE_HTTP_MIRRORS" != "1" ]; then
+			ck_info "no mirrors enabled -- this is fine, mackas builds from upstream with no mirror at all. Optionally set MACKAS_USE_HTTP_MIRRORS=1 in $(config_hint) to reuse a mirror host's sstate + downloads caches over HTTP instead (see mirror-server/)"
+		fi
+		return
+	fi
+
+	local ip
+	ip="$(host_ip)"
+	ck_info "this host's primary IP: ${ip:-unknown}"
+
+	if ping -c1 -t3 "$MACKAS_NFS_SERVER" >/dev/null 2>&1; then
+		ck_pass "$MACKAS_NFS_SERVER reachable"
+	else
+		ck_fail "$MACKAS_NFS_SERVER not reachable" \
+			"check DNS/mDNS and the host; or set MACKAS_USE_NFS_MIRRORS=0 in $(config_hint)"
+		return
+	fi
+
+	local exports acl
+	exports="$(showmount -e "$MACKAS_NFS_SERVER" 2>/dev/null || true)"
+	if [ -z "$exports" ]; then
+		ck_fail "showmount -e $MACKAS_NFS_SERVER returned nothing" \
+			"is nfsd running on $MACKAS_NFS_SERVER? ssh $MACKAS_NFS_SERVER 'systemctl status nfs-server'"
+		return
+	fi
+	acl="$(printf '%s\n' "$exports" | awk -v e="$MACKAS_NFS_EXPORT" '$1==e {$1=""; print}')"
+	if [ -z "$acl" ]; then
+		ck_fail "$MACKAS_NFS_SERVER does not export $MACKAS_NFS_EXPORT" \
+			"add it to /etc/exports on $MACKAS_NFS_SERVER, then: ssh $MACKAS_NFS_SERVER sudo exportfs -ra"
+		return
+	fi
+	ck_pass "$MACKAS_NFS_SERVER exports $MACKAS_NFS_EXPORT to:$acl"
+
+	# Is our IP inside any of the CIDRs in the ACL?
+	local tok matched=0
+	if [ -n "$ip" ]; then
+		for tok in $acl; do
+			# strip trailing "(opts)"
+			tok="${tok%%(*}"
+			case "$tok" in
+				*:*) continue ;;   # IPv6, skip
+				"") continue ;;
+			esac
+			if ip_in_cidr "$ip" "$tok"; then matched=1; break; fi
+		done
+		if [ "$matched" -eq 1 ]; then
+			ck_pass "$ip is inside the export ACL"
+		else
+			ck_fail "$ip is NOT inside the export ACL for $MACKAS_NFS_EXPORT" \
+				"on $MACKAS_NFS_SERVER add this host's subnet to /etc/exports, then sudo exportfs -ra"
+		fi
+	fi
+
+	if mount | grep -qF " on $MACKAS_NFS_MOUNT "; then
+		ck_pass "NFS already mounted at $MACKAS_NFS_MOUNT"
+	else
+		ck_info "NFS not mounted yet. macOS needs sudo and (almost always) -o resvport:"
+		ck_info "  sudo mkdir -p $(printf '%q' "$MACKAS_NFS_MOUNT")"
+		ck_info "  sudo mount -t nfs -o resvport,vers=3,ro,nolocks,locallocks ${MACKAS_NFS_SERVER}:${MACKAS_NFS_EXPORT} $(printf '%q' "$MACKAS_NFS_MOUNT")"
+		ck_info "  vers=3 is PINNED deliberately: '-o vers=4' kernel-panics macOS (see docs/storage.md)"
+		ck_info "  ('$SCRIPT_CMD setup' will offer to run this)"
+	fi
+}
+
+# Report one ext4 volume: is it there, what does it cost, and -- the bit that
+# actually bites -- who owns its root. A fresh volume's root is root:root, and
+# kas drops to USER_ID/GROUP_ID before touching it, so an unchowned volume
+# fails with EACCES on /build/CACHEDIR.TAG. `setup` chowns; this verifies it.
+check_one_volume() {
+	local name="$1" size="$2" role="$3" img owner want
+
+	if ! volume_exists "$name"; then
+		ck_info "volume '$name' not created yet ($role; will be ${size} ext4)"
+		return
+	fi
+
+	img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+	if [ -e "$img" ]; then
+		ck_pass "volume '$name' exists ($role, ${size} cap, $(du -h "$img" 2>/dev/null | awk '{print $1}') on disk)"
+	else
+		ck_pass "volume '$name' exists ($role, ${size} cap)"
+	fi
+
+	# Needs a booted container to see real Linux ownership; skip rather than
+	# guess if the runtime isn't up or the image isn't pulled.
+	container_running || return 0
+	image_present "$KAS_IMAGE" || return 0
+
+	# Attaching the volume to probe ownership would be a SECOND attach while a
+	# build still holds it. Don't: report it and move on rather than warn
+	# "could not read the ownership" (misleading) or fight the one-VM rule.
+	if volume_in_use "$name"; then
+		ck_info "volume '$name' is attached to a running build; skipping the ownership probe"
+		return 0
+	fi
+
+	want="$(id -u):$(id -g)"
+	owner="$(container run --rm -v "$name:/mnt" "$KAS_IMAGE" \
+		stat -c '%u:%g' /mnt 2>/dev/null | tr -d '\r')" || owner=""
+	if [ -z "$owner" ]; then
+		ck_warn "could not read the ownership of volume '$name'" \
+			"container run --rm -v $(printf '%q' "$name:/mnt") $KAS_IMAGE stat -c '%u:%g' /mnt"
+	elif [ "$owner" = "$want" ]; then
+		ck_pass "volume '$name' root is owned by $owner (kas drops to $want and can write it)"
+	else
+		ck_fail "volume '$name' root is owned by $owner, not $want -- kas will fail with EACCES on /build/CACHEDIR.TAG" \
+			"container run --rm -u 0:0 -v $(printf '%q' "$name:/mnt") $KAS_IMAGE chown $want /mnt   ('$SCRIPT_CMD setup' does this)"
+	fi
+}
+
+check_state() {
+	hdr "8. Existing state (idempotency)"
+
+	if image_present "$KAS_IMAGE"; then
+		ck_pass "image $KAS_IMAGE already pulled"
+	else
+		ck_info "image $KAS_IMAGE not pulled yet ('$SCRIPT_CMD setup' will pull it)"
+	fi
+
+	check_one_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
+	check_one_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
+	check_one_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "SSTATE_DIR -> /sstate"
+
+	# A volume from before the split into three. It is not used any more, and a
+	# stale 200G image is exactly the thing this disk cannot spare.
+	if volume_exists "$MACKAS_VOL_LEGACY"; then
+		ck_warn "volume '$MACKAS_VOL_LEGACY' is left over from the old single-volume scheme and is NOT used" \
+			"container volume delete $(printf '%q' "$MACKAS_VOL_LEGACY")   # after checking you want nothing in it"
+	fi
+
+	if [ "$MACKAS_RELOCATE_VOLUMES" = "1" ]; then
+		if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
+			ck_pass "container volumes dir relocated: $CONTAINER_VOLUMES_DIR -> $(readlink "$CONTAINER_VOLUMES_DIR")"
+		else
+			ck_info "container volumes dir still on the internal disk ($CONTAINER_VOLUMES_DIR)"
+			ck_info "  MACKAS_RELOCATE_VOLUMES=1: 'setup' will symlink it onto $MACKAS_ROOT"
+		fi
+	fi
+
+	if [ -x "$KAS_CONTAINER_BIN" ]; then
+		ck_pass "kas-container present: $("$KAS_CONTAINER_BIN" --version 2>&1 | head -1)"
+	else
+		ck_info "kas-container not installed yet -> $KAS_CONTAINER_BIN"
+	fi
+
+	if [ -d "$MACKAS_PROJECT/.git" ]; then
+		local br
+		br="$(git -C "$MACKAS_PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+		if [ "$br" = "$MACKAS_PROJECT_BRANCH" ]; then
+			ck_pass "project checked out at $MACKAS_PROJECT (branch $br)"
+		else
+			ck_warn "project at $MACKAS_PROJECT is on branch '$br', wanted '$MACKAS_PROJECT_BRANCH'" \
+				"git -C $(printf '%q' "$MACKAS_PROJECT") checkout $MACKAS_PROJECT_BRANCH"
+		fi
+	else
+		ck_info "project not cloned yet -> $MACKAS_PROJECT (branch $MACKAS_PROJECT_BRANCH from $MACKAS_PROJECT_URL)"
+	fi
+
+	if [ -f "$MACKAS_ENV_SH" ]; then
+		ck_pass "env.sh present: source $MACKAS_ENV_SH"
+	else
+		ck_info "env.sh not written yet -> $MACKAS_ENV_SH"
+	fi
+}
+
+# See setup_gitconfig() for the full story: without this, git inside the
+# container refuses /repo with "detected dubious ownership", and kas's
+# get_root_path() silently falls back to the wrong directory instead of
+# failing loudly -- which is what made this THE blocker to track down.
+check_gitconfig() {
+	hdr "9. git 'dubious ownership' workaround (GITCONFIG_FILE / safe.directory)"
+
+	if [ -n "${GITCONFIG_FILE:-}" ] && [ "$GITCONFIG_FILE" != "$MACKAS_GITCONFIG" ]; then
+		if [ -r "$GITCONFIG_FILE" ] && has_safe_directory_star "$GITCONFIG_FILE"; then
+			ck_pass "your own GITCONFIG_FILE=$GITCONFIG_FILE already has safe.directory = *"
+		else
+			ck_warn "GITCONFIG_FILE=$GITCONFIG_FILE is set (yours) but has no 'safe.directory = *' -- git inside the container will refuse /repo with 'dubious ownership'" \
+				"add [safe] / directory = * to $GITCONFIG_FILE by hand (mackas will not touch a GITCONFIG_FILE you set yourself)"
+		fi
+		return
+	fi
+
+	if [ -f "$MACKAS_GITCONFIG" ]; then
+		if has_safe_directory_star "$MACKAS_GITCONFIG"; then
+			ck_pass "gitconfig present: $MACKAS_GITCONFIG (safe.directory = *)"
+		else
+			ck_fail "gitconfig present at $MACKAS_GITCONFIG but missing safe.directory = *" \
+				"$SCRIPT_CMD setup"
+		fi
+	else
+		ck_info "gitconfig not written yet -> $MACKAS_GITCONFIG ('$SCRIPT_CMD setup' will create it)"
+	fi
+}
+
+cmd_check() {
+	info "${C_BLD}mackas preflight${C_RST}  (config: ${CONFIG_FILE_USED:-none, using built-in defaults})"
+	check_host
+	check_container_runtime
+	check_realpath
+	check_docker_shim
+	check_target_volume
+	check_short_link
+	check_network
+	check_state
+	check_gitconfig
+
+	hdr "Summary"
+	printf '  %s%d pass%s, %s%d warn%s, %s%d fail%s\n' \
+		"$C_GRN" "$N_PASS" "$C_RST" "$C_YEL" "$N_WARN" "$C_RST" "$C_RED" "$N_FAIL" "$C_RST"
+	if [ "$N_FAIL" -gt 0 ]; then
+		info "  Fix the FAILs above, then re-run: $SCRIPT_CMD check"
+		return 1
+	fi
+	if [ "$N_WARN" -gt 0 ]; then
+		info "  Warnings are non-fatal. When you're happy: $SCRIPT_CMD setup"
+	else
+		info "  All good. Next: $SCRIPT_CMD setup"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+STEP=0
+STEP_TOTAL=11
+
+step() {
+	STEP=$((STEP + 1))
+	printf '\n%s[%d/%d] %s%s\n' "$C_BLD" "$STEP" "$STEP_TOTAL" "$*" "$C_RST"
+}
+
+skip() { printf '      %s* already done: %s%s\n' "$C_DIM" "$*" "$C_RST"; }
+did()  { printf '      %s+ %s%s\n' "$C_GRN" "$*" "$C_RST"; }
+
+# Run a slow, OPAQUE command with a live elapsed-time spinner, so a multi-second
+# step (a container VM boot, an mkfs) never looks hung. It is honestly NOT a
+# percentage bar or an ETA: these operations stream no progress, and faking one
+# would be worse than none -- so this shows the truth, elapsed seconds ticking.
+# For a real byte-copy where the total IS known (the relocate rsync in
+# setup_relocate_volumes), rsync's own --info=progress2 shows a genuine bar +
+# ETA instead -- that is where a real percentage belongs.
+#
+# On a non-TTY (piped, CI, `nohup smoketest`) or under --dry-run it degrades to a
+# plain run(), so output stays identical where nobody is watching a terminal.
+# Usage: spin "label" command args...   (command output is shown only on failure)
+spin() {
+	local label="$1"; shift
+	if [ "$DRY_RUN" -eq 1 ] || [ ! -t 1 ]; then
+		run "$@"
+		return
+	fi
+	local out; out="$(mktemp "${TMPDIR:-/tmp}/mackas-spin.XXXXXX")" || { run "$@"; return; }
+	"$@" >"$out" 2>&1 &
+	local pid=$! i=0 start=$SECONDS el idx rc=0 fr='|/-\'
+	while kill -0 "$pid" 2>/dev/null; do
+		el=$((SECONDS - start)); idx=$((i % 4))
+		printf '\r      %s%s%s %s  %d:%02d ' \
+			"$C_DIM" "${fr:idx:1}" "$C_RST" "$label" "$((el / 60))" "$((el % 60))"
+		i=$((i + 1)); sleep 0.2
+	done
+	wait "$pid" || rc=$?
+	printf '\r\033[K'          # wipe the spinner line; the caller's did() records the result
+	if [ "$rc" -ne 0 ]; then
+		err "      $label failed:"
+		cat "$out" >&2
+	fi
+	rm -f "$out"
+	return "$rc"
+}
+
+setup_runtime() {
+	step "Apple container runtime"
+	if ! command -v container >/dev/null 2>&1; then
+		die "'container' is not installed" "brew install container && $SCRIPT_CMD setup"
+	fi
+	skip "$(container --version 2>&1 | head -1)"
+	if container_running; then
+		skip "container system is running"
+	else
+		run container system start
+		did "started container system"
+	fi
+}
+
+setup_oe_root() {
+	step "Build root: $MACKAS_ROOT"
+	if [ -d "$MACKAS_ROOT" ] && [ -w "$MACKAS_ROOT" ]; then
+		skip "$MACKAS_ROOT exists and is writable"
+	elif [ -d "$MACKAS_ROOT" ]; then
+		info "      $MACKAS_ROOT exists but is owned by $(stat -f '%Su:%Sg' "$MACKAS_ROOT")"
+		if confirm "      Take ownership with sudo?"; then
+			run_sudo chown "$(id -un):$(id -gn)" "$MACKAS_ROOT"
+			did "chowned $MACKAS_ROOT"
+		else
+			die "$MACKAS_ROOT is not writable" \
+				"sudo chown $(id -un):$(id -gn) $(printf '%q' "$MACKAS_ROOT")"
+		fi
+	else
+		local parent
+		parent="$(nearest_existing_dir "$MACKAS_ROOT")"
+		if [ -w "$parent" ]; then
+			run mkdir -p "$MACKAS_ROOT"
+			did "created $MACKAS_ROOT"
+		else
+			info "      $parent is not writable by $(id -un); creating $MACKAS_ROOT needs sudo."
+			if confirm "      Run the sudo mkdir + chown now?"; then
+				run_sudo mkdir -p "$MACKAS_ROOT"
+				run_sudo chown "$(id -un):$(id -gn)" "$MACKAS_ROOT"
+				did "created and chowned $MACKAS_ROOT"
+			else
+				die "cannot create $MACKAS_ROOT without sudo" \
+					"sudo mkdir -p $(printf '%q' "$MACKAS_ROOT") && sudo chown $(id -un):$(id -gn) $(printf '%q' "$MACKAS_ROOT")"
+			fi
+		fi
+	fi
+
+	# No build/downloads/sstate here: those three live in ext4 volumes, not on
+	# APFS. See kas_runtime_args().
+	local d
+	for d in bin kas logs; do
+		if [ -d "$MACKAS_ROOT/$d" ]; then
+			skip "$MACKAS_ROOT/$d"
+		else
+			run mkdir -p "$MACKAS_ROOT/$d"
+			did "created $MACKAS_ROOT/$d"
+		fi
+	done
+
+	# work/ gets its own handling: a workspace image (below) makes it a
+	# SYMLINK to wherever hdiutil mounted it, and hdiutil attach does not
+	# survive a reboot -- the sparse image is still on disk, but the mount
+	# point the symlink names is gone. `-d` alone can't tell "never set up"
+	# apart from "set up, just not mounted right now" (both read as false),
+	# so check -L first: a dangling symlink means reattach, not mkdir over it
+	# -- mkdir on a path that is already a (broken) symlink fails confusingly
+	# rather than just working.
+	if [ -d "$MACKAS_ROOT/work" ]; then
+		skip "$MACKAS_ROOT/work"
+	elif [ -L "$MACKAS_ROOT/work" ]; then
+		reattach_dangling_workspace_symlink
+	else
+		run mkdir -p "$MACKAS_ROOT/work"
+		did "created $MACKAS_ROOT/work"
+	fi
+
+	# Only `work/` (KAS_WORK_DIR, the layer checkouts) needs to be
+	# case-sensitive -- bin/kas/logs do not care. Probe work/ itself, not
+	# MACKAS_ROOT: once a workspace image (below) is mounted there, work/ is
+	# case-sensitive even though MACKAS_ROOT's own filesystem never changes.
+	if [ "$MACKAS_REQUIRE_CASE_SENSITIVE" = "1" ]; then
+		local cs; set +e; dir_is_case_sensitive "$MACKAS_ROOT/work"; cs=$?; set -e
+		case "$cs" in
+		1)	offer_workspace_image ;;
+		2)	warn "      could not verify $MACKAS_ROOT/work is case-sensitive; if a build fails oddly, run '$SCRIPT_CMD check'" ;;
+		esac
+	fi
+}
+
+# workspace_image_base -- the sparse image's path, WITHOUT the .sparseimage
+# suffix hdiutil appends on create. Callers needing the actual file add it.
+workspace_image_base() { printf '%s/workspace' "$MACKAS_ROOT"; }
+
+# offer_workspace_image -- work/ just failed the case-sensitivity probe.
+# Rather than die outright (the old behaviour, still what happens on
+# decline), offer a case-sensitive APFS sparse image mounted AT work/ --
+# see TODO item 18 for why this shape and not a 4th ext4 volume: it reuses
+# the exact virtiofs bind-mount mackas already does for /repo, so work/
+# stays host-native (git, bitbake -e keep working from macOS) and needs no
+# container-volume machinery. Spiked and confirmed this session: a real git
+# commit of case-colliding filenames round-trips correctly through a
+# container backed by exactly this mechanism.
+# attach_workspace_image IMG -- attach IMG and echo its real mount point.
+#
+# Deliberately does NOT use `hdiutil attach -mountpoint work/`. Found live:
+# `-mountpoint` onto a directory that itself lives on a non-APFS host volume
+# (confirmed: ExFAT) fails with "insufficient privileges" even though the
+# SAME image attaches fine either with no -mountpoint at all, or with
+# -mountpoint onto the boot (APFS) volume. Attaching plain (default
+# /Volumes/<name>) is universally reliable regardless of what MACKAS_ROOT
+# itself sits on, so that is the only path this uses -- work/ becomes a
+# SYMLINK to the real mount point instead, exactly the idiom volume_move/
+# volume_recover already use for ext4 volumes ("the symlink is the record").
+# A fixed -volname can collide (two workspace images, or a stale leftover
+# mount) and hdiutil silently uniquifies it (`mackas-workspace 2`), so the
+# real reported path is parsed from hdiutil's own output, never assumed.
+attach_workspace_image() {
+	local img="$1" out rc=0 mp
+	if [ "$DRY_RUN" -eq 1 ]; then
+		# Unlike run(), this function's STDOUT is a value the caller captures
+		# via command substitution (the mount point), not console text -- so
+		# the dry-run notice, unlike run()'s own, has to go to stderr, or it
+		# would be captured right along with the path it precedes.
+		printf '%s+ hdiutil attach %s -nobrowse%s\n' "$C_DIM" "$(printf '%q' "$img")" "$C_RST" >&2
+		printf '/Volumes/mackas-workspace\n'
+		return 0
+	fi
+	vrb "+ hdiutil attach $(printf '%q' "$img") -nobrowse"
+	out="$(hdiutil attach "$img" -nobrowse 2>&1)" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		printf '%s\n' "$out" >&2
+		return "$rc"
+	fi
+	# hdiutil's table output: the mounted filesystem's line ends in the real
+	# path (the EFI/partition-scheme lines above it have no such column).
+	mp="$(printf '%s\n' "$out" | grep -E '/Volumes/' | awk '{print $NF}' | tail -1)"
+	[ -n "$mp" ] || return 1
+	printf '%s\n' "$mp"
+}
+
+# reattach_workspace_image IMG -- attach an EXISTING workspace image and
+# (re)point $MACKAS_ROOT/work at wherever it mounts. Shared by
+# offer_workspace_image's reattach branch and reattach_dangling_workspace_
+# symlink below, which hit the exact same "the Mac rebooted" situation from
+# two different starting states (a case-insensitive work/ vs. a dangling
+# symlink).
+reattach_workspace_image() {
+	local img="$1" mp
+	mp="$(attach_workspace_image "$img")" \
+		|| die "hdiutil attach failed for $img" "check 'hdiutil info' and 'hdiutil imageinfo $(printf '%q' "$img")'"
+	if [ -e "$MACKAS_ROOT/work" ] || [ -L "$MACKAS_ROOT/work" ]; then
+		run rm -rf "$MACKAS_ROOT/work"
+	fi
+	run ln -s "$mp" "$MACKAS_ROOT/work"
+	did "reattached workspace image at $MACKAS_ROOT/work -> $mp"
+}
+
+# reattach_dangling_workspace_symlink -- setup_oe_root() found work/ as a
+# symlink whose target no longer exists. hdiutil attach does not persist
+# across a reboot, so this is almost always just "the Mac restarted since
+# the last build" rather than anything actually wrong; offer to reattach the
+# still-on-disk image rather than dying on what looks like a plain missing
+# directory.
+reattach_dangling_workspace_symlink() {
+	local base img
+	base="$(workspace_image_base)"
+	img="${base}.sparseimage"
+	if [ ! -f "$img" ]; then
+		die "$MACKAS_ROOT/work is a dangling symlink (-> $(readlink "$MACKAS_ROOT/work" 2>/dev/null)), and no workspace image exists at $img to reattach" \
+			"investigate by hand: readlink $(printf '%q' "$MACKAS_ROOT/work")"
+	fi
+	confirm "      work/ points at a workspace image that is no longer mounted (a reboot unmounts it) -- reattach $img?" \
+		|| die "$MACKAS_ROOT/work is a dangling symlink to an unmounted workspace image" \
+			"reattach by hand: hdiutil attach $(printf '%q' "$img") -nobrowse   (then symlink $(printf '%q' "$MACKAS_ROOT/work") to the mount point it reports)"
+	reattach_workspace_image "$img"
+}
+
+offer_workspace_image() {
+	local base img
+	base="$(workspace_image_base)"
+	img="${base}.sparseimage"
+
+	if [ -f "$img" ]; then
+		# A previous run already created one; hdiutil attach is NOT
+		# persistent across a reboot, so the common case here is just "the
+		# Mac restarted" -- offer to reattach, not recreate.
+		if ! confirm "      work/ is case-insensitive, but a workspace image already exists at $img -- reattach it?"; then
+			die "$MACKAS_ROOT/work is on a CASE-INSENSITIVE filesystem -- OpenEmbedded will fail in confusing ways (the oe-core checkout corrupts)" \
+				"reattach the existing workspace: hdiutil attach $(printf '%q' "$img") -nobrowse   (then symlink $(printf '%q' "$MACKAS_ROOT/work") to the mount point it reports)"
+		fi
+		reattach_workspace_image "$img"
+	else
+		if ! confirm "      work/ is case-insensitive -- create a case-sensitive workspace image and mount it at $MACKAS_ROOT/work?"; then
+			die "$MACKAS_ROOT/work is on a CASE-INSENSITIVE filesystem -- OpenEmbedded will fail in confusing ways (the oe-core checkout corrupts)" \
+				"point MACKAS_ROOT at a case-sensitive volume ('$SCRIPT_CMD check' shows how), or set MACKAS_REQUIRE_CASE_SENSITIVE=0 if the case-sensitive parts live elsewhere"
+		fi
+
+		# work/ may already hold a real checkout (mackas predates this gate,
+		# or the user hand-created it before ever running setup). Mounting
+		# an image AT work/ would just shadow that content, not merge with
+		# it, so move it aside first and copy it BACK onto the fresh image
+		# once mounted -- preserving every layer's git remote, branch and
+		# any uncommitted work exactly as-is (a plain file copy of a git
+		# repo is a perfect copy; there is nothing "git-aware" to do here).
+		local preserved="" stash=""
+		if [ -n "$(ls -A "$MACKAS_ROOT/work" 2>/dev/null)" ]; then
+			stash="$MACKAS_ROOT/work.pre-workspace-$(date +%Y%m%d-%H%M%S)"
+			run mv "$MACKAS_ROOT/work" "$stash"
+			preserved="$stash"
+			did "moved the existing work/ aside to $stash (will be copied onto the new image)"
+		fi
+		# ln -s onto an EXISTING directory creates the link INSIDE it rather
+		# than replacing it, so work/ must not exist here -- it either never
+		# did, or the block above just moved it aside.
+		[ -e "$MACKAS_ROOT/work" ] && run rm -rf "$MACKAS_ROOT/work"
+
+		run hdiutil create -type SPARSE -fs "Case-sensitive APFS" \
+			-size "$MACKAS_WORKSPACE_SIZE" -volname mackas-workspace "$base"
+		did "created workspace image: $img ($MACKAS_WORKSPACE_SIZE, sparse)"
+
+		local mp; mp="$(attach_workspace_image "$img")" \
+			|| die "hdiutil attach failed for the workspace image just created" \
+				"check 'hdiutil info'; the image itself is at $img"
+		run ln -s "$mp" "$MACKAS_ROOT/work"
+		did "mounted workspace image at $MACKAS_ROOT/work -> $mp"
+
+		if [ -n "$preserved" ]; then
+			run rsync -a "$preserved/" "$MACKAS_ROOT/work/"
+			did "copied the preserved checkout onto the new workspace"
+			info "      kept a backup at $preserved -- remove it by hand once you have"
+			info "      confirmed the copy (git status in each layer, or just 'diff -r')."
+		fi
+	fi
+
+	# Sanity check: work/ must actually be case-sensitive now, or something
+	# above silently failed (a stale mount, a dangling symlink) and
+	# continuing would repeat the exact bug this whole gate exists to catch.
+	local cs2; set +e; dir_is_case_sensitive "$MACKAS_ROOT/work"; cs2=$?; set -e
+	[ "$cs2" -eq 0 ] || [ "$DRY_RUN" -eq 1 ] || die "work/ is still not case-sensitive after mounting the workspace image -- something went wrong" \
+		"check 'mount | grep work' and 'hdiutil info'"
+}
+
+setup_short_link() {
+	step "Short symlink: $MACKAS_SHORT_LINK -> $MACKAS_ROOT"
+	if [ -L "$MACKAS_SHORT_LINK" ]; then
+		local tgt
+		tgt="$(readlink "$MACKAS_SHORT_LINK")"
+		if [ "$tgt" = "$MACKAS_ROOT" ]; then
+			skip "$MACKAS_SHORT_LINK -> $MACKAS_ROOT"
+		else
+			die "$MACKAS_SHORT_LINK already points at '$tgt'" \
+				"rm $(printf '%q' "$MACKAS_SHORT_LINK") && $SCRIPT_CMD setup"
+		fi
+	elif [ -e "$MACKAS_SHORT_LINK" ]; then
+		die "$MACKAS_SHORT_LINK exists and is not a symlink" \
+			"move it aside, then re-run '$SCRIPT_CMD setup'"
+	else
+		local parent
+		parent="$(dirname "$MACKAS_SHORT_LINK")"
+		if [ -w "$parent" ]; then
+			run ln -s "$MACKAS_ROOT" "$MACKAS_SHORT_LINK"
+			did "linked $MACKAS_SHORT_LINK -> $MACKAS_ROOT"
+		else
+			info "      $parent is not writable by $(id -un); the symlink needs sudo."
+			if confirm "      Create it with sudo?"; then
+				run_sudo ln -s "$MACKAS_ROOT" "$MACKAS_SHORT_LINK"
+				did "linked $MACKAS_SHORT_LINK -> $MACKAS_ROOT"
+			else
+				die "cannot create $MACKAS_SHORT_LINK" \
+					"sudo ln -s $(printf '%q' "$MACKAS_ROOT") $(printf '%q' "$MACKAS_SHORT_LINK")   -- or set MACKAS_SHORT_LINK=\$HOME/oe in $(config_hint)"
+			fi
+		fi
+	fi
+	# From here on MACKAS_BASE can use the link.
+	derive_paths
+}
+
+setup_shim_and_env() {
+	step "docker shim + GNU realpath + env.sh"
+
+	if [ -x "$SCRIPT_DIR/bin/docker" ]; then
+		if [ -f "$SHIM_DIR/docker" ] && cmp -s "$SCRIPT_DIR/bin/docker" "$SHIM_DIR/docker"; then
+			skip "$SHIM_DIR/docker is current"
+		else
+			run mkdir -p "$SHIM_DIR"
+			run cp "$SCRIPT_DIR/bin/docker" "$SHIM_DIR/docker"
+			run chmod +x "$SHIM_DIR/docker"
+			did "installed shim -> $SHIM_DIR/docker"
+		fi
+	else
+		die "shim missing at $SCRIPT_DIR/bin/docker" "re-clone the mackas repo"
+	fi
+
+	# GNU realpath: kas-container calls `realpath -e` / `--relative-base`, which
+	# macOS's BSD /bin/realpath rejects. `brew install coreutils` installs
+	# `grealpath`, not an unprefixed `realpath`, so guarantee a GNU one in our
+	# bin dir (first on env.sh PATH) automatically -- do not make the user
+	# arrange their own PATH or hand-symlink anything.
+	local gnu_rp
+	if gnu_rp="$(find_gnu_realpath)"; then
+		run mkdir -p "$SHIM_DIR"
+		if [ "$(readlink "$SHIM_DIR/realpath" 2>/dev/null || true)" = "$gnu_rp" ]; then
+			skip "GNU realpath shim is current ($gnu_rp)"
+		else
+			run ln -sf "$gnu_rp" "$SHIM_DIR/realpath"
+			did "GNU realpath -> $SHIM_DIR/realpath ($gnu_rp)"
+		fi
+	else
+		die "no GNU realpath found -- kas-container needs it (macOS's BSD realpath lacks -e/--relative-base)" \
+			"brew install coreutils"
+	fi
+
+	local mirrors_note=""
+	[ "$MACKAS_USE_NFS_MIRRORS" = "1" ] && mirrors_note="# NFS mirrors enabled; see $MACKAS_KAS_FRAGMENT_SRC"
+	[ "$MACKAS_USE_HTTP_MIRRORS" = "1" ] && mirrors_note="# HTTP mirrors enabled ($MACKAS_HTTP_MIRROR_SSTATE); see $MACKAS_KAS_FRAGMENT_SRC"
+
+	# Every value that becomes shell CODE in env.sh is quoted here, before the
+	# heredoc, rather than interpolated raw into a "..." in it.
+	#
+	# The raw form was an injection: the heredoc wrote export PATH="$SHIM_DIR:..."
+	# with SHIM_DIR pasted straight between the quotes, so a MACKAS_ROOT
+	# containing a double quote closed that string and everything after it was
+	# code -- executed by whoever sourced env.sh, which is the user, in their
+	# own interactive shell. It is also a plain bug with nobody attacking: a
+	# build root with a literal $ or " in it is perfectly legal on APFS and
+	# simply produced a broken env.sh.
+	#
+	# shq() emits a single-quoted string, so the value is inert. Note which
+	# things are NOT quoted this way: \$PATH, \$MACKAS_RUNTIME_ARGS and \$@
+	# below are escaped in the heredoc instead, because those must survive
+	# generation as text and expand when env.sh is SOURCED. That distinction is
+	# the whole point -- our values must not expand, the user's shell variables
+	# must.
+	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
+	local q_root q_base q_project q_cpus q_parallel q_scriptdir
+	q_shim="$(shq "$SHIM_DIR")"
+	q_scriptdir="$(shq "$SCRIPT_DIR")"
+	q_work="$(shq "$MACKAS_WORK")"
+	q_image="$(shq "$KAS_IMAGE")"
+	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
+	q_kasbin="$(shq "$KAS_CONTAINER_BIN")"
+	q_runtime_args="$(shq "$(kas_runtime_args)")"
+	q_root="$(shq "$MACKAS_ROOT")"
+	q_base="$(shq "$MACKAS_BASE")"
+	q_project="$(shq "$MACKAS_PROJECT")"
+	q_cpus="$(shq "$MACKAS_CPUS")"
+	q_parallel="$(shq "-j $MACKAS_CPUS")"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_ENV_SH" "$C_RST"
+	else
+		cat > "$MACKAS_ENV_SH" <<EOF
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION -- source this, don't execute it.
+#   source $MACKAS_ENV_SH
+#
+# The shim MUST come before /usr/local/bin (the real Docker CLI lives there).
+# /opt/homebrew/bin must come before /usr/bin so kas-container finds GNU realpath.
+# $SCRIPT_NAME's own checkout is on PATH too, so '$SCRIPT_NAME ...' works from
+# any directory once this is sourced -- no more cd-ing back to the repo first.
+$mirrors_note
+export PATH=$q_shim:/opt/homebrew/bin:$q_scriptdir:"\$PATH"
+
+# Force kas-container's engine selection instead of relying on its
+# 'docker -v | grep ^Docker' probe.
+export KAS_CONTAINER_ENGINE=docker
+
+export KAS_WORK_DIR=$q_work
+
+# The FULL image reference, tag included, and no KAS_IMAGE_VERSION alongside
+# it: kas-container's set_container_image_var() returns early when
+# KAS_CONTAINER_IMAGE is set, so KAS_IMAGE_VERSION is ignored and a tagless
+# name would silently run :latest instead of the pinned tag.
+export KAS_CONTAINER_IMAGE=$q_image
+
+# See setup_gitconfig() in $SCRIPT_NAME for the full story: under Apple
+# container's virtiofs, /repo's mount ROOT shows up owned by 0:0 while its
+# contents show as you, and git's dubious-ownership check then refuses to
+# touch /repo at all -- which silently broke BBLAYERS resolution, not just
+# printed a warning. kas-container forwards GITCONFIG_FILE into the
+# container as /var/kas/userdata/.gitconfig if it names a file that exists,
+# so this is the mechanism, not a kas patch.
+#
+# Only set it if THIS shell doesn't already have one: a GITCONFIG_FILE you
+# set yourself always wins, and \`setup\`/\`check\` already warned you if it is
+# missing 'safe.directory = *'. The check runs when env.sh is SOURCED, not
+# when it was generated, so it reflects whatever is exported in your shell
+# right now.
+if [ -z "\${GITCONFIG_FILE:-}" ]; then
+	export GITCONFIG_FILE=$q_gitconfig
+fi
+
+# NOTHING here exports KAS_BUILD_DIR, DL_DIR or SSTATE_DIR, and that is
+# deliberate -- do not "fix" it by adding them.
+#
+# kas-container's forward_dir() BIND-MOUNTS the host directory each of those
+# names, so setting them to a path on this Mac would put OpenEmbedded's TMPDIR on
+# APFS over virtiofs, which cannot give OE the Linux filesystem semantics it
+# needs (hardlinks, xattrs, rename()). Left unset, forward_dir() does nothing,
+# and the ext4 volumes below take their place.
+#
+# Likewise KAS_EXTRA_RUNTIME_ARGS is NOT an environment variable: kas-container
+# blanks it before parsing arguments, so exporting it does nothing at all. The
+# limits and volumes only arrive via the --runtime-args flag.
+#
+# 'mackas smoketest' and 'mackas shell' pass all of this for you and are the
+# supported way to build. The wrapper below exists so that a bare
+# 'kas-container ...' typed by hand in this shell gets the same treatment
+# instead of silently building at cpus=4/memory=1gb with no volumes.
+export MACKAS_RUNTIME_ARGS=$q_runtime_args
+
+kas-container() {
+	# Prepend our bin dir so kas-container ALWAYS finds the GNU realpath shim
+	# installed there, no matter what \$PATH looks like when this is called.
+	# kas-container calls \`realpath -e\` / \`--relative-base\`, which macOS's BSD
+	# realpath rejects with "illegal option -- e"; the shim (a symlink to GNU
+	# coreutils' realpath) is what makes a bare 'kas-container ...' just work.
+	env PATH=$q_shim:"\$PATH" KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
+		$q_kasbin --runtime-args "\$MACKAS_RUNTIME_ARGS" "\$@"
+}
+
+export BB_NUMBER_THREADS=$q_cpus
+export PARALLEL_MAKE=$q_parallel
+
+# Convenience
+export MACKAS_ROOT=$q_root
+export MACKAS_BASE=$q_base
+export MACKAS_PROJECT=$q_project
+EOF
+		did "wrote $MACKAS_ENV_SH"
+	fi
+}
+
+# A gitconfig forwarded into the container via kas-container's own
+# GITCONFIG_FILE mechanism (kas-container v5.4 ~line 728: it -v mounts the
+# file at /var/kas/userdata/.gitconfig:ro and exports GITCONFIG_FILE inside
+# the container when the host env var names a file that exists).
+#
+# WHY THIS IS NEEDED AT ALL, i.e. what "THE blocker" actually was:
+#
+# Under Apple's `container` runtime, the virtiofs bind mount that puts the
+# project checkout at /repo inside the guest shows the mount ROOT as owned by
+# 0:0 (root), while every file and directory INSIDE it (created by the host
+# user) shows up owned by the host user. That split is a virtiofs/bind-mount
+# ownership artifact of crossing the macOS/Linux boundary -- it is NOT a kas
+# bug and NOT something mackas' privilege-drop got wrong.
+#
+# git's own dubious-ownership protection (the CVE-2022-24765 fix) then
+# refuses to operate on /repo at all:
+#   fatal: detected dubious ownership in repository at '/repo'
+# kas's Repo.get_root_path() (kas/repos.py ~line 322) runs
+# `git rev-parse --show-toplevel` to resolve the root of a url-less repo --
+# the project's own local 'kas:' entry is exactly such a repo -- and SILENTLY
+# FALLS BACK to the input path (the config file's own directory) when git
+# exits non-zero. So this one git refusal was not just a scary warning: it
+# quietly mis-resolved BBLAYERS to .../kas instead of the real repo root, and
+# bitbake died on a missing layer.conf far away from the actual cause.
+#
+# `safe.directory = *` trusts every path git is ever pointed at, which reads
+# as alarming out of context. It is acceptable HERE, and ONLY here: this file
+# is forwarded exclusively into a throwaway, single-user, ephemeral
+# container (see the GITCONFIG_FILE mechanism above) -- never onto the host,
+# never into a shared or long-lived environment. Do not copy this file's
+# contents into a real ~/.gitconfig.
+setup_gitconfig() {
+	step "gitconfig for container git (macOS/virtiofs 'dubious ownership' workaround)"
+
+	if [ -n "${GITCONFIG_FILE:-}" ]; then
+		# The user already forwards their own gitconfig via this env var.
+		# Overwriting it here would be a genuinely surprising thing for a
+		# setup script to do to someone's git configuration -- so we never
+		# touch it. All we do is check it has what kas needs and say so.
+		if [ -r "$GITCONFIG_FILE" ] && has_safe_directory_star "$GITCONFIG_FILE"; then
+			skip "GITCONFIG_FILE=$GITCONFIG_FILE (yours) already has safe.directory = *"
+		else
+			warn "      GITCONFIG_FILE=$GITCONFIG_FILE is already set in your environment;"
+			warn "      leaving it alone rather than overwriting it. But without"
+			warn "      'safe.directory = *' in it, git inside the container will refuse"
+			warn "      /repo with 'detected dubious ownership' (see README). Add:"
+			warn "        [safe]"
+			warn "          directory = *"
+			warn "      to $GITCONFIG_FILE by hand, or unset GITCONFIG_FILE and re-run"
+			warn "      '$SCRIPT_CMD setup' to let it manage one for you."
+		fi
+		return
+	fi
+
+	if [ -f "$MACKAS_GITCONFIG" ] && has_safe_directory_star "$MACKAS_GITCONFIG"; then
+		skip "$MACKAS_GITCONFIG already has safe.directory = *"
+		return
+	fi
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_GITCONFIG" "$C_RST"
+		return
+	fi
+
+	mkdir -p "$(dirname "$MACKAS_GITCONFIG")"
+	cat > "$MACKAS_GITCONFIG" <<EOF
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION -- forwarded into the kas
+# container as /var/kas/userdata/.gitconfig via kas-container's GITCONFIG_FILE
+# mechanism. See the comment above setup_gitconfig() in $SCRIPT_NAME for the
+# full story: this is a macOS/virtiofs ownership quirk, not a kas bug, and
+# 'directory = *' is safe here specifically because this file only ever
+# reaches a throwaway, single-user, ephemeral container. Do not copy this
+# into your real ~/.gitconfig.
+[safe]
+	directory = *
+EOF
+	did "wrote $MACKAS_GITCONFIG"
+}
+
+setup_relocate_volumes() {
+	step "Relocate container volumes to the SSD"
+	if [ "$MACKAS_RELOCATE_VOLUMES" != "1" ]; then
+		skip "MACKAS_RELOCATE_VOLUMES=0, leaving $CONTAINER_VOLUMES_DIR alone"
+		return
+	fi
+
+	local dest="$MACKAS_ROOT/container-volumes"
+
+	if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
+		skip "already a symlink -> $(readlink "$CONTAINER_VOLUMES_DIR")"
+		return
+	fi
+
+	[ -d "$dest" ] || { run mkdir -p "$dest"; did "created $dest"; }
+
+	if [ -d "$CONTAINER_VOLUMES_DIR" ]; then
+		local n
+		# shellcheck disable=SC2012  # only counting entries; names irrelevant
+		n="$(ls -A "$CONTAINER_VOLUMES_DIR" 2>/dev/null | wc -l | tr -d ' ')"
+		if [ "$n" -gt 0 ]; then
+			warn "      $CONTAINER_VOLUMES_DIR is not empty ($n entries)."
+			if ! confirm "      Move its contents to $dest and replace it with a symlink?"; then
+				warn "      Skipping relocation. Volume images will stay on the internal disk."
+				return
+			fi
+			# rsync so a crash mid-move leaves the source intact. -a implies -l
+			# (copy symlinks AS symlinks, never follow), so a per-volume symlink
+			# a prior `volume move` planted here is preserved verbatim rather
+			# than dereferenced and clobbered -- move and setup do not fight.
+			#
+			# On a terminal, --info=progress2 gives a real % bar + ETA (the total
+			# IS known here). Keep it plain when piped, under --dry-run, or if the
+			# host rsync is too old to know the flag (macOS 26 ships rsync 3.4).
+			if [ -t 1 ] && [ "$DRY_RUN" -eq 0 ] && rsync --info=progress2 --version >/dev/null 2>&1; then
+				run rsync -a --info=progress2 "$CONTAINER_VOLUMES_DIR/" "$dest/"
+			else
+				run rsync -a "$CONTAINER_VOLUMES_DIR/" "$dest/"
+			fi
+			did "copied $n entries to $dest"
+		fi
+		run rm -rf "$CONTAINER_VOLUMES_DIR"
+	fi
+	run ln -s "$dest" "$CONTAINER_VOLUMES_DIR"
+	did "symlinked $CONTAINER_VOLUMES_DIR -> $dest"
+}
+
+# ensure_volume NAME SIZE ROLE -- create it if missing, and chown its root.
+#
+# The chown is not optional. `container volume create` makes a fresh ext4
+# whose root is root:root, and that ownership is REAL: a named volume is a
+# genuine Linux filesystem, not an APFS bind mount (where Apple's virtiofs
+# forces host-user ownership and hides the whole problem). kas correctly drops
+# to USER_ID/GROUP_ID and then dies with
+#   PermissionError: [Errno 13] Permission denied: '/build/CACHEDIR.TAG'
+# One chown at create time, and it stays right forever after.
+ensure_volume() {
+	local name="$1" size="$2" role="$3"
+
+	if volume_exists "$name"; then
+		skip "volume '$name' exists ($role)"
+	else
+		run container volume create -s "$size" "$name"
+		did "created ext4 volume '$name' ($size, $role, sparse until used)"
+	fi
+
+	# The chown attaches the volume. If a build still holds it, that would be a
+	# SECOND attach -- which the runtime refuses, aborting setup mid-run under
+	# set -e. A held volume was already created and chowned once, so skip it
+	# rather than fight the one-VM rule.
+	if volume_in_use "$name"; then
+		warn "      volume '$name' is attached to a running build; skipping the chown"
+		warn "      (re-run '$SCRIPT_CMD setup' once it finishes if ownership looks wrong)"
+		return 0
+	fi
+
+	# Chown unconditionally, not just on create. `container volume create` and
+	# the chown are two separate operations, so a crash (or a failing chown)
+	# between them leaves a volume that exists but is still root-owned. Bailing
+	# out early on "exists" would then skip the chown forever and leave kas
+	# permanently unable to write it. The chown is idempotent, so just redo it.
+	# -u 0:0 is mandatory. The kas image's default user is uid 30000 (builder),
+	# which cannot chown anything, and the run dies with
+	#   chown: changing ownership of '/mnt': Operation not permitted
+	# This boots a throwaway VM to set ownership -- a few seconds with no progress
+	# to report, so spin() ticks elapsed time rather than leaving the step silent.
+	spin "chowning '$name' (booting a VM)" \
+		container run --rm -u 0:0 -v "$name:/mnt" "$KAS_IMAGE" chown "$(id -u):$(id -g)" /mnt
+	did "chowned '$name' root to $(id -u):$(id -g) so kas can write it"
+}
+
+setup_volumes() {
+	step "ext4 volumes: ${MACKAS_VOLUME_NAME}-{tmp,dl,sstate} ($(total_volume_gb) GiB total)"
+
+	# kas-container word-splits --runtime-args, so a volume name with a space
+	# in it would silently become two arguments and mount something absurd.
+	case "$MACKAS_VOLUME_NAME" in
+		*[[:space:]]*|"")
+			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
+				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
+			;;
+	esac
+
+	ensure_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
+	ensure_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
+	ensure_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "SSTATE_DIR -> /sstate"
+
+	if volume_exists "$MACKAS_VOL_LEGACY"; then
+		warn "      volume '$MACKAS_VOL_LEGACY' is left over from the old single-volume"
+		warn "      scheme and is no longer used by anything. Nothing here will touch it."
+		warn "      Remove it once you are sure you want nothing in it:"
+		warn "        container volume delete $(printf '%q' "$MACKAS_VOL_LEGACY")"
+	fi
+
+	info "      These are reached via '$SCRIPT_CMD smoketest' / '$SCRIPT_CMD shell', which pass"
+	info "      them to kas with --runtime-args. They are NOT visible on the host."
+}
+
+setup_kas_container() {
+	step "kas-container v$KAS_CONTAINER_VERSION"
+	local want_sum have_sum
+	if [ -x "$KAS_CONTAINER_BIN" ]; then
+		have_sum="$(shasum -a 256 "$KAS_CONTAINER_BIN" | awk '{print $1}')"
+		if [ "$have_sum" = "$KAS_CONTAINER_SHA256" ]; then
+			skip "kas-container $KAS_CONTAINER_VERSION verified (sha256 ok)"
+			return
+		fi
+		warn "      existing kas-container has unexpected sha256; re-fetching"
+	fi
+
+	run mkdir -p "$MACKAS_BIN"
+	run curl -fsSL -o "$KAS_CONTAINER_BIN" "$KAS_CONTAINER_URL"
+	run chmod +x "$KAS_CONTAINER_BIN"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ verify sha256 == %s%s\n' "$C_DIM" "$KAS_CONTAINER_SHA256" "$C_RST"
+		return
+	fi
+
+	have_sum="$(shasum -a 256 "$KAS_CONTAINER_BIN" | awk '{print $1}')"
+	if [ "$have_sum" != "$KAS_CONTAINER_SHA256" ]; then
+		rm -f "$KAS_CONTAINER_BIN"
+		die "kas-container sha256 mismatch (got $have_sum, want $KAS_CONTAINER_SHA256)" \
+			"the upstream tag may have moved; verify $KAS_CONTAINER_URL by hand"
+	fi
+	want_sum="$("$KAS_CONTAINER_BIN" --version 2>&1 | head -1 || true)"
+	did "installed $KAS_CONTAINER_BIN ($want_sum, sha256 ok)"
+}
+
+setup_project() {
+	step "project $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH)"
+	if [ -d "$MACKAS_PROJECT/.git" ]; then
+		local br
+		br="$(git -C "$MACKAS_PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+		if [ "$br" = "$MACKAS_PROJECT_BRANCH" ]; then
+			# Already on the wanted branch: leave it alone. A live checkout may
+			# have uncommitted work or fetched layers -- never re-clone over it.
+			skip "$MACKAS_PROJECT_DIR on branch $MACKAS_PROJECT_BRANCH at $MACKAS_PROJECT"
+		else
+			run git -C "$MACKAS_PROJECT" fetch origin "$MACKAS_PROJECT_BRANCH"
+			run git -C "$MACKAS_PROJECT" checkout "$MACKAS_PROJECT_BRANCH"
+			did "switched $MACKAS_PROJECT_DIR to $MACKAS_PROJECT_BRANCH"
+		fi
+	else
+		run mkdir -p "$MACKAS_WORK"
+		run git clone --branch "$MACKAS_PROJECT_BRANCH" "$MACKAS_PROJECT_URL" "$MACKAS_PROJECT"
+		did "cloned $MACKAS_PROJECT_DIR -> $MACKAS_PROJECT"
+	fi
+	info "      The remaining layers kas composes (openembedded-core and friends"
+	info "      for the meta-ai example) are fetched by kas on the first build."
+}
+
+setup_kas_fragment() {
+	step "kas fragment: $MACKAS_KAS_FRAGMENT_SRC"
+	local mirrors=""
+
+	if [ "$MACKAS_USE_NFS_MIRRORS" = "1" ] && [ "$MACKAS_USE_HTTP_MIRRORS" = "1" ]; then
+		# Both would emit an SSTATE_MIRRORS line into the same fragment.
+		# bitbake's '?=' makes the first one win silently, which is exactly the
+		# kind of thing you debug for an hour. Refuse instead of guessing.
+		die "MACKAS_USE_NFS_MIRRORS and MACKAS_USE_HTTP_MIRRORS are both 1" \
+			"pick one in $(config_hint); HTTP is the recommended path (see README)"
+	fi
+
+	if [ "$MACKAS_USE_HTTP_MIRRORS" = "1" ]; then
+		# The recommended path. No virtiofs, no NFS-in-guest, no sudo: the
+		# container reaches the mirror host over its vmnet NAT and speaks
+		# plain HTTP, which is bitbake's own officially-supported mechanism.
+		#
+		# ';downloadfilename=PATH' IS valid here and IS needed: for an http://
+		# sstate mirror bitbake must be told what to call the file it fetches,
+		# and 'PATH' is the same literal placeholder as in the URL. It is NOT
+		# valid for the file:// mirrors above -- that asymmetry is real, not a
+		# copy-paste slip.
+		mirrors="$(cat <<FRAG
+    SSTATE_MIRRORS ?= "file://.* ${MACKAS_HTTP_MIRROR_SSTATE}/PATH;downloadfilename=PATH"
+    SOURCE_MIRROR_URL ?= "${MACKAS_HTTP_MIRROR_DL}"
+    INHERIT += "own-mirrors"
+    BB_GENERATE_MIRROR_TARBALLS ?= "0"
+FRAG
+)"
+	elif [ "$MACKAS_USE_NFS_MIRRORS" = "1" ]; then
+		# Read-only mirrors, mounted into the container by --runtime-args.
+		#
+		# SSTATE_MIRRORS: 'PATH' is a literal placeholder that bitbake
+		# substitutes with the sstate object's own hashed subpath, so the
+		# mirror is searched using the same layout sstate-cache has on disk.
+		# (The ';downloadfilename=PATH' suffix seen in the OpenEmbedded docs is only
+		# needed for http:// sstate mirrors, not local file:// ones.)
+		#
+		# Downloads: own-mirrors + SOURCE_MIRROR_URL is the supported way to
+		# add a pre-mirror for source fetches; it expands into PREMIRRORS for
+		# every fetcher. file:// URLs need no auth and fall through to the
+		# real upstream if the tarball isn't in the mirror.
+		mirrors="$(cat <<'FRAG'
+    SSTATE_MIRRORS ?= "file://.* file:///sstate-mirror/PATH"
+    SOURCE_MIRROR_URL ?= "file:///downloads-mirror"
+    INHERIT += "own-mirrors"
+    BB_GENERATE_MIRROR_TARBALLS ?= "0"
+FRAG
+)"
+	fi
+
+	# Built as its own single-quoted variable, NOT typed inline in the heredoc
+	# below -- this is a proven-shipped bug (see README/TODO), and the cause is
+	# subtle enough to write down. bash's unquoted-heredoc processing treats a
+	# literal "\" immediately followed by a real newline as a line
+	# CONTINUATION and SPLICES IT AWAY -- and it does this even when that "\"
+	# was itself the product of unescaping a typed "\\", because the splice
+	# scan runs over the raw source text before "\\" -> "\" unescaping is
+	# applied. So the obvious way to write this --
+	#   BB_DISKMON_DIRS ??= "\\
+	#       HALT,\${TMPDIR},2G,100K \\
+	# -- collapsed at generation time into ONE line: a single "\" followed by
+	# a run of spaces where each newline used to be, which is exactly what
+	# shipped. A single-quoted variable assignment has NO escape processing at
+	# all, so its embedded backslashes and newlines survive completely
+	# literally; interpolating "$diskmon_dirs" into the heredoc below is then
+	# a plain parameter expansion, which never re-parses for continuations.
+	# Do not "simplify" this back into an inline heredoc. Verified by `cat`ing
+	# the actual generated file on disk, not just eyeballing the source --
+	# see tests/volumes.bats.
+	local diskmon_dirs
+	# shellcheck disable=SC2016  # deliberately single-quoted: ${TMPDIR} etc.
+	# must reach bitbake literally, not be expanded by this shell.
+	diskmon_dirs='    BB_DISKMON_DIRS ??= "\
+      HALT,${TMPDIR},2G,100K \
+      HALT,${DL_DIR},2G,100K \
+      HALT,${SSTATE_DIR},2G,100K"'
+
+	# Precomputed, not embedded as a $(...) substitution inside the heredoc
+	# below -- see the quote-parity note just above the heredoc for why.
+	local mirrors_block=""
+	[ -n "$mirrors" ] && mirrors_block="$(printf '  macos-mirrors: |\n%s\n' "$mirrors")"
+
+	# NOTE FOR FUTURE EDITS: bash's unquoted-heredoc lexer (this one included,
+	# 3.2 and later alike) tracks single-quote (') balance across the WHOLE
+	# heredoc body even though the body is otherwise literal text -- an ODD
+	# total count of literal "'" characters anywhere in it is enough to make
+	# bash 3.2 report "unexpected EOF while looking for matching `''" at the
+	# very end of the script, nowhere near the real cause. This bit mackas
+	# once already (adding the macos-hashserve block below tipped an
+	# until-then-even apostrophe count to odd). So: no apostrophes/contractions
+	# and no scare-quoted 'words' in the heredoc body below -- rephrase
+	# instead of reaching for a quote mark. Verify any change here with
+	# /bin/bash -n (the real macOS 3.2, not just Homebrew's bash 5).
+	local content
+	content="$(cat <<EOF
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION -- macOS / Apple container tuning.
+# Canonical copy: $MACKAS_KAS_FRAGMENT_SRC
+# Installed into the project checkout as kas/macos-local.yml because
+# kas-container only mounts files that live under the repo directory.
+#
+# Compose it last so it wins:
+#   kas-container build $KAS_FILES_ARG
+header:
+  version: 14
+
+local_conf_header:
+  macos-parallelism: |
+    BB_NUMBER_THREADS ?= "$MACKAS_CPUS"
+    PARALLEL_MAKE ?= "-j $MACKAS_CPUS"
+  macos-diskmon: |
+    # Each of these is a separate, fixed-size ext4 volume, so disk full here
+    # means one volume, not the Mac. HALT (not WARN) because bitbake filling a
+    # TMPDIR mid-task leaves half-written sstate objects behind, which is far
+    # more annoying to unpick than a stopped build. The 2G/100K thresholds are
+    # the exact shape bitbake documents: halt with 2 GiB or 100k inodes left.
+    #
+    # This is a backstop for the volume, NOT for the SSD -- the volume caps
+    # are what keep a runaway build away from the free space Time Machine
+    # needs.
+$diskmon_dirs
+  macos-hashserve: |
+    # bitbake warns at parse time if this is left unset: SSTATE_DIR is an
+    # ext4 volume SHARED across builds, but the hash-equivalence database
+    # defaults to living inside the per-build /build volume, which mackas
+    # clean throws away -- silently discarding sstate reuse on every clean
+    # instead of just TMPDIR. Put the database in the same volume as the
+    # sstate it indexes so it survives exactly as long as the cache does.
+    #
+    # NOT the same fix as the BB_HASHSERVE_DB_DIR forward already built into
+    # kas-container (around line 636 of kas-container v5.4, which -v
+    # bind-mounts a HOST directory at /bb-hashserve-db): using that would put
+    # this database back on APFS over virtiofs, which is the exact bug the
+    # ext4 volumes exist to avoid. Setting it here, in local.conf, keeps it
+    # inside the /sstate volume instead -- no env var, no bind mount, no
+    # virtiofs.
+    BB_HASHSERVE_DB_DIR = "\${SSTATE_DIR}"
+$mirrors_block
+EOF
+)"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ write %s and %s%s\n' "$C_DIM" "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_KAS_FRAGMENT_REPO" "$C_RST"
+		return
+	fi
+
+	mkdir -p "$MACKAS_KAS"
+	printf '%s\n' "$content" > "$MACKAS_KAS_FRAGMENT_SRC"
+	did "wrote $MACKAS_KAS_FRAGMENT_SRC"
+
+	# The fragment must land at kas/macos-local.yml UNDER the checkout, because
+	# kas-container only mounts files below the repo dir and KAS_FILES_ARG
+	# refers to it by that relative path. Create the kas/ dir if this project
+	# does not already ship one -- not every layer repo does.
+	if [ -d "$MACKAS_PROJECT/.git" ]; then
+		mkdir -p "$MACKAS_PROJECT/kas"
+		cp "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_KAS_FRAGMENT_REPO"
+		did "installed $MACKAS_KAS_FRAGMENT_REPO"
+		# Keep the checkout clean.
+		local excl="$MACKAS_PROJECT/.git/info/exclude"
+		if [ -f "$excl" ] && ! grep -qxF "kas/macos-local.yml" "$excl"; then
+			printf 'kas/macos-local.yml\n' >> "$excl"
+			did "added kas/macos-local.yml to the checkout's .git/info/exclude"
+		fi
+	else
+		warn "      $MACKAS_PROJECT not cloned yet; re-run setup after the project checkout exists"
+	fi
+}
+
+setup_image() {
+	step "Pull $KAS_IMAGE"
+	if image_present "$KAS_IMAGE"; then
+		skip "$KAS_IMAGE already present"
+		return
+	fi
+	run container image pull "$KAS_IMAGE"
+	did "pulled $KAS_IMAGE"
+}
+
+cmd_setup() {
+	require_mackas_root
+	info "${C_BLD}mackas setup${C_RST}  (config: ${CONFIG_FILE_USED:-none, using built-in defaults})"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		warn "--dry-run: printing mutating commands, changing nothing."
+	fi
+
+	setup_runtime
+	setup_oe_root
+	setup_short_link
+	setup_shim_and_env
+	setup_gitconfig
+	setup_relocate_volumes
+	# The image comes before the volumes: chowning a fresh volume's root runs a
+	# throwaway container from it.
+	setup_image
+	setup_volumes
+	setup_kas_container
+	setup_project
+	setup_kas_fragment
+
+	hdr "Done"
+	info "  source $MACKAS_ENV_SH"
+	info "  $SCRIPT_CMD check     # confirm the shim now wins on PATH"
+	info "  $SCRIPT_CMD smoketest # parse-only, then the small-target ladder"
+	if [ "$MACKAS_USE_NFS_MIRRORS" = "1" ] && ! mount | grep -qF " on $MACKAS_NFS_MOUNT "; then
+		info ""
+		info "  NFS mirrors are enabled but not mounted. Run:"
+		info "    sudo mkdir -p $(printf '%q' "$MACKAS_NFS_MOUNT")"
+		info "    sudo mount -t nfs -o resvport,vers=3,ro,nolocks,locallocks ${MACKAS_NFS_SERVER}:${MACKAS_NFS_EXPORT} $(printf '%q' "$MACKAS_NFS_MOUNT")"
+		info "    (vers=3 is PINNED: '-o vers=4' kernel-panics macOS -- see docs/storage.md)"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# smoketest
+# ---------------------------------------------------------------------------
+
+kas_env_prefix() {
+	# Emitted for the log header so a failure is reproducible by hand.
+	# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are deliberately blanked, not set: see
+	# kas_runtime_args().
+	# shellcheck disable=SC2016  # literal text: $PATH must appear verbatim in
+	# the printed command line, to be expanded by the user's shell, not ours.
+	printf 'PATH=%s:/opt/homebrew/bin:$PATH KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s --runtime-args %s' \
+		"$SHIM_DIR" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$(printf '%q' "$(kas_runtime_args)")"
+}
+
+# auto_fstrim <before|after> [<log>] -- reclaim the three sparse volume images
+# around a kas run when MACKAS_FSTRIM_AUTO=1. Safe with the one-VM rule: it runs
+# before the kas container starts and after it exits, when nothing holds the
+# volumes. STRICTLY non-fatal -- a trim hiccup must never change a build's exit
+# status -- which is why it reuses volume_fstrim_one in its from_all mode (that
+# skips a busy or missing volume with a warning and returns rather than dies)
+# and swallows the rest with `|| true`. Detail goes to the build log when there
+# is one, so a multi-rung smoketest does not flood the console.
+auto_fstrim() {
+	[ "${MACKAS_FSTRIM_AUTO:-1}" = "1" ] || return 0
+	local phase="$1" log="${2:-}" v
+	info "auto-fstrim ($phase run)"
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		volume_exists "$v" || continue
+		if [ -n "$log" ]; then
+			volume_fstrim_one "$v" 1 >>"$log" 2>&1 || true
+		else
+			volume_fstrim_one "$v" 1 || true
+		fi
+	done
+	return 0
+}
+
+run_kas() {
+	# run_kas <logfile|""> <kas args...>
+	# An empty logfile means "don't pipe through tee" -- required for the
+	# interactive `shell` command, which needs a real TTY on stdout.
+	local log="$1"; shift
+	local rt_args gitconfig rc
+	rt_args="$(kas_runtime_args)"
+	# A GITCONFIG_FILE already in this shell's environment always wins; see
+	# setup_gitconfig() for why this exists and why we never override one the
+	# user set themselves. Otherwise fall back to the one 'setup' generates.
+	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ (cd %s && %s --runtime-args %s %s)%s\n' \
+			"$C_DIM" "$(printf '%q' "$MACKAS_PROJECT")" \
+			"$(printf '%q' "$KAS_CONTAINER_BIN")" "$(printf '%q' "$rt_args")" \
+			"$(quote_cmd "$@")" "$C_RST"
+		return 0
+	fi
+
+	_kas_exec() {
+		cd "$MACKAS_PROJECT" || return 1
+		# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are set EMPTY, not unset: the user may
+		# have an old env.sh sourced that exports them at APFS paths, and a
+		# non-empty one would make kas bind-mount that path over the ext4 volume
+		# we just asked for. forward_dir() returns early on an empty value.
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE=docker \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		BB_NUMBER_THREADS="$MACKAS_CPUS" \
+		PARALLEL_MAKE="-j $MACKAS_CPUS" \
+		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" "$@"
+	}
+
+	# Reclaim the images before the run (they may have ratcheted up last time)
+	# and after (this run's peak is now dead space). Both happen while nothing
+	# holds the volumes -- the kas container has not started / has exited.
+	auto_fstrim before "$log"
+
+	# Capture the exit code in a TESTED context (`|| rc=$?`). A bare
+	# `( _kas_exec ); rc=$?` would let `set -e` abort run_kas the moment kas
+	# exits non-zero -- before rc is read AND before the after-trim below -- so
+	# `shell` (which calls run_kas bare under set -e) would skip the after-trim
+	# on any failed build. With pipefail on, the tee pipeline's status is kas's
+	# own exit code, so no PIPESTATUS is needed.
+	rc=0
+	if [ -z "$log" ]; then
+		# No tee: keep stdout a real TTY so the interactive shell works.
+		( _kas_exec "$@" ) || rc=$?
+	else
+		( _kas_exec "$@" ) 2>&1 | tee -a "$log" || rc=$?
+	fi
+
+	auto_fstrim after "$log"
+	return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Host-side overhead sampling, folded into `smoketest`
+# ---------------------------------------------------------------------------
+#
+# buildstats measures the GUEST. Nothing recorded what a build costs the Mac
+# itself, so tools/mackas-overhead samples the host process set -- the
+# Virtualization.framework VM plus the container daemons -- with cheap `ps`
+# snapshots and reports host CPU-seconds and peak RSS around each smoketest rung.
+#
+# It is best-effort and MUST NEVER fail a build: every call is guarded, the
+# sampler runs backgrounded, and its exit status is ignored. /usr/bin/python3
+# (stock macOS) is used explicitly -- /opt/homebrew/bin/python3 may be absent.
+#
+# Honest limits, spelled out in docs/testing.md and the sampler's own caveats:
+#   * A fully-cached rung does almost no VM work, so its host figure is near
+#     zero -- correct, not a bug.
+#   * The guest buildstats live inside the volume until `mackas retrieve
+#     buildstats` extracts them, so the host figure is NOT yet differenced
+#     against guest CPU here. It is host cost, not isolated overhead.
+#
+# MACKAS_OVERHEAD_BIN is an undocumented test seam (cf. MACKAS_CONTAINER_BIN):
+# it points the sampler invocation at a fake so the hook is assertable without
+# a real build.
+overhead_start() {
+	OVERHEAD_PID=""
+	OVERHEAD_OUT=""
+	[ "${MACKAS_OVERHEAD:-1}" = "1" ] || return 0
+	[ "$DRY_RUN" -eq 0 ] || return 0
+	local bin="${MACKAS_OVERHEAD_BIN:-$SCRIPT_DIR/tools/mackas-overhead}"
+	[ -f "$bin" ] || { vrb "overhead: no sampler at $bin; skipping"; return 0; }
+	[ -x /usr/bin/python3 ] || { vrb "overhead: /usr/bin/python3 missing; skipping"; return 0; }
+	OVERHEAD_OUT="$(mktemp "${TMPDIR:-/tmp}/mackas-overhead.XXXXXX" 2>/dev/null)" \
+		|| { OVERHEAD_OUT=""; return 0; }
+	/usr/bin/python3 "$bin" --interval "$MACKAS_OVERHEAD_INTERVAL" \
+		> "$OVERHEAD_OUT" 2>&1 &
+	OVERHEAD_PID=$!
+	vrb "overhead: sampling host (pid $OVERHEAD_PID, interval ${MACKAS_OVERHEAD_INTERVAL}s)"
+	return 0
+}
+
+# overhead_stop LOG -- stop the sampler (if any), fold its summary into LOG and
+# print the headline host figures. Never fails, never affects the rung result.
+overhead_stop() {
+	local log="$1"
+	[ -n "${OVERHEAD_PID:-}" ] || return 0
+	kill -TERM "$OVERHEAD_PID" 2>/dev/null || true
+	wait "$OVERHEAD_PID" 2>/dev/null || true
+	if [ -n "${OVERHEAD_OUT:-}" ] && [ -s "$OVERHEAD_OUT" ]; then
+		{
+			printf '\n=== host-side overhead (mackas-overhead) ===\n'
+			cat "$OVERHEAD_OUT"
+		} >> "$log" 2>/dev/null || true
+		# Headline lines to the console: host CPU-seconds and peak RSS.
+		grep -E '^host (CPU|RSS)' "$OVERHEAD_OUT" 2>/dev/null | sed 's/^/      /' || true
+	fi
+	[ -n "${OVERHEAD_OUT:-}" ] && rm -f "$OVERHEAD_OUT" 2>/dev/null
+	OVERHEAD_PID=""
+	OVERHEAD_OUT=""
+	return 0
+}
+
+smoketest_rung() {
+	# smoketest_rung <n> <total> <label> <expect> <kas args...>
+	local n="$1" total="$2" label="$3" expect="$4"; shift 4
+	local log slug rc=0
+	slug="$(printf '%s' "$label" | tr ' /:' '---')"
+	log="$MACKAS_LOGS/smoketest-${n}-${slug}.log"
+
+	printf '\n%s[rung %s/%s] %s%s\n' "$C_BLD" "$n" "$total" "$label" "$C_RST"
+	printf '      %sexpect: %s%s\n' "$C_DIM" "$expect" "$C_RST"
+	printf '      %slog:    %s%s\n' "$C_DIM" "$log" "$C_RST"
+
+	[ "$DRY_RUN" -eq 1 ] || mkdir -p "$MACKAS_LOGS"
+	[ "$DRY_RUN" -eq 1 ] || {
+		{
+			printf '=== %s\n=== %s\n=== cwd: %s\n=== %s\n\n' \
+				"$label" "$(date)" "$MACKAS_PROJECT" "$(kas_env_prefix)"
+		} > "$log"
+	}
+
+	# Wrap the build in the host-side sampler. Everything overhead-related sits
+	# inside `set +e` so a sampler hiccup can never abort the rung, and
+	# overhead_stop() runs AFTER rc is captured so it cannot change the result.
+	set +e
+	overhead_start
+	run_kas "$log" "$@"
+	rc=$?
+	overhead_stop "$log"
+	set -e
+
+	if [ "$rc" -eq 0 ]; then
+		printf '      %s[OK]%s %s\n' "$C_GRN" "$C_RST" "$label"
+	else
+		printf '      %s[FAILED]%s %s (exit %s)\n' "$C_RED" "$C_RST" "$label" "$rc"
+		printf '      %ssee: %s%s\n' "$C_BLU" "$log" "$C_RST"
+		printf '      %slast 20 lines:%s\n' "$C_DIM" "$C_RST"
+		[ -f "$log" ] && tail -20 "$log" | sed 's/^/        /'
+	fi
+	return "$rc"
+}
+
+cmd_smoketest() {
+	require_mackas_root
+	[ -x "$KAS_CONTAINER_BIN" ] || die "kas-container not installed" "$SCRIPT_CMD setup"
+	[ -d "$MACKAS_PROJECT/.git" ] || die "project not checked out at $MACKAS_PROJECT" "$SCRIPT_CMD setup"
+	[ -f "$MACKAS_KAS_FRAGMENT_REPO" ] || die "kas fragment missing at $MACKAS_KAS_FRAGMENT_REPO" "$SCRIPT_CMD setup"
+
+	# The ladder is rung 1 (parse-only, universal) followed by one build rung
+	# per target in MACKAS_SMOKETEST_TARGETS. When that list is empty (the
+	# default), there is still exactly one build rung, but it passes no
+	# --target at all, so kas/bitbake builds whatever default target the kas
+	# config itself names -- exactly what `kas build <config>` does with no
+	# target. Set your own project's targets to exercise more than that.
+	local total=1 t
+	for t in $MACKAS_SMOKETEST_TARGETS; do total=$((total + 1)); done
+	[ -n "$MACKAS_SMOKETEST_TARGETS" ] || total=$((total + 1))
+
+	info "${C_BLD}mackas smoketest${C_RST}"
+	info "  kas files : $KAS_FILES_ARG"
+	info "  targets   : ${MACKAS_SMOKETEST_TARGETS:-<none: no --target, kas builds its own default>}"
+	info "  resources : -c $MACKAS_CPUS -m $MACKAS_MEMORY"
+	info "  logs      : $MACKAS_LOGS/"
+	info ""
+	if [ "$total" -gt 1 ]; then
+		warn "  Rungs 2-$total are real builds. A large target can take HOURS on a cold"
+		warn "  sstate cache. Ctrl-C is safe; re-running resumes."
+	fi
+
+	if [ "$DRY_RUN" -eq 0 ] && ! confirm "  Start the ladder?"; then
+		info "  Aborted. Nothing ran."
+		return 0
+	fi
+
+	smoketest_rung 1 "$total" "parse-only (bitbake -p)" \
+		"all layers fetched, recipes parse, no build" \
+		shell "$KAS_FILES_ARG" -c "bitbake -p" || return 1
+
+	local n=1
+	if [ -n "$MACKAS_SMOKETEST_TARGETS" ]; then
+		for t in $MACKAS_SMOKETEST_TARGETS; do
+			n=$((n + 1))
+			smoketest_rung "$n" "$total" "build $t" \
+				"$t builds from source or sstate" \
+				build "$KAS_FILES_ARG" --target "$t" || return 1
+		done
+	else
+		n=$((n + 1))
+		smoketest_rung "$n" "$total" "build (kas config's own default target)" \
+			"the kas config's own default target builds from source or sstate" \
+			build "$KAS_FILES_ARG" || return 1
+	fi
+
+	hdr "Smoketest ladder passed"
+	info "  Logs: $MACKAS_LOGS/"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# shell / status / clean
+# ---------------------------------------------------------------------------
+
+cmd_shell() {
+	require_mackas_root
+	[ -x "$KAS_CONTAINER_BIN" ] || die "kas-container not installed" "$SCRIPT_CMD setup"
+	[ -d "$MACKAS_PROJECT/.git" ] || die "project not checked out" "$SCRIPT_CMD setup"
+	info "Dropping into a kas shell for $KAS_FILES_ARG ..."
+	run_kas "" shell "$KAS_FILES_ARG"
+}
+
+# ---------------------------------------------------------------------------
+# retrieve -- copy build outputs out of the ext4 TMPDIR volume
+# buildstats -- work with buildstats already retrieved
+# ---------------------------------------------------------------------------
+#
+# tmp/buildstats, tmp/log and tmp/deploy live inside the oe-build-tmp ext4
+# image and are invisible from macOS (that is the deliberate cost of real Linux
+# filesystem semantics -- see the "Known limitations" section of the README).
+# This copies them out with a throwaway container that bind-mounts a host
+# directory as /out. The recipe is the one proven by hand:
+#
+#   container run --rm -u 0:0 -v oe-build-tmp:/build -v <dest>:/out \
+#       ghcr.io/siemens/kas/kas:5.4 sh -c 'cp -r /build/tmp/buildstats /out/'
+#
+# -u 0:0 is required: the kas image's default user (uid 30000) cannot read the
+# root-owned build tree cleanly, and it matches ensure_volume()'s reasoning. No
+# chown inside -- Apple's virtiofs forces host-user ownership on the /out bind
+# mount, so files land owned by the invoking user already and a `chown -R`
+# there fails "Operation not permitted".
+
+# fetch_tmp_subdir SUB DEST -- copy /build/tmp/SUB out of the TMPDIR volume into
+# DEST/SUB. Returns non-zero (with a clear message) when SUB is absent -- e.g.
+# no build has run, so there is no tmp/buildstats -- rather than letting a raw
+# `cp` error surface. Idempotent: re-copying overwrites in place.
+fetch_tmp_subdir() {
+	local sub="$1" dest="$2" guest="/build/tmp/$1"
+
+	# Existence probe first, so "no build has run yet" is a clear message and
+	# not an obscure cp failure. Under --dry-run run() prints and returns 0, so
+	# the copy command below is still shown.
+	if ! run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" test -d "$guest"; then
+		if [ "$sub" = "buildstats" ]; then
+			warn "  no $guest in '$MACKAS_VOL_TMP' -- has a build run yet? ($SCRIPT_CMD smoketest)"
+		else
+			warn "  no $guest in '$MACKAS_VOL_TMP'; skipping $sub"
+		fi
+		return 1
+	fi
+
+	run mkdir -p "$dest"
+	run container run --rm -u 0:0 \
+		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
+		sh -c "cp -r '$guest' /out/"
+	did "retrieved $sub -> $dest/$sub"
+	return 0
+}
+
+retrieve_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD retrieve${C_RST} -- copy build outputs out of the ext4 TMPDIR
+volume, where macOS cannot see them, via a throwaway container.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD retrieve <object> [<object>...] [--dest DIR]
+
+${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matter)
+  buildstats           tmp/buildstats -- per-task timing (bitbake -m stats).
+  logs                 tmp/log -- cooker.log and friends.
+  deploy               tmp/deploy -- the images and ipks. Can be tens of GB.
+
+${C_BLD}OPTIONS${C_RST}
+  --dest DIR      Where to copy (default \$MACKAS_BASE/artifacts).
+
+Options: --dry-run, -y/--yes and -v/--verbose work here too; put them before
+or after 'retrieve', e.g. '$SCRIPT_CMD --dry-run retrieve buildstats'.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. retrieve refuses while a
+  running build (smoketest/shell) still holds the TMPDIR volume -- stop it first.
+EOF
+}
+
+# retrieve <object>... [--dest DIR] -- copy one or more tmp/ subdirs out of the
+# TMPDIR volume. Each object maps 1:1 onto a guest dir under /build/tmp,
+# except 'logs' (the CLI-facing plural) which fetches tmp/log (singular).
+cmd_retrieve() {
+	local dest="" objects=() want_help=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dry-run)     DRY_RUN=1; shift ;;
+			-y|--yes)      ASSUME_YES=1; shift ;;
+			-v|--verbose)  VERBOSE=1; shift ;;
+			-h|--help)     want_help=1; shift ;;
+			help)          want_help=1; shift ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
+			--dest)        dest="${2:-}"; [ -n "$dest" ] || die "--dest needs a DIR"; shift 2 ;;
+			--dest=*)      dest="${1#*=}"; shift ;;
+			buildstats|logs|deploy) objects+=("$1"); shift ;;
+			-*) die "unknown option for 'retrieve': $1" "$SCRIPT_CMD retrieve --help" ;;
+			*) die "unknown object for 'retrieve': $1" \
+				"$SCRIPT_CMD retrieve --help  (objects: buildstats logs deploy)" ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		retrieve_usage
+		return 0
+	fi
+
+	[ "${#objects[@]}" -ge 1 ] || die "'retrieve' needs at least one object" \
+		"$SCRIPT_CMD retrieve <buildstats|logs|deploy> [<object>...] [--dest DIR]"
+
+	require_mackas_root
+
+	dest="${dest:-$MACKAS_BASE/artifacts}"
+
+	# dest becomes the host side of a -v "$dest:/out" bind mount, so it has two
+	# constraints Apple container imposes. A ':' in the path breaks the mount
+	# spec outright. And a RELATIVE path is read as a named-volume source, not a
+	# host directory, so files would vanish into a fresh volume instead of
+	# landing in ./out -- absolutise it against $PWD so --dest out means what it
+	# reads like.
+	case "$dest" in
+		*:*) die "--dest must not contain ':' (it is a bind-mount path)" \
+			"choose a destination without a colon" ;;
+	esac
+	case "$dest" in
+		/*) ;;
+		*)  dest="$PWD/$dest" ;;
+	esac
+
+	# One-VM rule: never attach the volume a build might still hold. Refuse
+	# loudly rather than corrupt an ext4 image mounted by two VMs at once.
+	if volume_in_use "$MACKAS_VOL_TMP"; then
+		die "volume '$MACKAS_VOL_TMP' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run '$SCRIPT_CMD retrieve'"
+	fi
+
+	info "${C_BLD}mackas retrieve${C_RST}"
+	info "  volume  : $MACKAS_VOL_TMP"
+	info "  objects : ${objects[*]}"
+	info "  dest    : $dest"
+	info ""
+
+	local it sub fetched=0 got_buildstats=0
+	for it in "${objects[@]}"; do
+		sub="$it"
+		[ "$it" = "logs" ] && sub="log"
+		[ "$it" = "deploy" ] && warn "  deploy can be large (tens of GB); this may take a while and fill $dest"
+		if fetch_tmp_subdir "$sub" "$dest"; then
+			fetched=$((fetched + 1))
+			[ "$it" = "buildstats" ] && got_buildstats=1
+		fi
+	done
+
+	if [ "$fetched" -eq 0 ]; then
+		warn "Nothing retrieved."
+		return 1
+	fi
+
+	hdr "Retrieved to $dest"
+	if [ "$got_buildstats" -eq 1 ]; then
+		info "  Summarise with: $SCRIPT_CMD buildstats analyze $(printf '%q' "$dest/buildstats")"
+	fi
+	return 0
+}
+
+buildstats_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD buildstats${C_RST} -- work with buildstats already retrieved
+from the TMPDIR volume ('$SCRIPT_CMD retrieve buildstats').
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD buildstats analyze [PATH]
+
+${C_BLD}SUBCOMMANDS${C_RST}
+  analyze [PATH]   Summarise a buildstats directory (wall time, parallelism,
+                   io-bound tasks) via tools/mackas-buildstats-analyze. PATH
+                   defaults to \$MACKAS_BASE/artifacts/buildstats -- the
+                   default '$SCRIPT_CMD retrieve buildstats' destination.
+
+Options: --dry-run, -y/--yes and -v/--verbose work here too; put them before
+or after the subcommand.
+EOF
+}
+
+# buildstats analyze [PATH] -- summarise a buildstats dir already on disk
+# (see cmd_retrieve). Non-fatal on a missing analyzer or a failed run: this is
+# a read-only summary, never worth taking the process down over.
+buildstats_analyze() {
+	[ "$#" -le 1 ] || die "'buildstats analyze' takes at most one PATH" \
+		"$SCRIPT_CMD buildstats analyze [PATH]"
+
+	local path="${1:-$MACKAS_BASE/artifacts/buildstats}"
+
+	local analyzer="$SCRIPT_DIR/tools/mackas-buildstats-analyze"
+	if [ ! -f "$analyzer" ] || [ ! -x /usr/bin/python3 ]; then
+		warn "analyzer not found at $analyzer; skipping"
+		return 1
+	fi
+
+	hdr "buildstats summary"
+	/usr/bin/python3 "$analyzer" "$path" --summary \
+		|| { warn "analyze failed (non-fatal); check $path"; return 1; }
+}
+
+cmd_buildstats() {
+	local sub="" rest=() a want_help=0
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|--yes)      ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildstats ;;
+			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		buildstats_usage
+		return 0
+	fi
+
+	case "${sub:-help}" in
+		analyze)  buildstats_analyze ${rest+"${rest[@]}"} ;;
+		help)     buildstats_usage ;;
+		*) die "unknown 'buildstats' subcommand: $sub" \
+			"$SCRIPT_CMD buildstats --help  (analyze)" ;;
+	esac
+}
+
+show() { printf '  %-24s %s\n' "$1" "$2"; }
+
+# One line per volume: name, what it backs, cap, and what it costs today.
+status_volume() {
+	local name="$1" size="$2" role="$3" img used="" moved="" near_cap=0
+	img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+	# du -h already reports actual disk BLOCKS allocated (sparse-aware on
+	# APFS), not volume.img's logical/apparent size -- this is real usage,
+	# not the cap, even when it reads the same as the cap. See the note
+	# under "total cap" below for why "on disk" can still climb to the cap:
+	# ext4 freeing space inside the guest does not, by itself, punch holes
+	# in the host image.
+	[ -e "$img" ] && used="$(du -h "$img" 2>/dev/null | awk '{print $1}')"
+	if [ -n "$used" ]; then
+		local used_gb cap_gb
+		used_gb="$(size_to_gb "$used")"
+		cap_gb="$(size_to_gb "$size")"
+		[ "$cap_gb" -gt 0 ] && [ "$((used_gb * 100 / cap_gb))" -ge 90 ] && near_cap=1
+	fi
+	# A per-volume symlink here means `volume move` (or `recover`) relocated it;
+	# the symlink is the record, so read it straight back.
+	[ -L "$CONTAINER_VOLUMES_DIR/$name" ] && moved="$(readlink "$CONTAINER_VOLUMES_DIR/$name")"
+	if volume_exists "$name"; then
+		printf '  %s[yes]%s %-22s %-22s cap %-5s %s\n' "$C_GRN" "$C_RST" \
+			"$name" "$role" "$size" "${used:+on disk: $used}"
+	else
+		printf '  %s[ no]%s %-22s %-22s cap %-5s (%s setup)\n' "$C_DIM" "$C_RST" \
+			"$name" "$role" "$size" "$SCRIPT_NAME"
+	fi
+	if [ -n "$moved" ]; then
+		printf '        %smoved to: %s%s\n' "$C_BLU" "$moved" "$C_RST"
+	fi
+	if [ "$near_cap" -eq 1 ]; then
+		printf '        %snear cap -- freed ext4 blocks do not shrink volume.img on their own;\n' "$C_YEL"
+		printf '        reclaim it: %s volume fstrim %s%s\n' "$SCRIPT_NAME" "$name" "$C_RST"
+	fi
+}
+
+cmd_status() {
+	hdr "Configuration"
+	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
+	local n
+	for n in $SETTING_NAMES; do
+		eval "show \"\$n\" \"\${$n}\""
+	done
+
+	# status never dies on a missing root -- it is the command you run to find
+	# out that it is missing -- but it must not let a blank line be the only
+	# clue either.
+	if [ -z "$MACKAS_ROOT" ]; then
+		hdr "MACKAS_ROOT is not set"
+		info "  Commands fall back to the current directory (with a warning). There is"
+		info "  no baked-in default because OE needs a case-sensitive filesystem and a"
+		info "  stock Mac's home is case-insensitive APFS; the derived paths below stay"
+		info "  empty until you set it. For a real build point it at a proper volume:"
+		root_hint | sed 's/^/  /'
+	fi
+
+	hdr "Derived paths"
+	show "MACKAS_BASE (in use)"   "$MACKAS_BASE"
+	show "kas work dir"       "$MACKAS_WORK"
+	show "project checkout"   "$MACKAS_PROJECT"
+	show "kas files"          "$KAS_FILES_ARG"
+	show "env.sh"             "$MACKAS_ENV_SH"
+	show "shim"               "$SHIM_DIR/docker"
+
+	hdr "Present?"
+	local p
+	for p in "$MACKAS_ROOT" "$MACKAS_SHORT_LINK" "$MACKAS_ENV_SH" "$KAS_CONTAINER_BIN" \
+	         "$SHIM_DIR/docker" "$MACKAS_PROJECT" "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_KAS_FRAGMENT_REPO"; do
+		if [ -e "$p" ]; then
+			printf '  %s[yes]%s %s\n' "$C_GRN" "$C_RST" "$p"
+		else
+			printf '  %s[ no]%s %s\n' "$C_DIM" "$C_RST" "$p"
+		fi
+	done
+
+	hdr "Runtime"
+	if container_running; then
+		show "container system" "running"
+	else
+		show "container system" "NOT running  (container system start)"
+	fi
+	if image_present "$KAS_IMAGE"; then show "image" "$KAS_IMAGE present"
+	else show "image" "$KAS_IMAGE NOT pulled  ($SCRIPT_CMD setup)"; fi
+	# Not `$(resolved_docker || echo '<none>')`: resolved_docker ends in
+	# `|| true`, so it always exits 0 and that fallback could never fire --
+	# a missing docker printed an empty line instead. The emptiness of the
+	# output is the signal, not the exit status.
+	local docker_path
+	docker_path="$(resolved_docker)"
+	show "docker resolves to"  "${docker_path:-<none>}"
+
+	hdr "ext4 volumes"
+	status_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "/build      TMPDIR"
+	status_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "/downloads  DL_DIR"
+	status_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "/sstate     SSTATE_DIR"
+	if volume_exists "$MACKAS_VOL_LEGACY"; then
+		printf '  %s[old]%s %-22s unused leftover of the single-volume scheme\n' \
+			"$C_YEL" "$C_RST" "$MACKAS_VOL_LEGACY"
+		printf '        %sremove with: container volume delete %s%s\n' \
+			"$C_BLU" "$(printf '%q' "$MACKAS_VOL_LEGACY")" "$C_RST"
+	fi
+	show "total cap" "$(total_volume_gb) GiB (sparse: costs only what is used)"
+	info ""
+	info "  \"on disk\" is REAL usage (du, sparse-aware), never the cap. It only"
+	info "  drops after an explicit fstrim hole-punches freed ext4 blocks back out"
+	info "  of the host image -- ext4 freeing space inside the guest does not do"
+	info "  that by itself. '$SCRIPT_CMD volume fstrim <name>|all' reclaims it."
+	info ""
+	info "  Their contents are NOT visible on the host -- they are ext4 images. To"
+	info "  look inside: $SCRIPT_CMD shell"
+
+	hdr "Effective kas --runtime-args"
+	printf '  %s\n' "$(kas_runtime_args)"
+
+	if [ -d "$MACKAS_ROOT" ]; then
+		hdr "Disk"
+		show "free on target" "$(free_gb_for "$MACKAS_ROOT") GiB"
+		show "MACKAS_ROOT size"   "$(du -sh "$MACKAS_ROOT" 2>/dev/null | awk '{print $1}')"
+	fi
+
+	if [ -d "$MACKAS_LOGS" ]; then
+		hdr "Recent logs"
+		# shellcheck disable=SC2012  # our own log filenames, all well-behaved
+		ls -t "$MACKAS_LOGS" 2>/dev/null | head -5 | sed 's/^/  /'
+	fi
+
+	if [ -n "$MACKAS_BASE" ]; then
+		hdr "Artifacts"
+		local artdir="$MACKAS_BASE/artifacts"
+		if [ -d "$artdir" ]; then
+			show "buildstats dest" "$artdir"
+			# shellcheck disable=SC2012  # our own dir names, all well-behaved
+			ls -1 "$artdir" 2>/dev/null | head -5 | sed 's/^/    /'
+		else
+			show "buildstats dest" "$artdir (empty; run '$SCRIPT_CMD retrieve buildstats')"
+		fi
+		info ""
+		info "  The volumes' tmp/{buildstats,log,deploy} are not visible on the host."
+		info "  Copy them out with: $SCRIPT_CMD retrieve buildstats [logs] [deploy]"
+	fi
+}
+
+cmd_clean() {
+	require_mackas_root
+	local destroy="$1"
+	local what
+
+	if [ "$destroy" = "1" ]; then
+		what="EVERYTHING: all three ext4 volumes ($MACKAS_VOL_TMP, $MACKAS_VOL_DL,
+  $MACKAS_VOL_SSTATE -- so downloads and sstate too), $MACKAS_ROOT (the project
+  checkout and logs), and the $MACKAS_SHORT_LINK symlink"
+	else
+		what="the TMPDIR volume '$MACKAS_VOL_TMP' (recreated empty) and $MACKAS_LOGS
+  (the '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' cache volumes and the project
+  checkout are KEPT -- having them in separate volumes is exactly why this works)"
+	fi
+
+	printf '\n%s%s WARNING %s\n' "$C_RED$C_BLD" "===" "===$C_RST"
+	printf '%sThis will PERMANENTLY DELETE %s%s\n\n' "$C_RED" "$what" "$C_RST"
+
+	if [ "$destroy" = "1" ]; then
+		# du fails if MACKAS_ROOT is already gone; pipefail would make the bare
+		# assignment abort the whole script under set -e.
+		local sz=""
+		sz="$(du -sh "$MACKAS_ROOT" 2>/dev/null | awk '{print $1}' || true)"
+		if [ -n "$sz" ]; then
+			printf '%s%s currently holds %s.%s\n\n' "$C_RED" "$MACKAS_ROOT" "$sz" "$C_RST"
+		fi
+		if [ "$DRY_RUN" -eq 1 ]; then
+			warn "--dry-run: skipping the DESTROY confirmation; nothing will be removed."
+		elif [ "$ASSUME_YES" -ne 1 ]; then
+			if [ ! -t 0 ]; then
+				die "destroy needs a terminal or --yes" "$SCRIPT_CMD destroy --yes"
+			fi
+			printf '%sType the word DESTROY to confirm: %s' "$C_BLD" "$C_RST"
+			local reply=""
+			read -r reply || true
+			[ "$reply" = "DESTROY" ] || { info "Aborted. Nothing was removed."; return 1; }
+		fi
+	else
+		confirm "Proceed?" || { info "Aborted. Nothing was removed."; return 1; }
+	fi
+
+	if [ "$destroy" = "1" ]; then
+		# Delete every volume FIRST and tally the survivors, BEFORE touching the
+		# symlink or rm -rf-ing anything. Order is the whole fix: with
+		# MACKAS_RELOCATE_VOLUMES=1 the volumes' LIVE backing images sit inside
+		# $MACKAS_ROOT/container-volumes, so removing the symlink and then
+		# rm -rf $MACKAS_ROOT while a volume refused to delete would erase that
+		# volume's image out from under a possibly-running VM -- and take any
+		# unrelated foreign volumes with it. So a survivor aborts here, before
+		# any of that runs.
+		local v survivors=0
+		for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" "$MACKAS_VOL_LEGACY"; do
+			delete_volume "$v" || survivors=$((survivors + 1))
+		done
+		if [ "$survivors" -ne 0 ]; then
+			err "$survivors volume(s) could NOT be removed (see the warnings above)"
+			die "destroy did not finish: some volumes survive -- refusing to remove $MACKAS_ROOT" \
+				"container volume ls   -- then stop whatever is using them and re-run"
+		fi
+
+		# All our volumes are gone. If setup relocated the container volumes dir
+		# onto the SSD, its REAL directory is $MACKAS_ROOT/container-volumes and
+		# may STILL hold FOREIGN volumes that setup_relocate_volumes rsync'd in
+		# from the internal disk. Move whatever remains back to the internal disk
+		# before removing the symlink or $MACKAS_ROOT -- rm -rf must never take a
+		# volume we did not create. This is the exact inverse of setup's move.
+		if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
+			local reloc leftover=0
+			reloc="$(readlink "$CONTAINER_VOLUMES_DIR")"
+			if [ -d "$reloc" ]; then
+				# shellcheck disable=SC2012  # counting entries; names irrelevant
+				leftover="$(ls -A "$reloc" 2>/dev/null | wc -l | tr -d ' ')"
+			fi
+			run rm -f "$CONTAINER_VOLUMES_DIR"
+			if [ "$leftover" -gt 0 ]; then
+				run mv "$reloc" "$CONTAINER_VOLUMES_DIR"
+				did "moved $leftover foreign volume(s) back to $CONTAINER_VOLUMES_DIR"
+			else
+				run mkdir -p "$CONTAINER_VOLUMES_DIR"
+				did "restored $CONTAINER_VOLUMES_DIR to a real directory"
+			fi
+		fi
+		if [ -L "$MACKAS_SHORT_LINK" ]; then
+			run rm -f "$MACKAS_SHORT_LINK"
+		fi
+		# Delete through the REAL path, never through the symlink.
+		if [ -d "$MACKAS_ROOT" ]; then
+			run rm -rf "$MACKAS_ROOT"
+			did "destroyed $MACKAS_ROOT"
+		else
+			did "$MACKAS_ROOT was already gone"
+		fi
+	else
+		# TMPDIR is a whole volume, so cleaning it is delete + recreate rather
+		# than rm -rf: it is faster, it cannot leave a half-deleted tree behind,
+		# and it hands back the sparse image's disk space in one go. The dl and
+		# sstate volumes are never touched here -- that is the entire reason
+		# they are separate volumes.
+		#
+		# Bail out rather than fall through to ensure_volume if the delete
+		# failed: ensure_volume would find the volume still present, skip
+		# creating it, and `clean` would report a cleaned TMPDIR over the old
+		# contents, still there.
+		if volume_exists "$MACKAS_VOL_TMP"; then
+			delete_volume "$MACKAS_VOL_TMP" || \
+				die "cannot clean TMPDIR: volume '$MACKAS_VOL_TMP' could not be removed" \
+					"stop anything still using it (container ls) and re-run '$SCRIPT_CMD clean'"
+		fi
+		ensure_volume "$MACKAS_VOL_TMP" "$MACKAS_VOLUME_SIZE_TMP" "TMPDIR -> /build"
+		if [ -d "$MACKAS_LOGS" ]; then
+			run rm -rf "$MACKAS_LOGS"; run mkdir -p "$MACKAS_LOGS"
+		fi
+		did "cleaned TMPDIR; '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' kept"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# volume -- manage the ext4 container volumes: list, fstrim (reclaim), duplicate
+# and destroy an arbitrary one. These operate on `container` volumes directly
+# (under CONTAINER_VOLUMES_DIR), so they do not need MACKAS_ROOT -- the volume
+# names are derived from MACKAS_VOLUME_NAME, which has a default.
+# ---------------------------------------------------------------------------
+
+# KiB -> human. `du` on APFS reports allocated blocks, i.e. what a sparse image
+# actually costs, so this formats the SAME quantity for before/after/reclaimed
+# and they stay internally consistent (a plain `du -h` uses the locale decimal
+# separator -- "2,3M" here -- which we deliberately avoid for the numbers we
+# compute on).
+fmt_kb() {
+	local kb="$1"
+	[ "$kb" -lt 0 ] && kb=0
+	# LC_ALL=C so the decimal separator is always '.', not the locale's ','
+	# (awk honours LC_NUMERIC), keeping the output predictable and testable.
+	if [ "$kb" -ge 1048576 ]; then
+		LC_ALL=C awk -v k="$kb" 'BEGIN { printf "%.1fG", k / 1048576 }'
+	elif [ "$kb" -ge 1024 ]; then
+		LC_ALL=C awk -v k="$kb" 'BEGIN { printf "%.1fM", k / 1024 }'
+	else
+		printf '%dK' "$kb"
+	fi
+}
+
+# du of a volume's backing image, in KiB (blocks actually used). Empty if the
+# image is absent (e.g. a volume that exists but was never written to). A `du`
+# that fails on an EXISTING image (a dangling relocation symlink, a permission
+# hiccup) must also degrade to empty, not abort: this runs inside `used_kb="$(
+# volume_img_kb ...)"` under `set -e`+pipefail, so a failing pipeline here would
+# otherwise kill `volume list` mid-listing. `|| true` keeps the listing going;
+# the caller renders empty as "-".
+volume_img_kb() {
+	local img="$1"
+	[ -e "$img" ] || return 0
+	du -k "$img" 2>/dev/null | awk '{print $1; exit}' || true
+}
+
+# The configured (declared) size of a volume, read from `container volume
+# inspect`'s JSON -- the "size" field under configuration.options, e.g. "800M".
+# Parsed with sed, not jq (stdlib only). "sizeInBytes" cannot be mismatched:
+# the pattern requires the closing quote right after `size`, which only the
+# options."size" line has.
+volume_size() {
+	container volume inspect "$1" 2>/dev/null \
+		| sed -n 's/.*"size"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+		| head -1
+}
+
+# Mark a volume name: which of the three mackas volumes it is (or the legacy
+# single-volume leftover), for `volume list`.
+volume_role() {
+	case "$1" in
+		"$MACKAS_VOL_TMP")    printf 'mackas/tmp' ;;
+		"$MACKAS_VOL_DL")     printf 'mackas/dl' ;;
+		"$MACKAS_VOL_SSTATE") printf 'mackas/sstate' ;;
+		"$MACKAS_VOL_LEGACY") printf 'old' ;;
+		*)                    printf '-' ;;
+	esac
+}
+
+# volume list -- every container volume, with its configured cap, what its
+# volume.img actually costs on disk today, and whether a running VM holds it.
+# The on-disk column is the whole motivation for `fstrim`: sparse ext4 images
+# only ratchet up, so this is where you SEE one that has grown far past what it
+# still holds.
+volume_list() {
+	[ "$#" -eq 0 ] || die "'volume list' takes no arguments" "$SCRIPT_CMD volume list"
+
+	hdr "Container volumes"
+	printf '  %-24s %-14s %-8s %-10s %s\n' "NAME" "ROLE" "CAP" "ON DISK" "IN USE"
+
+	# One `container volume ls`. Its OPTIONS column carries `size=<cap>`; pull
+	# the name (field 1) and that cap out in one pass, tab-separated so a value
+	# can never be confused for a column boundary.
+	local rows
+	rows="$(container volume ls 2>/dev/null | awk '
+		NR > 1 {
+			name = $1
+			cap = ""
+			for (i = 2; i <= NF; i++) if ($i ~ /^size=/) cap = substr($i, 6)
+			print name "\t" cap
+		}')"
+
+	if [ -z "$rows" ]; then
+		info "  (no volumes)"
+		return 0
+	fi
+
+	local name cap img used_kb used inuse moved
+	while IFS="$(printf '\t')" read -r name cap; do
+		[ -n "$name" ] || continue
+		img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+		used_kb="$(volume_img_kb "$img")"
+		if [ -n "$used_kb" ]; then used="$(fmt_kb "$used_kb")"; else used="-"; fi
+		if volume_in_use "$name"; then inuse="yes"; else inuse="no"; fi
+		printf '  %-24s %-14s %-8s %-10s %s\n' \
+			"$name" "$(volume_role "$name")" "${cap:--}" "$used" "$inuse"
+		# A per-volume symlink at the runtime path means `volume move` relocated
+		# it; the ON DISK figure was measured THROUGH that symlink, so note where
+		# the image actually lives (matching `status`'s "moved to:").
+		if [ -L "$CONTAINER_VOLUMES_DIR/$name" ]; then
+			moved="$(readlink "$CONTAINER_VOLUMES_DIR/$name")"
+			printf '  %s-> moved to: %s%s\n' "$C_DIM" "$moved" "$C_RST"
+		fi
+	done <<EOF
+$rows
+EOF
+
+	info ""
+	info "  ON DISK is what volume.img costs right now -- a sparse ext4 image only"
+	info "  grows; deleting files inside the guest never shrinks it. Reclaim the"
+	info "  freed space with: $SCRIPT_CMD volume fstrim <name>   (or 'all')"
+}
+
+# fstrim ONE volume. Returns non-zero on a real failure; when called from
+# 'all' a missing/busy volume is skipped (warned) rather than fatal.
+volume_fstrim_one() {
+	local name="$1" from_all="${2:-0}"
+
+	if ! volume_exists "$name"; then
+		if [ "$from_all" -eq 1 ]; then
+			warn "  volume '$name' does not exist; skipping"
+			return 0
+		fi
+		die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
+	fi
+
+	# One-VM rule: an ext4 image mounted by two VMs at once corrupts. Refuse to
+	# attach a volume a running build still holds rather than race it.
+	if volume_in_use "$name"; then
+		if [ "$from_all" -eq 1 ]; then
+			warn "  volume '$name' is attached to a running container; skipping (one-VM rule)"
+			return 0
+		fi
+		die "volume '$name' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run '$SCRIPT_CMD volume fstrim $name'"
+	fi
+
+	local img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+	local before_kb
+	before_kb="$(volume_img_kb "$img")"
+
+	info "${C_BLD}mackas volume fstrim $name${C_RST}"
+	info "  on disk before: $(fmt_kb "${before_kb:-0}")"
+
+	# The recipe, measured on this machine (an 800M image with 600M deleted
+	# inside fell to 202M in 0.01s):
+	#
+	#   container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v NAME:/mnt IMAGE fstrim -v /mnt
+	#
+	# Apple's own tooling never issues discards, but the hypervisor's
+	# virtio-blk backend DOES implement DISCARD -> host hole-punch (the guest's
+	# discard_max_bytes is non-zero). fstrim inside the guest is what triggers
+	# it. BOTH flags are required and neither alone works:
+	#   -u 0:0            the kas image's default user is uid 30000 and gets
+	#                     EPERM on the FITRIM ioctl.
+	#   --cap-add CAP_SYS_ADMIN   root without the cap still gets EPERM; the cap
+	#                     is dropped across the privilege-dropping exec otherwise.
+	# util-linux fstrim already ships in the kas image (no apk needed).
+	#
+	# NOT `hdiutil compact`: it returns "Function not implemented" on these raw
+	# ext4 images, so we do not attempt it.
+	if [ "$DRY_RUN" -eq 1 ]; then
+		run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" "$KAS_IMAGE" fstrim -v /mnt
+		info "  (dry-run: nothing was reclaimed)"
+		return 0
+	fi
+
+	vrb "+ $(quote_cmd container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" "$KAS_IMAGE" fstrim -v /mnt)"
+	# `|| st=$?` so a non-zero fstrim does not abort under `set -e` -- we handle
+	# the failure ourselves below (a device with discard_max_bytes=0 errors here).
+	local out st=0
+	out="$(container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" "$KAS_IMAGE" fstrim -v /mnt 2>&1)" || st=$?
+	[ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  fstrim: /'
+
+	if [ "$st" -ne 0 ]; then
+		# Some backing filesystems report discard_max_bytes=0 and fstrim
+		# errors on the FITRIM ioctl. Say so rather than claim a reclaim that
+		# never happened. Measured live: this is not a stale-volume or
+		# mackas-side problem -- a completely fresh volume fails identically
+		# -- it is whatever filesystem MACKAS_ROOT (and so
+		# CONTAINER_VOLUMES_DIR, symlinked under it) actually sits on. APFS
+		# supports the sparse-file hole-punch DISCARD needs; ExFAT does not.
+		warn "  fstrim did not succeed on '$name' -- this device may not support"
+		warn "  discard (discard_max_bytes=0); nothing was reclaimed."
+		warn "  This tracks the filesystem $MACKAS_ROOT is on, not a stale volume --"
+		warn "  a brand new volume fails the same way on a non-hole-punching host"
+		warn "  filesystem (e.g. ExFAT). See docs/storage.md's fstrim section."
+		return 1
+	fi
+
+	# Report reclaimed space by RE-MEASURING du of volume.img, before -> after.
+	# We deliberately do NOT trust fstrim's own "N bytes trimmed" line: that is
+	# the guest's free space, not host reclaim, and APFS block sharing (clones)
+	# would make any computed figure a lie. The host `du` delta is the truth.
+	local after_kb reclaimed_kb
+	after_kb="$(volume_img_kb "$img")"
+	reclaimed_kb=$(( ${before_kb:-0} - ${after_kb:-0} ))
+	[ "$reclaimed_kb" -lt 0 ] && reclaimed_kb=0
+
+	did "fstrim '$name': $(fmt_kb "${before_kb:-0}") -> $(fmt_kb "${after_kb:-0}") (reclaimed $(fmt_kb "$reclaimed_kb"))"
+	if [ "$reclaimed_kb" -eq 0 ]; then
+		info "  Nothing to reclaim -- the image was already compact."
+	fi
+	return 0
+}
+
+# volume fstrim <name> | all -- reclaim host disk from sparse ext4 image(s).
+# "all" is a positional keyword (object), not a flag -- 'volume fstrim' already
+# reads as verb+object, so a second object value is consistent, not --all.
+volume_fstrim() {
+	# fstrim ATTACHES each volume (via volume_fstrim_one), so it is a mutating
+	# command and needs a root like the rest. Without one, `all` would expand
+	# to the default volume names (oe-build-{tmp,dl,sstate}) and attach the real
+	# volumes of whatever install happens to share those names -- the one thing
+	# the root gate exists to stop. `volume list`, which only reads, does NOT
+	# require a root.
+	require_mackas_root
+	local do_all=0 names=() a
+	for a in "$@"; do
+		case "$a" in
+			all) do_all=1 ;;
+			-*) die "unknown option for 'volume fstrim': $a" \
+				"$SCRIPT_CMD volume fstrim <name> | all" ;;
+			*) names+=("$a") ;;
+		esac
+	done
+
+	if [ "$do_all" -eq 1 ]; then
+		[ "${#names[@]}" -eq 0 ] || die "'volume fstrim all' takes no volume name" \
+			"$SCRIPT_CMD volume fstrim all"
+		names=("$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE")
+	fi
+
+	[ "${#names[@]}" -ge 1 ] || die "'volume fstrim' needs a volume name (or 'all')" \
+		"$SCRIPT_CMD volume fstrim <name> | all"
+
+	local n rc=0
+	for n in "${names[@]}"; do
+		volume_fstrim_one "$n" "$do_all" || rc=1
+	done
+	return "$rc"
+}
+
+# volume duplicate <source> <duplicate> -- clone a volume cheaply via APFS
+# clonefile. Measured at 0.003s: `cp -c` is copy-on-write, so the clone SHARES
+# physical blocks with its source and costs almost nothing until one side is
+# written. <duplicate> is a NAME YOU CHOOSE for the new volume, not an
+# existing one.
+volume_duplicate() {
+	local src="${1:-}" dst="${2:-}"
+	[ -n "$src" ] && [ -n "$dst" ] || die "'volume duplicate' needs <source> and <duplicate>" \
+		"$SCRIPT_CMD volume duplicate <source> <duplicate>"
+	[ "$#" -le 2 ] || die "'volume duplicate' takes exactly <source> <duplicate>" \
+		"$SCRIPT_CMD volume duplicate <source> <duplicate>"
+	[ "$src" != "$dst" ] || die "source and duplicate name must differ" \
+		"$SCRIPT_CMD volume duplicate <source> <duplicate>"
+
+	volume_exists "$src" || die "source volume '$src' does not exist" "$SCRIPT_CMD volume list"
+	if volume_exists "$dst"; then
+		die "destination volume '$dst' already exists" \
+			"pick a new name, or remove it: $SCRIPT_CMD volume destroy $dst"
+	fi
+
+	# One-VM guard on the SOURCE too. The engine guards `rm` against a running
+	# container but does NOT guard read access, and cloning a live image
+	# (mid-write, dirty journal) yields an inconsistent copy.
+	if volume_in_use "$src"; then
+		die "source volume '$src' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run"
+	fi
+
+	local size
+	size="$(volume_size "$src")"
+	[ -n "$size" ] || die "could not read the size of '$src' from 'container volume inspect'" \
+		"container volume inspect $src"
+
+	local src_img="$CONTAINER_VOLUMES_DIR/$src/volume.img"
+	local dst_img="$CONTAINER_VOLUMES_DIR/$dst/volume.img"
+
+	info "${C_BLD}mackas volume duplicate $src -> $dst${C_RST}"
+	info "  size: $size (matched from the source)"
+
+	# 1. Create dst at the SAME size. This writes a valid entity.json we must
+	#    NOT edit -- only its volume.img gets swapped underneath it.
+	run container volume create -s "$size" "$dst"
+	# 2. Drop the fresh (empty) image `create` just made.
+	run rm -f "$dst_img"
+	# 3. clonefile the source image into its place. `cp -c` asks for a CoW
+	#    clone. TRAP: `cp -c` ACROSS APFS volumes silently falls back to a full
+	#    byte copy (exit 0, no warning) -- both images live under
+	#    CONTAINER_VOLUMES_DIR, so they are same-volume in normal use, but if
+	#    that dir is ever relocated onto a different filesystem the "clone"
+	#    would quietly become a full copy.
+	run cp -c "$src_img" "$dst_img"
+
+	did "duplicated '$src' -> '$dst' (size $size)"
+	info "  The clone SHARES physical blocks with '$src' (APFS copy-on-write), so"
+	info "  it costs almost nothing on disk until one of the two is written to."
+	return 0
+}
+
+# volume destroy <name> -- remove ONE arbitrary volume. Distinct from the
+# top-level `destroy`, which removes the THREE mackas volumes plus MACKAS_ROOT
+# and the short symlink. This is the counterpart to `duplicate`: remove a clone,
+# or a stray zztest-* volume, without touching anything else.
+volume_destroy() {
+	local name="${1:-}"
+	[ -n "$name" ] || die "'volume destroy' needs a volume name" "$SCRIPT_CMD volume destroy <name>"
+	[ "$#" -le 1 ] || die "'volume destroy' removes one volume at a time" \
+		"$SCRIPT_CMD volume destroy <name>"
+
+	volume_exists "$name" || die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
+
+	if volume_in_use "$name"; then
+		die "volume '$name' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run"
+	fi
+
+	local img="$CONTAINER_VOLUMES_DIR/$name/volume.img" before_kb
+	before_kb="$(volume_img_kb "$img")"
+
+	confirm "Delete volume '$name'${before_kb:+ (on disk: $(fmt_kb "$before_kb"))}? This cannot be undone." \
+		|| { info "Aborted. Nothing was removed."; return 1; }
+
+	delete_volume "$name" || die "could not delete volume '$name'" \
+		"stop whatever is using it (container ls) and re-run"
+	return 0
+}
+
+# The real on-disk directory that backs a volume. Normally this is just
+# $CONTAINER_VOLUMES_DIR/<name>, but `volume move` (and `recover`) leave a
+# SYMLINK there pointing at the image's new home on a roomier disk -- Apple's
+# runtime follows it (VERIFIED: it mounts a symlinked volume dir as ext4 with
+# data intact). readlink gives the stored absolute target; a plain dir gives
+# itself. This is the persistence mechanism: the symlink IS the record of where
+# a volume lives, so there is no second state file to drift out of sync.
+volume_real_dir() {
+	local name="$1"
+	local link="$CONTAINER_VOLUMES_DIR/$name"
+	if [ -L "$link" ]; then
+		readlink "$link"
+	else
+		printf '%s' "$link"
+	fi
+}
+
+# True (0) when a volume's runtime location does NOT resolve to a real
+# volume.img: a dangling symlink left by a hand-move, or a missing dir/image.
+# False (1) when it is healthy. This is what `recover` detects.
+volume_broken() {
+	local name="$1" real
+	real="$(volume_real_dir "$name")"
+	[ -f "$real/volume.img" ] && return 1
+	return 0
+}
+
+# Move a volume's on-disk tree $1 -> $2. cross=1 when the two are on different
+# filesystems. Same-fs is a plain `mv` -- an atomic rename. Cross-fs cannot
+# rename, and macOS `mv` across filesystems copies a sparse image WITHOUT its
+# holes: it writes the image's full logical size in zeros, ballooning a
+# 120G-cap TMPDIR to 120G on the destination (needs >= cap free, slow, lands
+# un-sparse). So clone it instead: `cp -cR` asks clonefile(2) for a
+# copy-on-write clone and, where that is impossible (a different filesystem),
+# falls back to a plain copy that STILL preserves holes. The source is removed
+# only AFTER the copy returns success, so a crash mid-copy leaves it intact --
+# nothing is lost (the copy is not atomic, but the source is the safety net).
+volume_transfer() {
+	local src="$1" dst="$2" cross="$3"
+	if [ "$cross" -eq 1 ]; then
+		run cp -cR "$src" "$dst" && run rm -rf "$src"
+	else
+		run mv "$src" "$dst"
+	fi
+}
+
+# volume move <name> <dir> -- relocate ONE volume's on-disk image tree to
+# <dir>/<name> and leave a symlink at the runtime location so the engine still
+# finds it. Apple `container` 1.1.0 has no per-volume storage-root knob, and its
+# whole-dir MACKAS_RELOCATE_VOLUMES symlink moves ALL volumes together; this
+# moves just one -- e.g. a big TMPDIR onto a disk with more room.
+volume_move() {
+	local name="${1:-}" dest_dir="${2:-}"
+	[ -n "$name" ] && [ -n "$dest_dir" ] || die "'volume move' needs <name> and <dir>" \
+		"$SCRIPT_CMD volume move <name> <dir>"
+	[ "$#" -le 2 ] || die "'volume move' takes exactly <name> <dir>" \
+		"$SCRIPT_CMD volume move <name> <dir>"
+
+	volume_exists "$name" || die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
+
+	# One-VM rule: never relocate an image a running VM still holds. Moving the
+	# backing dir of a mounted ext4 image is exactly the double-life the rule
+	# forbids.
+	if volume_in_use "$name"; then
+		die "volume '$name' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run '$SCRIPT_CMD volume move $name <dir>'"
+	fi
+
+	# Absolutise a relative <dir> against $PWD -- a relative destination for a
+	# persistent symlink target would be surprising (and, once stored, wrong from
+	# any other working directory).
+	case "$dest_dir" in
+		/*) ;;
+		*)  dest_dir="$PWD/$dest_dir" ;;
+	esac
+
+	local link="$CONTAINER_VOLUMES_DIR/$name"
+	local real_src dest
+	real_src="$(volume_real_dir "$name")"   # follows a prior move's symlink
+	dest="$dest_dir/$name"
+
+	if [ "$real_src" = "$dest" ]; then
+		die "volume '$name' is already located at '$dest'" "nothing to do"
+	fi
+
+	# Refuse to move a volume into its own subtree (mv would fail, or worse).
+	case "$dest/" in
+		"$real_src"/*) die "cannot move '$name' into its own subtree ('$dest' is under '$real_src')" \
+			"choose a directory outside '$real_src'" ;;
+	esac
+
+	# Moving a relocated volume BACK home: <dir> is the runtime volumes dir, so
+	# $dest is the runtime path itself, currently a symlink left by an earlier
+	# move-away. This is the inverse of a move -- put the tree back and drop the
+	# symlink so the engine sees a plain directory again. (When the volume was
+	# never moved, $real_src == $dest and we already died "already located", so
+	# reaching here with $dest == $link means $link is that symlink.)
+	local moving_home=0
+	[ "$dest" = "$link" ] && [ -L "$link" ] && moving_home=1
+
+	# Refuse a destination that already exists, UNLESS it is an empty directory
+	# we can reuse (mv into an existing dir would nest, not replace). The
+	# move-home symlink at $link is expected, not a collision -- skip the check.
+	if [ "$moving_home" -eq 0 ] && { [ -e "$dest" ] || [ -L "$dest" ]; }; then
+		if [ -d "$dest" ] && [ ! -L "$dest" ] && [ -z "$(ls -A "$dest" 2>/dev/null)" ]; then
+			run rmdir "$dest"
+		else
+			die "destination '$dest' already exists and is not an empty directory" \
+				"pick a different directory, or remove '$dest' first"
+		fi
+	fi
+
+	info "${C_BLD}mackas volume move $name -> $dest${C_RST}"
+
+	# Same-fs vs cross-fs decides HOW the tree moves. A cross-filesystem move
+	# cannot rename and, done with `mv`, would balloon the sparse image to its
+	# full logical size (see volume_transfer); cross-fs we clone with holes
+	# preserved instead. Either way the copy is not atomic, but the source
+	# stays intact until it finishes, so nothing is lost.
+	local src_mp dest_mp cross_fs=0
+	src_mp="$(volume_mount_point "$real_src")"
+	dest_mp="$(volume_mount_point "$dest_dir")"
+	if [ "$src_mp" != "$dest_mp" ]; then
+		cross_fs=1
+		info "  '$dest_dir' is on a different filesystem ($dest_mp) than the image"
+		info "  ($src_mp): copying with holes preserved (a CoW clone where the"
+		info "  filesystem allows, else a plain sparse copy), then removing the source."
+	fi
+
+	run mkdir -p "$dest_dir"
+
+	# The transfer-then-symlink window is crash-sensitive: on a FIRST move the
+	# runtime dir is about to move away, and until the replacement symlink lands
+	# nothing at $link resolves AND `container volume ls` no longer lists it
+	# (entity.json moved with the dir). A Ctrl-C in that gap (the INT trap exits
+	# immediately) would strand the volume where a no-arg `recover` scan can't
+	# see it. Block INT/TERM across the window and restore the trap after.
+	trap '' INT TERM
+	if [ "$moving_home" -eq 1 ]; then
+		# Drop the relocation symlink, then bring the tree back to the runtime
+		# path. Same-fs/cross-fs handling is identical to a normal move.
+		run rm -f "$link"
+		volume_transfer "$real_src" "$dest" "$cross_fs"
+	else
+		# Move the tree to its new home: same-fs an atomic rename, cross-fs a
+		# holes-preserving copy whose source is removed only after it succeeds.
+		volume_transfer "$real_src" "$dest" "$cross_fs"
+		# Plant the symlink atomically: create it under a temp name, then mv it
+		# into place. Renaming a symlink is atomic, so $link is only ever the OLD
+		# state or the NEW one, never absent -- and the mv also replaces a
+		# re-move's dangling symlink outright, so no separate `rm -f` is needed.
+		run ln -s "$dest" "$link.tmp.$$" && run mv -f "$link.tmp.$$" "$link"
+	fi
+	trap on_interrupt INT TERM
+
+	if [ "$moving_home" -eq 1 ]; then
+		did "moved '$name' back home to '$dest'"
+		info "  $link is a plain directory again (no relocation symlink)."
+	else
+		did "moved '$name' to '$dest'"
+		info "  $link -> $dest"
+		info "  '$SCRIPT_CMD status' now reports this location; it survives reboots and"
+		info "  a re-'$SCRIPT_CMD setup' preserves the symlink."
+	fi
+	return 0
+}
+
+# Ask Spotlight where a volume.img with the right shape lives. Prints one
+# candidate directory per line (the dir that CONTAINS volume.img). Test seam:
+# MACKAS_MDFIND overrides the mdfind binary, exactly like MACKAS_CONTAINER_BIN.
+volume_spotlight_find() {
+	local name="$1" mdfind="${MACKAS_MDFIND:-mdfind}" img dir
+	# A genuine container volume is <something>/<name>/volume.img with an
+	# entity.json sibling. Query by filename, then filter -- kMDItemFSName is the
+	# indexed attribute; the structural checks are ours, not Spotlight's.
+	"$mdfind" "kMDItemFSName == 'volume.img'" 2>/dev/null | while IFS= read -r img; do
+		[ -f "$img" ] || continue
+		dir="$(dirname "$img")"
+		[ "$(basename "$dir")" = "$name" ] || continue
+		[ -f "$dir/entity.json" ] || continue
+		printf '%s\n' "$dir"
+	done
+}
+
+# volume recover [<name>] -- when a volume.img has been moved by hand, the
+# runtime location ($CONTAINER_VOLUMES_DIR/<name>) no longer resolves to it.
+# Detect that, locate the image with Spotlight, and offer to re-point the
+# symlink. Nothing changes without confirmation.
+volume_recover() {
+	local only="${1:-}"
+	[ "$#" -le 1 ] || die "'volume recover' takes at most one <name>" \
+		"$SCRIPT_CMD volume recover [<name>]"
+
+	# The set to examine: an explicit name, else the mackas volumes.
+	local candidates
+	if [ -n "$only" ]; then
+		candidates="$only"
+	else
+		candidates="$MACKAS_VOL_TMP $MACKAS_VOL_DL $MACKAS_VOL_SSTATE $MACKAS_VOL_LEGACY"
+	fi
+
+	local name link any=0 fixed=0
+	for name in $candidates; do
+		link="$CONTAINER_VOLUMES_DIR/$name"
+
+		# Healthy: resolves to a real volume.img. Skip -- but if the user named
+		# it explicitly, say so rather than stay silent.
+		if ! volume_broken "$name"; then
+			[ -n "$only" ] && info "volume '$name' is healthy ($(volume_real_dir "$name")/volume.img)"
+			continue
+		fi
+
+		# Broken. When scanning (no explicit name), only treat it as broken if
+		# there is EVIDENCE the volume should exist -- a dangling symlink left by
+		# a hand-move, or the runtime still listing it -- so a volume that was
+		# simply never created is not reported as a problem. But an interrupted
+		# FIRST move strands a volume with NEITHER (the runtime dir is entirely
+		# gone and entity.json moved away with it), so before concluding "never
+		# created", ask Spotlight: if it finds a matching image, the volume is
+		# stranded and worth recovering; if not, stay silent.
+		if [ -z "$only" ] && [ ! -L "$link" ] && ! volume_exists "$name"; then
+			[ -n "$(volume_spotlight_find "$name")" ] || continue
+		fi
+
+		any=1
+		err "volume '$name' does not resolve to a volume.img (looked at $link)"
+
+		# Ask Spotlight where it went. Exclude the current broken location.
+		local matches match count=0 chosen=""
+		matches="$(volume_spotlight_find "$name" | grep -vxF "$(volume_real_dir "$name")" || true)"
+		if [ -n "$matches" ]; then
+			count="$(printf '%s\n' "$matches" | grep -c .)"
+		fi
+
+		if [ "$count" -eq 0 ]; then
+			# Spotlight found nothing. Is the likely disk even indexed?
+			local disk="$MACKAS_ROOT"
+			if command -v mdutil >/dev/null 2>&1 && \
+			   mdutil -s "$disk" 2>/dev/null | grep -qi "disabled"; then
+				warn "  Spotlight indexing is off for $disk, so it cannot search there."
+				info "  Re-point by hand once you know the path:"
+				info "    ln -s <the-dir-holding-volume.img> $(printf '%q' "$link")"
+			else
+				warn "  Spotlight found no volume.img named '$name' anywhere it indexes."
+				info "  If you moved it to an unindexed disk, re-point by hand:"
+				info "    ln -s <the-dir-holding-volume.img> $(printf '%q' "$link")"
+			fi
+			continue
+		fi
+
+		if [ "$count" -gt 1 ]; then
+			warn "  Spotlight found $count candidates; refusing to guess. Re-point the right one:"
+			printf '%s\n' "$matches" | while IFS= read -r match; do
+				info "    ln -s $(printf '%q' "$match") $(printf '%q' "$link")"
+			done
+			continue
+		fi
+
+		chosen="$matches"
+		info "  found it at: $chosen"
+		if confirm "  re-point '$name' there?"; then
+			run rm -f "$link"
+			run ln -s "$chosen" "$link"
+			if [ "$DRY_RUN" -eq 1 ]; then
+				# Under --dry-run the rm/ln above only PRINTED, so the volume
+				# is of course still broken -- verifying here would print a
+				# false failure over a perfectly good target. Skip it.
+				info "  (dry-run: would re-point '$name' to $chosen; nothing changed)"
+			elif volume_broken "$name"; then
+				err "  re-pointed, but '$name' still does not resolve -- check $chosen"
+			else
+				did "recovered '$name' -> $chosen"
+				fixed=$((fixed + 1))
+			fi
+		else
+			info "  left '$name' as-is."
+		fi
+	done
+
+	if [ "$any" -eq 0 ]; then
+		info "Nothing to recover -- every volume resolves to its image."
+	else
+		info "Recovered $fixed volume(s)."
+	fi
+	return 0
+}
+
+volume_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD volume${C_RST} -- manage the ext4 container volumes.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD volume list
+  $SCRIPT_CMD volume fstrim <name> | all
+  $SCRIPT_CMD volume duplicate <source> <duplicate>
+  $SCRIPT_CMD volume destroy <name>
+  $SCRIPT_CMD volume move <name> <dir>
+  $SCRIPT_CMD volume recover [<name>]
+
+${C_BLD}SUBCOMMANDS${C_RST}
+  list (ls)            Every volume: role, configured cap, actual on-disk cost
+                       of its volume.img, and whether a running VM holds it.
+  fstrim <name>        Reclaim host disk from a sparse ext4 image. Deleting
+  (trim)               files inside the guest never shrinks volume.img; fstrim
+                       inside the guest issues the discards that hole-punch it
+                       on the host. 'all' does the three mackas volumes,
+                       skipping any that are in use.
+  duplicate <source> <duplicate>  Clone a volume via APFS copy-on-write
+  (dup, clone)         (near-free; the clone shares blocks with its source
+                       until written). <duplicate> is a name you choose.
+  destroy <name>       Remove ONE volume. Unlike the top-level '$SCRIPT_NAME
+  (delete, rm)         destroy' (which removes all three mackas volumes,
+                       $MACKAS_ROOT and the symlink), this touches only <name>.
+  move <name> <dir>    Relocate one volume's on-disk image to <dir>/<name> and
+  (relocate)           leave a symlink behind so the engine still finds it --
+                       e.g. put a big TMPDIR on a roomier disk. Refuses an
+                       in-use volume (one-VM rule). '$SCRIPT_CMD status' then
+                       reports the new location.
+  recover [<name>]     When you have moved a volume.img by hand and the runtime
+                       can no longer find it, locate it with Spotlight and
+                       offer to re-point the symlink. With no name, checks all
+                       the mackas volumes. Never changes anything unprompted.
+
+  Parenthesized names are accepted aliases -- 'ls'/'rm' etc. match Apple
+  container's own vocabulary (this is a volume manager sitting right next to
+  'container volume ls'); the rest are contractions.
+
+Options: --dry-run, -y/--yes and -v/--verbose work here too; before or after
+the subcommand, e.g. '$SCRIPT_CMD --dry-run volume fstrim oe-build-tmp' or
+'$SCRIPT_CMD volume fstrim oe-build-tmp --dry-run' both work.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. fstrim, duplicate and destroy
+  all refuse a volume a running container holds -- for duplicate, that guard is
+  on the SOURCE, since a clone of a live (mid-write) image is inconsistent.
+EOF
+}
+
+cmd_volume() {
+	local sub="" rest=() a want_help=0
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|--yes)      ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			# -h/--help anywhere means help, whether it comes before the
+			# subcommand ('volume --help') or after it ('volume fstrim --help').
+			# The old form only mapped a LEADING -h/--help and let a trailing one
+			# fall through to the subcommand's arg parser, which died "unknown
+			# option".
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" volume ;;
+			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		volume_usage
+		return 0
+	fi
+
+	case "${sub:-help}" in
+		list|ls)               volume_list ${rest+"${rest[@]}"} ;;
+		fstrim|trim)           volume_fstrim ${rest+"${rest[@]}"} ;;
+		duplicate|dup|clone)   volume_duplicate ${rest+"${rest[@]}"} ;;
+		destroy|delete|rm)     volume_destroy ${rest+"${rest[@]}"} ;;
+		move|relocate)         volume_move ${rest+"${rest[@]}"} ;;
+		recover)               volume_recover ${rest+"${rest[@]}"} ;;
+		help)                  volume_usage ;;
+		*) die "unknown 'volume' subcommand: $sub" \
+			"$SCRIPT_CMD volume --help  (list | fstrim | duplicate | destroy | move | recover)" ;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_NAME${C_RST} v$SCRIPT_VERSION -- run kas-container OpenEmbedded builds on Apple's
+'container' runtime. Project: $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH); set MACKAS_PROJECT_* to
+build your own layers. qualcomm-linux/meta-ai is the shipped example.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_NAME [OPTIONS] [COMMAND]
+
+${C_BLD}COMMANDS${C_RST}
+  check      Preflight only. Changes nothing. ${C_BLD}This is the default.${C_RST}
+  setup      Do the full setup. Idempotent -- safe to re-run after a crash.
+  smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
+  status     Show what is configured and what exists on disk.
+  shell      Drop into a kas shell for the project's kas config.
+  retrieve   Copy build outputs (buildstats/logs/deploy) out of the ext4
+             TMPDIR volume, where macOS cannot see them. '$SCRIPT_CMD retrieve --help'.
+  buildstats Work with buildstats already retrieved (currently: analyze).
+             '$SCRIPT_CMD buildstats --help'.
+  clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the checkout.
+  destroy    Remove all three volumes, $MACKAS_ROOT and the short symlink.
+             Makes you type DESTROY.
+  volume     Manage the ext4 volumes: list, fstrim (reclaim disk), duplicate,
+             destroy one, move one to another disk, recover a hand-moved one.
+             '$SCRIPT_CMD volume --help'.
+  set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
+  get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.
+  unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
+  help       This message, or '$SCRIPT_CMD help COMMAND' for one command's own.
+
+${C_BLD}OPTIONS${C_RST}
+  --config FILE   Use this config file instead of searching.
+  --set NAME=VAL  Override one setting for THIS command only; beats config
+                  file and environment. Repeatable. For a PERSISTENT
+                  override, use '$SCRIPT_CMD set NAME VALUE' instead.
+                  '$SCRIPT_CMD status' lists the valid names.
+  --dry-run       Print every mutating command; change nothing.
+  -y, --yes       Assume yes; never prompt (required for non-interactive destroy).
+  -v, --verbose   Echo commands as they run.
+  -h, --help      This message.
+
+${C_BLD}CONFIGURATION${C_RST}
+  Precedence, lowest to highest:
+    built-in defaults  ->  config file  ->  environment  ->  command-line flags
+
+  Config file, first match wins:
+    \$MACKAS_CONF
+    ~/.config/mackas/config
+    ~/.mackas.conf
+
+  It is sourced as shell, so it is only looked for in places that are yours:
+  a searched file is skipped unless you (or root) own it and its directory,
+  and neither is writable by group or other. ./mackas.conf is NOT searched --
+  name a per-project config out loud with --config ./mackas.conf.
+
+  Every setting is also an environment variable of the same name, and can be
+  overridden with --set NAME=VALUE. See mackas.conf.example for the full
+  annotated list.
+
+${C_BLD}EXAMPLES${C_RST}
+  # See whether this Mac can do it at all -- touches nothing.
+  $SCRIPT_CMD check
+
+  # See exactly what setup would do, without doing it.
+  $SCRIPT_CMD --dry-run setup
+
+  # Set it up, answering yes to the sudo prompts.
+  $SCRIPT_CMD setup
+
+  # Use the shell afterwards.
+  source $MACKAS_ENV_SH
+  $SCRIPT_CMD smoketest
+
+  # Give the build more RAM, just this once.
+  MACKAS_MEMORY=48g $SCRIPT_CMD setup
+  $SCRIPT_CMD --set MACKAS_MEMORY=48g setup
+
+  # Reuse a mirror host's sstate + downloads caches as read-only mirrors,
+  # over HTTP. Needs mackas-mirrord running there; see mirror-server/.
+  MACKAS_USE_HTTP_MIRRORS=1 $SCRIPT_CMD check
+
+  # The same, over NFS instead (needs sudo to mount, and is unproven).
+  MACKAS_USE_NFS_MIRRORS=1 $SCRIPT_CMD check
+
+  # Build somewhere else entirely.
+  $SCRIPT_CMD --config ~/other.conf setup
+
+  # Start over.
+  $SCRIPT_CMD destroy
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+parse_set() {
+	local kv="$1" name
+	[ -n "$kv" ] || die "--set needs NAME=VALUE" "$SCRIPT_CMD --help"
+	case "$kv" in
+		*=*) ;;
+		*) die "--set expects NAME=VALUE, got: $kv" "$SCRIPT_CMD --help" ;;
+	esac
+	name="${kv%%=*}"
+	if ! is_setting_name "$name"; then
+		die "--set: unknown setting '$name'" \
+			"$SCRIPT_CMD status  (lists every valid setting name)"
+	fi
+	CLI_OVERRIDES+=("$kv")
+}
+
+main() {
+	setup_colors
+
+	local cmd="" config_flag=""
+	# Flags may appear before or after the subcommand.
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--config) config_flag="${2:-}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift 2 ;;
+			--config=*) config_flag="${1#*=}"; shift ;;
+			--set) parse_set "${2:-}"; shift 2 ;;
+			--set=*) parse_set "${1#*=}"; shift ;;
+			--dry-run) DRY_RUN=1; shift ;;
+			-y|--yes) ASSUME_YES=1; shift ;;
+			-v|--verbose) VERBOSE=1; shift ;;
+			-h|--help) cmd="help"; shift ;;
+			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			-*) die "unknown option: $1" "$SCRIPT_CMD --help" ;;
+			volume)
+				# `volume` owns everything after it (its subcommand and that
+				# subcommand's own args/flags), so capture the tail verbatim and
+				# stop parsing -- cmd_volume does the rest. Global flags still
+				# work BEFORE it (mackas --dry-run volume ...) and cmd_volume
+				# also honours --dry-run/-y/-v placed after it.
+				#
+				# 'mackas help volume [...]' arrives here with cmd already
+				# "help" -- rather than erroring as a second command, treat it
+				# as 'mackas volume [...] --help' so it reuses cmd_volume's own
+				# -h/--help handling instead of a separate help path to drift
+				# out of sync with.
+				if [ "$cmd" = "help" ]; then
+					shift; cmd="volume"; VOLUME_ARGS=("$@" "--help"); break
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="volume"; shift; VOLUME_ARGS=("$@"); break ;;
+			retrieve)
+				# Same shape as `volume`: retrieve owns everything after it (its
+				# objects and --dest), captured verbatim for cmd_retrieve.
+				if [ "$cmd" = "help" ]; then
+					shift; cmd="retrieve"; RETRIEVE_ARGS=("$@" "--help"); break
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="retrieve"; shift; RETRIEVE_ARGS=("$@"); break ;;
+			buildstats)
+				# Same shape again: buildstats owns everything after it (its
+				# subcommand, e.g. 'analyze', and that subcommand's own args).
+				if [ "$cmd" = "help" ]; then
+					shift; cmd="buildstats"; BUILDSTATS_ARGS=("$@" "--help"); break
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="buildstats"; shift; BUILDSTATS_ARGS=("$@"); break ;;
+			set)
+				# Same shape again: set owns everything after it (NAME and
+				# VALUE), captured verbatim for cmd_set. Persists to the config
+				# file -- see set_usage -- unlike the ephemeral --set flag.
+				if [ "$cmd" = "help" ]; then
+					shift; cmd="set"; SET_ARGS=("$@" "--help"); break
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="set"; shift; SET_ARGS=("$@"); break ;;
+			get)
+				if [ "$cmd" = "help" ]; then
+					shift; cmd="get"; GET_ARGS=("$@" "--help"); break
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="get"; shift; GET_ARGS=("$@"); break ;;
+			unset)
+				if [ "$cmd" = "help" ]; then
+					shift; cmd="unset"; UNSET_ARGS=("$@" "--help"); break
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="unset"; shift; UNSET_ARGS=("$@"); break ;;
+			check|setup|smoketest|status|shell|clean|destroy|help)
+				# 'mackas help check' AND 'mackas check help' must both work --
+				# bare 'help' before OR after, symmetric with every
+				# verb-object command. These bare commands have no dedicated
+				# usage text of their own (unlike volume/retrieve/buildstats/
+				# set/get/unset), so either spelling falls back to the general
+				# usage() rather than erroring as "two commands given".
+				if [ "$cmd" = "help" ] || { [ "$1" = "help" ] && [ -n "$cmd" ]; }; then
+					cmd="help"; shift; continue
+				fi
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="$1"; shift ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup smoketest status shell retrieve buildstats clean destroy volume set get unset help)" ;;
+		esac
+	done
+
+	snapshot_env
+	set_defaults
+
+	# `help` never loads the config file. Its text mentions a few settings, so
+	# it still needs the defaults, the environment and --set -- but none of
+	# those execute anything, whereas the config file is SOURCED AS SHELL.
+	# Running a stranger's shell code to print a usage message is a trade with
+	# nothing on the win side, so `mackas help` skips load_config entirely and
+	# stays safe to type in any directory.
+	if [ "${cmd:-check}" != "help" ]; then
+		case "${cmd:-check}" in
+			# See load_config's comment: only these three may target a
+			# --config/MACKAS_CONF path that does not exist yet.
+			set|get|unset) load_config "$config_flag" 1 ;;
+			*)              load_config "$config_flag" ;;
+		esac
+	fi
+	restore_env
+	apply_cli_overrides
+	validate_settings
+	derive_paths
+
+	case "${cmd:-check}" in
+		help)    usage ;;
+		check)   cmd_check ;;
+		setup)   cmd_setup ;;
+		smoketest) cmd_smoketest ;;
+		status)  cmd_status ;;
+		shell)   cmd_shell ;;
+		clean)   cmd_clean 0 ;;
+		destroy) cmd_clean 1 ;;
+		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
+		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
+		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;
+		set)        cmd_set ${SET_ARGS+"${SET_ARGS[@]}"} ;;
+		get)        cmd_get ${GET_ARGS+"${GET_ARGS[@]}"} ;;
+		unset)      cmd_unset ${UNSET_ARGS+"${UNSET_ARGS[@]}"} ;;
+	esac
+}
+
+# Running main is skipped when MACKAS_LIB_ONLY=1, which lets the test suite
+# source this file to unit-test the pure helper functions in isolation. It
+# has no effect on normal use.
+if [ "${MACKAS_LIB_ONLY:-0}" != "1" ]; then
+	main "$@"
+fi

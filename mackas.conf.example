@@ -1,0 +1,335 @@
+# mackas.conf -- configuration for mackas
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Copy to one of the searched locations and edit. First match wins:
+#
+#   $MACKAS_CONF                  (explicit, via env var)
+#   ~/.config/mackas/config       (per-user)
+#   ~/.mackas.conf                (per-user, dotfile)
+#
+# Or point at one directly:  mackas --config /path/to/conf
+#
+# This file is SOURCED AS SHELL. You can compute values, but anything you
+# execute here runs with your privileges -- keep it to assignments.
+#
+# ./mackas.conf IS NOT SEARCHED, and that is deliberate.
+#
+# It used to be, and because this file is shell, that made merely cd'ing into
+# a directory dangerous: unpack a tarball or clone a repo that happens to
+# contain a mackas.conf, run any mackas command inside it -- even
+# `mackas help` -- and that file ran as you. A cwd-relative config cannot be
+# made safe, because the whole point of one is that the directory is not
+# necessarily yours.
+#
+# A per-project config still works. It just has to be asked for out loud:
+#
+#   mackas --config ./mackas.conf status
+#
+# For the same reason, the two searched paths above are skipped (with a
+# warning saying so) unless you or root own the file AND its directory, and
+# neither is writable by group or other. If mackas says it is ignoring your
+# config, this is what it wants:
+#
+#   chmod go-w ~/.mackas.conf ~
+#
+# Values are checked before they are used: any setting mackas interpolates
+# into the env.sh or kas fragment it generates may not contain a double quote,
+# a backtick, or a control character (a newline especially) -- those corrupt
+# the generated file rather than appearing in it. Spaces, '$' and apostrophes
+# are all fine; a MACKAS_ROOT with a space in it (a volume named "My Disk")
+# is fully supported.
+#
+# PRECEDENCE, lowest to highest:
+#
+#   built-in defaults  ->  this file  ->  environment  ->  command-line flags
+#
+# So an env var always beats this file:
+#
+#   MACKAS_MEMORY=48g mackas setup
+#
+# ...and --set beats even that:
+#
+#   mackas --set MACKAS_MEMORY=48g setup
+#
+# Every setting below is also an environment variable of the same name.
+# Uncomment only what you want to change; the defaults shown are what the
+# script uses if you say nothing. Run `mackas status` to see
+# the values actually in effect.
+
+
+# --- Where the build lives ---------------------------------------------------
+
+# Top-level build directory. REQUIRED -- there is no default, on purpose.
+#
+# It must be on a CASE-SENSITIVE filesystem: OpenEmbedded breaks in baffling
+# ways on case-insensitive APFS/HFS+, and a stock Mac's boot volume (so your
+# home directory) is case-insensitive. There is therefore no generic default
+# worth shipping -- a $HOME path would pass `check` right up to the
+# case-sensitivity probe and then fail there. `check` probes this empirically
+# (it creates files; it does not trust diskutil).
+#
+# Make a case-sensitive volume once, then point MACKAS_ROOT at a dir on it:
+#   diskutil apfs addVolume <disk> "Case-sensitive APFS" oe   # see: diskutil list
+# or a case-sensitive sparse image that lives as one file on any volume:
+#   hdiutil create -type SPARSE -fs "Case-sensitive APFS" -size 200g \
+#       -volname oe ~/oe.sparseimage
+#   hdiutil attach ~/oe.sparseimage
+#
+#MACKAS_ROOT="/Volumes/<your-case-sensitive-volume>/oe"
+
+# A short, space-free symlink to MACKAS_ROOT. Everything the build touches goes
+# through this path instead of MACKAS_ROOT directly, which buys two things:
+#
+#   1. No spaces. If your volume name has any (many do), a long tail of OE
+#      recipes and third-party build scripts mishandle spaces in paths.
+#   2. Short paths. macOS caps AF_UNIX socket paths (sockaddr_un.sun_path)
+#      at ~104 characters; bitbake puts ${TOPDIR}/bitbake.sock there. This
+#      is kas issue #38. Under Apple container the bind actually happens
+#      inside the Linux guest at /build/bitbake.sock so the limit rarely
+#      bites -- but keeping host paths short costs nothing and removes the
+#      whole class of problem if you ever run bitbake natively.
+#
+# Default is $HOME/oe rather than /opt/oe: /opt is drwxr-xr-x root:wheel, so
+# /opt/oe needs sudo, and $HOME/oe needs none. Both are far under 104 chars.
+# Set /opt/oe if you want the extra 6 characters; setup will offer the sudo.
+#
+#MACKAS_SHORT_LINK="$HOME/oe"
+
+# setup REFUSES a case-insensitive work/ by default (OpenEmbedded corrupts on
+# one; the layer checkouts under work/ are a host bind-mount, not an ext4
+# volume) -- after first offering to create a case-sensitive workspace image
+# mounted at work/ (see MACKAS_WORKSPACE_SIZE below). Set to 0 only if you
+# know the case-sensitive parts genuinely live elsewhere.
+#MACKAS_REQUIRE_CASE_SENSITIVE=1
+
+# Size of the case-sensitive APFS sparse image setup offers to create at
+# work/ when the root turns out to be case-insensitive. Sparse, so this is a
+# ceiling, not real disk cost until written -- generous by default since it
+# only holds git checkouts (oe-core, bitbake, meta-*, the project layer),
+# nothing like TMPDIR/sstate.
+#MACKAS_WORKSPACE_SIZE="40G"
+
+
+# --- Apple container resources -----------------------------------------------
+
+# Apple container defaults to cpus=4 and memory=1gb PER CONTAINER, which is
+# nowhere near enough for bitbake. container 1.1.0 has no
+# `container system property set`, so these must be passed per-run; the script
+# does that on kas-container's --runtime-args flag.
+#
+# NOT via KAS_EXTRA_RUNTIME_ARGS: that is not an environment variable at all.
+# kas-container blanks it before parsing its arguments, so exporting it is
+# silently ignored and you get cpus=4/memory=1gb no matter what you set here.
+#
+# Default MACKAS_CPUS = physical cores - 2 (min 2), leaving the host usable.
+# Quirk: nproc INSIDE the container reports one MORE than the -c value.
+#MACKAS_CPUS=18
+
+# Default MACKAS_MEMORY = two thirds of host RAM. The OE guest is a VM, so
+# overcommitting here makes the host swap.
+#MACKAS_MEMORY="42g"
+
+
+# --- The ext4 volumes --------------------------------------------------------
+
+# `container volume create -s SIZE NAME` makes a SPARSE ext4 image at
+#   ~/Library/Application Support/com.apple.container/volumes/NAME/volume.img
+# Sparse means a 120G volume costs ~1.2M until you fill it. It gives you real
+# Linux filesystem semantics (hardlinks, xattrs, rename()) inside the
+# container -- which an APFS directory reaching the guest over virtiofs cannot,
+# and which OpenEmbedded requires.
+#
+# A FIXED size is the point, not a limitation: the target SSD is an active
+# Time Machine destination, and capped images mean a runaway build cannot eat
+# the free space that backups need.
+#
+# There are THREE volumes, not one, named off the stem below:
+#
+#   ${MACKAS_VOLUME_NAME}-tmp      -> /build      TMPDIR
+#   ${MACKAS_VOLUME_NAME}-dl       -> /downloads  DL_DIR
+#   ${MACKAS_VOLUME_NAME}-sstate   -> /sstate     SSTATE_DIR
+#
+# Separate volumes so `mackas clean` can throw TMPDIR away -- the big, churny,
+# rebuildable one -- and keep the two caches that are expensive to refill. One
+# volume could not do that. They are mounted by passing -v/-e to kas on
+# --runtime-args; see "The ext4 volumes" in docs/architecture.md for why they
+# cannot be passed as KAS_BUILD_DIR/DL_DIR/SSTATE_DIR instead.
+#
+# The stem must not contain whitespace: kas-container word-splits
+# --runtime-args, so a space would split one mount into two arguments. setup
+# refuses a name with one rather than mounting something absurd.
+#MACKAS_VOLUME_NAME="oe-build"
+
+# The three caps. They total 200G, which is what the SSD can spare alongside
+# Time Machine (it has ~296 GiB free). Sparse, so this is a ceiling, not a
+# cost. A volume CANNOT be grown after creation -- container 1.1.0 has no grow
+# command -- so getting one badly wrong means `destroy` and start over, which
+# is the other reason TMPDIR is not in the same volume as the caches.
+#MACKAS_VOLUME_SIZE_TMP="120G"
+#MACKAS_VOLUME_SIZE_DL="40G"
+#MACKAS_VOLUME_SIZE_SSTATE="40G"
+
+# container 1.1.0 has no config option for the volume storage root, so the
+# only way to keep volume.img off the internal disk is to symlink the volumes
+# directory. 1 = do that (onto $MACKAS_ROOT/container-volumes).
+#MACKAS_RELOCATE_VOLUMES=1
+
+
+# --- kas / image -------------------------------------------------------------
+
+#KAS_IMAGE="ghcr.io/siemens/kas/kas:5.4"
+
+
+# --- Project (which layers to build) -----------------------------------------
+#
+# mackas builds whatever git repo + kas config you point it at. The defaults
+# below are the EXAMPLE, qualcomm-linux/meta-ai -- it is what has actually been
+# tested end to end: the whole smoketest ladder (bitbake bash, tensorflow-lite,
+# then llama-cpp) builds green on macOS/aarch64. To build your own layer set,
+# override these four; nothing else in mackas is project-specific.
+#
+# The repo mackas clones into work/${MACKAS_PROJECT_DIR}. For the meta-ai
+# example, LAYERSERIES_COMPAT_ai="wrynose" and its LAYERDEPENDS are only core +
+# openembedded-layer, so kas pulls openembedded-core + meta-openembedded/meta-oe
+# + bitbake 2.18. No meta-qcom.
+#MACKAS_PROJECT_URL="https://github.com/qualcomm-linux/meta-ai.git"
+#MACKAS_PROJECT_BRANCH="wrynose"
+#MACKAS_PROJECT_DIR="meta-ai"
+
+# The kas files to compose, checkout-relative and colon-separated, exactly as
+# kas-container wants them. mackas appends its generated kas/macos-local.yml
+# after these, so do not list it yourself. This replaces the old MACKAS_MACHINE
+# knob: name the machine config directly here.
+#MACKAS_KAS_CONFIG="kas/base.yml:kas/qemuarm64.yml"
+
+# The smoketest ladder's build rungs: space-separated bitbake targets, run in
+# order after the universal parse-only rung. Empty by default (the built-in
+# default, not what is shown commented out below): with no targets set, the
+# ladder's one build rung passes no --target at all, so kas/bitbake builds
+# whatever default target the kas config itself names -- the same as running
+# `kas build <config>` by hand with no target. Set your own project's targets
+# to exercise more than that default, or use "bash" as a trivial fallback
+# target if your kas config has no sensible bare default of its own.
+#
+# The line below is NOT the built-in default -- it is meta-ai's own ladder,
+# kept here as a worked example of an override: smallest-first so failures
+# stay cheap and specific (flatbuffers-tflite-native proves the toolchain,
+# flatbuffers-tflite is the same recipe cross-compiled, then the real targets
+# tensorflow-lite + llama-cpp, hours cold).
+#MACKAS_SMOKETEST_TARGETS="flatbuffers-tflite-native flatbuffers-tflite tensorflow-lite llama-cpp"
+
+
+# --- Host-side overhead sampling ---------------------------------------------
+
+# `mackas smoketest` samples what each build rung costs the Mac itself -- host
+# CPU-seconds and peak RSS of the Virtualization.framework VM plus the container
+# daemons -- and appends it to the rung log. ON by default; it costs one `ps`
+# per interval and never fails the build. Set to 0 to turn it off.
+#MACKAS_OVERHEAD=1
+
+# Seconds between samples. Sampling cannot see spikes shorter than this.
+#MACKAS_OVERHEAD_INTERVAL=5
+#
+# Honest caveat: a fully-cached rung does almost no VM work, so its host figure
+# is near zero -- that is correct, not a bug. And the guest-vs-host comparison
+# needs the guest buildstats on the host first (`mackas retrieve buildstats`);
+# until then the number is host cost, not isolated overhead. See docs/testing.md.
+
+# Reclaim the sparse volume images with fstrim before and after every kas run,
+# so they don't ratchet up build after build (a sparse ext4 image only grows;
+# deleting files inside the guest never shrinks it -- see `mackas volume
+# fstrim`). ON by default; fstrim is ~0.01s and runs when nothing holds the
+# volumes, so it neither slows nor endangers the build. Set to 0 to turn it off.
+# It must be exactly 0 or 1: any other value disables it (matching
+# MACKAS_OVERHEAD -- only the literal "1" turns it on).
+#MACKAS_FSTRIM_AUTO=1
+
+
+# --- HTTP mirrors (OPTIONAL, opt-in) -----------------------------------------
+#
+# Mirrors of any kind are entirely optional. With MACKAS_USE_HTTP_MIRRORS=0 and
+# MACKAS_USE_NFS_MIRRORS=0 -- both the default, i.e. doing nothing here -- mackas
+# fetches everything from upstream and builds sstate locally, exactly like a
+# stock kas-container checkout. Nothing below is needed to use mackas.
+#
+# If you DO want to reuse a cache you didn't build yourself, this is the
+# recommended way to do it, over a mirror host's caches or your own:
+#
+# A Linux host that already has the NFS mount re-serves it read-only over HTTP
+# (see mirror-server/mackas-mirrord), and the container reaches it over its
+# vmnet NAT. No sudo, no NFS on the Mac, no virtiofs uncertainty -- and it is
+# bitbake's own officially-supported mirror mechanism.
+#
+# mackas-mirrord also has a second, distinct use: run it ON THIS MAC pointed at
+# your own local DL_DIR/SSTATE_DIR, and the container fetches them over HTTP
+# instead of those directories being bind-mounted through virtiofs. Verified
+# working (container -> host, both with and without auth) but its performance
+# is NOT measured -- HTTP has per-request overhead a bind mount doesn't, so
+# this is a trade-off for avoiding virtiofs specifically, not a free win. See
+# "Serving local files instead of bind-mounting them" in docs/storage.md.
+#
+# Turning this on makes `setup` write the mirror stanza into the generated kas
+# fragment, and `check` probe the mirror and report whether it answers.
+#
+# Mutually exclusive with MACKAS_USE_NFS_MIRRORS: both emit SSTATE_MIRRORS into
+# the same fragment and bitbake's '?=' would make one silently win, so setting
+# both is a hard error rather than a coin toss.
+#MACKAS_USE_HTTP_MIRRORS=0
+
+# Both default to port 8100 -- ONE mackas-mirrord process serving both caches
+# under two path prefixes. 8100 is mackas-mirrord's own default port.
+#
+# These become, in the fragment:
+#   SSTATE_MIRRORS ?= "file://.* ${MACKAS_HTTP_MIRROR_SSTATE}/PATH;downloadfilename=PATH"
+#   SOURCE_MIRROR_URL ?= "${MACKAS_HTTP_MIRROR_DL}"
+#
+# 'PATH' is a literal placeholder bitbake substitutes with each object's hashed
+# subpath, not a shell variable. ';downloadfilename=PATH' is valid (and needed)
+# for http:// mirrors and NOT for the file:// ones further down.
+#MACKAS_HTTP_MIRROR_SSTATE="http://linux-computer.local:8100/sstate"
+#MACKAS_HTTP_MIRROR_DL="http://linux-computer.local:8100/downloads"
+#
+# If the mirror needs a password, do NOT put it in the URL. bitbake and wget
+# read ~/.netrc, and kas-container forwards NETRC_FILE into the container:
+#   printf 'machine linux-computer.local\n  login builder\n  password ...\n' > ~/.netrc
+#   chmod 600 ~/.netrc
+#   export NETRC_FILE=~/.netrc
+
+
+# --- NFS mirrors (opt-in) ----------------------------------------------------
+
+# A mirror host that exports e.g. /build/<build>/build/{downloads,sstate-cache}
+# over NFS. Mounting them read-only as mirrors turns a cold multi-hour build
+# into a mostly-sstate-hit one.
+#
+# Off by default: it needs sudo to mount, and a flaky NFS server turns every
+# bitbake fetch into a hang. Turn it on once you've confirmed `check` is happy.
+#MACKAS_USE_NFS_MIRRORS=0
+
+#MACKAS_NFS_SERVER="linux-computer.local"
+#MACKAS_NFS_EXPORT="/build"
+
+# Where the export gets mounted. Defaults to $MACKAS_ROOT/nfs.
+#MACKAS_NFS_MOUNT="$MACKAS_ROOT/nfs"
+
+# Paths INSIDE the NFS mount. These get bind-mounted into the container as
+# /sstate-mirror and /downloads-mirror (read-only) and referenced from the
+# generated kas fragment.
+#MACKAS_SSTATE_MIRROR_PATH="$MACKAS_NFS_MOUNT/angstrom-2026.06/build/sstate-cache"
+#MACKAS_DL_MIRROR_PATH="$MACKAS_NFS_MOUNT/angstrom-2026.06/build/downloads"
+#
+# Note: macOS NFS needs sudo and almost always -o resvport:
+#   sudo mount -t nfs -o resvport,vers=3,ro,nolocks,locallocks linux-computer.local:/build "$MACKAS_NFS_MOUNT"
+#
+# vers=3 is pinned ON PURPOSE. '-o vers=4' KERNEL-PANICS macOS (reproduced
+# 2026-07-20 on 26.5.1 against a Linux nfs-kernel-server export) -- it takes
+# the whole machine down, mid-build if you are unlucky. See docs/storage.md.
+
+
+# --- Safety ------------------------------------------------------------------
+
+# GiB of headroom `check` demands on top of the three volume caps added
+# together before it will call the free-space check a PASS.
+#MACKAS_FREE_SPACE_MARGIN_GB=20

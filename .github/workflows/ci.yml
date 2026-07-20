@@ -1,0 +1,97 @@
+# mackas CI.
+#
+# Started by hand only (workflow_dispatch -- see the DISABLED note below).
+# The two main gates:
+#
+#   macos  -- the full ./run-tests.sh (shellcheck, bash 3.2 syntax, the bats
+#             suite, and the Python unittest suite). The bats suite is macOS-
+#             specific: it leans on `stat -f`, `sysctl`, BSD `du`, and Apple
+#             container's on-disk layout, so it does not run on Linux. Hosted
+#             runners have no `container` runtime, so tests/real_runtime.bats
+#             stays skipped (it self-skips unless MACKAS_REAL_RUNTIME=1), which
+#             is correct -- the real-runtime smoketest is dev-Mac-only.
+#
+#   linux  -- what a mirror host actually is: shellcheck, a bash syntax check,
+#             and the stdlib Python suite on BOTH 3.9 and 3.12. mackas-mirrord
+#             targets Python 3.7+ and runs on whatever stock python the host has;
+#             two of its tests broke on 3.9 once, so 3.9 is a first-class gate.
+#             Plus a static `systemd-analyze verify` of the mirrord unit.
+#
+# The real Apple container runtime, a real build, sudo, NFS and the network are
+# never touched -- CI runs exactly the hermetic suite.
+
+name: CI
+
+# DISABLED: this workflow never runs on its own -- no push/pull_request
+# triggers, so it consumes no GitHub Actions minutes (macOS runners in
+# particular are billed at a premium). It can only be started by hand from the
+# Actions tab ("Run workflow"). To re-enable automatic runs, add back:
+#   push:
+#     branches: [main]
+#   pull_request:
+# The local `./run-tests.sh` runs exactly the same hermetic suite for free.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (full suite)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tools
+        run: brew install bats-core shellcheck coreutils
+      - name: run-tests.sh
+        run: ./run-tests.sh
+
+  linux:
+    name: Linux (shellcheck + python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: shellcheck
+        # Ubuntu's packaged shellcheck; the same invocation run-tests.sh uses,
+        # so a local `./run-tests.sh` and CI check exactly the same files.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          # --severity=warning to match run-tests.sh: ignore info-level notes
+          # (e.g. SC2015) so the check is stable across shellcheck versions.
+          shellcheck --severity=warning -s bash mackas bin/docker run-tests.sh tests/mock/container
+      - name: bash syntax check
+        run: |
+          bash -n mackas
+          bash -n bin/docker
+          bash -n run-tests.sh
+      - name: py_compile
+        run: |
+          python3 -m py_compile mirror-server/mackas-mirrord
+          python3 -m py_compile tools/mackas-buildstats-analyze tools/mackas-overhead
+          python3 -m py_compile tests/test_*.py
+      - name: Python unittest suite
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+  systemd-unit:
+    name: Linux (systemd unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: systemd-analyze verify the mirrord unit
+        # Static check only -- the unit is never started here. It caught a real
+        # defect once (an ExecReload that crash-restarted the daemon).
+        # verify resolves ExecStart against the filesystem, so install the
+        # script at the path the unit names first; otherwise it fails with
+        # "Command ... is not executable" for a reason that is not a unit bug.
+        run: |
+          sudo install -m 0755 mirror-server/mackas-mirrord /usr/local/bin/mackas-mirrord
+          systemd-analyze verify mirror-server/mackas-mirrord.service

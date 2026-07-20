@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+#
+# docker -> Apple `container` (v1.1.0) compatibility shim
+#
+# Part of mackas.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# PURPOSE
+#   Some tools (notably Siemens kas-container v5.4) hard-require a `docker`
+#   CLI: they detect their engine with
+#       command -v docker && docker -v 2>/dev/null | grep -q '^Docker'
+#   This script masquerades as that `docker` binary and translates the
+#   handful of docker(1) invocations such tools actually issue into calls
+#   to Apple's `container` CLI. It must be earlier on $PATH than the real
+#   Docker CLI to take effect.
+#
+#   This is a narrow compatibility shim, NOT a general docker-CLI
+#   reimplementation. It only handles what kas-container v5.4 (OE / non-ISAR
+#   mode) is known to issue, plus a handful of obviously-analogous docker
+#   subcommands, on a best-effort basis.
+#
+# TRANSLATION RULES
+#
+#   docker -v / --version / version
+#       -> print "Docker version 29.3.1, build shim" (must start with
+#          "Docker" for kas-container's engine-detection grep to match).
+#
+#   docker context show
+#       -> print "default". kas-container greps this output for the literal
+#          string "rootless" to decide whether it is talking to rootless
+#          Docker (and, if so, mounts the repo read-only and switches to a
+#          privileged-container workaround path). Apple `container` has no
+#          such concept, so we always report a plain "default" context.
+#
+#   docker run [OPTIONS] IMAGE [CMD...]
+#       -> container run [OPTIONS'] IMAGE [CMD...]
+#       Flags are scanned left-to-right up to (and including) the first
+#       non-flag token, which is treated as IMAGE; the image and everything
+#       after it is forwarded byte-for-byte / argv-for-argv without further
+#       interpretation (so e.g. `sh -c '--privileged'` in the forwarded
+#       command is never touched).
+#
+#       - DROPPED (Apple `container` hard-rejects these with exit 64
+#         "Unknown option"; dropping is safe here because kas-container's
+#         plain-OpenEmbedded mode -- the mode this shim targets -- does not
+#         rely on their semantics on macOS; they only matter for
+#         ISAR/rootless paths this shim does not claim to support):
+#             --log-driver=none / --log-driver <val>
+#             --security-opt=<val> / --security-opt <val>
+#             --userns=<val> / --userns <val>
+#             --group-add=<val> / --group-add <val>
+#             --privileged
+#
+#       - HARD FAIL (no equivalent in Apple `container`; silently dropping
+#         would change semantics, so we refuse instead of guessing):
+#             --device=<val> / --device <val>
+#             --network host   (container: "network host not found")
+#
+#       - PASSED THROUGH VERBATIM (Apple `container` supports these
+#         natively): --rm/--remove, --init, -i/--interactive, -t/--tty,
+#         -e/--env, --env-file, -u/--user, -w/--workdir/--cwd, --name,
+#         --entrypoint, --cap-add/--cap-drop, --ulimit, -c/--cpus,
+#         -m/--memory, --platform, --tmpfs, --mount, --read-only,
+#         --shm-size, --network <non-host>, -v/--volume (INCLUDING the
+#         :ro / :rw suffix -- verified empirically that Apple `container`
+#         honors `-v host:container:ro` and `-v host:container:rw` exactly
+#         like Docker, so no rewriting is needed there).
+#
+#       - Any other unrecognized `--flag` is passed through opaquely
+#         (best effort). If it takes a separate value token, add it to
+#         known_value_flags below so the value stays paired with it.
+#
+#   docker pull IMAGE            -> container image pull IMAGE
+#   docker images [...]          -> container image ls [...]
+#   docker image SUBCMD [...]    -> container image SUBCMD [...]
+#   docker ps [...]              -> container list [...]
+#   docker rm [...]              -> container rm [...]        (alias exists)
+#   docker rmi [...]             -> container image rm [...]  (alias exists)
+#   docker volume SUBCMD [...]   -> container volume SUBCMD [...]
+#   docker inspect [...]         -> try `container inspect`, else fall back
+#                                    to `container image inspect` (docker's
+#                                    `inspect` works on both containers and
+#                                    images; Apple `container` splits them).
+#   anything else                -> passed straight through to `container`.
+#
+# ARGUMENT SAFETY
+#   Throughout, arguments are held in bash arrays and expanded as "${arr[@]}"
+#   / "$@" -- never captured into a plain string and re-split -- so values
+#   containing spaces (host paths, env values, etc.) survive intact.
+
+set -euo pipefail
+
+# The `container` binary to translate to. Overridable so the test suite can
+# point the shim at a mock that just echoes its argv, and so an unusual
+# install location can be accommodated without editing this file.
+# DOCKER_SHIM_CONTAINER_BIN is the pre-rename name, honoured as a deprecated
+# alias.
+CONTAINER_BIN="${MACKAS_CONTAINER_BIN:-${DOCKER_SHIM_CONTAINER_BIN:-container}}"
+
+# ---------------------------------------------------------------------------
+# docker -v / --version / version  (must come first: kas-container's engine
+# probe calls exactly `docker -v`)
+# ---------------------------------------------------------------------------
+if [ $# -ge 1 ]; then
+    case "$1" in
+        -v|--version|version)
+            echo "Docker version 29.3.1, build shim"
+            exit 0
+            ;;
+    esac
+fi
+
+if [ $# -eq 0 ]; then
+    exec "$CONTAINER_BIN"
+fi
+
+# ---------------------------------------------------------------------------
+# docker context show
+# ---------------------------------------------------------------------------
+if [ "$1" = "context" ] && [ "${2:-}" = "show" ]; then
+    echo "default"
+    exit 0
+fi
+
+subcmd="$1"
+shift
+
+case "$subcmd" in
+    run)
+        # Flags Apple `container` rejects outright; safe to drop for the
+        # plain-OE use case this shim targets. Boolean (no value) vs
+        # value-taking are tracked separately so we know whether to also
+        # swallow a following space-separated value token.
+        drop_flags_bool=(--privileged)
+        drop_flags_value=(--log-driver --security-opt --userns --group-add)
+
+        # Flags with genuinely no Apple-`container` equivalent: refuse
+        # rather than silently drop (would change semantics).
+        hardfail_flags_value=(--device)
+
+        # docker/container flags that consume a following value token when
+        # given in space-separated (not --flag=value) form. Must include
+        # every flag we pass through so its value doesn't get misread as
+        # the IMAGE positional.
+        known_value_flags=(
+            -v --volume -e --env --env-file -u --user -w --workdir --cwd
+            --entrypoint --cap-add --cap-drop --ulimit -c --cpus -m --memory
+            --platform --tmpfs --mount --shm-size --name --gid --uid
+            -a --arch --cidfile --dns --dns-domain --dns-option --dns-search
+            -k --kernel -l --label --network -p --publish --publish-socket
+            --runtime --scheme --progress --max-concurrent-downloads
+            --init-image --os
+        )
+
+        contains() {
+            local needle="$1" x
+            shift
+            for x in "$@"; do
+                [ "$x" = "$needle" ] && return 0
+            done
+            return 1
+        }
+
+        new_args=()
+        image_seen=0
+        while [ $# -gt 0 ]; do
+            arg="$1"
+
+            if [ "$image_seen" -eq 1 ]; then
+                # Past the IMAGE positional: forward verbatim, no parsing.
+                new_args+=("$arg")
+                shift
+                continue
+            fi
+
+            case "$arg" in
+                --*=*) flag="${arg%%=*}"; combined=1 ;;
+                *)     flag="$arg";       combined=0 ;;
+            esac
+
+            if contains "$flag" "${drop_flags_bool[@]}"; then
+                shift
+                continue
+            fi
+
+            if contains "$flag" "${drop_flags_value[@]}"; then
+                shift
+                [ "$combined" -eq 0 ] && shift  # also drop the separate value
+                continue
+            fi
+
+            if contains "$flag" "${hardfail_flags_value[@]}"; then
+                echo "docker-shim: error: '$flag' has no equivalent in Apple container; refusing to silently drop it (semantics would change). Original: $arg" >&2
+                exit 1
+            fi
+
+            if [ "$flag" = "--network" ]; then
+                if [ "$combined" -eq 1 ]; then
+                    val="${arg#*=}"
+                else
+                    val="${2:-}"
+                fi
+                if [ "$val" = "host" ]; then
+                    echo "docker-shim: error: --network host is not supported by Apple container (fails with \"network host not found\"); no safe translation available." >&2
+                    exit 1
+                fi
+            fi
+
+            if contains "$flag" "${known_value_flags[@]}"; then
+                new_args+=("$arg")
+                shift
+                if [ "$combined" -eq 0 ] && [ $# -gt 0 ]; then
+                    new_args+=("$1")
+                    shift
+                fi
+                continue
+            fi
+
+            case "$arg" in
+                -*)
+                    # Unrecognized flag: pass through opaque, best effort.
+                    new_args+=("$arg")
+                    shift
+                    ;;
+                *)
+                    # First non-flag token = IMAGE positional.
+                    new_args+=("$arg")
+                    image_seen=1
+                    shift
+                    ;;
+            esac
+        done
+
+        exec "$CONTAINER_BIN" run "${new_args[@]}"
+        ;;
+
+    pull)
+        exec "$CONTAINER_BIN" image pull "$@"
+        ;;
+
+    images)
+        exec "$CONTAINER_BIN" image ls "$@"
+        ;;
+
+    image)
+        exec "$CONTAINER_BIN" image "$@"
+        ;;
+
+    ps)
+        exec "$CONTAINER_BIN" list "$@"
+        ;;
+
+    rm)
+        exec "$CONTAINER_BIN" rm "$@"
+        ;;
+
+    rmi)
+        exec "$CONTAINER_BIN" image rm "$@"
+        ;;
+
+    volume)
+        exec "$CONTAINER_BIN" volume "$@"
+        ;;
+
+    inspect)
+        # docker inspect works on both containers and images; Apple
+        # `container` splits these. Try container inspect first, then fall
+        # back to image inspect.
+        if out=$("$CONTAINER_BIN" inspect "$@" 2>&1); then
+            printf '%s\n' "$out"
+            exit 0
+        fi
+        exec "$CONTAINER_BIN" image inspect "$@"
+        ;;
+
+    *)
+        # Anything else: pass straight through to `container` as-is.
+        exec "$CONTAINER_BIN" "$subcmd" "$@"
+        ;;
+esac

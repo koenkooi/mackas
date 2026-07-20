@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+#
+# Mock `container` binary for the mackas test suite.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Prints each argument it received on its own line, prefixed with "ARG:".
+# One-arg-per-line is deliberate: it makes an argument containing spaces
+# unambiguously distinguishable from two separate arguments, which is
+# exactly the property the shim's quoting tests need to assert.
+#
+# If MOCK_CONTAINER_FAIL is set, exit with that status instead (used to
+# check that the shim propagates failure from the real binary).
+
+set -euo pipefail
+
+if [ -n "${MOCK_CONTAINER_FAIL:-}" ]; then
+	echo "mock-container: simulated failure" >&2
+	exit "$MOCK_CONTAINER_FAIL"
+fi
+
+for a in "$@"; do
+	printf 'ARG:%s\n' "$a"
+done

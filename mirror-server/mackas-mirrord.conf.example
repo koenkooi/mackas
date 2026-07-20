@@ -1,0 +1,179 @@
+# mackas-mirrord.conf -- configuration for mackas-mirrord
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Point at it with --config FILE, or $MACKAS_MIRRORD_CONFIG.
+#
+# This file is KEY=VALUE and is NOT sourced as shell -- unlike mackas.conf,
+# which is. A daemon that exec'd its own config file would turn "can write the
+# config" into "can run code as the daemon user", and this file lives in /etc
+# next to a credential. No expansion, no substitution, no commands.
+#
+# PRECEDENCE, lowest to highest (the same convention as mackas):
+#
+#   built-in defaults  ->  this file  ->  environment  ->  command-line flags
+#
+# Every key here is also an environment variable named MACKAS_MIRRORD_<KEY>,
+# and a command-line flag named --<key-with-dashes>.
+
+
+# --- What to serve -----------------------------------------------------------
+
+# Comma-separated NAME=PATH. Each is served under /NAME/.
+#
+# One process serving both caches on one port, rather than two processes on
+# two ports: one privilege drop, one TLS context, one credential store, one
+# unit to harden. bitbake does not care -- a path prefix distinguishes the two
+# mirrors as well as a port number does.
+#
+# Example: the caches of a build tree on the mirror host.
+ROOTS=sstate=/build/angstrom-2026.06/build/sstate-cache,downloads=/build/angstrom-2026.06/build/downloads
+
+# Directory listings. OFF unless you say otherwise, and you should not: a
+# listing of an sstate cache is a map of every package, version and hash the
+# mirror host has ever built. bitbake never reads one -- it constructs exact
+# object URLs from its own hashes.
+#LISTING=0
+
+# Refuse ALL symlinks under the root, not just escaping ones.
+#
+# Escaping symlinks are ALWAYS refused, regardless of this setting -- that is
+# the non-negotiable part, because the root is an NFS mount whose contents we
+# do not control, and anyone who can write to the export could otherwise drop
+# in a link to /etc/shadow and read it through us.
+#
+# This setting additionally refuses symlinks that stay inside the root. Off by
+# default because DL_DIR legitimately contains them and refusing would break
+# real fetches. Turn it on for an sstate-only root, where there are none.
+#NO_SYMLINKS=0
+
+
+# --- Local cache ---------------------------------------------------------------
+
+# Off by default -- this is an opt-in accelerator, not a default-on cache.
+# Set it to enable: once an object has been requested more than
+# CACHE_MIN_HITS - 1 times today, it is copied into this directory in the
+# background and later requests are served from there instead of the
+# (possibly slow) NFS/SMB root. See docs/mirror-server.md for the full
+# design, including why this is the daemon's ONLY write path and how it
+# stays safe.
+#
+# Must be OUTSIDE every ROOTS path, in both directions. Created (mode 0700)
+# if it does not exist; refused at startup if it is group- or
+# world-writable, for the same reason the credential file is -- this is the
+# server's write path, and anyone who can write here can plant a file that
+# gets served as though it were a legitimate cache hit.
+#CACHE_DIR=/var/cache/mackas-mirrord
+
+# Promote to the cache after this many requests for the same object in one
+# calendar day. Default 3, i.e. "more than 2": the 1st and 2nd requests are
+# misses, the 3rd triggers a background copy.
+#CACHE_MIN_HITS=3
+
+# Evict least-recently-used cached objects once the cache exceeds this size,
+# in MiB. This is the backstop for a SINGLE day -- daily rotation (purging
+# yesterday's entries, not configurable, always on when caching is on) is
+# what actually keeps steady-state size down. 4096 (4 GiB) comfortably fits
+# a few dozen to a few hundred sstate objects without asking an operator who
+# just wants "cache the hot ones" to provision real storage.
+#CACHE_MAX_SIZE_MB=4096
+
+
+# --- Where to listen ---------------------------------------------------------
+
+# The default is 8100.
+#PORT=8100
+
+# 0.0.0.0 binds every interface. Narrow it if the host is multi-homed.
+#BIND=0.0.0.0
+
+
+# --- Access control ----------------------------------------------------------
+
+# IP allowlist, comma- or space-separated CIDRs. Host bits are tolerated
+# ("192.0.2.5/24" means the /24).
+#
+# On a trusted wired LAN this is a legitimate control ON ITS OWN, and running
+# allowlist-only is supported: no password to distribute, nothing to leak, and
+# the cache contents are build artefacts rather than secrets. It is NOT a
+# control on a network where anyone can spoof or where the "LAN" includes
+# guest wifi.
+ALLOW=192.0.2.0/24
+
+# Basic auth. Generate the record (it prompts; the password never appears on
+# argv, which /proc/PID/cmdline shows to every user on the box):
+#
+#   mackas-mirrord --hash-password > /etc/mackas-mirrord.cred
+#   chmod 600 /etc/mackas-mirrord.cred
+#
+# The file stores a salted PBKDF2-SHA256 hash, not the password. The daemon
+# REFUSES to start if the file is group- or world-accessible.
+#CRED_FILE=/etc/mackas-mirrord.cred
+
+#REALM=mackas mirror
+
+
+# --- TLS ---------------------------------------------------------------------
+
+# Off by default. Be clear-eyed about the trade:
+#
+#   Basic auth over plain HTTP sends the password in the clear. base64 is an
+#   encoding, not encryption -- anyone on the path reads it. On a trusted LAN
+#   with an IP allowlist that is an acceptable risk and this is why ALLOW
+#   above exists. Anywhere else, turn TLS on.
+#
+# The stdlib ssl module can load certs but not conveniently create them, so a
+# self-signed cert needs the openssl CLI. The exact command:
+#
+#   openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+#       -keyout /etc/mackas-mirrord.key -out /etc/mackas-mirrord.crt \
+#       -subj "/CN=linux-computer" \
+#       -addext "subjectAltName=DNS:linux-computer,IP:192.0.2.10"
+#   chmod 600 /etc/mackas-mirrord.key
+#
+# A self-signed cert means clients must either trust it explicitly or skip
+# verification -- and a client skipping verification gets no protection from
+# an active attacker, only from a passive one. If that matters, use a real CA.
+#
+# Minimum protocol version is TLS 1.2, not configurable. Nothing older is
+# worth supporting.
+#TLS_CERT=/etc/mackas-mirrord.crt
+#TLS_KEY=/etc/mackas-mirrord.key
+
+
+# --- Hardening ---------------------------------------------------------------
+
+# Drop to this user/group if started as root. The daemon REFUSES to run as
+# root without one (or an explicit ALLOW_ROOT=1), because nothing it does
+# needs privilege. The systemd unit sets User= itself, so these are for
+# running it by hand.
+#USER=nobody
+#GROUP=nogroup
+#ALLOW_ROOT=0
+
+# Per-connection socket timeout, in seconds. This is the slowloris defence: a
+# client dribbling one byte a minute gets evicted after this long instead of
+# holding a thread forever.
+#TIMEOUT=30
+
+# Hard cap on concurrent connections. Past it, new connections are closed
+# immediately rather than degrading things for everyone. ThreadingHTTPServer
+# alone would spawn a thread per connection until the box died.
+#MAX_CONNECTIONS=64
+
+# Per-IP token bucket: requests/second, and the burst allowance. 0 disables.
+#
+# Off by default, and honestly so: bitbake legitimately fires thousands of
+# sstate probes as fast as it can, and a limit tuned to stop an attacker would
+# also throttle the one client this exists to serve. Turn it on only if you
+# expose this beyond a LAN, and understand it is a blunt instrument -- not a
+# WAF, useless against a distributed source.
+#RATE=0
+#BURST=200
+
+
+# --- Logging -----------------------------------------------------------------
+
+# Suppress the per-request access log. Refusals are still logged.
+#QUIET=0
