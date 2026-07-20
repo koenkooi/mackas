@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+#
+# mackas-buildstats-analyze -- summarise a Yocto buildstats directory.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Summarise a Yocto buildstats directory as JSON or text. Stdlib only.
+
+`mackas buildstats analyze` runs this over what `mackas retrieve buildstats`
+fetched; it also stands alone against any buildstats directory, including one
+produced on a Linux builder.
+
+Field semantics follow meta/classes-global/buildstats.bbclass:
+
+    wall = Ended - Started
+    cpu  = rusage(ru_utime + ru_stime) + Child rusage(ru_utime + ru_stime)
+
+**Child rusage is not optional.** A task's own rusage covers the bitbake
+worker process only; do_compile's actual work happens in forked children
+(make, cc1, ld), so counting the parent alone makes every compile look free.
+The single largest recipe in a real build reports ~0.1 s of own rusage and
+hundreds of seconds of child rusage.
+
+Both directory shapes are accepted:
+
+    .../buildstats/<BUILDNAME>/     a single build, with build_stats in it
+    .../buildstats/                 several; the newest BUILDNAME wins
+
+BUILDNAME is a timestamp (20260717121723), so lexical order is chronological
+and "newest" needs no stat() calls.
+"""
+
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+# Not a recipe: buildstats.bbclass writes this alongside the recipe dirs.
+NOT_A_RECIPE = ("reduced_proc_pressure",)
+
+
+def parse_task(path):
+    """Parse one buildstats task file into a flat dict.
+
+    Keys are prefixed to keep the two rusage blocks apart: r_* is the task's
+    own rusage, c_* the Child rusage. Anything unrecognised is ignored -- the
+    format gains fields between Yocto releases and an unknown line is not an
+    error.
+    """
+    t = {"io": {}}
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            try:
+                if line.startswith("Started:"):
+                    t["start"] = float(line.split()[1])
+                elif line.startswith("Ended:"):
+                    t["end"] = float(line.split()[1])
+                elif line.startswith("Status:"):
+                    t["status"] = line.split()[1]
+                elif line.startswith("IO "):
+                    k, v = line[3:].split(":", 1)
+                    t["io"][k.strip()] = int(v)
+                elif line.startswith("rusage ru_"):
+                    k, v = line[7:].split(":", 1)
+                    t["r_" + k.strip()] = float(v)
+                elif line.startswith("Child rusage ru_"):
+                    k, v = line[13:].split(":", 1)
+                    t["c_" + k.strip()] = float(v)
+            except (ValueError, IndexError):
+                # A truncated file -- a build killed mid-task leaves one --
+                # must not sink the whole report.
+                continue
+    return t
+
+
+def resolve_buildstats_dir(path):
+    """Accept either a BUILDNAME dir or the buildstats dir containing them."""
+    if os.path.isfile(os.path.join(path, "build_stats")):
+        return path
+    try:
+        entries = sorted(os.listdir(path))
+    except OSError:
+        return path
+    builds = [d for d in entries
+              if os.path.isfile(os.path.join(path, d, "build_stats"))]
+    if builds:
+        return os.path.join(path, builds[-1])
+    return path
+
+
+def parse_build_stats(bsdir):
+    """The per-build summary bitbake writes at the root of a BUILDNAME dir."""
+    build = {}
+    path = os.path.join(bsdir, "build_stats")
+    if not os.path.isfile(path):
+        return build
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                if line.startswith("Elapsed time:"):
+                    build["wall"] = float(line.split()[2])
+                elif line.startswith("CPU usage:"):
+                    build["cpu_pct"] = float(line.split()[2].rstrip("%"))
+                elif line.startswith("Build Started:"):
+                    build["started"] = float(line.split()[2])
+            except (ValueError, IndexError):
+                continue
+    return build
+
+
+def collect_tasks(bsdir):
+    """Every task file under bsdir, as a list of dicts."""
+    tasks = []
+    for recipe in sorted(os.listdir(bsdir)):
+        rdir = os.path.join(bsdir, recipe)
+        if not os.path.isdir(rdir) or recipe in NOT_A_RECIPE:
+            continue
+        for task in sorted(os.listdir(rdir)):
+            path = os.path.join(rdir, task)
+            if not os.path.isfile(path):
+                continue
+            t = parse_task(path)
+            if "start" not in t or "end" not in t:
+                # Still running, or truncated. Not a data point.
+                continue
+            # Child rusage included -- see the module docstring.
+            cpu = (t.get("r_ru_utime", 0) + t.get("r_ru_stime", 0)
+                   + t.get("c_ru_utime", 0) + t.get("c_ru_stime", 0))
+            tasks.append({
+                "recipe": recipe,
+                "task": task,
+                "start": t["start"],
+                "wall": round(t["end"] - t["start"], 3),
+                "cpu": round(cpu, 3),
+                "status": t.get("status", "UNKNOWN"),
+                "rbytes": t["io"].get("read_bytes", 0),
+                "wbytes": t["io"].get("write_bytes", 0),
+                "maxrss_kb": int(max(t.get("r_ru_maxrss", 0),
+                                     t.get("c_ru_maxrss", 0))),
+                "majflt": int(t.get("c_ru_majflt", 0) + t.get("r_ru_majflt", 0)),
+            })
+    return tasks
+
+
+def analyze(bsdir, topn=25):
+    """Parse a BUILDNAME dir into the report dict. Raises ValueError if empty."""
+    build = parse_build_stats(bsdir)
+    tasks = collect_tasks(bsdir)
+    if not tasks:
+        raise ValueError(
+            "no parsable task files under %s -- is this a buildstats "
+            "directory?" % bsdir)
+
+    t0 = min(t["start"] for t in tasks)
+    for t in tasks:
+        t["offset"] = round(t["start"] - t0, 3)
+
+    total_cpu = sum(t["cpu"] for t in tasks)
+    # Prefer bitbake's own Elapsed time; fall back to the task span for a
+    # build that was killed before build_stats was written.
+    total_wall = build.get("wall") or (
+        max(t["start"] + t["wall"] for t in tasks) - t0)
+
+    by_type = defaultdict(lambda: {"wall": 0.0, "cpu": 0.0, "n": 0})
+    by_recipe = defaultdict(lambda: {"wall": 0.0, "cpu": 0.0, "n": 0})
+    for t in tasks:
+        for d in (by_type[t["task"]], by_recipe[t["recipe"]]):
+            d["wall"] += t["wall"]
+            d["cpu"] += t["cpu"]
+            d["n"] += 1
+
+    # Concurrency over time: sample the task intervals on a 1 s grid. This is
+    # what shows that do_configure serialises the build.
+    span = max(int(total_wall), 1) + 1
+    conc = [0] * span
+    for t in tasks:
+        a = max(int(t["offset"]), 0)
+        b = min(int(t["offset"] + t["wall"]), span - 1)
+        for i in range(a, b + 1):
+            conc[i] += 1
+
+    # IO-bound heuristic: ran for a while, burned almost no CPU doing it, and
+    # actually moved bytes. Deliberately crude -- it points at where to look.
+    io_bound = [t for t in tasks
+                if t["wall"] > 1 and t["cpu"] / t["wall"] < 0.3
+                and (t["rbytes"] + t["wbytes"]) > (1 << 20)]
+
+    return {
+        "buildstats_dir": os.path.abspath(bsdir),
+        "build": {
+            "wall_s": round(total_wall, 1),
+            "cpu_s": round(total_cpu, 1),
+            "cpu_pct_reported": build.get("cpu_pct"),
+            "started": build.get("started"),
+            "parallelism": round(total_cpu / total_wall, 2) if total_wall else 0,
+            "n_tasks": len(tasks),
+            "n_recipes": len(by_recipe),
+            "n_failed": sum(1 for t in tasks if t["status"] not in
+                            ("PASSED", "UNKNOWN")),
+            "read_gb": round(sum(t["rbytes"] for t in tasks) / 2 ** 30, 2),
+            "write_gb": round(sum(t["wbytes"] for t in tasks) / 2 ** 30, 2),
+            "peak_rss_mb": round(max(t["maxrss_kb"] for t in tasks) / 1024, 1),
+            "majflt": sum(t["majflt"] for t in tasks),
+            "concurrency_peak": max(conc),
+            "concurrency_mean": round(sum(conc) / len(conc), 1),
+        },
+        "top_wall": sorted(tasks, key=lambda t: -t["wall"])[:topn],
+        "top_cpu": sorted(tasks, key=lambda t: -t["cpu"])[:topn],
+        "by_type": sorted((dict(task=k, **v) for k, v in by_type.items()),
+                          key=lambda d: -d["cpu"])[:topn],
+        "by_recipe": sorted((dict(recipe=k, **v) for k, v in by_recipe.items()),
+                            key=lambda d: -d["cpu"])[:topn],
+        "concurrency": conc,
+        "io_bound_count": len(io_bound),
+        "timeline": sorted((dict(r=t["recipe"], t=t["task"], o=t["offset"],
+                                 w=t["wall"], c=t["cpu"])
+                            for t in tasks if t["wall"] >= 2),
+                           key=lambda d: d["o"]),
+    }
+
+
+def format_summary(rep, topn=10):
+    """The human-readable digest `mackas buildstats analyze` prints."""
+    b = rep["build"]
+    out = []
+    out.append("buildstats: %s" % rep["buildstats_dir"])
+    out.append("  wall              %.1f s (%.1f min)" % (b["wall_s"], b["wall_s"] / 60))
+    out.append("  task CPU          %.1f s  (rusage + child rusage)" % b["cpu_s"])
+    out.append("  parallelism       %.2fx" % b["parallelism"])
+    if b["cpu_pct_reported"] is not None:
+        out.append("  bitbake reported  %.1f%% CPU" % b["cpu_pct_reported"])
+    out.append("  tasks / recipes   %d / %d" % (b["n_tasks"], b["n_recipes"]))
+    if b["n_failed"]:
+        out.append("  tasks NOT passed  %d" % b["n_failed"])
+    out.append("  concurrency       peak %d, mean %.1f"
+               % (b["concurrency_peak"], b["concurrency_mean"]))
+    out.append("  io                %.2f GB read, %.2f GB written"
+               % (b["read_gb"], b["write_gb"]))
+    out.append("  peak task RSS     %.1f MB" % b["peak_rss_mb"])
+    out.append("  io-bound tasks    %d (>1 s wall, <0.3x CPU, >1 MB moved)"
+               % rep["io_bound_count"])
+
+    out.append("")
+    out.append("  by task type          cpu_s      wall_s   n     parallelism")
+    for d in rep["by_type"][:topn]:
+        par = d["cpu"] / d["wall"] if d["wall"] else 0
+        out.append("    %-18s %9.1f %9.1f %5d   %6.2fx"
+                   % (d["task"][:18], d["cpu"], d["wall"], d["n"], par))
+
+    out.append("")
+    out.append("  top recipes by cpu    cpu_s      wall_s   n")
+    for d in rep["by_recipe"][:topn]:
+        out.append("    %-18s %9.1f %9.1f %5d"
+                   % (d["recipe"][:18], d["cpu"], d["wall"], d["n"]))
+    return "\n".join(out)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="mackas-buildstats-analyze",
+        description="Summarise a Yocto buildstats directory (stdlib only).")
+    p.add_argument("dir", help="a buildstats dir, or one BUILDNAME dir in it")
+    p.add_argument("--summary", action="store_true",
+                   help="human-readable digest instead of JSON")
+    p.add_argument("--top", type=int, default=25, metavar="N",
+                   help="how many entries per top-N table (default 25)")
+    p.add_argument("-o", "--output", metavar="FILE",
+                   help="write to FILE instead of stdout")
+    args = p.parse_args(argv)
+
+    if not os.path.isdir(args.dir):
+        p.error("not a directory: %s" % args.dir)
+
+    bsdir = resolve_buildstats_dir(args.dir)
+    try:
+        rep = analyze(bsdir, topn=args.top)
+    except ValueError as exc:
+        sys.stderr.write("mackas-buildstats-analyze: error: %s\n" % exc)
+        return 1
+
+    text = (format_summary(rep) + "\n" if args.summary
+            else json.dumps(rep, indent=1) + "\n")
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

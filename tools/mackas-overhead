@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+#
+# mackas-overhead -- sample the macOS host cost of an Apple `container` run.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""mackas-overhead: sample the macOS HOST cost of an Apple `container` run.
+
+The background sampler `mackas smoketest` wraps around each rung (see
+overhead_start()/overhead_stop() in mackas); it also stands alone. Stdlib
+only, targets /usr/bin/python3 (stock macOS). No pip, no /proc, no sudo.
+
+WHAT IT MEASURES
+  Apple `container` does NOT run the guest in one obvious process. On this
+  machine (container 1.1.0, brew) the host-side set is:
+
+    persistent daemons (launchd, survive between runs):
+      container-apiserver           libexec/container-apiserver
+      container-core-images         .../container-core-images/bin/...
+      container-network-vmnet       .../container-network-vmnet/bin/...
+      machine-apiserver             .../machine-apiserver/bin/...
+
+    per-container, spawned at run start, gone at run end:
+      container-runtime-linux       launchd job
+                                    com.apple.container.container-runtime-linux.<UUID>
+      THE VM ITSELF is a child XPC service of container-runtime-linux:
+        com.apple.Virtualization.VirtualMachine.xpc
+      (Virtualization.framework). This process carries the guest's CPU and
+      the bulk of the RSS. It is the thing to watch.
+
+  We sum, over the matched process set, at each interval:
+    - RSS (resident bytes)  -> peak and mean host memory footprint
+    - cumulative CPU time   -> delta over the window = host CPU-seconds spent
+
+HONEST CAVEATS (printed in the summary too)
+  * macOS `ps %cpu` is a LIFETIME AVERAGE, not instantaneous. We never use it.
+    We read cumulative CPU *time* (ps -o time) and difference it. That is the
+    only honest CPU signal without sudo/powermetrics.
+  * Host CPU time for the VM process INCLUDES the guest's own work. Host cost
+    is therefore a DIFFERENCE (host_cpu_s - guest_cpu_s), with real error bars,
+    not a direct reading.
+  * Sampling at N seconds cannot see spikes shorter than N.
+  * powermetrics (per-process energy, true utilisation) needs sudo, which is
+    not available non-interactively here -> package/energy numbers are omitted,
+    not guessed.
+  * RSS across VM + daemons can double-count shared pages; treat host RSS as an
+    upper bound on private footprint.
+"""
+import argparse, json, os, re, signal, subprocess, sys, time
+
+# Match the host process set by command/args. Override with MACKAS_OVERHEAD_PATTERN.
+DEFAULT_PATTERN = (
+    r"com\.apple\.Virtualization\.VirtualMachine"   # the VM (guest CPU + RSS)
+    r"|container-runtime-linux"                      # per-run supervisor
+    r"|container-apiserver"                          # daemon
+    r"|container-core-images"                        # daemon
+    r"|container-network-vmnet"                      # daemon (virtio-net host side)
+    r"|machine-apiserver"                            # daemon
+)
+
+
+def parse_cputime(s):
+    """ps -o time -> seconds. Formats: 'SS.ss', 'MM:SS.ss', 'HH:MM:SS.ss',
+    'DD-HH:MM:SS.ss'."""
+    s = s.strip()
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        days = int(d)
+    parts = s.split(":")
+    parts = [float(p) for p in parts]
+    while len(parts) < 3:
+        parts.insert(0, 0.0)
+    h, m, sec = parts[-3], parts[-2], parts[-1]
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+def snapshot(pattern):
+    """One sample: {pid: {'rss': bytes, 'cpu': seconds, 'comm': str}} for
+    processes whose args match `pattern`. RSS from ps is in KiB."""
+    # ps fields: pid, rss(KiB), time(cumulative cpu), comm, args
+    out = subprocess.run(
+        ["ps", "-axo", "pid=,rss=,time=,comm=,args="],
+        capture_output=True, text=True,
+    ).stdout
+    rx = re.compile(pattern)
+    procs = {}
+    for line in out.splitlines():
+        line = line.rstrip()
+        if not line or not rx.search(line):
+            continue
+        # split off the 4 fixed leading columns; args is the remainder
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$", line)
+        if not m:
+            continue
+        pid, rss_kib, tm, comm, args = m.groups()
+        # exclude ourselves / the grep-y matches on this very script
+        if "mackas-overhead" in args:
+            continue
+        try:
+            procs[int(pid)] = {
+                "rss": int(rss_kib) * 1024,
+                "cpu": parse_cputime(tm),
+                "comm": friendly_label(comm, args),
+            }
+        except ValueError:
+            continue
+    return procs
+
+
+# order matters: VM first so it wins over its runtime-linux parent's args
+_LABELS = [
+    ("com.apple.Virtualization.VirtualMachine", "VM (Virtualization.framework)"),
+    ("container-runtime-linux",  "container-runtime-linux"),
+    ("container-apiserver",      "container-apiserver"),
+    ("container-core-images",    "container-core-images"),
+    ("container-network-vmnet",  "container-network-vmnet"),
+    ("machine-apiserver",        "machine-apiserver"),
+]
+
+
+def friendly_label(comm, args):
+    for needle, label in _LABELS:
+        if needle in args or needle in comm:
+            return label
+    return os.path.basename(comm)
+
+
+def guest_cpu_seconds(bsdir):
+    """Sum guest CPU-seconds from a Yocto buildstats dir, using the same
+    child-rusage rule as tools/mackas-buildstats-analyze (else every compile
+    looks free). Returns (cpu_s, wall_s, write_gb, read_gb, n_tasks) or None."""
+    if not bsdir or not os.path.isdir(bsdir):
+        return None
+    total_cpu = 0.0
+    starts, ends = [], []
+    wbytes = rbytes = 0
+    n = 0
+    wall_reported = None
+    bs = os.path.join(bsdir, "build_stats")
+    if os.path.isfile(bs):
+        with open(bs, errors="replace") as f:
+            for line in f:
+                if line.startswith("Elapsed time:"):
+                    try:
+                        wall_reported = float(line.split()[2])
+                    except (IndexError, ValueError):
+                        pass
+    for recipe in os.listdir(bsdir):
+        rdir = os.path.join(bsdir, recipe)
+        if not os.path.isdir(rdir) or recipe == "reduced_proc_pressure":
+            continue
+        for task in os.listdir(rdir):
+            p = os.path.join(rdir, task)
+            if not os.path.isfile(p):
+                continue
+            u = s = 0.0
+            st = en = None
+            with open(p, errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("Started:"):
+                        st = float(line.split()[1])
+                    elif line.startswith("Ended:"):
+                        en = float(line.split()[1])
+                    elif line.startswith("rusage ru_utime:"):
+                        u += float(line.split(":", 1)[1])
+                    elif line.startswith("rusage ru_stime:"):
+                        s += float(line.split(":", 1)[1])
+                    elif line.startswith("Child rusage ru_utime:"):
+                        u += float(line.split(":", 1)[1])
+                    elif line.startswith("Child rusage ru_stime:"):
+                        s += float(line.split(":", 1)[1])
+                    elif line.startswith("IO write_bytes:"):
+                        wbytes += int(line.split(":", 1)[1])
+                    elif line.startswith("IO read_bytes:"):
+                        rbytes += int(line.split(":", 1)[1])
+            if st is None or en is None:
+                continue
+            total_cpu += u + s
+            starts.append(st)
+            ends.append(en)
+            n += 1
+    if not n:
+        return None
+    wall = wall_reported or (max(ends) - min(starts))
+    return {
+        "cpu_s": round(total_cpu, 1),
+        "wall_s": round(wall, 1),
+        "write_gb": round(wbytes / 2**30, 2),
+        "read_gb": round(rbytes / 2**30, 2),
+        "n_tasks": n,
+    }
+
+
+class Sampler:
+    def __init__(self, pattern, interval, jsonl=None):
+        self.pattern = pattern
+        self.interval = interval
+        self.jsonl = jsonl
+        self.first_cpu = {}   # pid -> first cumulative cpu seen
+        self.last_cpu = {}    # pid -> last cumulative cpu seen
+        self.comm = {}        # pid -> comm
+        self.rss_series = []  # (t, summed_rss_bytes)
+        self.n_samples = 0
+        self.t0 = None
+        self.t1 = None
+        self._stop = False
+
+    def stop(self, *_):
+        self._stop = True
+
+    def sample_once(self):
+        now = time.time()
+        procs = snapshot(self.pattern)
+        total_rss = 0
+        for pid, d in procs.items():
+            total_rss += d["rss"]
+            self.comm[pid] = d["comm"]
+            if pid not in self.first_cpu:
+                self.first_cpu[pid] = d["cpu"]
+            self.last_cpu[pid] = d["cpu"]
+        self.rss_series.append((now, total_rss))
+        self.n_samples += 1
+        if self.t0 is None:
+            self.t0 = now
+        self.t1 = now
+        if self.jsonl:
+            rec = {"t": round(now, 3), "rss": total_rss, "npids": len(procs),
+                   "pids": {str(p): [d["rss"], round(d["cpu"], 2)]
+                            for p, d in procs.items()}}
+            self.jsonl.write(json.dumps(rec) + "\n")
+            self.jsonl.flush()
+
+    def run(self):
+        while not self._stop:
+            self.sample_once()
+            # sleep in small slices so a signal stops us promptly
+            slept = 0.0
+            while slept < self.interval and not self._stop:
+                time.sleep(min(0.25, self.interval - slept))
+                slept += 0.25
+        # one final sample to capture end state before teardown, if still up
+        self.sample_once()
+
+    def summary(self, guest=None):
+        wall = (self.t1 - self.t0) if self.t0 else 0.0
+        host_cpu_s = sum(self.last_cpu[p] - self.first_cpu[p] for p in self.last_cpu)
+        rss_vals = [r for _, r in self.rss_series if r > 0]
+        peak_rss = max(rss_vals) if rss_vals else 0
+        mean_rss = sum(rss_vals) / len(rss_vals) if rss_vals else 0
+        # per-process cpu-seconds during window (biggest first)
+        per_proc = sorted(
+            ({"pid": p, "comm": self.comm.get(p, "?"),
+              "cpu_s": round(self.last_cpu[p] - self.first_cpu[p], 1)}
+             for p in self.last_cpu),
+            key=lambda d: -d["cpu_s"],
+        )
+        out = {
+            "host": {
+                "wall_s": round(wall, 1),
+                "samples": self.n_samples,
+                "interval_s": self.interval,
+                "peak_rss_mb": round(peak_rss / 2**20, 1),
+                "mean_rss_mb": round(mean_rss / 2**20, 1),
+                "cpu_s": round(host_cpu_s, 1),
+                "per_process_cpu_s": per_proc,
+            },
+            "caveats": [
+                "ps %cpu is a lifetime average; CPU is measured as a delta of "
+                "cumulative CPU-time, not %cpu.",
+                "Host VM CPU-time INCLUDES the guest's work; overhead is a "
+                "difference with error bars, not a direct reading.",
+                "Sampling at %ss misses spikes shorter than the interval." % self.interval,
+                "powermetrics (energy/true utilisation) needs sudo and was not "
+                "used; those numbers are omitted, not estimated.",
+                "Summed RSS may double-count shared pages -> upper bound.",
+            ],
+        }
+        if guest:
+            gc = guest["cpu_s"]
+            out["guest"] = guest
+            # Guard: the host window must actually cover the build. If the host
+            # sampler saw ~no VM CPU, or its wall is far shorter than the guest
+            # build wall, the two windows do not match and a subtraction is
+            # meaningless. Refuse to print a number rather than mislead.
+            mismatch = None
+            if host_cpu_s < 1:
+                mismatch = ("host saw ~0 CPU-seconds: no VM ran during the "
+                            "sampling window (idle daemons only).")
+            elif wall < 0.5 * guest["wall_s"]:
+                mismatch = ("host window (%.0fs) is far shorter than the guest "
+                            "build wall (%.0fs): windows do not match."
+                            % (wall, guest["wall_s"]))
+            if mismatch:
+                out["overhead"] = {"unavailable": mismatch,
+                                   "note": "Run the sampler DURING the build it "
+                                           "is being compared against."}
+            else:
+                overhead_abs = round(host_cpu_s - gc, 1)
+                out["overhead"] = {
+                    "host_cpu_minus_guest_cpu_s": overhead_abs,
+                    "ratio_host_over_guest": round(host_cpu_s / gc, 3) if gc else None,
+                    "pct_of_guest": round(100 * overhead_abs / gc, 1) if gc else None,
+                    "note": ("Positive = host spent more CPU than the guest "
+                             "accounted for (virtiofs/virtio/vmexit/scheduling). "
+                             "Requires host and guest windows to cover the SAME "
+                             "build."),
+                }
+        return out
+
+
+def human(out):
+    h = out["host"]
+    L = []
+    L.append("=== mackas host-side overhead ===")
+    L.append("wall %.0fs  samples=%d  interval=%ss"
+             % (h["wall_s"], h["samples"], h["interval_s"]))
+    L.append("host RSS  peak %.1f MB  mean %.1f MB   (VM + container daemons)"
+             % (h["peak_rss_mb"], h["mean_rss_mb"]))
+    L.append("host CPU  %.1f CPU-seconds consumed during window" % h["cpu_s"])
+    for pp in h["per_process_cpu_s"][:6]:
+        if pp["cpu_s"] > 0:
+            L.append("    %-32s pid %-6d %8.1f CPU-s" % (pp["comm"], pp["pid"], pp["cpu_s"]))
+    if "overhead" in out:
+        g = out["guest"]; o = out["overhead"]
+        L.append("guest CPU %.1f CPU-s / wall %.0fs  (from buildstats, %d tasks)"
+                 % (g["cpu_s"], g["wall_s"], g["n_tasks"]))
+        if "unavailable" in o:
+            L.append("OVERHEAD  UNAVAILABLE: " + o["unavailable"])
+            L.append("          " + o["note"])
+        else:
+            L.append("OVERHEAD  host-guest = %.1f CPU-s  (%.1f%% of guest, %.3fx)"
+                     % (o["host_cpu_minus_guest_cpu_s"], o["pct_of_guest"],
+                        o["ratio_host_over_guest"]))
+            L.append("          " + o["note"])
+    L.append("caveats:")
+    for c in out["caveats"]:
+        L.append("  - " + c)
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Sample macOS host cost of Apple container.")
+    ap.add_argument("--interval", type=float,
+                    default=float(os.environ.get("MACKAS_OVERHEAD_INTERVAL", "5")),
+                    help="seconds between samples (default 5)")
+    ap.add_argument("--duration", type=float, default=0,
+                    help="stop after N seconds (0 = until SIGINT/SIGTERM)")
+    ap.add_argument("--pattern",
+                    default=os.environ.get("MACKAS_OVERHEAD_PATTERN", DEFAULT_PATTERN),
+                    help="regex matched against ps args to select the host set")
+    ap.add_argument("--buildstats", default=None,
+                    help="Yocto buildstats dir for the guest-side comparison")
+    ap.add_argument("--jsonl", default=None, help="append per-sample JSONL here")
+    ap.add_argument("--json", action="store_true", help="emit JSON summary to stdout")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the process set matched right now and exit")
+    args = ap.parse_args()
+
+    if args.dry_run:
+        procs = snapshot(args.pattern)
+        if not procs:
+            print("dry-run: NO matching host processes (no container running?)")
+        for pid, d in sorted(procs.items()):
+            print("  pid %-6d %-32s rss=%.1fMB cpu=%.1fs"
+                  % (pid, d["comm"], d["rss"] / 2**20, d["cpu"]))
+        return 0
+
+    jsonl = open(args.jsonl, "a") if args.jsonl else None
+    s = Sampler(args.pattern, args.interval, jsonl)
+    signal.signal(signal.SIGINT, s.stop)
+    signal.signal(signal.SIGTERM, s.stop)
+
+    if args.duration > 0:
+        # arm an alarm; SIGALRM also triggers stop
+        signal.signal(signal.SIGALRM, s.stop)
+        signal.setitimer(signal.ITIMER_REAL, args.duration)
+
+    s.run()
+    if jsonl:
+        jsonl.close()
+
+    guest = guest_cpu_seconds(args.buildstats)
+    out = s.summary(guest)
+    if args.json:
+        json.dump(out, sys.stdout, indent=1)
+        print()
+    else:
+        print(human(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

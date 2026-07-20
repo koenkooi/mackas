@@ -1,0 +1,156 @@
+# mackas-mirrord — read-only HTTP bridge for NFS-mounted Yocto build caches.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Target: a Debian 13 mirror host. Install:
+#
+#   sudo install -m 0755 mackas-mirrord /usr/local/bin/mackas-mirrord
+#   sudo install -m 0644 mackas-mirrord.service /etc/systemd/system/
+#   sudo install -m 0644 mackas-mirrord.conf.example /etc/mackas-mirrord.conf
+#   sudoedit /etc/mackas-mirrord.conf
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mackas-mirrord
+#
+# Check the config without starting anything:
+#   sudo -u nobody mackas-mirrord --config /etc/mackas-mirrord.conf --check
+#
+# NOT YET DEPLOYED ANYWHERE. This unit has never been started on the mirror
+# host or anywhere else; see TODO.md. The hardening directives below are believed
+# correct from the systemd.exec documentation, not from an observed run.
+
+[Unit]
+Description=mackas read-only HTTP mirror for Yocto sstate/downloads
+Documentation=https://github.com/koenkooi/mackas
+After=network-online.target
+Wants=network-online.target
+# The caches live on an NFS mount. Without this the daemon can start before
+# the mount lands and serve 404s for everything -- which looks exactly like a
+# cold cache and wastes an afternoon.
+RequiresMountsFor=/build
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/mackas-mirrord --config /etc/mackas-mirrord.conf
+# No ExecReload: the daemon has no reload capability. It installs handlers
+# only for SIGTERM and SIGINT (clean shutdown); SIGHUP's default disposition
+# is to terminate the process, and with Restart=on-failure a `systemctl
+# reload` would therefore crash-restart the daemon rather than reload it. To
+# apply a config change, restart the unit. If a real reload is ever added,
+# add a SIGHUP handler in the daemon and reinstate ExecReload here together.
+Restart=on-failure
+RestartSec=5s
+
+# --- Identity ---------------------------------------------------------------
+#
+# DynamicUser= is deliberately NOT used, despite being the modern default.
+# Two reasons, both specific to this deployment:
+#
+#   1. The caches are on an NFS export. NFS authorises by numeric uid/gid on
+#      the wire; a DynamicUser's uid is allocated per-start from the transient
+#      range, so it differs run to run and the server has no stable identity
+#      to grant access to. With root_squash the daemon would simply be denied.
+#   2. DynamicUser implies ProtectSystem=strict plus a private /tmp and /var,
+#      which is fine, but it also brings ProtectHome and a private user
+#      namespace whose interaction with a kernel NFS client is not something
+#      to discover in production.
+#
+# A plain static unprivileged user is boring, stable, and works. If the caches
+# were ever local, DynamicUser=yes would be the better answer.
+User=nobody
+Group=nogroup
+
+# --- Privileges -------------------------------------------------------------
+#
+# The daemon needs no capability at all: it binds 8100 (>1024), reads files,
+# and writes to a socket. Handing it an empty capability set means a code
+# execution bug in it gains the attacker nothing a shell as `nobody` would
+# not already give.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# If the port ever moves below 1024, this is the whole change needed:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Filesystem -------------------------------------------------------------
+#
+# ProtectSystem=strict makes the ENTIRE filesystem read-only, including /etc
+# and /var. This costs nothing by default: with CACHE_DIR unset (the
+# default, see mackas-mirrord.conf.example), the daemon still never writes --
+# there is no code path in it that opens a file for writing, creates one, or
+# unlinks one. If you enable CACHE_DIR, that is no longer true, and you MUST
+# add a ReadWritePaths= line below for it -- ProtectSystem=strict would
+# otherwise make the daemon's own cache directory read-only and every
+# promotion would fail (harmlessly: a failed promotion just means the
+# request is served from source and logged, never a crash, but the cache
+# would never actually cache anything).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# The only things it may read. Everything else on the box is invisible or
+# unreadable, so a path-traversal bug that somehow got past the checks in the
+# code would still have nothing to reach.
+ReadOnlyPaths=/build/angstrom-2026.06/build/sstate-cache
+ReadOnlyPaths=/build/angstrom-2026.06/build/downloads
+ReadOnlyPaths=/etc/mackas-mirrord.conf
+# Add the credential file here if you use one:
+#ReadOnlyPaths=/etc/mackas-mirrord.cred
+# ...and the TLS material if you use that:
+#ReadOnlyPaths=/etc/mackas-mirrord.crt /etc/mackas-mirrord.key
+
+# Only needed if CACHE_DIR is set in mackas-mirrord.conf. This is the ONLY
+# path the daemon ever writes to; it must be outside every ReadOnlyPaths=
+# root above (mackas-mirrord itself refuses to start otherwise) and owned by
+# the User=/Group= above so the daemon can create it at mode 0700.
+#ReadWritePaths=/var/cache/mackas-mirrord
+
+# --- Kernel / syscall surface -----------------------------------------------
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @mount @swap @reboot @debug
+
+# --- Network ----------------------------------------------------------------
+#
+# It speaks TCP over IPv4/IPv6 and nothing else. No unix sockets to other
+# services, no netlink, no raw sockets.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=any
+# The LAN, and only the LAN. This is a second, kernel-level copy of the
+# --allow allowlist: the userspace check can be misconfigured, this one is
+# enforced before a packet reaches the process. Defence in depth, cheap.
+# Set this to your LAN's CIDR; 192.0.2.0/24 is a documentation placeholder.
+IPAddressAllow=192.0.2.0/24
+IPAddressAllow=localhost
+
+# --- Resources --------------------------------------------------------------
+#
+# A bound on the damage a bug or a flood can do to the rest of the box.
+# The thread cap sits above the daemon's own --max-connections default of 64,
+# so the daemon's limiter is what normally applies and this is the backstop.
+TasksMax=256
+MemoryMax=512M
+LimitNOFILE=4096
+
+# --- Logging ----------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mackas-mirrord
+
+[Install]
+WantedBy=multi-user.target

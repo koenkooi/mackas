@@ -1,0 +1,27 @@
+# Local configuration -- may contain paths and hostnames specific to one Mac.
+mackas.conf
+*.log
+
+# Scratch reproduction notes -- personal working notes, not for the tree.
+REPRODUCE-*.md
+
+# Reference checkout of upstream kas, for reading and debugging only.
+#
+# Deliberately NOT a submodule and NOT vendored. mackas' central design goal
+# is ZERO patches to kas: all adaptation lives in bin/docker and in the
+# environment/config mackas builds. Committing kas here -- even as a pinned
+# submodule -- would invite patching it and blur that line. Clone it yourself:
+#
+#     git clone https://github.com/siemens/kas.git kas-upstream
+#
+# Note that mackas does not run this checkout: it downloads a pinned,
+# sha256-verified kas-container release (see KAS_CONTAINER_VERSION in mackas).
+kas-upstream/
+
+# macOS
+.DS_Store
+
+# Python bytecode from mirror-server/ and its tests. `python3 -m py_compile`
+# and the unittest suite both drop these.
+__pycache__/
+*.py[cod]

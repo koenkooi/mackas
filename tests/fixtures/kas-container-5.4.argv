@@ -1,0 +1,239 @@
+# kas-container docker-argv conformance fixture
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# WHAT THIS IS
+#   The exact `docker` argv that the real kas-container 5.4 issues for the
+#   four invocations mackas drives: `checkout`, `shell ... -c "bitbake -p"`,
+#   `build ... --target X`, and a plain `shell`. This pins the *kas half* of the
+#   bin/docker shim contract: previously "verified by reading upstream", now
+#   recorded from the real tool.
+#
+# HOW IT WAS RECORDED
+#   Run tests/fixtures/record-kas-argv.sh. It points a recording `docker` stub
+#   (which answers kas's engine probe and appends its argv here, starting no
+#   container) at the real kas-container, then normalizes machine-specific values.
+#   NO container is ever started; the stub records and exits 0.
+#
+# NORMALIZATION (so the fixture is identical on any machine)
+#   host mount paths -> /MACKAS/... ; USER_ID/GROUP_ID -> 1000. Container-side
+#   paths (/repo, /work, /build, ...) and every flag/value SHAPE are verbatim.
+#
+# FILENAME <-> VERSION
+#   The "5.4" in the name is mackas's pinned KAS_CONTAINER_VERSION. tests/
+#   kas_argv_replay.bats fails loudly if that pin has no matching fixture, so a
+#   version bump without re-recording cannot pass silently.
+#
+# FORMAT
+#   Blocks delimited by `INVOCATION` and `END` markers; between them, one argv
+#   element per line (so a value containing spaces stays one element). Lines
+#   starting with `#` (outside a block) are comments.
+=== INVOCATION: checkout
+run
+-v
+/MACKAS/work/project/kas:/repo:ro
+-v
+/MACKAS/work:/work:rw
+-e
+KAS_WORK_DIR=/work
+--workdir=/repo
+-e
+KAS_CONTAINER_SCRIPT_VERSION=5.4
+-e
+USER_ID=1000
+-e
+GROUP_ID=1000
+--rm
+--init
+-v
+/MACKAS/gitconfig:/var/kas/userdata/.gitconfig:ro
+-e
+GITCONFIG_FILE=/var/kas/userdata/.gitconfig
+-e
+TERM=xterm-256color
+-e
+BB_NUMBER_THREADS=18
+-e
+PARALLEL_MAKE=-j 18
+-e
+SHELL=/bin/bash
+--log-driver=none
+--user=root
+-c
+18
+-m
+42g
+-v
+oe-build-tmp:/build
+-e
+KAS_BUILD_DIR=/build
+-v
+oe-build-dl:/downloads
+-e
+DL_DIR=/downloads
+-v
+oe-build-sstate:/sstate
+-e
+SSTATE_DIR=/sstate
+ghcr.io/siemens/kas/kas:5.4
+checkout
+/repo/base.yml:/repo/macos-local.yml
+=== END
+=== INVOCATION: shell-bitbake-p
+run
+-v
+/MACKAS/work/project/kas:/repo:rw
+-v
+/MACKAS/work:/work:rw
+-e
+KAS_WORK_DIR=/work
+--workdir=/repo
+-e
+KAS_CONTAINER_SCRIPT_VERSION=5.4
+-e
+USER_ID=1000
+-e
+GROUP_ID=1000
+--rm
+--init
+-v
+/MACKAS/gitconfig:/var/kas/userdata/.gitconfig:ro
+-e
+GITCONFIG_FILE=/var/kas/userdata/.gitconfig
+-e
+TERM=xterm-256color
+-e
+BB_NUMBER_THREADS=18
+-e
+PARALLEL_MAKE=-j 18
+-e
+SHELL=/bin/bash
+--log-driver=none
+--user=root
+-c
+18
+-m
+42g
+-v
+oe-build-tmp:/build
+-e
+KAS_BUILD_DIR=/build
+-v
+oe-build-dl:/downloads
+-e
+DL_DIR=/downloads
+-v
+oe-build-sstate:/sstate
+-e
+SSTATE_DIR=/sstate
+ghcr.io/siemens/kas/kas:5.4
+shell
+-c
+bitbake -p
+/repo/base.yml:/repo/macos-local.yml
+=== END
+=== INVOCATION: build-target
+run
+-v
+/MACKAS/work/project/kas:/repo:ro
+-v
+/MACKAS/work:/work:rw
+-e
+KAS_WORK_DIR=/work
+--workdir=/repo
+-e
+KAS_CONTAINER_SCRIPT_VERSION=5.4
+-e
+USER_ID=1000
+-e
+GROUP_ID=1000
+--rm
+--init
+-v
+/MACKAS/gitconfig:/var/kas/userdata/.gitconfig:ro
+-e
+GITCONFIG_FILE=/var/kas/userdata/.gitconfig
+-e
+TERM=xterm-256color
+-e
+BB_NUMBER_THREADS=18
+-e
+PARALLEL_MAKE=-j 18
+-e
+SHELL=/bin/bash
+--log-driver=none
+--user=root
+-c
+18
+-m
+42g
+-v
+oe-build-tmp:/build
+-e
+KAS_BUILD_DIR=/build
+-v
+oe-build-dl:/downloads
+-e
+DL_DIR=/downloads
+-v
+oe-build-sstate:/sstate
+-e
+SSTATE_DIR=/sstate
+ghcr.io/siemens/kas/kas:5.4
+build
+--target
+core-image-minimal
+/repo/base.yml:/repo/macos-local.yml
+=== END
+=== INVOCATION: shell
+run
+-v
+/MACKAS/work/project/kas:/repo:rw
+-v
+/MACKAS/work:/work:rw
+-e
+KAS_WORK_DIR=/work
+--workdir=/repo
+-e
+KAS_CONTAINER_SCRIPT_VERSION=5.4
+-e
+USER_ID=1000
+-e
+GROUP_ID=1000
+--rm
+--init
+-v
+/MACKAS/gitconfig:/var/kas/userdata/.gitconfig:ro
+-e
+GITCONFIG_FILE=/var/kas/userdata/.gitconfig
+-e
+TERM=xterm-256color
+-e
+BB_NUMBER_THREADS=18
+-e
+PARALLEL_MAKE=-j 18
+-e
+SHELL=/bin/bash
+--log-driver=none
+--user=root
+-c
+18
+-m
+42g
+-v
+oe-build-tmp:/build
+-e
+KAS_BUILD_DIR=/build
+-v
+oe-build-dl:/downloads
+-e
+DL_DIR=/downloads
+-v
+oe-build-sstate:/sstate
+-e
+SSTATE_DIR=/sstate
+ghcr.io/siemens/kas/kas:5.4
+shell
+/repo/base.yml:/repo/macos-local.yml
+=== END

@@ -1,0 +1,2734 @@
+#!/usr/bin/env python3
+#
+# mackas-mirrord — bridge an NFS-mounted OpenEmbedded build cache to HTTP, read-only,
+# so bitbake can consume it via SSTATE_MIRRORS / SOURCE_MIRROR_URL.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+#
+# macOS + Apple `container` cannot mount NFS *inside* the container: the Kata
+# guest kernel (6.18.15) has no NFS client compiled in -- /proc/filesystems
+# lists no `nfs`, there is no /lib/modules to load one from, and
+# `mount -t nfs` fails with "failed to prepare mount: No such device".
+# --cap-add SYS_ADMIN does not help; it is not a permissions problem, the code
+# is simply absent. Bind-mounting a macOS NFS mount through virtiofs is
+# unverified and risky (see docs/storage.md).
+#
+# But the container CAN reach the LAN over its vmnet NAT, egressing as the
+# Mac's real IP. So: a Linux host that already has the NFS mount re-serves the
+# cache read-only over HTTP, and bitbake consumes it through its own
+# officially-supported mirror mechanism. No virtiofs, no NFS-in-guest, no
+# kernel surgery.
+#
+# ---------------------------------------------------------------------------
+# WHY NOT `python3 -m http.server`
+#
+# http.server's own documentation says it is "not recommended for production
+# use ... only implements basic security checks". This program deliberately
+# does NOT subclass SimpleHTTPRequestHandler. Inheriting it would drag in
+# translate_path (which we do not trust), the directory-listing generator
+# (which leaks the cache's shape), and a send_head() whose behaviour we would
+# have to audit anyway. Everything here is built on BaseHTTPRequestHandler,
+# which does request parsing and nothing else, and every filesystem decision
+# is made by code in this file that we can defend line by line.
+#
+# ---------------------------------------------------------------------------
+# WHY ONE PROCESS, ONE PORT, MANY ROOTS
+#
+# The obvious layout is two servers on two ports (sstate on 8100, downloads on
+# 8101). We serve both from one process on one port under distinct path
+# prefixes instead:
+#
+#   http://linux-computer:8100/sstate/...
+#   http://linux-computer:8100/downloads/...
+#
+# Because:
+#   * One process means one privilege drop, one TLS context, one credential
+#     store, one rate limiter, one systemd unit to harden. Two processes means
+#     two of each, and two chances to get one of them wrong.
+#   * The security-critical code (path resolution) is per-root anyway -- it
+#     takes the root as an argument -- so serving N roots costs no extra
+#     attack surface, just a dict lookup.
+#   * One port is one firewall rule and one TLS certificate.
+#   * bitbake does not care: SSTATE_MIRRORS and SOURCE_MIRROR_URL are
+#     independent URLs, and a path prefix distinguishes them as well as a port
+#     does.
+#
+# Requires Python 3.7+ (ThreadingHTTPServer landed in 3.7). Standard library
+# only, on purpose: it must run on a host with no pip, no venv, no network
+# install step -- scp one file and go.
+# ---------------------------------------------------------------------------
+
+"""Read-only HTTP bridge from NFS-mounted OpenEmbedded build caches to bitbake."""
+
+import argparse
+import base64
+import binascii
+import errno
+import getpass
+import hashlib
+import hmac
+import http
+import http.client  # explicit: we tighten its header limits below
+import ipaddress
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import ssl
+import stat
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import unquote, urlsplit
+
+PROGRAM = "mackas-mirrord"
+VERSION = "1.0.0"
+
+MIN_PYTHON = (3, 7)
+
+# Defaults. Precedence, lowest to highest, matching mackas' convention:
+#   built-in defaults -> config file -> environment -> command-line flags
+DEFAULT_PORT = 8100
+DEFAULT_BIND = "0.0.0.0"
+DEFAULT_TIMEOUT = 30.0
+DEFAULT_MAX_CONNECTIONS = 64
+DEFAULT_RATE = 0.0  # requests/second/IP; 0 disables
+DEFAULT_BURST = 200
+
+# Local file cache. OFF unless --cache-dir is given -- see the "Local file
+# cache" section below for the full design; this is just the numbers.
+#
+# DEFAULT_CACHE_MIN_HITS=3 is "more than 2": the 1st and 2nd requests for a
+# path in a day are misses, the 3rd promotes it.
+#
+# DEFAULT_CACHE_MAX_SIZE_MB=4096 (4 GiB) is a deliberately small backstop,
+# not a sizing target: daily rotation is what is supposed to keep
+# steady-state size down (see CacheManager), so this cap exists only to
+# survive a single bad day, not to hold a meaningful fraction of an sstate
+# mirror. 4 GiB comfortably fits a few dozen to a few hundred sstate objects
+# (which run tens to low-hundreds of MB each) without asking an operator who
+# just wants "cache the hot ones" to also go provision real storage.
+DEFAULT_CACHE_MIN_HITS = 3
+DEFAULT_CACHE_MAX_SIZE_MB = 4096
+
+# PBKDF2 derivations/second/IP. NOT the same thing as a request limit, and not
+# configurable on purpose -- see MirrorHandler.check_password(). A legitimate
+# client derives once per cache TTL no matter how many thousands of objects it
+# fetches, so 4/s with a burst of 16 is unreachable by accident and immediately
+# exhausted by anyone trying passwords.
+DEFAULT_KDF_RATE = 4.0
+DEFAULT_KDF_BURST = 16
+
+ENV_PREFIX = "MACKAS_MIRRORD_"
+
+# Request-line and header limits.
+#
+# The checks in parse_request() below are NOT what bounds our memory, and the
+# comment that used to live here claimed otherwise. It was wrong. By the time
+# parse_request() can look at self.headers, http.client.parse_headers() has
+# already read the whole header block into memory: its _read_headers() loop
+# accepts up to _MAXHEADERS (100) lines of up to _MAXLINE (65536) bytes, so
+# ~6.6 MB per connection is buffered *before* our first check runs, and the
+# 431 we then send is an autopsy, not a defence. At --max-connections 64 that
+# is ~420 MB an unauthenticated client can pin.
+#
+# So the limits have to be enforced by the loop doing the reading, and the only
+# knobs that loop has are http.client's two module globals. We set them.
+#
+# WHY TOUCHING A PRIVATE GLOBAL IS THE RIGHT TRADE HERE, HONESTLY STATED:
+#
+#   * The alternatives are worse. MessageClass is useless -- it is handed to
+#     the email parser only after _read_headers() has already buffered
+#     everything. There is no hook: http.server calls
+#     http.client.parse_headers() inline, so the only way to bound the read
+#     without patching a private name is to reimplement parse_request()
+#     wholesale, and a hand-rolled HTTP header parser is a far bigger security
+#     liability than an underscore.
+#   * The blast radius is nil. These globals affect http.client, and this
+#     program never acts as an HTTP *client* -- there is no outbound request
+#     anywhere in this file. We are a single-purpose daemon, not a library, so
+#     we are not changing behaviour out from under someone else's code.
+#   * It fails safe. If a future CPython renames them, the hasattr() check
+#     below skips the tightening and we are back to the stock 6.6 MB -- worse,
+#     but not broken. The regression test asserts the tightening works, so we
+#     find out.
+#
+# With these, the worst case is MAX_HEADERS * MAX_HEADER_LINE = 512 KiB per
+# connection (32 MB at the default cap) instead of 6.6 MB (420 MB). The
+# MAX_HEADER_BYTES total is still checked afterwards, and is what actually
+# holds bitbake-shaped traffic to something sane.
+MAX_REQUEST_LINE = 8192
+MAX_HEADERS = 64
+MAX_HEADER_LINE = 8192
+MAX_HEADER_BYTES = 16384
+
+# Largest request body we will read and throw away before answering 413. No
+# method here takes a body at all; this only exists so that a body cannot be
+# left in the socket to be re-parsed as the next request. See
+# consume_request_body().
+MAX_REQUEST_BODY = 65536
+
+if hasattr(http.client, "_MAXLINE"):
+    http.client._MAXLINE = MAX_HEADER_LINE
+if hasattr(http.client, "_MAXHEADERS"):
+    http.client._MAXHEADERS = MAX_HEADERS
+
+# PBKDF2 cost for the stored credential. 200k SHA-256 iterations is ~0.1s on
+# modest server hardware: irrelevant next to a 47G cache fetch, and expensive
+# enough that an offline attacker who steals the credential file gains little.
+PBKDF2_ITERATIONS = 200_000
+PBKDF2_ALGO = "sha256"
+SALT_BYTES = 16
+
+log = logging.getLogger(PROGRAM)
+
+
+# ---------------------------------------------------------------------------
+# Logging hygiene
+# ---------------------------------------------------------------------------
+
+# Control characters and newlines in a request path let a client forge log
+# lines ("log injection"): a GET for "/a\n2026-01-01 ... 200 OK GET /admin"
+# writes a second, fake entry into the log an operator or a parser will read
+# as real. bitbake never needs a control character in a URL, so we do not try
+# to preserve them -- everything outside printable ASCII becomes an escape.
+_UNSAFE_LOG_CHARS = re.compile(r"[^\x20-\x7e]")
+
+
+def sanitize_for_log(text: str, limit: int = 512) -> str:
+    """Make an untrusted string safe to write to a line-oriented log.
+
+    Threat: log injection / terminal escape-sequence injection. Anything a
+    client controls (path, User-Agent, username) reaches the log, and a log is
+    read by humans in terminals and by parsers that split on newlines.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) > limit:
+        text = text[:limit] + "...<truncated>"
+    return _UNSAFE_LOG_CHARS.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+
+class Credential:
+    """One username plus a salted PBKDF2 hash of its password.
+
+    The password is never stored, never passed on argv (argv is world-readable
+    via ps(1) on Linux), and never logged. The on-disk record is:
+
+        username:pbkdf2_sha256:ITERATIONS:SALT_B64:HASH_B64
+
+    Generate one with `mackas-mirrord --hash-password`.
+    """
+
+    __slots__ = ("username", "algo", "iterations", "salt", "digest")
+
+    def __init__(self, username: str, algo: str, iterations: int,
+                 salt: bytes, digest: bytes) -> None:
+        self.username = username
+        self.algo = algo
+        self.iterations = iterations
+        self.salt = salt
+        self.digest = digest
+
+    @classmethod
+    def parse(cls, line: str) -> "Credential":
+        parts = line.strip().split(":")
+        if len(parts) != 5:
+            raise ValueError(
+                "credential must have 5 colon-separated fields "
+                "(username:algo:iterations:salt:hash)")
+        username, algo, iters, salt_b64, hash_b64 = parts
+        if not username:
+            raise ValueError("credential has an empty username")
+        if algo != "pbkdf2_" + PBKDF2_ALGO:
+            raise ValueError("unsupported credential algorithm: %r" % algo)
+        try:
+            iterations = int(iters)
+        except ValueError:
+            raise ValueError("credential iteration count is not a number")
+        if iterations < 1000:
+            raise ValueError("credential iteration count is implausibly low")
+        try:
+            salt = base64.b64decode(salt_b64, validate=True)
+            digest = base64.b64decode(hash_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("credential salt/hash is not valid base64")
+        if not salt or not digest:
+            raise ValueError("credential salt/hash is empty")
+        return cls(username, algo, iterations, salt, digest)
+
+    def derive(self, password: str) -> bytes:
+        return hashlib.pbkdf2_hmac(
+            PBKDF2_ALGO, password.encode("utf-8"), self.salt,
+            self.iterations, dklen=len(self.digest))
+
+    def verify(self, password: str) -> bool:
+        """Constant-time password check.
+
+        `==` on the derived digests would leak, through its early exit, how
+        many leading bytes matched -- enough to reconstruct the digest one
+        byte at a time over many requests. hmac.compare_digest does not
+        short-circuit.
+        """
+        return hmac.compare_digest(self.derive(password), self.digest)
+
+    def __str__(self) -> str:
+        return "%s:%s:%d:%s:%s" % (
+            self.username, self.algo, self.iterations,
+            base64.b64encode(self.salt).decode("ascii"),
+            base64.b64encode(self.digest).decode("ascii"))
+
+
+def make_credential(username: str, password: str) -> Credential:
+    salt = os.urandom(SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac(
+        PBKDF2_ALGO, password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return Credential(username, "pbkdf2_" + PBKDF2_ALGO,
+                      PBKDF2_ITERATIONS, salt, digest)
+
+
+class CredentialStore:
+    """The set of accepted credentials, and the Basic-auth check itself.
+
+    THE AMPLIFIER THIS GUARDS AGAINST
+
+    Every request carrying an Authorization header used to cost a full
+    200k-iteration PBKDF2 -- 0.03-0.1s depending on hardware -- before we knew
+    anything about the client. That is an unauthenticated attacker spending one
+    cheap HTTP request to buy 0.1s of our CPU: ~34 req/s pegs a core, and
+    DEFAULT_RATE was 0.0, so nothing was in the way. The KDF being slow is the
+    point of a KDF; being slow *on demand, for anyone* is the bug.
+
+    The fix is a verification cache, and it has to come first, because it is
+    what makes rate-limiting the KDF safe. bitbake is a legitimate flood: it
+    fires thousands of sstate probes, all with the identical Authorization
+    header. Rate-limiting KDF invocations alone would start 401ing a real
+    build. With the cache, that flood costs exactly ONE derivation and every
+    subsequent probe is a dict lookup -- so a per-IP budget on actual
+    derivations (see MirrorHandler.check_password) only ever bites a client
+    trying *distinct* passwords, which is precisely the attacker and never
+    bitbake.
+
+    What is cached is a keyed hash, not the password: the key is HMAC-SHA256 of
+    user:pass under a per-process random secret, so the table is useless to
+    anyone who reads our memory later and cannot be precomputed. Entries expire
+    (TTL) and the table is bounded, so it cannot be grown into a memory attack.
+    Both hits and misses are cached -- a flood of one wrong password is as
+    cheap to refuse as a right one is to accept.
+
+    Timing, honestly: a cache hit is fast and a miss is slow, so an attacker
+    can tell "this exact user:password pair was tried in the last few minutes"
+    apart from a fresh one. That leaks nothing about whether a username exists
+    or a password is right -- the unknown-username decoy above still equalises
+    that -- and it is a good trade for removing the amplifier.
+    """
+
+    _CACHE_MAX = 1024
+    _CACHE_TTL = 300.0
+
+    def __init__(self, creds: Sequence[Credential]) -> None:
+        self._by_user = {c.username: c for c in creds}
+        self._cache = {}
+        self._cache_lock = threading.Lock()
+        self._cache_secret = os.urandom(32)
+        # A decoy used when the username is unknown, so that a wrong username
+        # costs the same wall-clock time as a wrong password. Without this,
+        # response latency is a username oracle.
+        #
+        # The decoy's cost must be COPIED FROM A REAL CREDENTIAL, not from our
+        # own defaults. It used to hardcode PBKDF2_ITERATIONS and dklen=32, so
+        # a cred file written with different parameters -- an older file, a
+        # hand-tuned one, a future default -- made the decoy cheaper or dearer
+        # than the real thing, and the timing oracle this exists to close
+        # reopened. Deriving the shape from a loaded credential means the decoy
+        # tracks whatever is actually in the file.
+        template = creds[0] if creds else None
+        if template is not None:
+            self._decoy = Credential(
+                "", template.algo, template.iterations,
+                b"\x00" * len(template.salt), b"\x00" * len(template.digest))
+        else:
+            self._decoy = Credential(
+                "", "pbkdf2_" + PBKDF2_ALGO, PBKDF2_ITERATIONS,
+                b"\x00" * SALT_BYTES, b"\x00" * 32)
+        # Honest limit: with a mixed-parameter cred file the decoy can only
+        # match one of them, so users whose records differ from creds[0] stay
+        # distinguishable from each other by timing. Matching every record is
+        # not possible with one decoy, and a file with per-user PBKDF2 costs is
+        # not a thing this tool creates -- make_credential() writes one shape.
+
+    def __bool__(self) -> bool:
+        return bool(self._by_user)
+
+    def __len__(self) -> int:
+        return len(self._by_user)
+
+    def _cache_key(self, username: str, password: str) -> bytes:
+        # Length-prefixed so that ("ab", "c") and ("a", "bc") cannot collide
+        # into the same key and let one credential authenticate as another.
+        blob = ("%d:%s:%s" % (len(username), username, password))
+        return hmac.new(self._cache_secret, blob.encode("utf-8"),
+                        "sha256").digest()
+
+    def cached_result(self, username: str, password: str) -> Optional[bool]:
+        """A previously computed verdict for this exact pair, or None."""
+        key = self._cache_key(username, password)
+        now = time.monotonic()
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            result, expires = entry
+            if expires <= now:
+                self._cache.pop(key, None)
+                return None
+            return result
+
+    def _remember(self, username: str, password: str, result: bool) -> None:
+        key = self._cache_key(username, password)
+        now = time.monotonic()
+        with self._cache_lock:
+            if len(self._cache) >= self._CACHE_MAX:
+                for stale, (_, expires) in list(self._cache.items()):
+                    if expires <= now:
+                        del self._cache[stale]
+                if len(self._cache) >= self._CACHE_MAX:
+                    # Still full of live entries: this is a flood of distinct
+                    # passwords, i.e. an attack, not a working set. Drop the
+                    # lot rather than grow without bound. The KDF budget is
+                    # what actually rate-limits them; this just bounds memory.
+                    self._cache.clear()
+            self._cache[key] = (result, now + self._CACHE_TTL)
+
+    def check(self, username: str, password: str) -> bool:
+        """Verify a credential, paying the full KDF cost. Caller must budget it.
+
+        Do NOT call this on every request -- call MirrorHandler.check_password,
+        which consults the cache and the per-IP KDF budget first.
+        """
+        cred = self._by_user.get(username)
+        if cred is None:
+            self._decoy.verify(password)  # burn the same time, then fail
+            result = False
+        else:
+            result = cred.verify(password)
+        self._remember(username, password, result)
+        return result
+
+
+def load_credentials(text: str, source: str) -> List[Credential]:
+    creds = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            creds.append(Credential.parse(line))
+        except ValueError as exc:
+            raise ConfigError("%s:%d: %s" % (source, lineno, exc))
+    return creds
+
+
+# ---------------------------------------------------------------------------
+# Path resolution -- the security-critical core
+# ---------------------------------------------------------------------------
+
+
+class PathRejected(Exception):
+    """The request path is malformed or hostile. Never serve it."""
+
+
+def split_url_path(raw: str) -> str:
+    """Take the path component of a request target and decode it exactly once.
+
+    Decoding once is deliberate and sufficient. A client sending `%252e%252e`
+    gets one decode to the literal seven characters `%2e%2e`, which is a
+    filename, not a traversal -- decoding twice is the bug that makes
+    double-encoding attacks work, so we do not.
+
+    The leading-'//' collapse is not cosmetic. urlsplit('//sstate/x') reads
+    'sstate' as a NETLOC, not a path segment, and returns path='/x' -- so the
+    root prefix would silently vanish and '/x' would be resolved against
+    whichever root came first. Today that is unreachable, because
+    parse_request() collapses a leading '//' before we ever see it, which means
+    our safety here rests on an undocumented implementation detail of a
+    function we do not control. That is a fine thing to have noticed and a
+    terrible thing to depend on: it can change in a point release, and the
+    failure mode is silent. So we normalize it ourselves and stop caring what
+    parse_request does.
+    """
+    if raw.startswith("//"):
+        raw = "/" + raw.lstrip("/")
+    return urlsplit(raw).path
+
+
+def resolve_under_root(root_real: str, url_path: str,
+                       allow_symlinks: bool = True) -> str:
+    """Map a URL path to a real file inside `root_real`, or refuse.
+
+    This is the function that stands between a public port and the rest of the
+    filesystem. It defends against, in order:
+
+      * Absolute paths and drive-letter tricks -- the path must start with '/'
+        and is treated as relative to the root regardless.
+      * NUL bytes -- os.* raises ValueError on embedded NUL, but some layers
+        historically truncated at it, so `/etc/passwd\\0.txt` could pass an
+        extension check and open something else. Rejected outright.
+      * Control characters -- no legitimate cache object has one, and they
+        exist in a request only to confuse a downstream parser or a log.
+      * Backslashes -- not a separator on POSIX, but they are on other
+        platforms and in some client libraries' idea of normalization. There
+        is no legitimate '\\' in a bitbake sstate path; refusing is free.
+      * '..' segments, encoded or not -- after the single unquote above,
+        `..`, `%2e%2e`, `..%2f` and `%2e%2e%2f` are all just `..`, and are
+        rejected as segments rather than normalized away. Normalizing is
+        where traversal bugs live; refusing is unambiguous.
+      * Symlink escape -- the root is an NFS mount whose *contents we do not
+        control*. Anyone who can write to the export can drop in a symlink to
+        /etc/shadow and read it through us. os.path.realpath resolves every
+        component, so the containment check below sees the true target.
+      * Prefix confusion -- containment is checked with os.path.commonpath,
+        NOT str.startswith. '/root-evil/x'.startswith('/root') is True, and
+        that single line is a complete filesystem escape. commonpath compares
+        path *components*, so commonpath(['/root', '/root-evil']) == '/'.
+
+    Returns the resolved absolute real path. Raises PathRejected otherwise.
+
+    WHAT THIS FUNCTION IS AND IS NOT
+
+    Everything above is a *check*, and every check is a snapshot: it describes
+    the filesystem as it was at realpath() time. The root is an NFS export
+    whose contents we do not control, so anyone who can write to it can change
+    the shape of the tree immediately after we look. This function therefore
+    decides only "is this request plausible" -- it is a cheap first gate that
+    rejects the overwhelming majority of hostile paths without touching an
+    open().
+
+    It is NOT the containment mechanism, and its answer must never be re-opened
+    by string. Containment is enforced by open_under_root() below, which walks
+    the result component by component from a descriptor on the root. See the
+    comment there for why the obvious "realpath then open(path, O_NOFOLLOW)"
+    is not enough.
+    """
+    if "\0" in url_path:
+        raise PathRejected("NUL byte in path")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url_path):
+        raise PathRejected("control character in path")
+    if "\\" in url_path:
+        raise PathRejected("backslash in path")
+
+    if not url_path.startswith("/"):
+        raise PathRejected("path is not absolute")
+
+    segments = []
+    for seg in url_path.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            raise PathRejected("'..' segment in path")
+        if "\0" in seg:
+            raise PathRejected("NUL byte in segment")
+        segments.append(seg)
+
+    candidate = os.path.join(root_real, *segments) if segments else root_real
+
+    try:
+        resolved = os.path.realpath(candidate)
+    except (OSError, ValueError) as exc:
+        raise PathRejected("cannot resolve path: %s" % exc)
+
+    # Containment. Both paths are absolute and already realpath'd, so
+    # commonpath is comparing canonical component lists.
+    try:
+        common = os.path.commonpath([root_real, resolved])
+    except ValueError as exc:
+        # Raised for mixed absolute/relative or (on Windows) mixed drives.
+        raise PathRejected("cannot compare path to root: %s" % exc)
+    if common != root_real:
+        raise PathRejected("resolved path escapes the root")
+
+    if not allow_symlinks:
+        # Strict mode: refuse if any component under the root is a symlink,
+        # even one that stays inside. Cheap because the depth is small.
+        rel = os.path.relpath(resolved, root_real)
+        if rel != ".":
+            walk = root_real
+            for seg in rel.split(os.sep):
+                walk = os.path.join(walk, seg)
+                try:
+                    if stat.S_ISLNK(os.lstat(walk).st_mode):
+                        raise PathRejected("symlink in path (strict mode)")
+                except OSError:
+                    break  # nonexistent -> the open below will 404
+        # A path that realpath changed at all means a symlink was traversed
+        # somewhere; catch the case the walk above cannot see.
+        if os.path.realpath(candidate) != os.path.abspath(candidate):
+            raise PathRejected("symlink in path (strict mode)")
+
+    return resolved
+
+
+# Flags, resolved once. getattr() because the O_* names are POSIX-only and we
+# would rather degrade loudly than crash at import on an exotic platform.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def open_under_root(root_real: str, resolved: str) -> int:
+    """Open `resolved` by descending from `root_real` one component at a time.
+
+    WHY THIS EXISTS -- the bug this replaces
+
+    The previous code realpath'd the path and then re-opened the *string* with
+    O_NOFOLLOW, on the theory that "realpath's output contains no symlinks by
+    construction, so O_NOFOLLOW can only fire if the path changed under us".
+    That reasoning is wrong, and only ever described the LAST component.
+    O_NOFOLLOW governs the final component and nothing else: every directory
+    in the middle is resolved by the kernel, following symlinks, exactly as
+    normal. So an attacker with write access to the export could swap an
+    intermediate directory -- root/sub -- for a symlink to /etc in the window
+    between our realpath() and our open(), and the open would cheerfully walk
+    through it. The checks all passed; they just described a tree that no
+    longer existed. On NFS the window is wide: realpath costs a network round
+    trip per component.
+
+    HOW THIS FIXES IT
+
+    We never hand a multi-component path to the kernel again. We open the root
+    directory once, then for each component call
+    os.open(seg, O_NOFOLLOW|O_DIRECTORY, dir_fd=parent), closing each parent as
+    we descend. Every step is relative to a descriptor we already hold, so
+    there is no name for the kernel to re-resolve and nothing for an attacker
+    to swap: a descriptor keeps pointing at the inode it was opened on even if
+    the directory entry that produced it is renamed or replaced a microsecond
+    later. O_NOFOLLOW on *every* component means a symlink appearing anywhere
+    in the chain is refused (ELOOP) rather than followed. Containment stops
+    being a property we check and hope holds, and becomes a property of how the
+    descriptors were obtained.
+
+    The one open-by-string is the root itself. That is deliberate and safe: the
+    root is operator-supplied, realpath'd at config time, and its parent
+    directories are the mount path, which is outside the threat model -- the
+    attacker controls the *contents* of the export, not the path to it.
+
+    WHY NOT openat2(RESOLVE_BENEATH)
+
+    It does exactly this in one syscall, but it is Linux 5.6+ only and has no
+    stdlib binding. This walk is pure stdlib and behaves identically on the
+    Linux mirror host and on macOS, where the tests run.
+
+    WHAT THIS MEANS FOR SYMLINKS (--no-symlinks semantics are unchanged)
+
+    Note we walk the components of the *realpath output*, not of the URL. That
+    is what keeps legitimate symlinks working, and DL_DIR is full of them:
+
+      * An intra-root symlink leaf -- downloads/foo.tar.gz -> ../git2/foo --
+        was already resolved by realpath, so the components we walk are the
+        real ones and the file is served. Correct: the reviewer's rule is that
+        an intra-root symlink is legitimate.
+      * An escaping symlink was already refused by the commonpath check, so we
+        never get here.
+      * A symlink that appears in the chain *after* resolve_under_root looked
+        is precisely the attack, and O_NOFOLLOW refuses it. That is the
+        default, and it is not the same thing as "refuse all symlinks": a
+        symlink resolved before the check is followed, a symlink that appears
+        after it is not.
+
+    So the default still serves symlinked cache objects, and --no-symlinks
+    still means the stricter "no symlink anywhere under the root", enforced by
+    resolve_under_root above. Neither option's meaning changed; only the
+    mechanism that enforces the default did.
+
+    Returns an open descriptor the caller owns. Raises OSError (ENOENT, ELOOP,
+    ENOTDIR ... -- mapped to a status by the caller) or PathRejected.
+    """
+    dir_flags = os.O_RDONLY | _O_NOFOLLOW | _O_DIRECTORY
+    # O_NONBLOCK on the leaf so that opening a FIFO an attacker planted in the
+    # export cannot hang this thread forever.
+    leaf_flags = os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK
+
+    rel = os.path.relpath(resolved, root_real)
+    segments = [] if rel == os.curdir else rel.split(os.sep)
+    # relpath on two realpath'd, commonpath-contained absolutes cannot produce
+    # these. Belt and braces: if it ever did, we would be walking upwards.
+    for seg in segments:
+        if seg in ("", os.curdir, os.pardir):
+            raise PathRejected("non-canonical component after resolution")
+
+    parent = os.open(root_real, dir_flags)
+    try:
+        for seg in segments[:-1]:
+            child = os.open(seg, dir_flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        if not segments:
+            # The request is for the root directory itself.
+            return os.dup(parent)
+        return os.open(segments[-1], leaf_flags, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+
+class RateLimiter:
+    """A per-IP token bucket. Honest about what it is: a blunt instrument.
+
+    This is not a WAF and does not pretend to be one. It stops one broken or
+    looping client from monopolising the server; it does not stop a
+    distributed attacker, and a spoofed source IP defeats it entirely (though
+    not usefully, since TCP needs the handshake to complete).
+
+    The table is bounded so that the limiter itself cannot be turned into a
+    memory-exhaustion vector by a source-IP flood.
+    """
+
+    MAX_ENTRIES = 4096
+
+    def __init__(self, rate: float, burst: int) -> None:
+        self.rate = rate
+        self.burst = burst
+        self._buckets: Dict[str, Tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        if self.rate <= 0:
+            return True
+        now = time.monotonic()
+        with self._lock:
+            tokens, last = self._buckets.get(key, (float(self.burst), now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            if tokens < 1.0:
+                self._buckets[key] = (tokens, now)
+                return False
+            tokens -= 1.0
+            if key not in self._buckets and len(self._buckets) >= self.MAX_ENTRIES:
+                self._prune(now)
+            self._buckets[key] = (tokens, now)
+            return True
+
+    def _prune(self, now: float) -> None:
+        """Drop buckets that have refilled to full; they carry no state."""
+        if self.rate <= 0:
+            return
+        full_after = self.burst / self.rate
+        stale = [k for k, (_, last) in self._buckets.items()
+                 if now - last > full_after]
+        for k in stale:
+            del self._buckets[k]
+        if len(self._buckets) >= self.MAX_ENTRIES:
+            # Still full of active talkers: forget the oldest half rather than
+            # grow without bound. Forgetting is fail-open for those IPs, which
+            # is the right trade -- the alternative is OOM.
+            oldest = sorted(self._buckets.items(), key=lambda kv: kv[1][1])
+            for k, _ in oldest[: len(oldest) // 2]:
+                del self._buckets[k]
+
+
+# ---------------------------------------------------------------------------
+# Local file cache -- the server's FIRST real disk-write path
+# ---------------------------------------------------------------------------
+#
+# Everything above this comment reads. This section is the one place
+# mackas-mirrord writes, and it is opt-in: --cache-dir unset (the default)
+# means none of this code ever runs, and behaviour is byte-for-byte what it
+# was before this feature existed.
+#
+# THE INVARIANT THIS MUST NOT BREAK
+#
+# _reject_method(), below, says every mutating HTTP method 405s because
+# there is no code that turns a CLIENT REQUEST into a write. That is still
+# true: a request body is never opened as a file, a request path is never
+# passed to open(..., "wb"). The write path that follows is reached only
+# from inside serve_file(), AFTER resolve_under_root() and
+# open_under_root() have already validated and opened the object being
+# served -- the same fully-resolved real path that is about to be (or just
+# was) streamed to the client. Nothing here re-parses the URL and nothing
+# here accepts a caller-supplied filename: the on-disk cache filename is
+# always sha256(resolved real path).hexdigest(), computed from a string
+# THIS SERVER produced, never from one a client sent.
+#
+# WHERE A CACHED FILE LIVES, AND WHY
+#
+#   <cache_dir>/<YYYY-MM-DD>/<sha256(target_real).hexdigest()>
+#
+# The date directory is what makes "purge anything not touched today" a
+# single shutil.rmtree() of a handful of stale directories rather than a
+# scan of every file's mtime -- and it means a file cached yesterday is
+# simply not found by today's lookup (the day component of its path
+# changed), so it stops being served the instant the calendar rolls over,
+# even before anything sweeps the old directory away.
+#
+# ATOMICITY
+#
+# A cache write is: mkstemp() a temp file in the SAME day directory as the
+# final name (so the eventual os.replace() is a same-filesystem rename,
+# which POSIX guarantees is atomic), write the whole file, then
+# os.replace() over the final name. fsync is deliberately skipped: this is
+# a disposable accelerator, not a WAL -- a write torn by a crash just means
+# an orphaned temp file that a later sweep or eviction pass removes, never
+# a corrupt file visible under its final name. A reader that calls
+# open_cached() a microsecond before the rename either does not find the
+# file yet (ENOENT, falls back to the source root) or finds the fully
+# written file after it -- there is no window in which the final name
+# refers to a partial file.
+#
+# WHAT NEVER HAPPENS ON THE REQUEST PATH
+#
+# Promotion (the actual copy) never runs on the thread answering the
+# request that triggered it -- it is handed to a small bounded pool of
+# background threads (see CacheManager.maybe_promote()). The triggering
+# request is served from the source root exactly as it always was; only
+# requests AFTER a promotion completes see the cache. That keeps this what
+# its name says it is -- a hit-rate optimization for FUTURE requests -- and
+# never a source of added latency on the request that happens to cross the
+# threshold.
+
+_CACHE_DAY_FMT = "%Y-%m-%d"
+_CACHE_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CACHE_TMP_PREFIX = ".tmp-"
+_CACHE_PROMOTE_WORKERS = 4
+_CACHE_HITS_MAX = 200_000
+
+
+class CacheManager:
+    """Promote hot objects from a (possibly slow) root into a local cache.
+
+    Policy, exactly as specified:
+
+      * A resolved path is promoted to the cache once it has been requested
+        MORE than `min_hits - 1` times today -- i.e. on the `min_hits`-th
+        request (default 3: the 1st and 2nd requests are misses, the 3rd
+        triggers promotion; subsequent requests are served from cache once
+        the background copy finishes).
+      * Eviction is hybrid:
+          (a) Daily rotation -- anything not under TODAY's date directory
+              is purged. This is what actually bounds steady-state size;
+              see the module comment above for why the day-keyed filename
+              makes it cheap (a directory removal, not a per-file scan).
+          (b) A size cap, enforced by deleting least-recently-used files
+              (oldest atime first) until back under budget. This is the
+              backstop WITHIN a single day -- daily rotation alone does not
+              stop one day's traffic from growing the cache past what the
+              disk can hold before the day rolls over.
+
+    "Recently used" is atime, bumped explicitly on every cache-served
+    request (see open_cached()) rather than relied on from the filesystem,
+    because noatime is a common, sane mount option and this code must not
+    assume the host running the cache has not chosen it.
+
+    mtime is deliberately NOT used for recency: a cached copy's mtime is
+    set to the SOURCE file's mtime (see _promote_once()), not the copy
+    time, so Last-Modified / If-Modified-Since behave identically whether a
+    request is served from cache or from the root. Using mtime for LRU too
+    would make caching change what If-Modified-Since means for a resource
+    -- exactly the kind of externally-visible behaviour change a "private
+    cache-hit optimization" must not have.
+    """
+
+    def __init__(self, cache_dir_real: str, min_hits: int,
+                 max_size_bytes: int) -> None:
+        self.cache_dir = cache_dir_real
+        self.min_hits = min_hits
+        self.max_size_bytes = max_size_bytes
+        self._lock = threading.Lock()
+        self._hits: Dict[str, Tuple[str, int]] = {}  # target -> (day, count)
+        self._promoting: Set[str] = set()
+        self._promote_slots = threading.BoundedSemaphore(_CACHE_PROMOTE_WORKERS)
+        # A fresh process may start well after a day boundary it never saw
+        # (long downtime, first run after install). Catch up once here, in
+        # addition to the lazy sweep on every subsequent promotion below.
+        self._sweep_daily()
+
+    # -- naming --------------------------------------------------------
+
+    @staticmethod
+    def _today() -> str:
+        # UTC, not local time: HTTP dates are GMT for the same reason this
+        # is -- "today" should not depend on which timezone the operator
+        # (or a DST transition) happens to be in right now.
+        return time.strftime(_CACHE_DAY_FMT, time.gmtime())
+
+    @staticmethod
+    def _key_for(target_real: str) -> str:
+        # The cache key is a hash of the RESOLVED path handle_download()
+        # already validated and is about to (or just did) open -- never the
+        # raw request path. See the module comment above for why that is
+        # load-bearing.
+        return hashlib.sha256(
+            target_real.encode("utf-8", "surrogateescape")).hexdigest()
+
+    def _cache_path(self, target_real: str,
+                    day: Optional[str] = None) -> Tuple[str, str]:
+        day = day or self._today()
+        day_dir = os.path.join(self.cache_dir, day)
+        return day_dir, os.path.join(day_dir, self._key_for(target_real))
+
+    # -- hit tracking ----------------------------------------------------
+
+    def record_hit(self, target_real: str) -> int:
+        """Count one request for `target_real` today; return today's total.
+
+        Only called by serve_file() AFTER the source file has been opened
+        and confirmed to be a regular file -- i.e. never on the sstate-MISS
+        path, which is the dominant request pattern here (see
+        docs/mirror-server.md). Counting misses too would make this dict
+        grow one entry per DISTINCT object bitbake ever probed for, most of
+        which never exist; counting only confirmed hits keeps it bounded by
+        the number of objects actually ever served, which is the cache's
+        legitimate working set.
+        """
+        today = self._today()
+        with self._lock:
+            day, count = self._hits.get(target_real, (today, 0))
+            count = count + 1 if day == today else 1
+            if (len(self._hits) >= _CACHE_HITS_MAX
+                    and target_real not in self._hits):
+                self._prune_hits(today)
+            self._hits[target_real] = (today, count)
+            return count
+
+    def _prune_hits(self, today: str) -> None:
+        """Bounded, same idea as CredentialStore._remember: drop stale
+        entries first; if that is not enough, drop everything rather than
+        grow without bound. Called with the lock already held."""
+        stale = [k for k, (day, _) in self._hits.items() if day != today]
+        for k in stale:
+            del self._hits[k]
+        if len(self._hits) >= _CACHE_HITS_MAX:
+            self._hits.clear()
+
+    # -- serving from cache ------------------------------------------------
+
+    def open_cached(self, target_real: str) -> Optional[int]:
+        """Open today's cached copy of `target_real`, or return None.
+
+        The path opened here is entirely of this server's own construction
+        (a date string this process generated plus a hex digest), never a
+        client-supplied name, so there are no untrusted intermediate
+        components to walk one at a time the way open_under_root() must for
+        the served roots -- see the module comment for why that asymmetry
+        is safe. O_NOFOLLOW is still used, defensively: nothing in this
+        program ever creates a symlink here, but refusing to follow one
+        costs nothing, and it means a cache directory an operator manually
+        tampered with cannot redirect a read somewhere unexpected.
+        """
+        _, path = self._cache_path(target_real)
+        try:
+            fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP,
+                             errno.ENAMETOOLONG):
+                return None
+            raise
+        ok = False
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            if hasattr(os, "O_NONBLOCK"):
+                import fcntl
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+            # Bump atime to "now" so the LRU sweep treats this object as
+            # freshly used; mtime is left exactly as _promote_once() set it
+            # (the SOURCE file's mtime) -- not touched here.
+            try:
+                os.utime(fd, (time.time(), st.st_mtime))
+            except OSError:
+                pass  # best-effort: a failed atime bump only skews LRU order
+            ok = True
+            return fd
+        finally:
+            if not ok:
+                os.close(fd)
+
+    # -- promotion -----------------------------------------------------
+
+    def maybe_promote(self, root_real: str, target_real: str) -> None:
+        """Kick off a background copy of `target_real` into the cache, once.
+
+        Idempotent under concurrency: the check-and-mark against
+        `_promoting` happens under the lock, so if two threads both decide
+        "this path just crossed the threshold" for the same path at the
+        same moment, only one of them submits a copy. The other just
+        returns -- the file will show up in the cache once the first one
+        finishes, and if the copy fails, `_promoting` is cleared in
+        `_do_promote`'s `finally`, so a LATER request (there will be one:
+        every request past the threshold calls this) gets to retry.
+
+        Bounded, not unbounded: a bounded semaphore caps how many
+        promotions run at once. If it is full, this call is a no-op --
+        again, a later request retries. The alternative (blocking here)
+        would mean a slow NFS copy for path A delays the response for path
+        B, and B's request has nothing to do with A's promotion.
+        """
+        with self._lock:
+            if target_real in self._promoting:
+                return
+            if not self._promote_slots.acquire(blocking=False):
+                return
+            self._promoting.add(target_real)
+        thread = threading.Thread(
+            target=self._do_promote, args=(root_real, target_real),
+            name="mirrord-cache-promote", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                self._promoting.discard(target_real)
+            self._promote_slots.release()
+
+    def _do_promote(self, root_real: str, target_real: str) -> None:
+        try:
+            self._promote_once(root_real, target_real)
+        except Exception:
+            log.exception("cache promotion failed")
+        finally:
+            with self._lock:
+                self._promoting.discard(target_real)
+            self._promote_slots.release()
+
+    def _promote_once(self, root_real: str, target_real: str) -> None:
+        """The actual copy. See the module comment for the atomicity story.
+
+        Reopens `target_real` through open_under_root() -- the SAME
+        containment-by-descriptor mechanism serve_file() uses, with the
+        same (root_real, target_real) pair resolve_under_root() already
+        produced and validated. This function never receives, and never
+        derives a filename from, anything else.
+        """
+        fd = open_under_root(root_real, target_real)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return  # a directory or special file raced in; not cacheable
+
+            self._sweep_daily()
+            day_dir, final_path = self._cache_path(target_real)
+            os.makedirs(day_dir, mode=0o700, exist_ok=True)
+
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=day_dir, prefix=_CACHE_TMP_PREFIX)
+            try:
+                with os.fdopen(tmp_fd, "wb") as out:
+                    while True:
+                        chunk = os.read(fd, 262144)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                # atime=now (freshly created counts as freshly used),
+                # mtime=the SOURCE's mtime -- see the class docstring.
+                os.utime(tmp_path, (time.time(), st.st_mtime))
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, final_path)  # atomic: same directory
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(fd)
+
+        self._enforce_size_cap()
+
+    # -- eviction --------------------------------------------------------
+
+    def _sweep_daily(self) -> None:
+        """Delete every day-directory that is not today's.
+
+        Triggered lazily, from _promote_once(), i.e. on cache WRITES -- not
+        by a dedicated background thread on a timer. A write already means
+        "we are about to touch this filesystem"; piggy-backing the sweep
+        there means idle periods cost nothing, and a server that only ever
+        gets exactly enough traffic to promote a handful of objects a day
+        still rotates correctly without a thread sitting in a sleep loop
+        for its entire lifetime. Also run once at construction (see
+        __init__) to catch up after a restart that crossed a day boundary
+        with no writes since.
+
+        Only ever removes entries matching our own YYYY-MM-DD naming
+        convention, so an operator who (against the docs) points
+        --cache-dir at a directory holding something else loses nothing but
+        obviously misnamed lookalikes.
+        """
+        today = self._today()
+        try:
+            names = os.listdir(self.cache_dir)
+        except OSError:
+            return
+        for name in names:
+            if name == today or not _CACHE_DAY_RE.match(name):
+                continue
+            path = os.path.join(self.cache_dir, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+
+    def _enforce_size_cap(self) -> None:
+        """LRU eviction (oldest atime first) until under `max_size_bytes`.
+
+        This is the single-day backstop: daily rotation is what keeps
+        steady-state size down (see the module comment), but within one
+        calendar day nothing else stops traffic from writing more than the
+        disk can hold before rotation gets a chance to run. Walking the
+        whole tree on every promotion is O(files in the cache); acceptable
+        because daily rotation keeps that count to roughly one day's worth
+        of promoted objects, and because this only ever runs after an
+        actual write, never on the far hotter read path.
+        """
+        entries = []  # (atime, size, path)
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(self.cache_dir):
+            for name in filenames:
+                if name.startswith(_CACHE_TMP_PREFIX):
+                    continue  # an in-progress or orphaned write; leave it
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                total += st.st_size
+                entries.append((st.st_atime, st.st_size, path))
+        if total <= self.max_size_bytes:
+            return
+        entries.sort(key=lambda e: e[0])  # oldest atime first
+        for _atime, size, path in entries:
+            if total <= self.max_size_bytes:
+                break
+            try:
+                os.unlink(path)
+                total -= size
+            except OSError:
+                pass
+
+
+def validate_cache_dir(path: str, roots: Dict[str, str]) -> str:
+    """Resolve, create if needed, and lock down --cache-dir.
+
+    This directory is the server's first write target, so it gets the same
+    discipline as a credential file (refuse if group/world writable) plus a
+    containment check against every served root: the cache dir must be
+    OUTSIDE every root, in both directions. A root nested inside the cache
+    dir would risk a cached copy being re-served as though it were source
+    content under a root's own URL space; a cache dir nested inside a root
+    would let cached copies be fetched directly through the mirror,
+    bypassing the promotion policy (and the hit-count bookkeeping)
+    entirely.
+    """
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError("cannot create cache dir %s: %s" % (path, exc))
+
+    real = os.path.realpath(path)
+    if not os.path.isdir(real):
+        raise ConfigError("cache dir is not a directory: %s" % path)
+    if not os.access(real, os.R_OK | os.W_OK | os.X_OK):
+        raise ConfigError("cache dir is not readable/writable: %s" % path)
+
+    try:
+        st = os.stat(real)
+    except OSError as exc:
+        raise ConfigError("cannot stat cache dir: %s" % exc)
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ConfigError(
+            "cache dir %s is group/world writable (mode %o); chmod 700 it "
+            "-- this is the server's write path, and anyone who can write "
+            "here can plant a file that gets served as though it were a "
+            "cache hit" % (real, st.st_mode & 0o777))
+
+    for name, root_real in roots.items():
+        try:
+            common = os.path.commonpath([root_real, real])
+        except ValueError:
+            continue  # mixed absolute/relative or, on Windows, mixed drives
+        if common in (root_real, real):
+            raise ConfigError(
+                "cache dir %s overlaps with served root /%s (%s); the "
+                "cache dir must be outside every served root"
+                % (real, name, root_real))
+    return real
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+class ConfigError(Exception):
+    """Bad configuration. Always fatal; never reported to a client."""
+
+
+class Config:
+    def __init__(self) -> None:
+        self.roots: Dict[str, str] = {}
+        self.bind = DEFAULT_BIND
+        self.port = DEFAULT_PORT
+        self.allow_nets: List[ipaddress._BaseNetwork] = []
+        self.creds = CredentialStore([])
+        self.realm = "mackas mirror"
+        self.tls_cert: Optional[str] = None
+        self.tls_key: Optional[str] = None
+        self.listing = False
+        self.allow_symlinks = True
+        self.timeout = DEFAULT_TIMEOUT
+        self.max_connections = DEFAULT_MAX_CONNECTIONS
+        self.rate = DEFAULT_RATE
+        self.burst = DEFAULT_BURST
+        self.cache_dir: Optional[str] = None
+        self.cache_min_hits = DEFAULT_CACHE_MIN_HITS
+        self.cache_max_size_mb = DEFAULT_CACHE_MAX_SIZE_MB
+        self.cache: Optional[CacheManager] = None
+        self.user: Optional[str] = None
+        self.group: Optional[str] = None
+        self.quiet = False
+
+
+def parse_kv_file(path: str) -> Dict[str, str]:
+    """Parse a KEY=VALUE config file.
+
+    Note this is NOT sourced as shell (mackas.conf is; this is not). A Python
+    daemon that exec'd its config file would turn "can write the config" into
+    "can run code as the daemon user", and the config may live somewhere more
+    widely writable than the binary.
+    """
+    out: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for lineno, raw in enumerate(fh, 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    raise ConfigError("%s:%d: not KEY=VALUE" % (path, lineno))
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                out[key] = value
+    except OSError as exc:
+        raise ConfigError("cannot read config file %s: %s" % (path, exc))
+    return out
+
+
+def _as_bool(value: str, what: str) -> bool:
+    v = value.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError("%s: not a boolean: %r" % (what, value))
+
+
+def parse_root_spec(spec: str) -> Tuple[str, str]:
+    """Parse NAME=PATH (or a bare PATH, which is served at the URL root)."""
+    if "=" in spec:
+        name, path = spec.split("=", 1)
+        name = name.strip().strip("/")
+        if not name:
+            raise ConfigError("root name is empty in %r" % spec)
+        if "/" in name:
+            raise ConfigError("root name may not contain '/': %r" % name)
+        if not re.match(r"^[A-Za-z0-9._-]+$", name):
+            raise ConfigError("root name must be [A-Za-z0-9._-]+: %r" % name)
+    else:
+        name, path = "", spec
+    path = path.strip()
+    if not path:
+        raise ConfigError("root path is empty in %r" % spec)
+    return name, path
+
+
+def validate_roots(specs: Sequence[str]) -> Dict[str, str]:
+    roots: Dict[str, str] = {}
+    for spec in specs:
+        name, path = parse_root_spec(spec)
+        real = os.path.realpath(path)
+        if not os.path.isdir(real):
+            raise ConfigError("root is not a directory: %s" % path)
+        if not os.access(real, os.R_OK | os.X_OK):
+            raise ConfigError("root is not readable: %s" % path)
+        if name in roots:
+            raise ConfigError("duplicate root name: %r" % name)
+        if "" in roots or (name == "" and roots):
+            raise ConfigError(
+                "an unnamed root serves the whole URL space and cannot be "
+                "combined with named roots")
+        roots[name] = real
+    return roots
+
+
+# ---------------------------------------------------------------------------
+# The HTTP handler
+# ---------------------------------------------------------------------------
+
+
+class MirrorHandler(BaseHTTPRequestHandler):
+    """Read-only file serving with authentication, and nothing else.
+
+    Deliberately built on BaseHTTPRequestHandler rather than
+    SimpleHTTPRequestHandler: we want request parsing, not translate_path(),
+    not list_directory(), not send_head().
+    """
+
+    # HTTP/1.1 for keep-alive: bitbake issues a long stream of sstate probes
+    # against this server and a fresh TCP (and TLS) handshake per probe is
+    # most of the cost of a miss. Every response below sets Content-Length,
+    # which is what makes keep-alive safe.
+    protocol_version = "HTTP/1.1"
+
+    # Do not advertise "BaseHTTP/0.6 Python/3.13.5". A version banner is free
+    # reconnaissance: it tells an attacker exactly which CVEs to try. This is
+    # not security by obscurity as a *control*, it is declining to help.
+    server_version = PROGRAM
+    sys_version = ""
+
+    config: Config
+    limiter: RateLimiter
+
+    # -- plumbing ----------------------------------------------------------
+
+    def version_string(self) -> str:
+        return PROGRAM
+
+    def address_string(self) -> str:
+        # BaseHTTPRequestHandler's version reverse-resolves the client IP for
+        # logging. That is a DNS round trip per request, on the request path,
+        # against a name the client's own PTR record controls. No.
+        return self.client_address[0]
+
+    def log_message(self, fmt: str, *args) -> None:
+        # Route BaseHTTPRequestHandler's internal chatter (parse errors and
+        # the like) through logging, sanitized. Our own access log is emitted
+        # by _respond(), which knows the byte count.
+        log.debug("%s %s", self.address_string(),
+                  sanitize_for_log(fmt % args))
+
+    def log_error(self, fmt: str, *args) -> None:
+        log.warning("%s %s", self.address_string(),
+                    sanitize_for_log(fmt % args))
+
+    def log_access(self, status: int, nbytes: int) -> None:
+        if self.config.quiet:
+            return
+        log.info('%s "%s %s" %d %d',
+                 self.address_string(),
+                 sanitize_for_log(getattr(self, "command", "-") or "-", 16),
+                 sanitize_for_log(getattr(self, "path", "-") or "-"),
+                 status, nbytes)
+
+    def parse_request(self) -> bool:
+        """Belt-and-braces limits on top of the ones enforced during the read.
+
+        The real memory bound is set by http.client._MAXLINE/_MAXHEADERS at
+        import (see the comment on MAX_HEADER_LINE) -- a header block that
+        blows those never gets here, it dies inside parse_headers() and
+        http.server turns it into a 431. What is left for us is the aggregate
+        limit, which no per-line cap can express: 64 lines of 8 KiB each are
+        individually legal and collectively absurd.
+        """
+        if not super().parse_request():
+            return False
+        if len(self.requestline) > MAX_REQUEST_LINE:
+            self.fail(http.HTTPStatus.REQUEST_URI_TOO_LONG)
+            return False
+        if len(self.headers) > MAX_HEADERS:
+            self.fail(http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE)
+            return False
+        total = sum(len(k) + len(v) for k, v in self.headers.items())
+        if total > MAX_HEADER_BYTES:
+            self.fail(http.HTTPStatus.REQUEST_HEADER_FIELDS_TOO_LARGE)
+            return False
+        return True
+
+    def handle_one_request(self) -> None:
+        """Never let an exception reach the client as a traceback."""
+        try:
+            super().handle_one_request()
+        except (socket.timeout, TimeoutError):
+            # Slowloris and friends, or just a client that wandered off.
+            log.debug("%s timed out", self.address_string())
+            self.close_connection = True
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+        except Exception:
+            # An unexpected bug in our own code. The client gets a bare 500
+            # with no detail; the traceback goes to our log, where it belongs.
+            log.exception("%s unhandled error", self.address_string())
+            try:
+                self.fail(http.HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+            self.close_connection = True
+
+    # -- responses ---------------------------------------------------------
+
+    def send_error(self, code, message=None, explain=None) -> None:
+        """Replace BaseHTTPRequestHandler's error pages entirely.
+
+        The stock send_error() interpolates `message` and `explain` into an
+        HTML body. Historically that was a reflected-XSS hole in http.server
+        (the request path landed in the page), and it still echoes strings we
+        may not have vetted. We never echo anything: a fixed body per status
+        code, and the detail goes to the log.
+        """
+        try:
+            status = http.HTTPStatus(int(code))
+            phrase = status.phrase
+        except ValueError:
+            phrase = "Error"
+        self.fail(int(code), phrase=phrase)
+
+    def fail(self, code, phrase: Optional[str] = None,
+             headers: Optional[Sequence[Tuple[str, str]]] = None,
+             reason: Optional[str] = None) -> None:
+        """Send a generic error. `reason` is logged, never sent."""
+        try:
+            status = http.HTTPStatus(int(code))
+            code_int = int(status)
+            phrase = phrase or status.phrase
+        except ValueError:
+            code_int = int(code)
+            phrase = phrase or "Error"
+        if reason:
+            log.info("%s refused: %s", self.address_string(),
+                     sanitize_for_log(reason))
+        # A fixed, input-free body. No user data, so no XSS, no reflection,
+        # no oracle.
+        body = ("%d %s\n" % (code_int, phrase)).encode("ascii", "replace")
+        self.send_response_only(code_int, phrase)
+        self.send_header("Server", PROGRAM)
+        self.send_header("Date", self.date_time_string())
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (headers or ()):
+            self.send_header(key, value)
+        if code_int >= 400:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.log_access(code_int, len(body) if self.command != "HEAD" else 0)
+
+    # -- access control ----------------------------------------------------
+
+    def client_ip(self) -> Optional[ipaddress._BaseAddress]:
+        raw = self.client_address[0]
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return None
+        # A v4-mapped v6 address (::ffff:192.0.2.68) must be compared against
+        # v4 CIDRs as v4, or a dual-stack listener silently ignores the
+        # allowlist.
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        return addr
+
+    def ip_allowed(self) -> bool:
+        """IP allowlist check. Complementary to auth, not a substitute.
+
+        Deliberately no X-Forwarded-For support: this server is meant to be
+        reached directly, and honouring a client-supplied header as identity
+        would let anyone claim any address. If it is ever put behind a proxy,
+        that must be an explicit, separate decision.
+        """
+        if not self.config.allow_nets:
+            return True
+        addr = self.client_ip()
+        if addr is None:
+            return False
+        return any(addr in net for net in self.config.allow_nets)
+
+    def authenticated(self) -> bool:
+        store = self.config.creds
+        if not store:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header:
+            return False
+        try:
+            scheme, _, payload = header.partition(" ")
+            if scheme.lower() != "basic":
+                return False
+            decoded = base64.b64decode(payload.strip(), validate=True)
+            username, sep, password = decoded.decode("utf-8").partition(":")
+            if not sep:
+                return False
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return False
+        return self.check_password(store, username, password)
+
+    def check_password(self, store: "CredentialStore", username: str,
+                       password: str) -> bool:
+        """Verify a password, but never let a stranger choose our CPU bill.
+
+        A cache hit costs a dict lookup, so bitbake's thousands of identical
+        sstate probes pay for one PBKDF2 between them. Only a genuinely new
+        user:password pair reaches the KDF, and that is what the budget covers:
+        DEFAULT_KDF_RATE derivations per second per IP, with a burst that no
+        real client can exhaust (a real client has ONE password, so it misses
+        the cache once per TTL) and an attacker exhausts immediately.
+
+        Over budget is a plain 401, deliberately: the same answer a wrong
+        password gets. Answering 429 here would tell an attacker they had found
+        the interesting endpoint, and would let them distinguish "throttled"
+        from "wrong" -- the throttle is not a secret worth leaking. The event
+        is logged, so an operator can see it happening.
+
+        Note this is the only rate limit that is on by default (DEFAULT_RATE is
+        0.0, i.e. the general request limiter is off). That asymmetry is
+        intentional: a general limit would break bitbake's request pattern,
+        this one cannot, because bitbake does not brute-force passwords.
+        """
+        cached = store.cached_result(username, password)
+        if cached is not None:
+            return cached
+        if not self.kdf_limiter.allow(self.client_address[0]):
+            log.warning("%s exceeded the password-hashing budget; refusing "
+                        "without hashing", self.address_string())
+            return False
+        return store.check(username, password)
+
+    def check_access(self) -> bool:
+        """Rate limit, then allowlist, then auth -- all before any FS access.
+
+        Order matters. Every check here is cheaper than a stat() on an NFS
+        mount, and more importantly none of them may be *skippable* by a path
+        that reaches the filesystem first. An unauthenticated client must not
+        be able to learn whether a file exists, which is exactly what
+        checking auth after a stat would tell it (via response timing, if not
+        the status code).
+        """
+        if not self.limiter.allow(self.client_address[0]):
+            self.fail(http.HTTPStatus.TOO_MANY_REQUESTS,
+                      headers=[("Retry-After", "1")],
+                      reason="rate limit")
+            return False
+        if not self.ip_allowed():
+            self.fail(http.HTTPStatus.FORBIDDEN, reason="ip not in allowlist")
+            return False
+        if not self.authenticated():
+            self.fail(
+                http.HTTPStatus.UNAUTHORIZED,
+                headers=[("WWW-Authenticate",
+                          'Basic realm="%s", charset="UTF-8"'
+                          % self.config.realm)],
+                reason="authentication failed")
+            return False
+        return True
+
+    # -- request bodies ----------------------------------------------------
+
+    def consume_request_body(self) -> bool:
+        """Read and discard any request body. False if we already responded.
+
+        THE BUG THIS FIXES -- CL.0 request smuggling
+
+        This server has no method that takes a body, so nothing ever called
+        rfile.read(). A GET with `Content-Length: 6` and a body was answered
+        normally, keep-alive stayed on, and the six unread bytes sat in the
+        socket buffer -- where the next loop of handle_one_request() parsed
+        them as a brand-new request line. One request in, two responses out.
+        That is a request-smuggling primitive: anything in front of us (a
+        proxy, a load balancer) counts one request where we count two, and an
+        attacker chooses what the second one says. do_OPTIONS was the worst of
+        them -- 204, no body read, connection kept alive.
+
+        The rule is now: nothing reaches a response until the body is off the
+        socket, or the connection is closed. Called after check_access(), so an
+        unauthenticated client is still refused before we read anything --
+        every failure path routes through fail(), which sets close_connection
+        on any status >= 400, so a smuggled body dies with the connection.
+        """
+        if self.headers.get("Transfer-Encoding", "").strip():
+            # Chunked, or something exotic. No method here takes a body, so
+            # there is nothing to be gained by implementing dechunking -- and a
+            # dechunker we do not need is a parser differential we do not want.
+            # Refuse and close; the framing is now unknowable, so the socket is
+            # not reusable.
+            self.fail(http.HTTPStatus.BAD_REQUEST,
+                      reason="body with Transfer-Encoding on a bodyless method")
+            return False
+
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
+            return True
+        # Two Content-Lengths is a smuggling attempt by construction: it exists
+        # only to make us and a proxy disagree about where the body ends.
+        if len(set(v.strip() for v in values)) > 1:
+            self.fail(http.HTTPStatus.BAD_REQUEST,
+                      reason="conflicting Content-Length headers")
+            return False
+        try:
+            length = int(values[0].strip())
+        except ValueError:
+            self.fail(http.HTTPStatus.BAD_REQUEST,
+                      reason="malformed Content-Length")
+            return False
+        if length < 0:
+            self.fail(http.HTTPStatus.BAD_REQUEST,
+                      reason="negative Content-Length")
+            return False
+        if length == 0:
+            return True
+        if length > MAX_REQUEST_BODY:
+            # We will not read megabytes to be polite about a body that should
+            # not exist. 413 and close: the unread remainder goes with it.
+            self.fail(http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                      reason="body of %d bytes on a bodyless method" % length)
+            return False
+
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 16384))
+            if not chunk:
+                # Client promised more than it sent. Framing is broken; the
+                # connection cannot be reused safely.
+                self.close_connection = True
+                return False
+            remaining -= len(chunk)
+        return True
+
+    # -- methods -----------------------------------------------------------
+
+    ALLOWED_METHODS = "GET, HEAD, OPTIONS"
+
+    def do_GET(self) -> None:
+        self.handle_download(body=True)
+
+    def do_HEAD(self) -> None:
+        self.handle_download(body=False)
+
+    def do_OPTIONS(self) -> None:
+        if not self.check_access():
+            return
+        if not self.consume_request_body():
+            return
+        self.send_response_only(http.HTTPStatus.NO_CONTENT)
+        self.send_header("Server", PROGRAM)
+        self.send_header("Date", self.date_time_string())
+        self.send_header("Allow", self.ALLOWED_METHODS)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.log_access(204, 0)
+
+    def _reject_method(self) -> None:
+        # Every mutating method lands here. No CLIENT REQUEST can cause a
+        # write -- there is no code that opens a request body as a file, or
+        # turns a request path into an open(..., "wb")/unlink() argument --
+        # so 405 is a statement of fact about what a client can trigger, not
+        # a policy knob. (With --cache-dir, the daemon does have one
+        # internal write path now: see the "Local file cache" section
+        # above. It is reached only from serve_file(), only after the
+        # requested object has already been resolved and opened read-only
+        # through the same path-containment logic every response goes
+        # through, and it never accepts a client-supplied filename. That is
+        # a different claim from "no request can write", and this comment
+        # is about the latter.)
+        # Access control runs first so that an unauthenticated prober cannot
+        # even learn which methods exist.
+        #
+        # No body drain here, and none needed: a POST/PUT body is left unread,
+        # but fail() answers 405 and sets close_connection, so the socket dies
+        # with the unread bytes still in it. Nothing can be smuggled onto a
+        # connection that is not reused. (This is load-bearing -- if fail()
+        # ever stops closing on 4xx, this method needs consume_request_body().)
+        if not self.check_access():
+            return
+        self.fail(http.HTTPStatus.METHOD_NOT_ALLOWED,
+                  headers=[("Allow", self.ALLOWED_METHODS)],
+                  reason="method %s" % sanitize_for_log(self.command or "?", 16))
+
+    do_POST = _reject_method
+    do_PUT = _reject_method
+    do_DELETE = _reject_method
+    do_PATCH = _reject_method
+    do_PROPFIND = _reject_method
+    do_PROPPATCH = _reject_method
+    do_MKCOL = _reject_method
+    do_COPY = _reject_method
+    do_MOVE = _reject_method
+    do_LOCK = _reject_method
+    do_UNLOCK = _reject_method
+    do_TRACE = _reject_method
+    do_CONNECT = _reject_method
+
+    # -- the actual download ----------------------------------------------
+
+    def pick_root(self, url_path: str) -> Tuple[str, str]:
+        """Split '/sstate/xx/foo.tgz' into (root_real, '/xx/foo.tgz')."""
+        roots = self.config.roots
+        if "" in roots:
+            return roots[""], url_path
+        trimmed = url_path.lstrip("/")
+        name, sep, rest = trimmed.partition("/")
+        if name not in roots:
+            raise PathRejected("unknown root %r" % name)
+        return roots[name], "/" + (rest if sep else "")
+
+    def handle_download(self, body: bool) -> None:
+        if not self.check_access():
+            return
+        if not self.consume_request_body():
+            return
+
+        try:
+            url_path = unquote(split_url_path(self.path), errors="strict")
+        except (ValueError, UnicodeDecodeError):
+            self.fail(http.HTTPStatus.BAD_REQUEST, reason="undecodable path")
+            return
+
+        try:
+            root_real, rel = self.pick_root(url_path)
+            target = resolve_under_root(root_real, rel,
+                                        self.config.allow_symlinks)
+        except PathRejected as exc:
+            # 404, not 403: a hostile path and a missing file are reported
+            # identically so that probing cannot map what exists or where the
+            # roots are. The real reason goes to the log.
+            self.fail(http.HTTPStatus.NOT_FOUND,
+                      reason="rejected path %s (%s)"
+                             % (sanitize_for_log(url_path), exc))
+            return
+
+        self.serve_file(target, root_real, body)
+
+    def serve_file(self, target: str, root_real: str, body: bool) -> None:
+        """Open and send one regular file.
+
+        The open is the last line of defence and it does its own checking
+        rather than trusting the checks above:
+
+          * open_under_root() walks from a descriptor on the root, one
+            component at a time, O_NOFOLLOW on each. It never re-opens
+            `target` as a string, so there is no window in which an attacker
+            can swap an intermediate directory for a symlink and be followed
+            through it. Containment is structural, not checked-then-hoped.
+          * fstat on the opened descriptor, not stat on the path, so what we
+            check is exactly what we send.
+          * S_ISREG: no directories, no devices, no FIFOs. Opening a FIFO on
+            an NFS export would hang this thread forever, which is a
+            denial-of-service handed to anyone who can write to the export.
+
+        If --cache-dir is configured, a cache lookup happens FIRST, before
+        any of the above touches the (possibly slow) source root at all --
+        see CacheManager.open_cached(). Hit-count bookkeeping and promotion
+        happen only AFTER the source open below confirms a regular file
+        exists, deliberately: the dominant request here is the sstate MISS
+        (bitbake probing an object that does not exist), and that path must
+        stay exactly as cheap with caching as without it.
+        """
+        cache = self.config.cache
+        if cache is not None:
+            cfd = cache.open_cached(target)
+            if cfd is not None:
+                try:
+                    cst = os.fstat(cfd)
+                    self.send_regular_file(cfd, cst, target, body)
+                finally:
+                    os.close(cfd)
+                return
+
+        fd = None
+        try:
+            try:
+                fd = open_under_root(root_real, target)
+            except PathRejected as exc:
+                self.fail(http.HTTPStatus.NOT_FOUND, reason=str(exc))
+                return
+            except OSError as exc:
+                # The dominant request pattern here is the sstate MISS: bitbake
+                # probes for thousands of objects that do not exist, and this
+                # is that path -- open, ENOENT, 404. No stat, no listdir, no
+                # body.
+                #
+                # It used to say "as cheap as the filesystem allows", and the
+                # dir_fd walk made that not quite true any more: a miss now
+                # costs one open per component (typically three: root, the
+                # hash-prefix directory, the leaf) instead of one. That is the
+                # price of containment, it is bounded by the path depth, and it
+                # is small next to the realpath() the check already does -- both
+                # are O(components) round trips on NFS. ELOOP/ENOTDIR arriving
+                # here is the interesting case: it means a component was a
+                # symlink at open time, i.e. either a genuine race or an
+                # attacker, and either way the answer is 404.
+                if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP,
+                                 errno.ENAMETOOLONG):
+                    self.fail(http.HTTPStatus.NOT_FOUND)
+                elif exc.errno in (errno.EACCES, errno.EPERM):
+                    self.fail(http.HTTPStatus.FORBIDDEN,
+                              reason="permission denied on target")
+                else:
+                    log.warning("open failed: %s", sanitize_for_log(str(exc)))
+                    self.fail(http.HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+            except ValueError:
+                self.fail(http.HTTPStatus.NOT_FOUND, reason="invalid target")
+                return
+
+            st = os.fstat(fd)
+
+            if stat.S_ISDIR(st.st_mode):
+                self.serve_directory(fd, body)
+                return
+
+            if not stat.S_ISREG(st.st_mode):
+                self.fail(http.HTTPStatus.NOT_FOUND,
+                          reason="not a regular file")
+                return
+
+            # Only now -- confirmed regular, existing file -- does caching
+            # get involved. See the docstring above for why counting here,
+            # not before the open, is what keeps the sstate-MISS path free.
+            if cache is not None:
+                count = cache.record_hit(target)
+                if count >= cache.min_hits:
+                    cache.maybe_promote(root_real, target)
+
+            # Clear O_NONBLOCK now that we know it is a regular file; regular
+            # files ignore it for reads anyway, but leave nothing surprising
+            # for the reader below.
+            if hasattr(os, "O_NONBLOCK"):
+                import fcntl
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+
+            self.send_regular_file(fd, st, target, body)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def serve_directory(self, fd: int, body: bool) -> None:
+        """Directory listings are OFF unless explicitly enabled.
+
+        A listing of an sstate cache is a map of every package and every hash
+        the mirror host has ever built -- product names, versions, internal
+        branch names. bitbake never needs it: it constructs exact object URLs
+        from its own hashes. So the default is 404, indistinguishable from a
+        missing file.
+
+        Takes the descriptor serve_file already opened, not a path: listing by
+        name would re-introduce exactly the string-reopen bug open_under_root()
+        exists to kill. os.listdir() and os.stat() both accept a dir_fd.
+        """
+        if not self.config.listing:
+            self.fail(http.HTTPStatus.NOT_FOUND, reason="listing disabled")
+            return
+        try:
+            names = sorted(os.listdir(fd))
+        except OSError:
+            self.fail(http.HTTPStatus.NOT_FOUND, reason="listdir failed")
+            return
+        # Plain text, not HTML: nothing to escape means nothing to escape
+        # wrongly. wget and curl read it fine and bitbake does not read it at
+        # all.
+        lines = []
+        for name in names:
+            try:
+                is_dir = stat.S_ISDIR(os.stat(name, dir_fd=fd).st_mode)
+            except OSError:
+                is_dir = False
+            lines.append(name + ("/" if is_dir else ""))
+        payload = ("\n".join(lines) + "\n").encode("utf-8", "replace")
+        self.send_response_only(http.HTTPStatus.OK)
+        self.send_header("Server", PROGRAM)
+        self.send_header("Date", self.date_time_string())
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if body:
+            self.wfile.write(payload)
+        self.log_access(200, len(payload) if body else 0)
+
+    def send_regular_file(self, fd: int, st: os.stat_result, target: str,
+                          body: bool) -> None:
+        size = st.st_size
+        mtime = st.st_mtime
+        last_modified = self.date_time_string(int(mtime))
+
+        # If-Modified-Since. bitbake/wget send it when re-checking a mirror,
+        # and answering 304 saves the whole transfer. BaseHTTPRequestHandler
+        # gives us nothing here (that logic lives in SimpleHTTPRequestHandler,
+        # which we do not inherit), so it is implemented explicitly.
+        ims = self.headers.get("If-Modified-Since")
+        if ims and not self.headers.get("If-None-Match"):
+            try:
+                import email.utils
+                parsed = email.utils.parsedate_to_datetime(ims)
+                if parsed is not None:
+                    if parsed.tzinfo is None:
+                        ims_ts = time.mktime(parsed.timetuple())
+                    else:
+                        ims_ts = parsed.timestamp()
+                    if int(mtime) <= int(ims_ts):
+                        self.send_response_only(http.HTTPStatus.NOT_MODIFIED)
+                        self.send_header("Server", PROGRAM)
+                        self.send_header("Date", self.date_time_string())
+                        self.send_header("Last-Modified", last_modified)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        self.log_access(304, 0)
+                        return
+            except (TypeError, ValueError, OverflowError, IndexError):
+                pass  # Unparseable date: ignore it and send the file.
+
+        # Range. SimpleHTTPRequestHandler does NOT implement Range at all --
+        # it ignores the header and sends 200 with the whole body, which is
+        # correct-but-useless for a resumed wget. We implement single-range
+        # requests (the only form wget sends) because a resumed 200 MB
+        # download over a flaky link is a real cost here. Multi-range is not
+        # implemented; per RFC 7233 a server may ignore a Range it does not
+        # understand and answer 200, which is what happens below.
+        start, end = 0, size - 1
+        partial = False
+        range_header = self.headers.get("Range")
+        if range_header and size > 0:
+            parsed_range = parse_byte_range(range_header, size)
+            if parsed_range == "unsatisfiable":
+                self.fail(http.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                          headers=[("Content-Range", "bytes */%d" % size)],
+                          reason="unsatisfiable range")
+                return
+            if parsed_range is not None:
+                start, end = parsed_range
+                partial = True
+
+        length = end - start + 1 if size > 0 else 0
+
+        status = (http.HTTPStatus.PARTIAL_CONTENT if partial
+                  else http.HTTPStatus.OK)
+        self.send_response_only(status)
+        self.send_header("Server", PROGRAM)
+        self.send_header("Date", self.date_time_string())
+        # One content type for everything. Sniffing the extension to decide
+        # between application/octet-stream and text/html is how a stored file
+        # becomes stored XSS; every object here is an opaque blob to bitbake,
+        # so we say so and add nosniff to stop the browser second-guessing us.
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if partial:
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+
+        if not body:
+            self.log_access(int(status), 0)
+            return
+
+        sent = 0
+        try:
+            if start:
+                os.lseek(fd, start, os.SEEK_SET)
+            remaining = length
+            while remaining > 0:
+                chunk = os.read(fd, min(65536, remaining))
+                if not chunk:
+                    break  # File shrank under us; Content-Length now lies, so
+                    # close the connection rather than desync the stream.
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
+                sent += len(chunk)
+            if remaining > 0:
+                self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        self.log_access(int(status), sent)
+
+
+def parse_byte_range(header: str, size: int):
+    """Parse a single-range 'Range: bytes=a-b' header.
+
+    Returns (start, end) inclusive, None if the header should be ignored, or
+    the string 'unsatisfiable' for a 416. Anything malformed is ignored rather
+    than rejected, per RFC 7233 section 3.1.
+    """
+    header = header.strip()
+    if not header.lower().startswith("bytes="):
+        return None
+    spec = header[6:].strip()
+    if "," in spec:
+        return None  # multi-range: not implemented, ignore and send 200
+    first, sep, last = spec.partition("-")
+    if not sep:
+        return None
+    first, last = first.strip(), last.strip()
+    try:
+        if not first:
+            # Suffix range: "bytes=-500" == the last 500 bytes.
+            if not last:
+                return None
+            nbytes = int(last)
+            if nbytes <= 0:
+                return "unsatisfiable"
+            start = max(0, size - nbytes)
+            return (start, size - 1)
+        start = int(first)
+        if start < 0:
+            return None
+        if start >= size:
+            return "unsatisfiable"
+        if not last:
+            return (start, size - 1)
+        end = int(last)
+        if end < start:
+            return None
+        return (start, min(end, size - 1))
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# The server
+# ---------------------------------------------------------------------------
+
+
+class MirrorServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on concurrent connections.
+
+    ThreadingHTTPServer alone will happily spawn a thread per connection until
+    the box dies -- 10k idle connections is 10k threads and ~80 GB of reserved
+    stack. The semaphore turns that into a bounded queue: past the cap we
+    close new connections immediately rather than degrade for everyone.
+
+    daemon_threads=True so that a SIGTERM does not wait for a client that is
+    halfway through a 200 MB download before exiting.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+    # Set by serve() when TLS is configured. The LISTENING socket is never
+    # wrapped -- see process_request_thread() for why that matters.
+    ssl_context = None
+
+    def __init__(self, addr, handler_cls, max_connections: int,
+                 timeout: float, address_family=socket.AF_INET):
+        self.address_family = address_family
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self._conn_timeout = timeout
+        super().__init__(addr, handler_cls)
+
+    def get_request(self):
+        """Accept a plain TCP connection and bound it in time immediately.
+
+        The timeout has to be set HERE, not in the handler. StreamRequestHandler
+        .setup() applies self.timeout, but setup() runs after the TLS handshake
+        -- so a handshake that never completes was never covered by --timeout at
+        all. Setting it on the raw socket at accept() time means the deadline is
+        already armed when wrap_socket() starts talking.
+        """
+        sock, addr = self.socket.accept()
+        sock.settimeout(self._conn_timeout)
+        return sock, addr
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            log.warning("connection cap reached; dropping %s",
+                        sanitize_for_log(str(client_address[0])))
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        """Do the TLS handshake HERE, in the worker thread. Never on the listener.
+
+        THE BUG THIS REPLACES
+
+        serve() used to do `httpd.socket = ctx.wrap_socket(httpd.socket,
+        server_side=True)`, wrapping the *listening* socket. That turns
+        SSLSocket.accept() into "accept, then run the whole TLS handshake
+        inline" -- and accept() is called from serve_forever's single accept
+        loop. One client that completes the TCP handshake and then sends zero
+        bytes blocks that loop forever, and with it every other client on the
+        server. Not slow: stopped. --timeout did not help (it is applied in
+        StreamRequestHandler.setup(), which never ran), and the connection cap
+        did not help either (it lives downstream of the block).
+
+        WHY HERE AND NOT IN get_request()
+
+        get_request() still runs on the accept thread, so wrapping there would
+        move the handshake but not get it off the accept path -- the wedge would
+        survive. Doing it in the worker thread buys two things:
+
+          * The accept loop only ever does accept(), so it cannot be stalled by
+            anything a client does or fails to do.
+          * The handshake happens under the semaphore, already counted against
+            --max-connections. A flood of clients that open TCP and go silent
+            is bounded by the cap and by the accept-time timeout, and costs the
+            same as any other slow client instead of being a server-wide
+            off switch.
+        """
+        try:
+            if self.ssl_context is not None:
+                try:
+                    request = self.ssl_context.wrap_socket(
+                        request, server_side=True)
+                except (ssl.SSLError, OSError) as exc:
+                    # A failed handshake is routine: port scanners, a plain
+                    # HTTP client hitting an HTTPS port, a timeout. Log at
+                    # debug and drop the connection; never a traceback.
+                    log.debug("TLS handshake failed from %s: %s",
+                              sanitize_for_log(str(client_address[0])),
+                              sanitize_for_log(str(exc)))
+                    self.shutdown_request(request)
+                    return
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        # The default prints a traceback to stderr with a banner. Log it
+        # properly instead; the client has already been dealt with.
+        log.debug("error handling request from %s",
+                  sanitize_for_log(str(client_address)), exc_info=True)
+
+
+# Slowloris: a client opens a connection and dribbles one header byte per
+# minute, holding a thread forever. The counter is the socket timeout set on
+# the handler below: any read that stalls longer raises socket.timeout,
+# handle_one_request() catches it, and the thread goes back to the pool. 30s
+# is generous for a LAN and still bounds the damage -- with a 64-connection
+# cap an attacker holds the server for at most 30s per connection.
+def make_handler(config: Config, limiter: RateLimiter):
+    class Handler(MirrorHandler):
+        pass
+
+    Handler.config = config
+    Handler.limiter = limiter
+    # Separate from `limiter`, and always on. See check_password(): this budgets
+    # PBKDF2 derivations, not requests, so it cannot throttle bitbake (which
+    # reuses one Authorization header and therefore one cache entry) but does
+    # cap what an unauthenticated stranger can make us compute.
+    Handler.kdf_limiter = RateLimiter(DEFAULT_KDF_RATE, DEFAULT_KDF_BURST)
+    Handler.timeout = config.timeout
+    return Handler
+
+
+def build_ssl_context(cert: str, key: str) -> ssl.SSLContext:
+    """TLS context: 1.2 minimum, server-side, no client cert.
+
+    Honest scope: this protects the Basic-auth password and the cache contents
+    in transit. It does not authenticate the client -- that is what the
+    password and the IP allowlist are for.
+
+    TLS 1.2 is the floor because everything older (1.0/1.1) is deprecated and
+    broken in ways with names (BEAST, POODLE, and the general fragility of
+    RC4/3DES). PROTOCOL_TLS_SERVER already disables SSLv2/v3; the explicit
+    minimum_version makes the intent legible and survives a distro that ships
+    a permissive default.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.options |= ssl.OP_NO_COMPRESSION  # CRIME
+    if hasattr(ssl, "OP_SINGLE_DH_USE"):
+        ctx.options |= ssl.OP_SINGLE_DH_USE
+    if hasattr(ssl, "OP_SINGLE_ECDH_USE"):
+        ctx.options |= ssl.OP_SINGLE_ECDH_USE
+    try:
+        ctx.load_cert_chain(certfile=cert, keyfile=key)
+    except (OSError, ssl.SSLError) as exc:
+        raise ConfigError("cannot load TLS cert/key: %s" % exc)
+    return ctx
+
+
+def drop_privileges(user: Optional[str], group: Optional[str]) -> None:
+    """Drop root to an unprivileged user, in the only correct order.
+
+    ORDER MATTERS AND IS THE WHOLE POINT:
+
+        setgroups() -> setgid() -> setuid()
+
+    setuid() first is the classic bug: it drops the root privilege that
+    setgid() and setgroups() require, so the subsequent calls fail (silently,
+    if unchecked) and the process keeps root's group membership -- including
+    the supplementary groups -- while looking unprivileged. Anything readable
+    by group root remains readable.
+
+    setgroups() must precede setgid() for the same reason: it needs
+    CAP_SETGID, which setgid() to a non-root group gives away.
+
+    We verify afterwards rather than trusting the calls, because a partial
+    drop is worse than no drop: it looks safe in `ps` and is not.
+    """
+    if os.getuid() != 0:
+        return
+    if not user:
+        return
+
+    import grp
+    import pwd
+
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        raise ConfigError("no such user: %s" % user)
+
+    if group:
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            raise ConfigError("no such group: %s" % group)
+    else:
+        gid = pw.pw_gid
+
+    if pw.pw_uid == 0:
+        raise ConfigError("--user must not be root")
+
+    try:
+        os.setgroups([gid])
+        os.setgid(gid)
+        os.setuid(pw.pw_uid)
+    except OSError as exc:
+        raise ConfigError("privilege drop failed: %s" % exc)
+
+    # Trust nothing: confirm we actually landed where we meant to, and that
+    # the drop is irreversible (setuid, not seteuid).
+    if os.getuid() != pw.pw_uid or os.geteuid() != pw.pw_uid:
+        raise ConfigError("privilege drop did not take effect (uid)")
+    if os.getgid() != gid or os.getegid() != gid:
+        raise ConfigError("privilege drop did not take effect (gid)")
+    try:
+        os.setuid(0)
+    except OSError:
+        pass  # Good: we cannot get root back.
+    else:
+        raise ConfigError("privilege drop is reversible; refusing to run")
+
+    log.info("dropped privileges to %s:%s (uid=%d gid=%d)",
+             user, group or pw.pw_gid, pw.pw_uid, gid)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+EPILOG = """\
+examples:
+
+  # Serve both build caches on one port, LAN-only, no password.
+  # The IP allowlist is the only control here; fine for a trusted wired LAN.
+  # Replace the CIDR with your own LAN's.
+  %(prog)s \\
+      --root sstate=/build/angstrom-2026.06/build/sstate-cache \\
+      --root downloads=/build/angstrom-2026.06/build/downloads \\
+      --port 8100 --allow 192.0.2.0/24
+
+  # Same, with a password. Generate the credential first (it prompts; the
+  # password never appears on argv, which `ps` shows to every user):
+  %(prog)s --hash-password > /etc/mackas-mirrord.cred
+  chmod 600 /etc/mackas-mirrord.cred
+  %(prog)s --root sstate=/srv/sstate --cred-file /etc/mackas-mirrord.cred
+
+  # With TLS. Basic auth over plain HTTP sends the password in the clear --
+  # base64 is not encryption. On anything but a trusted LAN, use this.
+  # A self-signed cert needs the openssl CLI (the stdlib ssl module can load
+  # certs but not conveniently create them):
+  #   openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \\
+  #       -keyout /etc/mackas-mirrord.key -out /etc/mackas-mirrord.crt \\
+  #       -subj "/CN=linux-computer" \\
+  #       -addext "subjectAltName=DNS:linux-computer,IP:192.0.2.10"
+  %(prog)s --root sstate=/srv/sstate \\
+      --tls-cert /etc/mackas-mirrord.crt --tls-key /etc/mackas-mirrord.key
+
+  # Validate the configuration and exit without binding the port.
+  %(prog)s --root sstate=/srv/sstate --check
+
+client side (bitbake):
+
+  SSTATE_MIRRORS ?= "file://.* http://linux-computer:8100/sstate/PATH;downloadfilename=PATH"
+  SOURCE_MIRROR_URL ?= "http://linux-computer:8100/downloads"
+  INHERIT += "own-mirrors"
+
+  PATH is a literal placeholder bitbake substitutes, not a shell variable.
+  For Basic auth, put the credentials in ~/.netrc (bitbake's fetchers and
+  wget read it) and let kas-container forward it with NETRC_FILE.
+
+environment:
+
+  Every flag has an environment variable: MACKAS_MIRRORD_<FLAG>, with dashes
+  as underscores (MACKAS_MIRRORD_PORT, MACKAS_MIRRORD_ALLOW, ...). Roots go
+  in MACKAS_MIRRORD_ROOTS as a comma-separated list of NAME=PATH.
+
+  Precedence, lowest to highest (matching mackas):
+      built-in defaults -> config file -> environment -> command-line flags
+"""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Read-only HTTP bridge from an NFS-mounted OpenEmbedded build "
+                    "cache to bitbake's SSTATE_MIRRORS / SOURCE_MIRROR_URL.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    p.add_argument("--version", action="version",
+                   version="%s %s" % (PROGRAM, VERSION))
+    p.add_argument("--config", metavar="FILE",
+                   help="KEY=VALUE config file (not sourced as shell)")
+
+    g = p.add_argument_group("what to serve")
+    g.add_argument("--root", metavar="NAME=PATH", action="append", default=[],
+                   help="serve PATH under /NAME/. Repeatable. A bare PATH "
+                        "serves it at the URL root.")
+    g.add_argument("--listing", action="store_true", default=None,
+                   help="enable directory listings (OFF by default: a listing "
+                        "of an sstate cache maps every package you build)")
+    g.add_argument("--no-symlinks", action="store_true", default=None,
+                   help="refuse ALL symlinks under the root, not just "
+                        "escaping ones (escaping symlinks are always refused)")
+
+    g = p.add_argument_group("local cache")
+    g.add_argument("--cache-dir", metavar="DIR",
+                   help="cache hot objects here after --cache-min-hits "
+                        "requests/day and serve later requests from disk "
+                        "instead of the (possibly slow) root. Must be "
+                        "outside every --root. Default: unset, i.e. "
+                        "caching OFF -- opt-in only.")
+    g.add_argument("--cache-min-hits", metavar="N", type=int,
+                   help="promote an object to the cache after this many "
+                        "requests for it in one calendar day (default: "
+                        "%d, i.e. 'more than %d')"
+                        % (DEFAULT_CACHE_MIN_HITS, DEFAULT_CACHE_MIN_HITS - 1))
+    g.add_argument("--cache-max-size-mb", metavar="N", type=int,
+                   help="evict least-recently-used cached objects once the "
+                        "cache exceeds this size, in MiB (default: %d). "
+                        "The backstop for a single day -- daily rotation is "
+                        "what actually keeps steady-state size down."
+                        % DEFAULT_CACHE_MAX_SIZE_MB)
+
+    g = p.add_argument_group("where to listen")
+    g.add_argument("--bind", metavar="ADDR",
+                   help="address to bind (default: %s)" % DEFAULT_BIND)
+    g.add_argument("--port", metavar="N", type=int,
+                   help="port (default: %d)" % DEFAULT_PORT)
+
+    g = p.add_argument_group("access control")
+    g.add_argument("--allow", metavar="CIDR", action="append", default=[],
+                   help="allow only these IPs/CIDRs. Repeatable. Without "
+                        "--cred-file this is the ONLY control -- acceptable "
+                        "on a trusted LAN, and stated as such.")
+    g.add_argument("--cred-file", metavar="FILE",
+                   help="file of username:pbkdf2_sha256:iters:salt:hash lines "
+                        "(see --hash-password)")
+    g.add_argument("--realm", metavar="STR", help="Basic-auth realm")
+    g.add_argument("--hash-password", action="store_true",
+                   help="prompt for a username and password, print a "
+                        "credential line, and exit")
+
+    g = p.add_argument_group("tls")
+    g.add_argument("--tls-cert", metavar="FILE", help="PEM certificate chain")
+    g.add_argument("--tls-key", metavar="FILE", help="PEM private key")
+
+    g = p.add_argument_group("hardening")
+    g.add_argument("--user", metavar="NAME",
+                   help="drop to this user if started as root (required when "
+                        "running as root)")
+    g.add_argument("--group", metavar="NAME", help="drop to this group")
+    g.add_argument("--allow-root", action="store_true", default=None,
+                   help="permit running as root with no --user (loudly "
+                        "discouraged)")
+    g.add_argument("--timeout", metavar="SEC", type=float,
+                   help="per-connection socket timeout, blunts slowloris "
+                        "(default: %g)" % DEFAULT_TIMEOUT)
+    g.add_argument("--max-connections", metavar="N", type=int,
+                   help="hard cap on concurrent connections (default: %d)"
+                        % DEFAULT_MAX_CONNECTIONS)
+    g.add_argument("--rate", metavar="RPS", type=float,
+                   help="per-IP requests/second, 0 disables (default: %g)"
+                        % DEFAULT_RATE)
+    g.add_argument("--burst", metavar="N", type=int,
+                   help="per-IP burst allowance (default: %d)" % DEFAULT_BURST)
+
+    g = p.add_argument_group("other")
+    g.add_argument("--check", "--dry-run", dest="check", action="store_true",
+                   help="validate the configuration, report it, and exit "
+                        "without binding the port")
+    g.add_argument("--quiet", action="store_true", default=None,
+                   help="suppress the per-request access log")
+    g.add_argument("--debug", action="store_true", help="verbose logging")
+    return p
+
+
+def env_get(name: str) -> Optional[str]:
+    return os.environ.get(ENV_PREFIX + name)
+
+
+def resolve_config(args: argparse.Namespace) -> Config:
+    """Apply precedence: defaults -> config file -> env -> CLI flags."""
+    cfg = Config()
+
+    filecfg: Dict[str, str] = {}
+    config_path = args.config or env_get("CONFIG")
+    if config_path:
+        filecfg = parse_kv_file(config_path)
+
+    def pick(key: str, cli_value, default=None):
+        if cli_value is not None and cli_value != [] and cli_value is not False:
+            return cli_value
+        env_value = env_get(key)
+        if env_value is not None:
+            return env_value
+        if key in filecfg:
+            return filecfg[key]
+        if ENV_PREFIX + key in filecfg:
+            return filecfg[ENV_PREFIX + key]
+        return default
+
+    root_specs: List[str] = list(args.root)
+    if not root_specs:
+        raw = pick("ROOTS", None)
+        if raw:
+            root_specs = [s for s in raw.split(",") if s.strip()]
+    if not root_specs:
+        raise ConfigError("no --root given; there is nothing to serve")
+    cfg.roots = validate_roots(root_specs)
+
+    cfg.bind = str(pick("BIND", args.bind, DEFAULT_BIND))
+    port = pick("PORT", args.port, DEFAULT_PORT)
+    try:
+        cfg.port = int(port)
+    except (TypeError, ValueError):
+        raise ConfigError("port is not a number: %r" % port)
+    if not (1 <= cfg.port <= 65535):
+        raise ConfigError("port out of range: %d" % cfg.port)
+
+    allow_specs: List[str] = list(args.allow)
+    if not allow_specs:
+        raw = pick("ALLOW", None)
+        if raw:
+            allow_specs = [s for s in re.split(r"[,\s]+", raw) if s]
+    for spec in allow_specs:
+        try:
+            # strict=False so that "192.0.2.5/24" is accepted as the /24 it
+            # obviously means, rather than erroring on host bits.
+            cfg.allow_nets.append(ipaddress.ip_network(spec, strict=False))
+        except ValueError as exc:
+            raise ConfigError("bad --allow %r: %s" % (spec, exc))
+
+    cred_text = None
+    cred_source = "<none>"
+    cred_file = pick("CRED_FILE", args.cred_file)
+    inline = env_get("CRED")
+    if cred_file:
+        try:
+            st = os.stat(cred_file)
+        except OSError as exc:
+            raise ConfigError("cannot stat credential file: %s" % exc)
+        if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            # A credential file readable by other local users is a credential
+            # everyone has. Refuse rather than warn: a warning in a systemd
+            # journal is a warning nobody reads.
+            raise ConfigError(
+                "credential file %s is group/world accessible (mode %o); "
+                "chmod 600 it" % (cred_file, st.st_mode & 0o777))
+        try:
+            with open(cred_file, "r", encoding="utf-8") as fh:
+                cred_text = fh.read()
+        except OSError as exc:
+            raise ConfigError("cannot read credential file: %s" % exc)
+        cred_source = cred_file
+    elif inline:
+        # An env var is visible in /proc/PID/environ to the owning user and
+        # root only -- unlike argv, which /proc/PID/cmdline shows to everyone.
+        # Still second-best to a file; documented as such.
+        cred_text = inline
+        cred_source = "$%sCRED" % ENV_PREFIX
+    if cred_text is not None:
+        creds = load_credentials(cred_text, cred_source)
+        if not creds:
+            raise ConfigError("%s contains no credentials" % cred_source)
+        cfg.creds = CredentialStore(creds)
+
+    cfg.realm = str(pick("REALM", args.realm, "mackas mirror"))
+    cfg.tls_cert = pick("TLS_CERT", args.tls_cert)
+    cfg.tls_key = pick("TLS_KEY", args.tls_key)
+    if bool(cfg.tls_cert) != bool(cfg.tls_key):
+        raise ConfigError("--tls-cert and --tls-key must be given together")
+
+    listing = pick("LISTING", args.listing, False)
+    cfg.listing = listing if isinstance(listing, bool) else _as_bool(listing, "LISTING")
+    nosym = pick("NO_SYMLINKS", args.no_symlinks, False)
+    nosym = nosym if isinstance(nosym, bool) else _as_bool(nosym, "NO_SYMLINKS")
+    cfg.allow_symlinks = not nosym
+
+    timeout = pick("TIMEOUT", args.timeout, DEFAULT_TIMEOUT)
+    cfg.timeout = float(timeout)
+    if cfg.timeout <= 0:
+        raise ConfigError("timeout must be positive")
+    maxconn = pick("MAX_CONNECTIONS", args.max_connections,
+                   DEFAULT_MAX_CONNECTIONS)
+    cfg.max_connections = int(maxconn)
+    if cfg.max_connections < 1:
+        raise ConfigError("max-connections must be >= 1")
+    cfg.rate = float(pick("RATE", args.rate, DEFAULT_RATE))
+    cfg.burst = int(pick("BURST", args.burst, DEFAULT_BURST))
+    if cfg.burst < 1:
+        raise ConfigError("burst must be >= 1")
+
+    cache_dir = pick("CACHE_DIR", args.cache_dir)
+    cfg.cache_dir = str(cache_dir) if cache_dir else None
+    min_hits = pick("CACHE_MIN_HITS", args.cache_min_hits,
+                    DEFAULT_CACHE_MIN_HITS)
+    try:
+        cfg.cache_min_hits = int(min_hits)
+    except (TypeError, ValueError):
+        raise ConfigError("cache-min-hits is not a number: %r" % min_hits)
+    if cfg.cache_min_hits < 1:
+        raise ConfigError("cache-min-hits must be >= 1")
+    max_mb = pick("CACHE_MAX_SIZE_MB", args.cache_max_size_mb,
+                 DEFAULT_CACHE_MAX_SIZE_MB)
+    try:
+        cfg.cache_max_size_mb = int(max_mb)
+    except (TypeError, ValueError):
+        raise ConfigError("cache-max-size-mb is not a number: %r" % max_mb)
+    if cfg.cache_max_size_mb < 1:
+        raise ConfigError("cache-max-size-mb must be >= 1")
+    if cfg.cache_dir:
+        real = validate_cache_dir(cfg.cache_dir, cfg.roots)
+        cfg.cache_dir = real
+        cfg.cache = CacheManager(
+            real, cfg.cache_min_hits, cfg.cache_max_size_mb * 1024 * 1024)
+
+    cfg.user = pick("USER", args.user)
+    cfg.group = pick("GROUP", args.group)
+    quiet = pick("QUIET", args.quiet, False)
+    cfg.quiet = quiet if isinstance(quiet, bool) else _as_bool(quiet, "QUIET")
+
+    allow_root = pick("ALLOW_ROOT", args.allow_root, False)
+    allow_root = (allow_root if isinstance(allow_root, bool)
+                  else _as_bool(allow_root, "ALLOW_ROOT"))
+
+    if os.getuid() == 0 and not cfg.user and not allow_root:
+        raise ConfigError(
+            "refusing to run as root without --user. This process reads an "
+            "NFS mount and answers a public port; it needs no privilege at "
+            "all beyond binding it. Pass --user nobody (or use the systemd "
+            "unit, which does it for you), or --allow-root if you have "
+            "genuinely thought about it.")
+
+    if not cfg.allow_nets and not cfg.creds:
+        log.warning(
+            "no --allow and no --cred-file: this server is open to anyone "
+            "who can reach %s:%d. That may be what you want on a trusted "
+            "LAN; it is not what you want anywhere else.", cfg.bind, cfg.port)
+    if cfg.creds and not cfg.tls_cert:
+        log.warning(
+            "Basic auth without TLS: the password crosses the network "
+            "base64-encoded, which is not encryption. Fine behind a trusted "
+            "LAN; use --tls-cert/--tls-key otherwise.")
+
+    return cfg
+
+
+def describe(cfg: Config) -> str:
+    lines = ["%s %s configuration:" % (PROGRAM, VERSION)]
+    for name, path in sorted(cfg.roots.items()):
+        lines.append("  root        /%s -> %s" % (name, path))
+    lines.append("  listen      %s:%d (%s)"
+                 % (cfg.bind, cfg.port, "https" if cfg.tls_cert else "http"))
+    lines.append("  allowlist   %s"
+                 % (", ".join(str(n) for n in cfg.allow_nets) or "(none - all IPs)"))
+    lines.append("  auth        %s"
+                 % ("%d credential(s)" % len(cfg.creds) if cfg.creds
+                    else "(none - anonymous)"))
+    lines.append("  tls         %s" % (cfg.tls_cert or "off"))
+    lines.append("  listings    %s" % ("on" if cfg.listing else "off"))
+    lines.append("  symlinks    %s"
+                 % ("inside root only" if cfg.allow_symlinks else "refused"))
+    lines.append("  timeout     %gs" % cfg.timeout)
+    lines.append("  max conns   %d" % cfg.max_connections)
+    lines.append("  rate limit  %s"
+                 % ("%g/s per IP, burst %d" % (cfg.rate, cfg.burst)
+                    if cfg.rate > 0 else "off"))
+    lines.append("  cache       %s"
+                 % ("%s (>= %d hits/day, cap %d MiB)"
+                    % (cfg.cache_dir, cfg.cache_min_hits,
+                       cfg.cache_max_size_mb)
+                    if cfg.cache_dir else "off"))
+    lines.append("  privdrop    %s"
+                 % ("%s:%s" % (cfg.user, cfg.group or "(primary)")
+                    if cfg.user else "(not root / none)"))
+    return "\n".join(lines)
+
+
+def do_hash_password() -> int:
+    """Interactive credential generator. The password never touches argv."""
+    username = input("username: ").strip()
+    if not username:
+        print("empty username", file=sys.stderr)
+        return 2
+    if ":" in username:
+        print("username may not contain ':'", file=sys.stderr)
+        return 2
+    password = getpass.getpass("password: ")
+    again = getpass.getpass("password (again): ")
+    if not hmac.compare_digest(password, again):
+        print("passwords do not match", file=sys.stderr)
+        return 2
+    if len(password) < 12:
+        print("warning: password is shorter than 12 characters",
+              file=sys.stderr)
+    print(make_credential(username, password))
+    return 0
+
+
+def setup_logging(debug: bool) -> None:
+    for existing in list(log.handlers):
+        log.removeHandler(existing)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z"))
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG if debug else logging.INFO)
+    log.propagate = False
+
+
+def serve(cfg: Config) -> int:
+    limiter = RateLimiter(cfg.rate, cfg.burst)
+    handler_cls = make_handler(cfg, limiter)
+
+    family = socket.AF_INET
+    try:
+        if ipaddress.ip_address(cfg.bind).version == 6:
+            family = socket.AF_INET6
+    except ValueError:
+        pass  # a hostname; let getaddrinfo sort it out as v4
+
+    try:
+        httpd = MirrorServer((cfg.bind, cfg.port), handler_cls,
+                             cfg.max_connections, cfg.timeout, family)
+    except OSError as exc:
+        log.error("cannot bind %s:%d: %s", cfg.bind, cfg.port, exc)
+        return 1
+
+    if cfg.tls_cert and cfg.tls_key:
+        # Hand the context to the server; it wraps each accepted connection in
+        # that connection's own worker thread. The listener stays plain TCP on
+        # purpose -- see MirrorServer.process_request_thread().
+        httpd.ssl_context = build_ssl_context(cfg.tls_cert, cfg.tls_key)
+
+    # Bind first, then drop: binding a port below 1024 needs root, and the
+    # order here means we hold that privilege for microseconds rather than
+    # for the process lifetime.
+    drop_privileges(cfg.user, cfg.group)
+
+    if os.getuid() == 0:
+        log.warning("running as root. Nothing here needs root; use --user.")
+
+    stopping = threading.Event()
+
+    def on_signal(signum, _frame):
+        if stopping.is_set():
+            return
+        stopping.set()
+        log.info("caught %s; shutting down",
+                 signal.Signals(signum).name)
+        # shutdown() blocks until serve_forever returns, and cannot be called
+        # from the thread running serve_forever -- hence the helper thread.
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+
+    log.info("%s %s serving %s on %s:%d%s", PROGRAM, VERSION,
+             ", ".join("/" + n if n else "/" for n in sorted(cfg.roots)),
+             cfg.bind, cfg.port, " (TLS)" if cfg.tls_cert else "")
+    try:
+        httpd.serve_forever(poll_interval=0.5)
+    finally:
+        httpd.server_close()
+    log.info("stopped")
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    if sys.version_info < MIN_PYTHON:
+        sys.stderr.write("%s needs Python %d.%d or newer (found %s)\n"
+                         % (PROGRAM, MIN_PYTHON[0], MIN_PYTHON[1],
+                            ".".join(str(n) for n in sys.version_info[:3])))
+        return 2
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    setup_logging(args.debug)
+
+    if args.hash_password:
+        return do_hash_password()
+
+    try:
+        cfg = resolve_config(args)
+    except ConfigError as exc:
+        log.error("%s", exc)
+        return 2
+
+    if args.check:
+        print(describe(cfg))
+        print("\nconfiguration is valid; not binding the port (--check).")
+        return 0
+
+    # serve() raises ConfigError too, and not only in theory: a bad TLS
+    # cert/key (build_ssl_context) and a failed privilege drop
+    # (drop_privileges) both surface here, i.e. exactly the two things most
+    # likely to be wrong on a first deployment. Without this the operator gets
+    # a raw traceback with filesystem paths in it instead of one clean line
+    # and exit 2. Same handler, same exit code, wherever it was raised.
+    try:
+        return serve(cfg)
+    except ConfigError as exc:
+        log.error("%s", exc)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
