@@ -103,6 +103,32 @@ teardown() {
 	printf '%s\n' "$output" | grep -qi 'usage'
 }
 
+@test "each bare command's --help shows ITS OWN usage, not the general commands list" {
+	# Regression: 'mackas setup --help' used to show the SAME general usage()
+	# as bare 'mackas --help' (COMMANDS list, EXAMPLES, the works) because
+	# -h/--help clobbered cmd to the sentinel "help", losing which command
+	# was named. Each bare command now has its own *_usage() function, the
+	# same treatment volume/retrieve/buildstats/set/get/unset already had.
+	local name; name="$(basename "$MACKAS")"
+	for c in check setup smoketest status shell clean destroy; do
+		run "$MACKAS" "$c" --help
+		[ "$status" -eq 0 ]
+		printf '%s\n' "$output" | grep -qi 'usage'
+		! printf '%s\n' "$output" | grep -qF 'COMMANDS'
+		printf '%s\n' "$output" | grep -qF "$name $c"
+	done
+}
+
+@test "'X help' and 'help X' also show the command-specific usage, not the general one" {
+	run "$MACKAS" setup help
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qF 'COMMANDS'
+
+	run "$MACKAS" help setup
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qF 'COMMANDS'
+}
+
 @test "'help X' and 'X help' produce the SAME output for a bare command" {
 	run "$MACKAS" help status
 	local a="$output"

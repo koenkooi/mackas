@@ -1954,6 +1954,25 @@ check_gitconfig() {
 	fi
 }
 
+check_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD check${C_RST} -- preflight only. Changes nothing. ${C_BLD}This is the
+default${C_RST} when no command is given.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD check
+
+Runs every preflight probe -- host OS/arch/RAM, the Apple container runtime,
+GNU realpath, the docker->container shim, the build volume (case-sensitivity,
+free space, Time Machine), the short-path/socket limit, network reachability,
+existing state (idempotency), and the git dubious-ownership workaround -- and
+prints a pass/warn/fail summary. Exits non-zero on any FAIL.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
+though check reads only and never prompts, so none of them change anything.
+EOF
+}
+
 cmd_check() {
 	info "${C_BLD}mackas preflight${C_RST}  (config: ${CONFIG_FILE_USED:-none, using built-in defaults})"
 	check_host
@@ -2892,6 +2911,26 @@ setup_image() {
 	did "pulled $KAS_IMAGE"
 }
 
+setup_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD setup${C_RST} -- do the full setup. Idempotent -- safe to re-run
+after a crash, or after changing settings.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD setup
+
+Downloads the pinned, sha256-verified kas-container release; installs the
+docker->container shim; creates the three ext4 volumes (TMPDIR, downloads,
+sstate); clones the project; and writes env.sh, the git dubious-ownership
+workaround, and the generated kas fragment. Each step is skipped if it is
+already done, so re-running is always safe -- nothing here is destructive.
+
+Options: --dry-run (print every mutating command, change nothing), -y/--yes
+(or -f/--force, for the sudo prompts an external volume may need) and
+-v/--verbose all work here too.
+EOF
+}
+
 cmd_setup() {
 	require_mackas_root
 	info "${C_BLD}mackas setup${C_RST}  (config: ${CONFIG_FILE_USED:-none, using built-in defaults})"
@@ -3126,6 +3165,26 @@ smoketest_rung() {
 	return "$rc"
 }
 
+smoketest_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD smoketest${C_RST} -- run the validation ladder: parse-only, then
+MACKAS_SMOKETEST_TARGETS (or the kas config's own default target, if unset).
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD smoketest
+
+Two rungs. First, parse-only (\`kas shell ... -c "bitbake -p"\`) -- confirms
+every layer fetches and every recipe parses, with no build. Then, one build
+rung per target in MACKAS_SMOKETEST_TARGETS -- or, if that is empty (the
+default), whatever \`bitbake\` builds with no --target, i.e. the project's
+own kas config default. \`auto-fstrim\` reclaims the sparse ext4 volumes
+before and after. Logs land in \$MACKAS_LOGS/smoketest-*.log; host CPU/RSS
+overhead is sampled around each rung.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+EOF
+}
+
 cmd_smoketest() {
 	require_mackas_root
 	[ -x "$KAS_CONTAINER_BIN" ] || die "kas-container not installed" "$SCRIPT_CMD setup"
@@ -3185,6 +3244,24 @@ cmd_smoketest() {
 # ---------------------------------------------------------------------------
 # shell / status / clean
 # ---------------------------------------------------------------------------
+
+shell_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD shell${C_RST} -- drop into a kas shell for the project's kas config.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD shell
+
+Runs \`kas shell\` with the same volumes, runtime args and kas fragment a real
+build would use, so \`bitbake -e bash | grep ^TUNE_FEATURES\` and similar
+interactive poking see the real, mounted TMPDIR/DL_DIR/SSTATE_DIR -- not a
+bind-mounted host directory. Exits back to macOS when the shell exits.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
+though shell has nothing to confirm and nothing --dry-run would print instead
+of doing.
+EOF
+}
 
 cmd_shell() {
 	require_mackas_root
@@ -3456,6 +3533,24 @@ status_volume() {
 	fi
 }
 
+status_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD status${C_RST} -- show what is configured and what exists on disk.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD status
+
+Read-only, like check, but reports state rather than grading it: every
+resolved setting and where it came from, derived paths, whether env.sh/
+kas-container/the project checkout/gitconfig exist, the container runtime's
+own state, the three ext4 volumes (cap vs. real on-disk cost, and a reclaim
+hint when one is near its cap), free disk space, and recent logs/artifacts.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
+though status reads only and never prompts, so none of them change anything.
+EOF
+}
+
 cmd_status() {
 	hdr "Configuration"
 	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
@@ -3560,6 +3655,47 @@ cmd_status() {
 		info "  The volumes' tmp/{buildstats,log,deploy} are not visible on the host."
 		info "  Copy them out with: $SCRIPT_CMD retrieve buildstats [logs] [deploy]"
 	fi
+}
+
+clean_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD clean${C_RST} -- drop the TMPDIR volume (recreated empty). Keeps the
+downloads/sstate volumes and the project checkout.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD clean
+
+Deletes and recreates only the TMPDIR volume, so the next build starts with a
+clean \${TMPDIR} but reuses everything already fetched/cached in DL_DIR and
+SSTATE_DIR -- having them in separate volumes is exactly why this works.
+Unlike '$SCRIPT_CMD destroy', this never touches \$MACKAS_ROOT or the short
+symlink, and only prompts once (no typed confirmation word).
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+EOF
+}
+
+destroy_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD destroy${C_RST} -- remove all four volumes (the three active ones
+plus a rarely-present legacy one), \$MACKAS_ROOT and the short symlink.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD destroy
+
+The widest-blast-radius command mackas has: every ext4 volume, the project
+checkout, logs and artifacts under \$MACKAS_ROOT, and the \$MACKAS_SHORT_LINK
+symlink, all gone. Refuses to remove \$MACKAS_ROOT if any volume survives
+deletion (e.g. still in use), so a partial failure never silently drops the
+checkout while leaving orphaned volumes behind.
+
+For a narrower reset, see '$SCRIPT_CMD clean' (TMPDIR only) or
+'$SCRIPT_CMD volume destroy --all' (every volume, but not \$MACKAS_ROOT).
+
+Requires typing the word DESTROY to confirm, unless -y/--yes/-f/--force is
+given (required for non-interactive use). --dry-run and -v/--verbose also
+work here.
+EOF
 }
 
 cmd_clean() {
@@ -4583,8 +4719,12 @@ parse_set() {
 main() {
 	setup_colors
 
-	local cmd="" config_flag=""
-	# Flags may appear before or after the subcommand.
+	local cmd="" config_flag="" want_help=0
+	# Flags may appear before or after the subcommand. want_help is tracked
+	# SEPARATELY from cmd (rather than cmd="help" as a sentinel) so that
+	# 'mackas setup --help'/'mackas setup help'/'mackas help setup' all still
+	# know which command's OWN usage to show, instead of -h/--help/'help'
+	# clobbering which command was named.
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--config) config_flag="${2:-}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift 2 ;;
@@ -4592,9 +4732,10 @@ main() {
 			--set) parse_set "${2:-}"; shift 2 ;;
 			--set=*) parse_set "${1#*=}"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
-			-y|--yes) ASSUME_YES=1; shift ;;
+			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
-			-h|--help) cmd="help"; shift ;;
+			-h|--help) want_help=1; shift ;;
+			help) want_help=1; shift ;;
 			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
 			-*) die "unknown option: $1" "$SCRIPT_CMD --help" ;;
 			volume)
@@ -4604,63 +4745,46 @@ main() {
 				# work BEFORE it (mackas --dry-run volume ...) and cmd_volume
 				# also honours --dry-run/-y/-v placed after it.
 				#
-				# 'mackas help volume [...]' arrives here with cmd already
-				# "help" -- rather than erroring as a second command, treat it
-				# as 'mackas volume [...] --help' so it reuses cmd_volume's own
-				# -h/--help handling instead of a separate help path to drift
-				# out of sync with.
-				if [ "$cmd" = "help" ]; then
-					shift; cmd="volume"; VOLUME_ARGS=("$@" "--help"); break
-				fi
+				# 'mackas help volume [...]' arrives here with want_help
+				# already 1 -- reuse cmd_volume's own -h/--help handling
+				# instead of a separate help path to drift out of sync with.
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
-				cmd="volume"; shift; VOLUME_ARGS=("$@"); break ;;
+				cmd="volume"; shift
+				if [ "$want_help" -eq 1 ]; then VOLUME_ARGS=("$@" "--help"); else VOLUME_ARGS=("$@"); fi
+				break ;;
 			retrieve)
 				# Same shape as `volume`: retrieve owns everything after it (its
 				# objects and --dest), captured verbatim for cmd_retrieve.
-				if [ "$cmd" = "help" ]; then
-					shift; cmd="retrieve"; RETRIEVE_ARGS=("$@" "--help"); break
-				fi
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
-				cmd="retrieve"; shift; RETRIEVE_ARGS=("$@"); break ;;
+				cmd="retrieve"; shift
+				if [ "$want_help" -eq 1 ]; then RETRIEVE_ARGS=("$@" "--help"); else RETRIEVE_ARGS=("$@"); fi
+				break ;;
 			buildstats)
 				# Same shape again: buildstats owns everything after it (its
 				# subcommand, e.g. 'analyze', and that subcommand's own args).
-				if [ "$cmd" = "help" ]; then
-					shift; cmd="buildstats"; BUILDSTATS_ARGS=("$@" "--help"); break
-				fi
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
-				cmd="buildstats"; shift; BUILDSTATS_ARGS=("$@"); break ;;
+				cmd="buildstats"; shift
+				if [ "$want_help" -eq 1 ]; then BUILDSTATS_ARGS=("$@" "--help"); else BUILDSTATS_ARGS=("$@"); fi
+				break ;;
 			set)
 				# Same shape again: set owns everything after it (NAME and
 				# VALUE), captured verbatim for cmd_set. Persists to the config
 				# file -- see set_usage -- unlike the ephemeral --set flag.
-				if [ "$cmd" = "help" ]; then
-					shift; cmd="set"; SET_ARGS=("$@" "--help"); break
-				fi
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
-				cmd="set"; shift; SET_ARGS=("$@"); break ;;
+				cmd="set"; shift
+				if [ "$want_help" -eq 1 ]; then SET_ARGS=("$@" "--help"); else SET_ARGS=("$@"); fi
+				break ;;
 			get)
-				if [ "$cmd" = "help" ]; then
-					shift; cmd="get"; GET_ARGS=("$@" "--help"); break
-				fi
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
-				cmd="get"; shift; GET_ARGS=("$@"); break ;;
+				cmd="get"; shift
+				if [ "$want_help" -eq 1 ]; then GET_ARGS=("$@" "--help"); else GET_ARGS=("$@"); fi
+				break ;;
 			unset)
-				if [ "$cmd" = "help" ]; then
-					shift; cmd="unset"; UNSET_ARGS=("$@" "--help"); break
-				fi
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
-				cmd="unset"; shift; UNSET_ARGS=("$@"); break ;;
-			check|setup|smoketest|status|shell|clean|destroy|help)
-				# 'mackas help check' AND 'mackas check help' must both work --
-				# bare 'help' before OR after, symmetric with every
-				# verb-object command. These bare commands have no dedicated
-				# usage text of their own (unlike volume/retrieve/buildstats/
-				# set/get/unset), so either spelling falls back to the general
-				# usage() rather than erroring as "two commands given".
-				if [ "$cmd" = "help" ] || { [ "$1" = "help" ] && [ -n "$cmd" ]; }; then
-					cmd="help"; shift; continue
-				fi
+				cmd="unset"; shift
+				if [ "$want_help" -eq 1 ]; then UNSET_ARGS=("$@" "--help"); else UNSET_ARGS=("$@"); fi
+				break ;;
+			check|setup|smoketest|status|shell|clean|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
 			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup smoketest status shell retrieve buildstats clean destroy volume set get unset help)" ;;
@@ -4670,13 +4794,14 @@ main() {
 	snapshot_env
 	set_defaults
 
-	# `help` never loads the config file. Its text mentions a few settings, so
-	# it still needs the defaults, the environment and --set -- but none of
-	# those execute anything, whereas the config file is SOURCED AS SHELL.
-	# Running a stranger's shell code to print a usage message is a trade with
-	# nothing on the win side, so `mackas help` skips load_config entirely and
-	# stays safe to type in any directory.
-	if [ "${cmd:-check}" != "help" ]; then
+	# Showing help -- whether bare 'help'/'-h' or 'X --help'/'X help'/'help X'
+	# for any command X -- never loads the config file. Its text mentions a
+	# few settings, so it still needs the defaults, the environment and --set
+	# -- but none of those execute anything, whereas the config file is
+	# SOURCED AS SHELL. Running a stranger's shell code to print a usage
+	# message is a trade with nothing on the win side, so any --help path
+	# skips load_config entirely and stays safe to type in any directory.
+	if [ "$want_help" -ne 1 ]; then
 		case "${cmd:-check}" in
 			# See load_config's comment: only these three may target a
 			# --config/MACKAS_CONF path that does not exist yet.
@@ -4689,15 +4814,23 @@ main() {
 	validate_settings
 	derive_paths
 
+	# A bare 'help'/'-h' (no command named at all) shows the general usage.
+	# volume/retrieve/buildstats/set/get/unset handle their OWN --help
+	# internally (via the "--help" appended to their *_ARGS above), so they
+	# are dispatched normally either way, below.
+	if [ "$want_help" -eq 1 ] && [ -z "$cmd" ]; then
+		usage
+		return 0
+	fi
+
 	case "${cmd:-check}" in
-		help)    usage ;;
-		check)   cmd_check ;;
-		setup)   cmd_setup ;;
-		smoketest) cmd_smoketest ;;
-		status)  cmd_status ;;
-		shell)   cmd_shell ;;
-		clean)   cmd_clean 0 ;;
-		destroy) cmd_clean 1 ;;
+		check)     if [ "$want_help" -eq 1 ]; then check_usage;     else cmd_check;     fi ;;
+		setup)     if [ "$want_help" -eq 1 ]; then setup_usage;     else cmd_setup;     fi ;;
+		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
+		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
+		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
+		clean)     if [ "$want_help" -eq 1 ]; then clean_usage;     else cmd_clean 0;   fi ;;
+		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_clean 1;   fi ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
 		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
 		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;
