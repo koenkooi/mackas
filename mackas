@@ -2666,7 +2666,45 @@ setup_relocate_volumes() {
 	local dest="$MACKAS_ROOT/container-volumes"
 
 	if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
-		skip "already a symlink -> $(readlink "$CONTAINER_VOLUMES_DIR")"
+		local cur
+		cur="$(strip_trailing_slash "$(readlink "$CONTAINER_VOLUMES_DIR")")"
+		if [ "$cur" = "$dest" ]; then
+			skip "already a symlink -> $dest"
+			return
+		fi
+		# Apple's container has exactly ONE volumes directory for the whole
+		# machine, not one per MACKAS_ROOT -- a symlink to a DIFFERENT
+		# location almost always means an earlier setup against a different
+		# root (a previous test disk, a previous project). Silently treating
+		# "is a symlink" as "is done" -- the old bug here -- would leave every
+		# volume this run creates/uses physically on THAT other disk, not
+		# this one, with nothing said about it.
+		warn "      $CONTAINER_VOLUMES_DIR is a symlink to a DIFFERENT root's volumes:"
+		warn "        $cur"
+		warn "      not this root's own $dest."
+		if ! confirm "      Move its contents to $dest and re-point the symlink here?"; then
+			warn "      Leaving it as-is. This root's volumes will live at $cur too,"
+			warn "      not under $MACKAS_ROOT, until you re-run and accept, or move them"
+			warn "      by hand."
+			return
+		fi
+		[ -d "$dest" ] || { run mkdir -p "$dest"; did "created $dest"; }
+		if [ -d "$cur" ]; then
+			local n
+			# shellcheck disable=SC2012  # only counting entries; names irrelevant
+			n="$(ls -A "$cur" 2>/dev/null | wc -l | tr -d ' ')"
+			if [ "$n" -gt 0 ]; then
+				if [ -t 1 ] && [ "$DRY_RUN" -eq 0 ] && rsync --info=progress2 --version >/dev/null 2>&1; then
+					run rsync -a --info=progress2 "$cur/" "$dest/"
+				else
+					run rsync -a "$cur/" "$dest/"
+				fi
+				did "copied $n entries from $cur to $dest"
+			fi
+		fi
+		run rm -f "$CONTAINER_VOLUMES_DIR"
+		run ln -s "$dest" "$CONTAINER_VOLUMES_DIR"
+		did "re-symlinked $CONTAINER_VOLUMES_DIR -> $dest (was -> $cur)"
 		return
 	fi
 
