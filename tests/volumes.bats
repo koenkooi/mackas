@@ -219,6 +219,21 @@ teardown() {
 	[ "$MACKAS_LOGS" = "$MACKAS_SHORT_LINK/logs" ]
 }
 
+@test "short link: a target recorded with a trailing slash (an older mackas) is still adopted" {
+	# ln -sfn "$MACKAS_ROOT/" ... bakes the trailing slash into the symlink's
+	# OWN recorded target -- readlink returns it verbatim. A mackas from
+	# before MACKAS_ROOT normalization existed could have created exactly
+	# this. Comparing unnormalized would read as "does not resolve to
+	# MACKAS_ROOT" even though it is the same directory.
+	MACKAS_ROOT="$TESTDIR/realroot"
+	mkdir -p "$MACKAS_ROOT"
+	MACKAS_SHORT_LINK="$TESTDIR/oe"
+	ln -sfn "$MACKAS_ROOT/" "$MACKAS_SHORT_LINK"
+	derive_paths
+	[ "$MACKAS_BASE" = "$MACKAS_SHORT_LINK" ]
+	[ "$MACKAS_LOGS" = "$MACKAS_SHORT_LINK/logs" ]
+}
+
 @test "short link: a DANGLING link is not adopted" {
 	MACKAS_ROOT="$TESTDIR/realroot"
 	mkdir -p "$MACKAS_ROOT"
