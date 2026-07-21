@@ -3596,21 +3596,54 @@ cleanup_example_project() {
 	did "removed $MACKAS_PROJECT and $MACKAS_KAS_FRAGMENT_SRC"
 }
 
+# ensure_kas_container_installed -- offer to run setup_kas_container (the
+# same pinned-download-and-sha256-verify step 'setup' does) instead of just
+# refusing. Very likely to be hit -- anyone running smoketest/shell before a
+# full 'setup' lands here -- and nothing external needs installing (unlike a
+# missing 'container' or Homebrew), so mackas can just do it.
+ensure_kas_container_installed() {
+	[ -x "$KAS_CONTAINER_BIN" ] && return 0
+	warn "      kas-container is not installed yet."
+	if ! confirm "      Install it now (setup's own step)?"; then
+		die "kas-container not installed" "$SCRIPT_CMD setup"
+	fi
+	setup_kas_container
+}
+
+# ensure_project_checked_out -- offer to run setup_project (the exact
+# clone/fetch+checkout logic 'setup' uses) instead of just refusing, when a
+# project IS configured but hasn't been cloned yet. Safe to call
+# unconditionally: refuses with a clear, specific message (no auto-clone
+# offered) when no project is configured at all, rather than attempting to
+# clone an empty URL.
+ensure_project_checked_out() {
+	[ -d "$MACKAS_PROJECT/.git" ] && return 0
+	if [ -z "$MACKAS_PROJECT_URL" ]; then
+		die "no project configured (MACKAS_PROJECT_URL is empty)" \
+			"set MACKAS_PROJECT_URL/_BRANCH/_DIR in $(config_hint) (see mackas.conf.example), then re-run"
+	fi
+	warn "      $MACKAS_PROJECT_DIR is not checked out yet at $MACKAS_PROJECT."
+	if ! confirm "      Clone it now (setup's own step)?"; then
+		die "project not checked out at $MACKAS_PROJECT" "$SCRIPT_CMD setup"
+	fi
+	setup_project
+}
+
 cmd_smoketest() {
 	require_mackas_root
-	[ -x "$KAS_CONTAINER_BIN" ] || die "kas-container not installed" "$SCRIPT_CMD setup"
+	ensure_kas_container_installed
 
 	# A checkout already on disk (a real project, however it got there) always
 	# wins -- only fall back to offering the example when there is genuinely
 	# nothing to build: no checkout AND no project configured at all. A
-	# project configured but not yet cloned keeps the existing "run setup"
-	# refusal; that case is not what the offer is for.
+	# project configured but not yet cloned goes through
+	# ensure_project_checked_out (clone-or-refuse); that case is not what the
+	# example offer is for.
 	local example_active=0
 	if [ ! -d "$MACKAS_PROJECT/.git" ]; then
 		if [ -n "$MACKAS_PROJECT_URL" ]; then
-			die "project not checked out at $MACKAS_PROJECT" "$SCRIPT_CMD setup"
-		fi
-		if offer_example_project; then
+			ensure_project_checked_out
+		elif offer_example_project; then
 			example_active=1
 		else
 			info "  Declined -- smoketest needs a project to build against."
@@ -3618,7 +3651,13 @@ cmd_smoketest() {
 			return 1
 		fi
 	fi
-	[ -f "$MACKAS_KAS_FRAGMENT_REPO" ] || die "kas fragment missing at $MACKAS_KAS_FRAGMENT_REPO" "$SCRIPT_CMD setup"
+	if [ ! -f "$MACKAS_KAS_FRAGMENT_REPO" ]; then
+		warn "      kas fragment missing at $MACKAS_KAS_FRAGMENT_REPO."
+		if ! confirm "      Write it now (setup's own step)?"; then
+			die "kas fragment missing at $MACKAS_KAS_FRAGMENT_REPO" "$SCRIPT_CMD setup"
+		fi
+		setup_kas_fragment
+	fi
 
 	local rc=0
 	smoketest_ladder || rc=$?
@@ -3704,8 +3743,8 @@ EOF
 
 cmd_shell() {
 	require_mackas_root
-	[ -x "$KAS_CONTAINER_BIN" ] || die "kas-container not installed" "$SCRIPT_CMD setup"
-	[ -d "$MACKAS_PROJECT/.git" ] || die "project not checked out" "$SCRIPT_CMD setup"
+	ensure_kas_container_installed
+	ensure_project_checked_out
 	info "Dropping into a kas shell for $KAS_FILES_ARG ..."
 	run_kas "" shell "$KAS_FILES_ARG"
 }

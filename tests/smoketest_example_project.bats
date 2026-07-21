@@ -126,14 +126,74 @@ smoketest() {
 }
 
 @test "smoketest: a real project configured (even if not yet cloned) never triggers the offer" {
+	# Deliberately no -y: ensure_project_checked_out would otherwise offer to
+	# auto-clone $FIXTURE (a genuine improvement, covered by its own test
+	# below) -- this test's point is narrower, that the EXAMPLE offer never
+	# fires once a real project is configured, declined-clone path or not.
 	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
 		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
 		--set MACKAS_RELOCATE_VOLUMES=0 \
 		--set "MACKAS_PROJECT_URL=$FIXTURE" \
-		-y smoketest
+		smoketest
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'project not checked out'
 	! printf '%s\n' "$output" | grep -qi 'meta-ai example'
+}
+
+@test "smoketest: accepting the clone offer for a real (not-yet-cloned) project clones it, no example involved" {
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_PROJECT_URL=$FIXTURE" \
+		--set MACKAS_PROJECT_BRANCH=examplebranch \
+		--set MACKAS_PROJECT_DIR=real-project \
+		--set MACKAS_KAS_CONFIG=kas/base.yml \
+		-y smoketest
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/work/real-project/.git" ]
+	grep -q "bitbake -p" "$KLOG"
+	! printf '%s\n' "$output" | grep -qi 'meta-ai example'
+	# Never cleaned up -- this is a REAL configured project, not the
+	# ephemeral one cleanup_example_project is scoped to.
+	[ -d "$ROOT/work/real-project" ]
+}
+
+@test "smoketest: accepting the offer to write a missing kas fragment writes it and proceeds" {
+	# A project checkout that pre-existed setup (or had its generated
+	# fragment deleted by hand): .git is there, kas/macos-local.yml is not.
+	mkdir -p "$ROOT/work"
+	git clone -q --branch examplebranch "$FIXTURE" "$ROOT/work/real-project"
+
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_PROJECT_URL=$FIXTURE" \
+		--set MACKAS_PROJECT_BRANCH=examplebranch \
+		--set MACKAS_PROJECT_DIR=real-project \
+		--set MACKAS_KAS_CONFIG=kas/base.yml \
+		-y smoketest
+	[ "$status" -eq 0 ]
+	[ -f "$ROOT/work/real-project/kas/macos-local.yml" ]
+	grep -q "bitbake -p" "$KLOG"
+	printf '%s\n' "$output" | grep -qi 'kas fragment missing'
+}
+
+@test "smoketest: declining to write a missing kas fragment refuses with the same message as before" {
+	mkdir -p "$ROOT/work"
+	git clone -q --branch examplebranch "$FIXTURE" "$ROOT/work/real-project"
+
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_PROJECT_URL=$FIXTURE" \
+		--set MACKAS_PROJECT_BRANCH=examplebranch \
+		--set MACKAS_PROJECT_DIR=real-project \
+		--set MACKAS_KAS_CONFIG=kas/base.yml \
+		smoketest
+	[ "$status" -ne 0 ]
+	[ ! -f "$ROOT/work/real-project/kas/macos-local.yml" ]
+	[ ! -f "$KLOG" ]
+	printf '%s\n' "$output" | grep -qi 'kas fragment missing'
 }
 
 @test "smoketest: the example project is never written to the config file" {
