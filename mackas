@@ -1334,9 +1334,20 @@ delete_volume() {
 	volume_exists "$name" || return 0
 	if run container volume delete "$name" || run container volume rm "$name"; then
 		did "removed volume '$name'"
+		# A prior 'volume move' plants a per-volume symlink at
+		# $CONTAINER_VOLUMES_DIR/$name pointing at the volume's relocated
+		# home (see setup_relocate_volumes()'s own comment on this). The
+		# daemon-level delete above never touches it -- confirmed live: three
+		# volumes, previously moved onto separate disks, were destroyed
+		# (daemon shows them gone) yet the symlinks stayed behind, now
+		# dangling at nonexistent paths. Clean it up at the source.
+		if [ -L "$CONTAINER_VOLUMES_DIR/$name" ]; then
+			run rm -f "$CONTAINER_VOLUMES_DIR/$name"
+			did "removed the now-dangling symlink at $CONTAINER_VOLUMES_DIR/$name"
+		fi
 		return 0
 	fi
-	warn "could not delete volume '$name'; remove it by hand: container volume ls"
+	warn "could not delete volume '$name'; check what's using it: mackas volume list"
 	return 1
 }
 
