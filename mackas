@@ -3846,6 +3846,36 @@ bitbake_getvar() {
 		setup_kas_fragment 1>&2
 	fi
 
+	# kas's own 'shell' (and 'build') unconditionally re-runs its repo setup
+	# steps every invocation -- checkout, patch application, writing
+	# local.conf/bblayers.conf -- unless told '-k'/--keep-config-unchanged to
+	# skip them (confirmed against the real kas source: kas/libkas.py's
+	# setup_parser_keep_config_unchanged_arg lists exactly those steps).
+	# retrieve can call this once per object in a single invocation, and it
+	# is a read-only variable query, not a build -- without -k, every call
+	# would needlessly re-checkout/re-patch every declared repo, real cost
+	# and real risk (repo state churn) for something that only wants one
+	# variable's value. Never add -k to run_kas()'s own shared invocation:
+	# an actual build/shell session SHOULD go through kas's normal setup.
+	#
+	# -k also skips write_bbconfig, though, so it can only be used once a
+	# parseable state already exists -- a checkout bitbake-getvar has never
+	# successfully queried before has no local.conf/bblayers.conf yet, and -k
+	# would leave it with nothing to parse. KAS_BUILD_DIR is blanked here
+	# (same reasoning as run_kas()'s own comment: kas-container's forward_dir
+	# would otherwise bind-mount a host path over the volumes), which makes
+	# kas default its build dir to $KAS_REPO_DIR itself (confirmed against
+	# the real source: Context.__init__ falls back to KAS_WORK_DIR/build only
+	# when KAS_BUILD_DIR is UNSET, not when it's blank -- os.environ.get's
+	# default never fires for an explicitly-empty value -- so build_dir
+	# becomes os.path.abspath('') = cwd = /repo = $MACKAS_PROJECT here). So
+	# conf/local.conf and conf/bblayers.conf under $MACKAS_PROJECT are the
+	# real, host-visible signal for "has this ever been configured before".
+	local kflag="-k"
+	if [ ! -f "$MACKAS_PROJECT/conf/local.conf" ] || [ ! -f "$MACKAS_PROJECT/conf/bblayers.conf" ]; then
+		kflag=""
+	fi
+
 	# kas-container's own stderr (e.g. "configuration file '...' not found",
 	# the exact symptom of the MACKAS_KAS_CONFIG-without-MACKAS_PROJECT_DIR
 	# mistake above surviving some OTHER way) is captured, not discarded --
@@ -3863,7 +3893,7 @@ bitbake_getvar() {
 		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
 		BB_NUMBER_THREADS="$MACKAS_CPUS" \
 		PARALLEL_MAKE="-j $MACKAS_CPUS" \
-		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell "$KAS_FILES_ARG" \
+		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell $kflag "$KAS_FILES_ARG" \
 			-c "bitbake-getvar --value -q $(printf '%q' "$var")"
 	)" 2>"$errfile"
 	rc=$?
