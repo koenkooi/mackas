@@ -554,6 +554,24 @@ reattach/migrate logic in `tests/case_sensitivity.bats`. `MACKAS_WORKSPACE_SIZE`
 lifecycle beyond `setup` itself (surviving a reboot, `check`/`status`
 visibility, recovery when the image file goes missing) — that is item 19.
 
+### 19a. `volume destroy`/`volume move` leave dangling per-volume symlinks behind
+
+Found live: after `volume move`, `$CONTAINER_VOLUMES_DIR/<name>` is a
+per-volume symlink to the volume's new location (see the "a per-volume
+symlink a prior `volume move` planted here is preserved verbatim" comment in
+`setup_relocate_volumes()`). `delete_volume()` (`mackas:1225`) only calls
+`container volume delete`/`rm` — the daemon-level removal — and never
+touches that symlink itself. Confirmed on a real Mac: three volumes,
+previously `volume move`d onto separate disks, were destroyed via `mackas
+volume destroy` (daemon confirms they're gone — `container volume ls` shows
+nothing), yet `$CONTAINER_VOLUMES_DIR/<name>` still had three dangling
+symlinks pointing at now-nonexistent paths. Harmless clutter today (nothing
+reads them — `volume_exists()` asks the daemon, not the filesystem), but
+confusing to find by hand and worth cleaning up at the source: after a
+successful `container volume delete`, `delete_volume()` should also remove
+`$CONTAINER_VOLUMES_DIR/$name` if it is a symlink (dangling or not — the
+volume it pointed at is gone either way).
+
 ### 19. Workspace "sync": git remotes already are the sync — the image needs a lifecycle
 
 Follow-on to item 18, answering "what keeps the workspace image in sync?"
