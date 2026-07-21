@@ -1006,6 +1006,33 @@ auto_fstrim_doubles() {
 	[ -f "$other_root/container-volumes/oe-build-tmp/volume.img" ]
 }
 
+@test "setup relocate: a symlink target that no longer exists (a renamed volume) is just re-pointed, nothing to copy" {
+	# The real-world case: the disk/volume got renamed. The data never moved
+	# -- it is already sitting at $dest, reachable under the NEW MACKAS_ROOT
+	# -- only the relocation symlink is stale. There is nothing to rsync;
+	# this must not claim there is, and must not fail trying to read a
+	# directory that no longer exists.
+	this_root="$TESTDIR/renamed-root"
+	link="$TESTDIR/cvd5"
+	mkdir -p "$this_root/container-volumes/oe-build-tmp"
+	: > "$this_root/container-volumes/oe-build-tmp/volume.img"
+	ln -s "$TESTDIR/this-root-before-the-rename/container-volumes" "$link"
+
+	CONTAINER_VOLUMES_DIR="$link"
+	MACKAS_ROOT="$this_root"
+	MACKAS_RELOCATE_VOLUMES=1
+	ASSUME_YES=1
+	DRY_RUN=0
+
+	setup_relocate_volumes >/dev/null 2>&1
+
+	[ -L "$link" ]
+	[ "$(readlink "$link")" = "$this_root/container-volumes" ]
+	# The pre-existing data (never touched, since nothing needed copying) is
+	# still there, reachable through the freshly re-pointed symlink.
+	[ -f "$this_root/container-volumes/oe-build-tmp/volume.img" ]
+}
+
 @test "setup relocate: with RELOCATE=0 it leaves the volumes dir untouched" {
 	src="$TESTDIR/cvd2"
 	CONTAINER_VOLUMES_DIR="$src"
