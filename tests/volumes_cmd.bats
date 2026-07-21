@@ -67,10 +67,14 @@ case "$1 $2" in
 		fi
 		grep -vxF "$3" "$VSTATE" > "$VSTATE.new" 2>/dev/null || true
 		mv "$VSTATE.new" "$VSTATE"
-		# Mirror reality: the runtime also removes the volume's on-disk
-		# directory (under the container volumes dir, which may be a symlink
-		# onto the SSD). Foreign volumes and undeletable ones stay put.
-		rm -rf "$HOME/Library/Application Support/com.apple.container/volumes/$3" 2>/dev/null || true
+		# Mirror reality: the runtime removes the volume's own on-disk
+		# directory, but -- confirmed live, this is item 20's whole bug --
+		# does NOT clean up a per-volume symlink 'volume move' planted at this
+		# same path (it leaves it dangling; only mackas's own delete_volume()
+		# cleanup, under test here, does that). So only remove a plain
+		# directory here, never a symlink. Foreign/undeletable volumes stay put.
+		d="$HOME/Library/Application Support/com.apple.container/volumes/$3"
+		[ -L "$d" ] || rm -rf "$d" 2>/dev/null || true
 		;;
 	"system status") echo "status running" ;;
 	"system restart")
@@ -401,6 +405,69 @@ refute_call() {
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qF "removed volume 'oe-build-tmp'"
 	printf '%s\n' "$output" | grep -qF "removed volume 'oe-build-sstate'"
+}
+
+# ---------------------------------------------------------------------------
+# item 20: a prior 'volume move' plants a per-volume symlink at
+# $CONTAINER_VOLUMES_DIR/<name> pointing at the volume's relocated home.
+# delete_volume() only ever called the daemon-level delete, never touching
+# that symlink -- confirmed live: three volumes, previously moved onto
+# separate disks, were destroyed (daemon confirms gone) yet the symlinks
+# stayed behind, dangling at now-nonexistent paths.
+# ---------------------------------------------------------------------------
+
+moved_volume_symlink() {
+	printf '%s/Library/Application Support/com.apple.container/volumes/%s' "$HOME" "$1"
+}
+
+@test "destroy: removes the dangling per-volume symlink a prior 'volume move' left behind" {
+	have_volumes oe-build-tmp oe-build-dl oe-build-sstate
+	local link; link="$(moved_volume_symlink oe-build-tmp)"
+	mkdir -p "$(dirname "$link")"
+	ln -s "/Volumes/SomeOtherDisk/oe-build-tmp" "$link"
+	mackas_setup destroy
+	[ "$status" -eq 0 ]
+	[ ! -e "$link" ] && [ ! -L "$link" ]
+	printf '%s\n' "$output" | grep -qF "removed the now-dangling symlink at $link"
+}
+
+@test "destroy: does not touch a volume's symlink when that volume survives deletion" {
+	have_volumes oe-build-tmp oe-build-dl oe-build-sstate
+	local link; link="$(moved_volume_symlink oe-build-sstate)"
+	mkdir -p "$(dirname "$link")"
+	ln -s "/Volumes/SomeOtherDisk/oe-build-sstate" "$link"
+	MOCK_UNDELETABLE=oe-build-sstate mackas_setup destroy
+	[ -L "$link" ]
+	[ "$(readlink "$link")" = "/Volumes/SomeOtherDisk/oe-build-sstate" ]
+}
+
+@test "destroy: a volume with no per-volume symlink (never moved) is unaffected" {
+	have_volumes oe-build-tmp oe-build-dl oe-build-sstate
+	mackas_setup destroy
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi "dangling symlink"
+}
+
+@test "clean: removes TMPDIR's dangling symlink too, not just destroy's" {
+	have_volumes oe-build-tmp
+	local link; link="$(moved_volume_symlink oe-build-tmp)"
+	mkdir -p "$(dirname "$link")"
+	ln -s "/Volumes/SomeOtherDisk/oe-build-tmp" "$link"
+	mackas_setup clean
+	[ ! -e "$link" ] && [ ! -L "$link" ]
+}
+
+@test "destroy --dry-run leaves the dangling symlink exactly as-is" {
+	have_volumes oe-build-tmp oe-build-dl oe-build-sstate
+	local link; link="$(moved_volume_symlink oe-build-tmp)"
+	mkdir -p "$(dirname "$link")"
+	ln -s "/Volumes/SomeOtherDisk/oe-build-tmp" "$link"
+	run "$MACKAS" -y --dry-run --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 destroy
+	[ "$status" -eq 0 ]
+	[ -L "$link" ]
+	[ "$(readlink "$link")" = "/Volumes/SomeOtherDisk/oe-build-tmp" ]
 }
 
 # ---------------------------------------------------------------------------
