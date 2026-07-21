@@ -66,6 +66,16 @@ voldir="$HOME/Library/Application Support/com.apple.container/volumes"
 
 case "$1 $2" in
 	"system status") echo "status running"; exit 0 ;;
+	"system restart")
+		# Simulate a REAL restart: the daemon re-scans volumes/*/entity.json
+		# into its index -- exactly what refuse_if_stale_entity relies on.
+		for d in "$voldir"/*/; do
+			[ -e "${d}entity.json" ] || continue
+			n="$(basename "$d")"
+			grep -q -e "^$n	" "$VSTATE" 2>/dev/null || printf '%s\t800M\n' "$n" >> "$VSTATE"
+		done
+		exit 0
+		;;
 	"volume ls")
 		echo "NAME TYPE DRIVER OPTIONS"
 		# name<TAB>size -> `name  named  local  size=<size>`
@@ -424,6 +434,26 @@ refute_call() {
 	printf '%s\n' "$output" | grep -qi "stale"
 	refute_call "[volume] [create]"
 	# The pre-existing image must survive, byte-for-byte untouched.
+	[ "$(du -k "$(VOLDIR)/dst-vol/volume.img" | awk '{print $1}')" -eq 4096 ]
+}
+
+@test "volume duplicate: accepting the restart offer refuses as 'already exists', not a silent create" {
+	# -y auto-accepts "restart the daemon now?" -- a real restart re-scans
+	# entity.json into the index (simulated in the fake container's own
+	# 'system restart' handler), so dst is now recognized as existing, and
+	# duplicate must refuse exactly the way it already does for a destination
+	# the daemon knew about from the start -- not silently overwrite it.
+	have_volume src-vol 800M
+	mkdir -p "$(VOLDIR)/dst-vol"
+	: > "$(VOLDIR)/dst-vol/entity.json"
+	dd if=/dev/zero of="$(VOLDIR)/dst-vol/volume.img" bs=1024 count=4096 2>/dev/null
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 volume duplicate src-vol dst-vol
+	[ "$status" -ne 0 ]
+	assert_call "[system] [restart]"
+	printf '%s\n' "$output" | grep -qi "already exists"
+	refute_call "[volume] [create]"
 	[ "$(du -k "$(VOLDIR)/dst-vol/volume.img" | awk '{print $1}')" -eq 4096 ]
 }
 
