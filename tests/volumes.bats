@@ -402,6 +402,19 @@ write_env_sh() {
 	[ "$rc" -ne 0 ]
 }
 
+@test "settings: a literal backslash in MACKAS_ROOT is refused with the actual fix" {
+	# The classic mistake: MACKAS_ROOT="/a\ path" in a config file. Backslash
+	# is not special inside double quotes, so it survives as a literal
+	# character instead of escaping the space -- refuse it with guidance,
+	# rather than silently building against a near-certainly-broken path.
+	MACKAS_ROOT='/Volumes/2TB\ Samsung\ 970\ EVO\ Plus/Angstrom'
+	out="$( (validate_settings) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'MACKAS_ROOT'
+	printf '%s\n' "$out" | grep -qi 'backslash'
+	printf '%s\n' "$out" | grep -q 'next:'
+}
+
 @test "settings: a double quote in the HTTP mirror URL is refused" {
 	# This one lands inside a bitbake assignment inside a YAML block scalar,
 	# where shell quoting cannot help it.

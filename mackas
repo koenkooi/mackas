@@ -369,6 +369,21 @@ validate_settings() {
 					"remove it from $n in $(config_hint) -- $SCRIPT_NAME cannot write such a value into the env.sh and kas fragment it generates without corrupting them"
 				;;
 		esac
+		# A literal backslash is legal on APFS but has never once shown up in a
+		# real path -- what actually produces one is writing MACKAS_ROOT="/a\
+		# path" in a config file: backslash-space is NOT special inside double
+		# quotes, so the backslash survives as a literal character instead of
+		# escaping the space, and everything downstream (mkdir, %q's display
+		# under --dry-run/-v) then faithfully operates on that broken value,
+		# which reads as "extra" escaping once %q re-escapes an already-literal
+		# backslash. Catch it here with the actual fix, rather than silently
+		# building against a path that is very likely wrong.
+		case "$v" in
+			*'\'*)
+				die "$n contains a literal backslash: $v" \
+					"this usually means backslash-escaped spaces got combined with quotes in $(config_hint) -- backslash is not special inside double quotes, so it survives as a literal character instead of escaping the space. Use EITHER plain quotes (\"$n=/path with spaces\") OR backslash escapes with no surrounding quotes (\`$n=/path\\ with\\ spaces\`), not both."
+				;;
+		esac
 	done
 
 	# MACKAS_CPUS and MACKAS_MEMORY are word-split into kas-container's
