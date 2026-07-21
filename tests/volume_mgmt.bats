@@ -409,6 +409,24 @@ refute_call() {
 	refute_call "[volume] [create]"
 }
 
+@test "volume duplicate: refuses to create dst when the daemon's index is stale (on-disk data it doesn't know about)" {
+	have_volume src-vol 800M
+	# Simulate a stale container-daemon index: dst's entity.json is on disk
+	# (e.g. after relocating CONTAINER_VOLUMES_DIR, or attaching a disk
+	# carried over from another Mac) but 'volume ls' does not list it --
+	# 'volume create' would otherwise reformat the real volume.img in place
+	# BEFORE erroring "entity already exists".
+	mkdir -p "$(VOLDIR)/dst-vol"
+	: > "$(VOLDIR)/dst-vol/entity.json"
+	dd if=/dev/zero of="$(VOLDIR)/dst-vol/volume.img" bs=1024 count=4096 2>/dev/null
+	vol duplicate src-vol dst-vol
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "stale"
+	refute_call "[volume] [create]"
+	# The pre-existing image must survive, byte-for-byte untouched.
+	[ "$(du -k "$(VOLDIR)/dst-vol/volume.img" | awk '{print $1}')" -eq 4096 ]
+}
+
 @test "volume duplicate: --dry-run mutates nothing" {
 	have_volume src-vol 800M 4096
 	vol --dry-run duplicate src-vol dst-vol
