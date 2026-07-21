@@ -200,6 +200,20 @@ refute_call() {
 	refute_call "[volume] [create]"
 }
 
+@test "setup: refuses to create a volume when the daemon's index is stale (entity.json on disk it doesn't know about)" {
+	# Simulate a stale container-daemon index: entity.json is on disk (as it
+	# would be right after relocating CONTAINER_VOLUMES_DIR, or attaching a
+	# disk carried over from another Mac) but 'volume ls' does not list it --
+	# 'volume create' would otherwise reformat the existing volume.img BEFORE
+	# erroring "entity already exists", destroying whatever was in it.
+	mkdir -p "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp"
+	: > "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp/entity.json"
+	mackas_setup setup
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'stale'
+	refute_call "[volume] [create]"
+}
+
 # ---------------------------------------------------------------------------
 # A7: attaching a busy volume is a SECOND attach. The runtime refuses it, and
 # under set -e that aborts the whole command. setup's chown and check's

@@ -1213,6 +1213,30 @@ volume_exists() {
 	container volume ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qxF "$1"
 }
 
+# refuse_if_stale_entity NAME -- guard every 'container volume create' against
+# a stale daemon index.
+#
+# Apple's container daemon (apiserver) scans volumes/*/entity.json into an
+# in-memory index ONCE, at its own startup; 'container volume ls' / the
+# existence check inside 'volume create' only ever consult that cached index
+# afterwards, never the filesystem directly. So right after anything that
+# changes what's on disk without the daemon knowing -- relocating
+# CONTAINER_VOLUMES_DIR (setup_relocate_volumes), restoring a backup, or
+# plugging in an external disk carried over from another Mac -- volume_exists
+# can report false for a name whose entity.json is sitting right there on
+# disk. Confirmed live: 'container volume create' does NOT refuse cleanly in
+# that state. It reformats the EXISTING volume.img to a fresh, empty ext4
+# filesystem FIRST, and only THEN errors with "entity already exists" --
+# silently destroying whatever was in it. volume_exists() alone is therefore
+# never sufficient license to create; call this immediately before every
+# 'container volume create' as well.
+refuse_if_stale_entity() {
+	local name="$1"
+	[ -e "$CONTAINER_VOLUMES_DIR/$name/entity.json" ] || return 0
+	die "volume '$name' has on-disk data the container daemon's index does not know about" \
+		"the daemon's volume index is likely stale (e.g. after relocating $CONTAINER_VOLUMES_DIR, or attaching a disk carried over from another Mac) -- restart it first: container system restart"
+}
+
 # Remove one volume, tolerating both spellings of the subcommand and a volume
 # that was already gone. Returns non-zero if the volume is still there.
 #
@@ -2622,6 +2646,7 @@ ensure_volume() {
 	if volume_exists "$name"; then
 		skip "volume '$name' exists ($role)"
 	else
+		refuse_if_stale_entity "$name"
 		run container volume create -s "$size" "$name"
 		did "created ext4 volume '$name' ($size, $role, sparse until used)"
 	fi
@@ -4101,6 +4126,8 @@ volume_duplicate() {
 
 	info "${C_BLD}mackas volume duplicate $src -> $dst${C_RST}"
 	info "  size: $size (matched from the source)"
+
+	refuse_if_stale_entity "$dst"
 
 	# 1. Create dst at the SAME size. This writes a valid entity.json we must
 	#    NOT edit -- only its volume.img gets swapped underneath it.
