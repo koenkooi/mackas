@@ -94,13 +94,14 @@ ASSUME_YES=0
 OVERHEAD_PID=""
 OVERHEAD_OUT=""
 
-# The `volume`/`retrieve`/`buildstats` subcommands' tails (everything after
+# The `volume`/`retrieve`/`buildstats`/`sstate` subcommands' tails (everything after
 # the command word), captured verbatim by main()'s flag loop and handed to the
 # matching cmd_*(). Declared empty here so `${FOO_ARGS+...}` is safe under
 # `set -u` when that command never ran.
 VOLUME_ARGS=()
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
+SSTATE_ARGS=()
 ADOPT_ARGS=()
 SET_ARGS=()
 GET_ARGS=()
@@ -320,7 +321,7 @@ is_setting_name() {
 }
 
 # die_on_misplaced_global_flag ARG CMD -- every verb-object command
-# (volume/retrieve/buildstats/set/get/unset) owns everything after its own
+# (volume/retrieve/buildstats/sstate/set/get/unset) owns everything after its own
 # command word, captured verbatim by main() before cmd_CMD ever runs -- so
 # --config/--set typed AFTER the command word are silently never seen by the
 # code that would act on them (main()'s own arg loop, and load_config/
@@ -4479,6 +4480,147 @@ cmd_buildstats() {
 	esac
 }
 
+sstate_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD sstate${C_RST} -- manage the shared sstate cache volume.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD sstate prune --older-than N[d]
+
+${C_BLD}SUBCOMMANDS${C_RST}
+  prune --older-than N[d]   Delete sstate objects bitbake has not reused in
+                            at least N days. Reports what would go and how
+                            much space it frees first; only deletes after
+                            confirmation (or with -y/--yes).
+
+bitbake touches (updates the mtime of) an sstate object every time it finds
+and reuses it -- see sstate.bbclass's sstate_eventhandler and the
+setscene-valid check, both call oe.utils.touch()/os.utime() on a hit. So
+"N days old" here really means "nothing built in N days has needed this",
+not merely "created N days ago".
+
+sstate's own hash-addressing makes this safe to prune conservatively: an
+object pruned here that turns out still to be needed just gets rebuilt, at
+the one-time cost of that task, never a correctness risk.
+
+For more surgical pruning -- keep only what a SPECIFIC checkout's stamps/
+still reference, or drop older duplicates of the same package/arch/task
+signature -- see openembedded-core's own scripts/sstate-cache-management.py,
+run inside a project checkout. '$SCRIPT_CMD sstate prune' does not replace
+it; it solves the coarser "nothing has touched this in months" case.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after the subcommand.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. prune refuses while a
+  running build (smoketest/shell) still holds the sstate volume.
+EOF
+}
+
+# sstate_prune -- delete sstate objects bitbake has not touched (reused) in
+# at least N days, inside a throwaway container mounting the sstate volume --
+# sstate lives inside the ext4 volume, invisible on the host, the same
+# constraint item 5/retrieve already work around. No project/kas-container
+# context is needed (unlike bitbake_getvar): this only ever runs `find`
+# against the mounted volume, never bitbake itself.
+sstate_prune() {
+	local older_than="" days report rc count=0 total_kb=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--older-than)   older_than="${2:-}"
+				[ -n "$older_than" ] || die "--older-than needs a value, e.g. 90d" \
+					"$SCRIPT_CMD sstate prune --older-than N[d]"
+				shift 2 ;;
+			--older-than=*) older_than="${1#*=}"; shift ;;
+			-*) die "unknown option for 'sstate prune': $1" "$SCRIPT_CMD sstate --help" ;;
+			*) die "unexpected argument for 'sstate prune': $1" \
+				"$SCRIPT_CMD sstate prune --older-than N[d]" ;;
+		esac
+	done
+
+	[ -n "$older_than" ] || die "'sstate prune' needs --older-than N[d]" \
+		"$SCRIPT_CMD sstate prune --older-than N[d]  (e.g. --older-than 90d)"
+
+	days="${older_than%d}"
+	case "$days" in
+		''|*[!0-9]*) die "--older-than must be a whole number of days, e.g. 90d (got '$older_than')" \
+			"$SCRIPT_CMD sstate --help" ;;
+	esac
+
+	require_mackas_root
+
+	# One-VM rule: never attach the volume a build might still hold. Refuse
+	# loudly rather than corrupt an ext4 image mounted by two VMs at once.
+	if volume_in_use "$MACKAS_VOL_SSTATE"; then
+		die "volume '$MACKAS_VOL_SSTATE' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD sstate prune'"
+	fi
+
+	info "${C_BLD}mackas sstate prune${C_RST}"
+	info "  volume     : $MACKAS_VOL_SSTATE"
+	info "  older than : ${days}d"
+	info ""
+
+	# Always runs for real, dry-run or not -- a read-only scan, and --dry-run
+	# needs the REAL count/size to be worth anything (same reasoning as
+	# bitbake_getvar()).
+	report="$(container run --rm -u 0:0 -v "$MACKAS_VOL_SSTATE:/sstate" "$KAS_IMAGE" \
+		find /sstate -type f -mtime "+$days" -printf '%s\n' 2>/dev/null)"
+	rc=$?
+	[ "$rc" -eq 0 ] || die "could not scan '$MACKAS_VOL_SSTATE' (rc=$rc)" "check the container runtime: $SCRIPT_CMD status"
+
+	if [ -n "$report" ]; then
+		count="$(printf '%s\n' "$report" | grep -c .)"
+		total_kb="$(printf '%s\n' "$report" | LC_ALL=C awk '{s+=$1} END{printf "%d", s/1024}')"
+	fi
+
+	if [ "$count" -eq 0 ]; then
+		info "Nothing to prune -- no sstate objects untouched for ${days}+ days."
+		return 0
+	fi
+
+	info "  found      : $count object(s), $(fmt_kb "$total_kb") reclaimable"
+	info ""
+
+	if ! confirm "Delete $count sstate object(s) untouched for ${days}+ days ($(fmt_kb "$total_kb"))?"; then
+		info "Declined -- nothing deleted."
+		return 1
+	fi
+
+	run container run --rm -u 0:0 -v "$MACKAS_VOL_SSTATE:/sstate" "$KAS_IMAGE" \
+		find /sstate -type f -mtime "+$days" -delete
+	did "pruned $count sstate object(s), freed $(fmt_kb "$total_kb")"
+}
+
+cmd_sstate() {
+	local sub="" rest=() a want_help=0
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" sstate ;;
+			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		sstate_usage
+		return 0
+	fi
+
+	case "${sub:-help}" in
+		prune)  sstate_prune ${rest+"${rest[@]}"} ;;
+		help)   sstate_usage ;;
+		*) die "unknown 'sstate' subcommand: $sub" \
+			"$SCRIPT_CMD sstate --help  (prune)" ;;
+	esac
+}
+
 show() { printf '  %-24s %s\n' "$1" "$2"; }
 
 # One line per volume: name, what it backs, cap, and what it costs today.
@@ -5616,6 +5758,8 @@ ${C_BLD}COMMANDS${C_RST}
              TMPDIR volume, where macOS cannot see them. '$SCRIPT_CMD retrieve --help'.
   buildstats Work with buildstats already retrieved (currently: analyze).
              '$SCRIPT_CMD buildstats --help'.
+  sstate     Prune sstate objects bitbake hasn't reused in a while.
+             '$SCRIPT_CMD sstate --help'.
   clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the checkout.
   destroy    Remove all three volumes, $MACKAS_ROOT and the short symlink.
              Makes you type DESTROY.
@@ -5759,6 +5903,13 @@ main() {
 				cmd="buildstats"; shift
 				if [ "$want_help" -eq 1 ]; then BUILDSTATS_ARGS=("$@" "--help"); else BUILDSTATS_ARGS=("$@"); fi
 				break ;;
+			sstate)
+				# Same shape again: sstate owns everything after it (its
+				# subcommand, e.g. 'prune', and that subcommand's own args).
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="sstate"; shift
+				if [ "$want_help" -eq 1 ]; then SSTATE_ARGS=("$@" "--help"); else SSTATE_ARGS=("$@"); fi
+				break ;;
 			set)
 				# Same shape again: set owns everything after it (NAME and
 				# VALUE), captured verbatim for cmd_set. Persists to the config
@@ -5797,7 +5948,7 @@ main() {
 			check|smoketest|status|shell|clean|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats clean destroy volume set get unset help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats sstate clean destroy volume set get unset help)" ;;
 		esac
 	done
 
@@ -5827,7 +5978,7 @@ main() {
 	derive_paths
 
 	# A bare 'help'/'-h' (no command named at all) shows the general usage.
-	# volume/retrieve/buildstats/set/get/unset handle their OWN --help
+	# volume/retrieve/buildstats/sstate/set/get/unset handle their OWN --help
 	# internally (via the "--help" appended to their *_ARGS above), so they
 	# are dispatched normally either way, below.
 	if [ "$want_help" -eq 1 ] && [ -z "$cmd" ]; then
@@ -5847,6 +5998,7 @@ main() {
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
 		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
 		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;
+		sstate)     cmd_sstate ${SSTATE_ARGS+"${SSTATE_ARGS[@]}"} ;;
 		set)        cmd_set ${SET_ARGS+"${SET_ARGS[@]}"} ;;
 		get)        cmd_get ${GET_ARGS+"${GET_ARGS[@]}"} ;;
 		unset)      cmd_unset ${UNSET_ARGS+"${UNSET_ARGS[@]}"} ;;
