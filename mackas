@@ -3995,7 +3995,7 @@ cmd_retrieve() {
 	# loudly rather than corrupt an ext4 image mounted by two VMs at once.
 	if volume_in_use "$MACKAS_VOL_TMP"; then
 		die "volume '$MACKAS_VOL_TMP' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run '$SCRIPT_CMD retrieve'"
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD retrieve'"
 	fi
 
 	info "${C_BLD}mackas retrieve${C_RST}"
@@ -4406,7 +4406,7 @@ cmd_clean() {
 		if volume_exists "$MACKAS_VOL_TMP"; then
 			delete_volume "$MACKAS_VOL_TMP" || \
 				die "cannot clean TMPDIR: volume '$MACKAS_VOL_TMP' could not be removed" \
-					"stop anything still using it (container ls) and re-run '$SCRIPT_CMD clean'"
+					"stop anything still using it (mackas volume list) and re-run '$SCRIPT_CMD clean'"
 		fi
 		ensure_volume "$MACKAS_VOL_TMP" "$MACKAS_VOLUME_SIZE_TMP" "TMPDIR -> /build"
 		if [ -d "$MACKAS_LOGS" ]; then
@@ -4553,7 +4553,7 @@ volume_fstrim_one() {
 			return 0
 		fi
 		die "volume '$name' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run '$SCRIPT_CMD volume fstrim $name'"
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD volume fstrim $name'"
 	fi
 
 	local img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
@@ -4690,7 +4690,7 @@ volume_duplicate() {
 	# (mid-write, dirty journal) yields an inconsistent copy.
 	if volume_in_use "$src"; then
 		die "source volume '$src' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run"
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run"
 	fi
 
 	local size
@@ -4769,7 +4769,7 @@ volume_destroy() {
 
 	if volume_in_use "$name"; then
 		die "volume '$name' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run"
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run"
 	fi
 
 	local img="$CONTAINER_VOLUMES_DIR/$name/volume.img" before_kb
@@ -4779,7 +4779,7 @@ volume_destroy() {
 		|| { info "Aborted. Nothing was removed."; return 1; }
 
 	delete_volume "$name" || die "could not delete volume '$name'" \
-		"stop whatever is using it (container ls) and re-run"
+		"stop whatever is using it (mackas volume list) and re-run"
 	return 0
 }
 
@@ -4890,7 +4890,7 @@ volume_move() {
 	# forbids.
 	if volume_in_use "$name"; then
 		die "volume '$name' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (container ls), then re-run '$SCRIPT_CMD volume move $name <dir>'"
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD volume move $name <dir>'"
 	fi
 
 	# Absolutise a relative <dir> against $PWD -- a relative destination for a
