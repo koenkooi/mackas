@@ -43,8 +43,8 @@ setting() {
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
 	[ "$(setting MACKAS_VOLUME_SIZE_TMP)" = "120G" ]
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
-	[ "$(setting MACKAS_PROJECT_BRANCH)" = "wrynose" ]
+	[ "$(setting MACKAS_VOLUME_SIZE_DL)" = "40G" ]
+	[ "$(setting MACKAS_VOLUME_SIZE_SSTATE)" = "40G" ]
 }
 
 @test "defaults: status reports that no config file was used" {
@@ -101,8 +101,9 @@ setting() {
 	echo 'MACKAS_KAS_CONFIG="kas/pwned.yml"' > "$TESTDIR/mackas.conf"
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
-	# The built-in default, not the value the cwd file asked for.
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
+	# The built-in default (empty -- no baked-in project), not the value the
+	# cwd file asked for.
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 	printf '%s\n' "$output" | grep -q 'built-in defaults'
 }
 
@@ -181,10 +182,13 @@ setting() {
 @test "help still prints usage with its settings filled in" {
 	# Skipping load_config must not leave the settings usage interpolates
 	# unset -- set -u would turn that into a crash instead of a help message.
+	# No project is configured by default, so usage() takes its "nothing
+	# configured yet" branch -- still an interpolated settings-derived line,
+	# still proof the unset-variable path didn't crash.
 	run "$MACKAS" help
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -q 'USAGE'
-	printf '%s\n' "$output" | grep -q 'wrynose'
+	printf '%s\n' "$output" | grep -qi 'no project configured'
 }
 
 @test "help no longer advertises ./mackas.conf as a searched path" {
@@ -194,7 +198,10 @@ setting() {
 }
 
 @test "help honours --set and the environment, just not the config file" {
-	run "$MACKAS" --set MACKAS_PROJECT_BRANCH=fromflag help
+	# usage() only prints the branch when a project is configured at all --
+	# give it a URL too, or this is testing "no project configured" instead.
+	run "$MACKAS" --set MACKAS_PROJECT_URL=https://example.invalid/x.git \
+		--set MACKAS_PROJECT_BRANCH=fromflag help
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -q 'fromflag'
 }
@@ -208,7 +215,7 @@ setting() {
 	chmod g+w "$HOME/.mackas.conf"
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 	printf '%s\n' "$output" | grep -qi 'ignoring'
 }
 
@@ -217,7 +224,7 @@ setting() {
 	chmod o+w "$HOME/.mackas.conf"
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 }
 
 @test "a searched config in a group-writable directory is ignored" {
@@ -230,7 +237,7 @@ setting() {
 	run "$MACKAS" status
 	chmod g-w "$HOME"
 	[ "$status" -eq 0 ]
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 }
 
 @test "a normal 0644 config in a 0755 home is still used" {
@@ -255,7 +262,7 @@ setting() {
 	chmod g+w "$HOME/.config/mackas/config"
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 }
 
 @test "an explicit --config is used even when group-writable" {
@@ -538,16 +545,17 @@ setting() {
 
 # ---------------------------------------------------------------------------
 # The project settings (URL / branch / dir / kas config) drive the clone and
-# the composed kas files. meta-ai is the shipped EXAMPLE default, not baked-in.
+# the composed kas files. There is no baked-in default project -- meta-ai is
+# only the worked EXAMPLE in mackas.conf.example.
 # ---------------------------------------------------------------------------
 
-@test "project settings default to the meta-ai example" {
+@test "project settings default to empty (no built-in project)" {
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
-	[ "$(setting MACKAS_PROJECT_URL)" = "https://github.com/qualcomm-linux/meta-ai.git" ]
-	[ "$(setting MACKAS_PROJECT_BRANCH)" = "wrynose" ]
-	[ "$(setting MACKAS_PROJECT_DIR)" = "meta-ai" ]
-	[ "$(setting MACKAS_KAS_CONFIG)" = "kas/base.yml:kas/qemuarm64.yml" ]
+	[ "$(setting MACKAS_PROJECT_URL)" = "" ]
+	[ "$(setting MACKAS_PROJECT_BRANCH)" = "" ]
+	[ "$(setting MACKAS_PROJECT_DIR)" = "" ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 }
 
 @test "MACKAS_PROJECT_DIR names the checkout directory under work/" {

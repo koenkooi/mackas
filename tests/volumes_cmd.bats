@@ -515,6 +515,10 @@ mackas_check() {
 # it. It records its argv AND the three environment variables that decide
 # whether kas bind-mounts a host directory over our volumes.
 install_fake_kas() {
+	# No project is configured by default any more (MACKAS_PROJECT_DIR is
+	# empty) -- name one explicitly so MACKAS_PROJECT resolves to this
+	# fixture, the way an actual configured project would.
+	export MACKAS_PROJECT_DIR=meta-ai
 	mkdir -p "$ROOT/bin" "$ROOT/work/meta-ai/.git" "$ROOT/work/meta-ai/kas"
 	touch "$ROOT/work/meta-ai/kas/macos-local.yml"
 	cat > "$ROOT/bin/kas-container" <<'EOF'

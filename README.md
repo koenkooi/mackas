@@ -8,8 +8,10 @@ Desktop, no Lima, no Colima.
 
 The project to build — its git repo, branch and kas config — is
 configuration (`MACKAS_PROJECT_URL` / `_BRANCH` / `_DIR` and
-`MACKAS_KAS_CONFIG`). The shipped example, and what every command below builds
-unless you override it, is
+`MACKAS_KAS_CONFIG`). There is no built-in default project: `setup` does its
+whole job (volumes, kas-container, the shim, gitconfig) with none of this
+set, and just skips the project checkout step until you configure one. The
+worked example throughout this README is
 [qualcomm-linux/meta-ai](https://github.com/qualcomm-linux/meta-ai) (branch
 `wrynose`, kas config `kas/base.yml:kas/qemuarm64.yml`) — the layer set the
 tool has actually been exercised against end to end.
@@ -139,7 +141,7 @@ Plus two files `setup` **generates** rather than ships:
 | Command | Does |
 |---|---|
 | `check` | Preflight only. PASS/WARN/FAIL, each with the remediation command. **Default.** |
-| `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. |
+| `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. Takes an optional root path and `--tmpdir-size`/`--sstate-size`/`--downloads-size`; asks interactively for whichever is still unconfigured. Skips the project checkout step if none is configured. |
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
@@ -294,10 +296,10 @@ used. `mackas.conf.example` has the full annotated list.
 | `KAS_IMAGE` | `ghcr.io/siemens/kas/kas:5.4` | kas container image. |
 | `MACKAS_CPUS` | physical cores − 2 | Passed as `-c`. |
 | `MACKAS_MEMORY` | ⅔ of host RAM | Passed as `-m`. |
-| `MACKAS_PROJECT_URL` | meta-ai's git URL | Repo `setup` clones. Example: qualcomm-linux/meta-ai. |
-| `MACKAS_PROJECT_BRANCH` | `wrynose` | Branch to check out. |
-| `MACKAS_PROJECT_DIR` | `meta-ai` | Checkout name under `work/`; also the cwd kas runs in. |
-| `MACKAS_KAS_CONFIG` | `kas/base.yml:kas/qemuarm64.yml` | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
+| `MACKAS_PROJECT_URL` | *(no baked-in default)* | Repo `setup` clones. With this empty, `setup` skips the checkout step entirely. |
+| `MACKAS_PROJECT_BRANCH` | *(empty)* | Branch to check out. |
+| `MACKAS_PROJECT_DIR` | *(empty)* | Checkout name under `work/`; also the cwd kas runs in. |
+| `MACKAS_KAS_CONFIG` | *(empty)* | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty means one build rung with no `--target`, so kas builds its own default; see [mackas.conf.example](mackas.conf.example) for meta-ai's ladder as an example override. |
 | `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |
 | `MACKAS_OVERHEAD_INTERVAL` | `5` | Seconds between host-overhead samples. Spikes shorter than this are invisible. |

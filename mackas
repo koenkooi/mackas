@@ -104,6 +104,7 @@ BUILDSTATS_ARGS=()
 SET_ARGS=()
 GET_ARGS=()
 UNSET_ARGS=()
+SETUP_ARGS=()
 
 setup_colors() {
 	if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
@@ -270,8 +271,39 @@ restore_env() {
 	for name in $SETTING_NAMES; do
 		if eval "[ \"\${__ENV_${name}_SET}\" = 1 ]"; then
 			eval "${name}=\"\${__ENV_${name}}\""
+			eval "__EXPLICIT_${name}=1"
 		fi
 	done
+}
+
+# snapshot_defaults/mark_explicit_from_config/setting_is_explicit -- track
+# whether a setting's final value came from anything OTHER than
+# set_defaults() (the config file, the environment via restore_env above, or
+# --set via apply_cli_overrides below). Needed because several settings (the
+# volume sizes) default to a non-empty value, so a plain "is it set" check
+# cannot tell "explicitly configured to this value" from "just still reading
+# as the factory default" apart -- 'setup's interactive prompting relies on
+# the distinction to know which of its settings to actually prompt for.
+#
+# snapshot_defaults() must run right after set_defaults() (before
+# load_config), so mark_explicit_from_config() has a factory baseline to
+# compare load_config's result against.
+snapshot_defaults() {
+	local name
+	for name in $SETTING_NAMES; do
+		eval "__FACTORY_${name}=\"\${${name}}\""
+	done
+}
+
+mark_explicit_from_config() {
+	local name
+	for name in $SETTING_NAMES; do
+		eval "if [ \"\${${name}}\" != \"\${__FACTORY_${name}}\" ]; then __EXPLICIT_${name}=1; fi"
+	done
+}
+
+setting_is_explicit() {
+	eval "[ \"\${__EXPLICIT_$1:-0}\" = 1 ]"
 }
 
 # --set NAME=VALUE overrides, collected during arg parsing and applied last so
@@ -314,6 +346,7 @@ apply_cli_overrides() {
 		# eval body rather than interpolating it, so values containing quotes,
 		# spaces or $ are assigned literally and never re-evaluated.
 		eval "${name}=\"\$value\""
+		eval "__EXPLICIT_${name}=1"
 	done
 }
 
@@ -535,11 +568,16 @@ set_defaults() {
 	MACKAS_HTTP_MIRROR_SSTATE="http://linux-computer.local:8100/sstate"
 	MACKAS_HTTP_MIRROR_DL="http://linux-computer.local:8100/downloads"
 
-	# The project to build. meta-ai is the EXAMPLE -- it is what has actually
-	# been tested end to end (bitbake bash, then tensorflow-lite) -- and it
-	# rides the ordinary defaults->config->env->--set machinery like any other
-	# setting, so pointing mackas at a different layer set is a config change,
-	# not a code change. See mackas.conf.example for how to do that.
+	# The project to build. Empty here on purpose -- there is no baked-in
+	# default project. meta-ai (github.com/qualcomm-linux/meta-ai, branch
+	# wrynose) is what has actually been tested end to end (bitbake bash, then
+	# tensorflow-lite), and is shipped as the worked EXAMPLE in
+	# mackas.conf.example, not silently checked out for anyone who never asked
+	# for it. These ride the ordinary defaults->config->env->--set machinery
+	# like any other setting, so pointing mackas at a layer set is purely a
+	# config change. With none of this set, 'setup' still does its whole job
+	# (volumes, kas-container, the shim, gitconfig) and just skips the project
+	# checkout step -- see setup_project/setup_kas_fragment's callers.
 	#
 	#   _URL     git repo to clone
 	#   _BRANCH  branch to check out
@@ -547,10 +585,10 @@ set_defaults() {
 	#   MACKAS_KAS_CONFIG  the kas files to compose, checkout-relative and
 	#                      colon-separated, exactly as kas-container wants them.
 	#                      macos-local.yml (generated) is appended after these.
-	MACKAS_PROJECT_URL="https://github.com/qualcomm-linux/meta-ai.git"
-	MACKAS_PROJECT_BRANCH="wrynose"
-	MACKAS_PROJECT_DIR="meta-ai"
-	MACKAS_KAS_CONFIG="kas/base.yml:kas/qemuarm64.yml"
+	MACKAS_PROJECT_URL=""
+	MACKAS_PROJECT_BRANCH=""
+	MACKAS_PROJECT_DIR=""
+	MACKAS_KAS_CONFIG=""
 
 	# The smoketest ladder's build rungs, space-separated bitbake targets, run
 	# in order after the universal parse-only rung. Empty by default: with no
@@ -1929,7 +1967,10 @@ check_state() {
 		ck_info "kas-container not installed yet -> $KAS_CONTAINER_BIN"
 	fi
 
-	if [ -d "$MACKAS_PROJECT/.git" ]; then
+	if [ -z "$MACKAS_PROJECT_URL" ]; then
+		ck_info "no project configured -- 'setup' skips the checkout step until MACKAS_PROJECT_URL is set"
+		ck_info "  set MACKAS_PROJECT_URL/_BRANCH/_DIR in $(config_hint) (see mackas.conf.example), then re-run setup"
+	elif [ -d "$MACKAS_PROJECT/.git" ]; then
 		local br
 		br="$(git -C "$MACKAS_PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 		if [ "$br" = "$MACKAS_PROJECT_BRANCH" ]; then
@@ -2942,13 +2983,28 @@ ${C_BLD}$SCRIPT_CMD setup${C_RST} -- do the full setup. Idempotent -- safe to re
 after a crash, or after changing settings.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD setup
+  $SCRIPT_CMD setup [<root>] [--tmpdir-size <size>] [--sstate-size <size>]
+                    [--downloads-size <size>]
+
+  <root>               MACKAS_ROOT for this run (a case-sensitive volume).
+  --tmpdir-size <size>    TMPDIR volume size, e.g. 1T, 200G (default 120G).
+  --sstate-size <size>    sstate volume size (default 40G).
+  --downloads-size <size> Downloads volume size (default 40G).
+
+These are one-shot for this invocation, exactly like --set -- they are not
+written to the config file. If <root> or a size is not given here, and is
+not already set by --set/the environment/the config file, and this is
+running on a terminal, setup ASKS for it interactively (Enter keeps the
+current value).
 
 Downloads the pinned, sha256-verified kas-container release; installs the
 docker->container shim; creates the three ext4 volumes (TMPDIR, downloads,
-sstate); clones the project; and writes env.sh, the git dubious-ownership
-workaround, and the generated kas fragment. Each step is skipped if it is
-already done, so re-running is always safe -- nothing here is destructive.
+sstate); and writes env.sh, the git dubious-ownership workaround, and the
+generated kas fragment. Each step is skipped if it is already done, so
+re-running is always safe -- nothing here is destructive. If no project is
+configured (MACKAS_PROJECT_URL is empty), the project checkout and its kas
+fragment are skipped -- not required for the rest of this to work -- with a
+message on how to add one and re-run.
 
 Options: --dry-run (print every mutating command, change nothing), -y/--yes
 (or -f/--force, for the sudo prompts an external volume may need) and
@@ -2956,7 +3012,123 @@ Options: --dry-run (print every mutating command, change nothing), -y/--yes
 EOF
 }
 
+# validate_setup_size FLAG VALUE -- keeps whitespace/garbage out of a size
+# given directly on setup's own command line or typed at its interactive
+# prompt, before it ever reaches MACKAS_VOLUME_SIZE_*. Not a check of unit
+# spelling -- size_to_gb() already tolerates an unrecognised unit letter by
+# treating it as GiB, and this accepts the same shape it does: digits,
+# optionally followed by letters.
+validate_setup_size() {
+	local flag="$1" val="$2"
+	case "$val" in
+		''|[!0-9]*|*[!0-9a-zA-Z]*)
+			die "$flag '$val' is not a size like 1T, 200G or 512M" "$SCRIPT_CMD setup --help"
+			;;
+	esac
+}
+
+# prompt_setup_settings -- ask for whichever of the root path / three volume
+# sizes is not already resolved (setting_is_explicit) via this invocation's
+# own flag, --set, the environment or the config file -- one prompt per
+# setting, never a single lump, so anything already pinned down another way
+# is never re-asked. Enter keeps the current value (the factory default, for
+# a size never configured at all). Never runs when stdin is not a terminal,
+# same guard confirm() uses -- a non-interactive invocation behaves exactly
+# as it always has: sizes stay at their defaults, MACKAS_ROOT falls through
+# to require_mackas_root's own $PWD fallback.
+prompt_setup_settings() {
+	[ -t 0 ] || return 0
+	local reply
+
+	if ! setting_is_explicit MACKAS_ROOT; then
+		printf '%sRoot path for OpenEmbedded builds%s [nothing configured, falls back to the current directory]: ' \
+			"$C_BLD" "$C_RST"
+		read -r reply || reply=""
+		[ -n "$reply" ] && MACKAS_ROOT="$reply"
+	fi
+
+	if ! setting_is_explicit MACKAS_VOLUME_SIZE_TMP; then
+		printf '%sTMPDIR volume size%s [%s]: ' "$C_BLD" "$C_RST" "$MACKAS_VOLUME_SIZE_TMP"
+		read -r reply || reply=""
+		if [ -n "$reply" ]; then
+			validate_setup_size "TMPDIR volume size" "$reply"
+			MACKAS_VOLUME_SIZE_TMP="$reply"
+		fi
+	fi
+
+	if ! setting_is_explicit MACKAS_VOLUME_SIZE_DL; then
+		printf '%sDownloads volume size%s [%s]: ' "$C_BLD" "$C_RST" "$MACKAS_VOLUME_SIZE_DL"
+		read -r reply || reply=""
+		if [ -n "$reply" ]; then
+			validate_setup_size "Downloads volume size" "$reply"
+			MACKAS_VOLUME_SIZE_DL="$reply"
+		fi
+	fi
+
+	if ! setting_is_explicit MACKAS_VOLUME_SIZE_SSTATE; then
+		printf '%ssstate volume size%s [%s]: ' "$C_BLD" "$C_RST" "$MACKAS_VOLUME_SIZE_SSTATE"
+		read -r reply || reply=""
+		if [ -n "$reply" ]; then
+			validate_setup_size "sstate volume size" "$reply"
+			MACKAS_VOLUME_SIZE_SSTATE="$reply"
+		fi
+	fi
+}
+
 cmd_setup() {
+	local a val root="" want_help=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			# -h/--help/bare 'help' anywhere means help, the same shape
+			# cmd_volume's own tail-parsing already established: 'setup' owns
+			# everything after it (main()'s own -h/--help/help only fires
+			# BEFORE the word 'setup' is seen), so it has to recognise these
+			# itself rather than fall through to "unknown option"/"the root
+			# path is literally the word help".
+			-h|--help|help) want_help=1; shift ;;
+			--tmpdir-size|--sstate-size|--downloads-size)
+				a="$1"; val="${2:-}"
+				[ -n "$val" ] || die "$a needs a value" "$SCRIPT_CMD setup --help"
+				shift 2 ;;
+			--tmpdir-size=*|--sstate-size=*|--downloads-size=*)
+				a="${1%%=*}"; val="${1#*=}"
+				shift ;;
+			-*) die "unknown option for 'setup': $1" "$SCRIPT_CMD setup --help" ;;
+			*)
+				[ -z "$root" ] || die "'setup' takes one root path at most" "$SCRIPT_CMD setup --help"
+				root="$1"
+				shift
+				continue ;;
+		esac
+		[ "$want_help" -eq 1 ] && continue
+		validate_setup_size "$a" "$val"
+		case "$a" in
+			--tmpdir-size)    MACKAS_VOLUME_SIZE_TMP="$val";    __EXPLICIT_MACKAS_VOLUME_SIZE_TMP=1 ;;
+			--sstate-size)    MACKAS_VOLUME_SIZE_SSTATE="$val"; __EXPLICIT_MACKAS_VOLUME_SIZE_SSTATE=1 ;;
+			--downloads-size) MACKAS_VOLUME_SIZE_DL="$val";     __EXPLICIT_MACKAS_VOLUME_SIZE_DL=1 ;;
+		esac
+	done
+	if [ "$want_help" -eq 1 ]; then
+		setup_usage
+		return 0
+	fi
+	if [ -n "$root" ]; then
+		MACKAS_ROOT="$root"
+		__EXPLICIT_MACKAS_ROOT=1
+	fi
+
+	prompt_setup_settings
+
+	# MACKAS_ROOT/the sizes may just have changed above (own flag, or the
+	# interactive prompt) -- main() already ran validate_settings/derive_paths
+	# once, against the OLD values. Redo both: derive_paths is what computes
+	# MACKAS_WORK/MACKAS_BASE/etc. from MACKAS_ROOT, and require_mackas_root's
+	# own re-derive (see its own comment) only fires when IT is the one
+	# setting MACKAS_ROOT, which no longer happens here if a value was just
+	# given.
+	validate_settings
+	derive_paths
+
 	require_mackas_root
 	info "${C_BLD}mackas setup${C_RST}  (config: ${CONFIG_FILE_USED:-none, using built-in defaults})"
 	if [ "$DRY_RUN" -eq 1 ]; then
@@ -2974,8 +3146,13 @@ cmd_setup() {
 	setup_image
 	setup_volumes
 	setup_kas_container
-	setup_project
-	setup_kas_fragment
+	if [ -n "$MACKAS_PROJECT_URL" ]; then
+		setup_project
+		setup_kas_fragment
+	else
+		info "no project configured (MACKAS_PROJECT_URL is empty) -- skipping project checkout"
+		info "  set MACKAS_PROJECT_URL/_BRANCH/_DIR/_KAS_CONFIG in $(config_hint), then re-run setup"
+	fi
 
 	hdr "Done"
 	info "  source $MACKAS_ENV_SH"
@@ -3031,6 +3208,11 @@ run_kas() {
 	# run_kas <logfile|""> <kas args...>
 	# An empty logfile means "don't pipe through tee" -- required for the
 	# interactive `shell` command, which needs a real TTY on stdout.
+	# Both callers (cmd_smoketest, cmd_shell) already refuse with a clear,
+	# specific message before ever reaching here if $MACKAS_PROJECT/.git does
+	# not exist -- true whether no project is configured at all or one is
+	# configured but setup hasn't cloned it yet -- so this has nothing further
+	# to check on that front.
 	local log="$1"; shift
 	local rt_args gitconfig rc
 	rt_args="$(kas_runtime_args)"
@@ -4632,10 +4814,16 @@ cmd_volume() {
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
+	local project_line
+	if [ -n "$MACKAS_PROJECT_URL" ]; then
+		project_line="Project: $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH)."
+	else
+		project_line="No project configured yet -- 'setup' still works, just skips the checkout step."
+	fi
 	cat <<EOF
 ${C_BLD}$SCRIPT_NAME${C_RST} v$SCRIPT_VERSION -- run kas-container OpenEmbedded builds on Apple's
-'container' runtime. Project: $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH); set MACKAS_PROJECT_* to
-build your own layers. qualcomm-linux/meta-ai is the shipped example.
+'container' runtime. $project_line Set MACKAS_PROJECT_* to build your own
+layers -- qualcomm-linux/meta-ai is a worked example, see mackas.conf.example.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_NAME [OPTIONS] [COMMAND]
@@ -4811,7 +4999,16 @@ main() {
 				cmd="unset"; shift
 				if [ "$want_help" -eq 1 ]; then UNSET_ARGS=("$@" "--help"); else UNSET_ARGS=("$@"); fi
 				break ;;
-			check|setup|smoketest|status|shell|clean|destroy)
+			setup)
+				# Same shape as `volume`: setup owns everything after it (an
+				# optional positional root path and its own --tmpdir-size/
+				# --sstate-size/--downloads-size flags), captured verbatim for
+				# cmd_setup.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="setup"; shift
+				if [ "$want_help" -eq 1 ]; then SETUP_ARGS=("$@" "--help"); else SETUP_ARGS=("$@"); fi
+				break ;;
+			check|smoketest|status|shell|clean|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
 			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup smoketest status shell retrieve buildstats clean destroy volume set get unset help)" ;;
@@ -4820,6 +5017,7 @@ main() {
 
 	snapshot_env
 	set_defaults
+	snapshot_defaults
 
 	# Showing help -- whether bare 'help'/'-h' or 'X --help'/'X help'/'help X'
 	# for any command X -- never loads the config file. Its text mentions a
@@ -4835,6 +5033,7 @@ main() {
 			set|get|unset) load_config "$config_flag" 1 ;;
 			*)              load_config "$config_flag" ;;
 		esac
+		mark_explicit_from_config
 	fi
 	restore_env
 	apply_cli_overrides
@@ -4852,7 +5051,7 @@ main() {
 
 	case "${cmd:-check}" in
 		check)     if [ "$want_help" -eq 1 ]; then check_usage;     else cmd_check;     fi ;;
-		setup)     if [ "$want_help" -eq 1 ]; then setup_usage;     else cmd_setup;     fi ;;
+		setup)     if [ "$want_help" -eq 1 ]; then setup_usage;     else cmd_setup ${SETUP_ARGS+"${SETUP_ARGS[@]}"}; fi ;;
 		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;

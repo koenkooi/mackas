@@ -137,6 +137,7 @@ mk() {
 		--set MACKAS_MEMORY=12g \
 		--set "MACKAS_PROJECT_URL=$FIXTURE" \
 		--set MACKAS_PROJECT_BRANCH=testbranch \
+		--set MACKAS_PROJECT_DIR=meta-ai \
 		--set MACKAS_KAS_CONFIG=kas/base.yml \
 		"$@"
 }

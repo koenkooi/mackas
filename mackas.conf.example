@@ -184,11 +184,16 @@
 
 # --- Project (which layers to build) -----------------------------------------
 #
-# mackas builds whatever git repo + kas config you point it at. The defaults
-# below are the EXAMPLE, qualcomm-linux/meta-ai -- it is what has actually been
-# tested end to end: the whole smoketest ladder (bitbake bash, tensorflow-lite,
-# then llama-cpp) builds green on macOS/aarch64. To build your own layer set,
-# override these four; nothing else in mackas is project-specific.
+# mackas builds whatever git repo + kas config you point it at -- and there is
+# no built-in default: with all four of these left unset, 'setup' still does
+# its whole job (volumes, kas-container, the shim, gitconfig) and just skips
+# the project checkout step.
+#
+# The values commented out below are the EXAMPLE, qualcomm-linux/meta-ai -- it
+# is what has actually been tested end to end: the whole smoketest ladder
+# (bitbake bash, tensorflow-lite, then llama-cpp) builds green on
+# macOS/aarch64. To build your own layer set, set these four yourself;
+# nothing else in mackas is project-specific.
 #
 # The repo mackas clones into work/${MACKAS_PROJECT_DIR}. For the meta-ai
 # example, LAYERSERIES_COMPAT_ai="wrynose" and its LAYERDEPENDS are only core +
