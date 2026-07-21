@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+#
+# mackas-monitor -- poll the in-container bitbake progress bridge
+# (mackas-uibridge/mackasjson.py) and render progress in the terminal.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Poll http://127.0.0.1:<port>/ (published by kas_runtime_args() when
+MACKAS_MONITOR=1 -- see TODO.md item 22) and print progress lines until the
+build reports success/failed or this process is interrupted. Stdlib only,
+matching every other mackas-side tool.
+
+`mackas monitor` is a thin wrapper: it does not start anything, it only
+polls an already-running build's already-published bridge.
+"""
+
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+POLL_INTERVAL = 2.0
+REQUEST_TIMEOUT = 2.0
+
+
+def fetch(port):
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/", timeout=REQUEST_TIMEOUT
+    ) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def render(state):
+    current = state.get("current") or {}
+    progress = state.get("progress") or {}
+    recipe = current.get("recipe") or "-"
+    task = current.get("task") or "-"
+    done = progress.get("done", 0)
+    total = progress.get("total", 0)
+    status = state.get("status", "?")
+    print(f"[{status}] {done}/{total}  {recipe}:{task}", flush=True)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--port", type=int, required=True,
+                    help="port to poll (MACKAS_MONITOR_PORT)")
+    p.add_argument("--once", action="store_true",
+                    help="fetch and print a single snapshot, then exit")
+    args = p.parse_args(argv)
+
+    try:
+        while True:
+            try:
+                state = fetch(args.port)
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+                print(f"could not reach the bridge at 127.0.0.1:{args.port}: {exc}",
+                      file=sys.stderr)
+                return 1
+            render(state)
+            if args.once or state.get("status") in ("success", "failed"):
+                return 0 if state.get("status") != "failed" else 1
+            time.sleep(POLL_INTERVAL)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

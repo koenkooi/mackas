@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+#
+# mackas-uibridge/bitbake -- mounted OVER the checked-out project's own
+# bin/bitbake, for the lifetime of one container run, so mackas can observe
+# build progress live (see mackasjson.py and TODO.md item 22 for the why).
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# ---------------------------------------------------------------------------
+# WHY A FILE OVERLAY, NOT A PATH-SHADOW
+#
+# The obvious approach -- put a wrapper directory earlier on $PATH than the
+# real bitbake -- does NOT work: openembedded-core's own
+# scripts/oe-buildenv-internal (sourced via oe-init-build-env, which kas
+# itself sources to build its subprocess environment -- see
+# kas/libkas.py's get_build_environ()) explicitly strips any previously
+# "OE-added" PATH entries and re-prepends "$OEROOT/scripts:$BITBAKEDIR/bin"
+# onto PATH LAST. Whatever PATH mackas set before kas ran would end up
+# AFTER that, so the real bitbake would always win.
+#
+# So instead: this file is bind-mounted directly onto the real bitbake
+# checkout's own bin/bitbake path (see monitor_mount_args() in mackas, which
+# discovers that real path from the HOST side -- the checkout is a plain
+# host bind-mount, not inside an ext4 volume, so a host-side `find` sees it
+# directly). Whatever ends up in PATH, the FILE at that path is this one.
+# This is the exact same technique kas-container's own script already uses
+# for its .git overlay (-v $GIT_OVERLAY_FILE:/repo/.git:ro) -- a per-
+# container mount substitution, not a patch: the real checkout on the host's
+# disk is never modified, only what THIS container instance sees at that
+# path for its own lifetime.
+#
+# Because this file is mounted AT the real bin/bitbake's own path, it can
+# derive bitbake's lib/ directory the exact same way the real script does
+# (../lib relative to its own location) -- no separate "find the real
+# bitbake" logic needed; there is nothing to delegate to, this IS bitbake,
+# just bitbake_main() called with one extra UI module made importable.
+# ---------------------------------------------------------------------------
+
+import os
+import sys
+import warnings
+warnings.simplefilter("default")
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib'))
+try:
+    import bb
+except RuntimeError as exc:
+    sys.exit(str(exc))
+
+from bb import cookerdata
+from bb.main import bitbake_main, BitBakeConfigParameters, BBMainException
+
+bb.utils.check_system_locale()
+
+# The only two additions over the real bin/bitbake launcher: make
+# bb.ui.mackasjson importable (bb.ui.__path__ is a plain, runtime-appendable
+# list -- bb/ui/__init__.py does nothing special), and select it as the UI
+# unless something more specific already asked for a different one.
+import bb.ui  # noqa: E402  (must follow the sys.path.insert above)
+_UIBRIDGE_DIR = "/mackas-uibridge"
+if os.path.isdir(_UIBRIDGE_DIR) and _UIBRIDGE_DIR not in bb.ui.__path__:
+    bb.ui.__path__.append(_UIBRIDGE_DIR)
+os.environ.setdefault("BITBAKE_UI", "mackasjson")
+
+if __name__ == "__main__":
+    try:
+        sys.exit(bitbake_main(BitBakeConfigParameters(sys.argv),
+                               cookerdata.CookerConfiguration()))
+    except BBMainException as err:
+        sys.exit(err)
+    except bb.BBHandledException:
+        sys.exit(1)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
