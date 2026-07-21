@@ -31,6 +31,10 @@ setup() {
 	# interpreter start) before the rung ends and it is signalled.
 	mkdir -p "$ROOT/bin" "$ROOT/work/meta-ai/.git" "$ROOT/work/meta-ai/kas"
 	touch "$ROOT/work/meta-ai/kas/macos-local.yml"
+	# run_kas refuses before ever reaching kas-container if the gitconfig it
+	# would forward is missing/incomplete -- matching what a real 'setup' run
+	# leaves behind at $ROOT/gitconfig.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	KLOG="$TESTDIR/kas.log"
 	export KLOG
 	cat > "$ROOT/bin/kas-container" <<'EOF'

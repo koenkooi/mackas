@@ -36,6 +36,10 @@ setup() {
 	# A checkout that cmd_smoketest's three preconditions accept.
 	mkdir -p "$ROOT/bin" "$ROOT/logs" "$PROJ/.git" "$PROJ/kas"
 	touch "$PROJ/kas/macos-local.yml"
+	# run_kas refuses before ever reaching kas-container if the gitconfig it
+	# would forward is missing/incomplete -- matching what a real 'setup' run
+	# leaves behind at $ROOT/gitconfig.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 
 	# Fake kas-container: record "PWD=<pwd>|ARG=<a>|..." one line per call, emit
 	# a body line to stdout so the rung log (tee'd) has content to tail, and exit

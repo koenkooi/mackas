@@ -612,6 +612,71 @@ write_gitconfig() {
 	! printf '%s\n' "$out" | grep -qi 'warn'
 }
 
+@test "gitconfig: accepting the offer appends safe.directory to an incomplete GITCONFIG_FILE" {
+	local mine="$TESTDIR/mine.gitconfig"
+	printf '[user]\n\tname = someone\n' > "$mine"
+	ASSUME_YES=1
+	out="$(GITCONFIG_FILE="$mine" setup_gitconfig 2>&1)"
+	printf '%s\n' "$out" | grep -qi 'appended'
+	# The user's own content survives, untouched, alongside the addition.
+	grep -qF 'name = someone' "$mine"
+	grep -qxF '[safe]' "$mine"
+	grep -qE '^[[:space:]]*directory[[:space:]]*=[[:space:]]*\*[[:space:]]*$' "$mine"
+}
+
+@test "gitconfig: declining the offer leaves an incomplete GITCONFIG_FILE exactly as-is" {
+	local mine="$TESTDIR/mine.gitconfig"
+	printf '[user]\n\tname = someone\n' > "$mine"
+	ASSUME_YES=0
+	out="$(GITCONFIG_FILE="$mine" setup_gitconfig 2>&1)"
+	[ "$(cat "$mine")" = "$(printf '[user]\n\tname = someone\n')" ]
+	printf '%s\n' "$out" | grep -qi 'by hand'
+}
+
+@test "gitconfig: accepting the offer creates a GITCONFIG_FILE that names a path with nothing there yet" {
+	local mine="$TESTDIR/does-not-exist-yet/mine.gitconfig"
+	ASSUME_YES=1
+	out="$(GITCONFIG_FILE="$mine" setup_gitconfig 2>&1)"
+	[ -f "$mine" ]
+	grep -qxF '[safe]' "$mine"
+	printf '%s\n' "$out" | grep -qi "wrote $mine"
+}
+
+@test "gitconfig: declining to create a missing GITCONFIG_FILE leaves nothing on disk" {
+	local mine="$TESTDIR/does-not-exist-yet/mine.gitconfig"
+	ASSUME_YES=0
+	GITCONFIG_FILE="$mine" setup_gitconfig >/dev/null 2>&1
+	[ ! -e "$mine" ]
+}
+
+@test "run_kas: refuses before ever reaching kas-container when the resolved gitconfig is missing" {
+	local okkas="$TESTDIR/okkas"
+	printf '#!/bin/bash\ntouch %s/KAS_RAN\nexit 0\n' "$TESTDIR" > "$okkas"; chmod +x "$okkas"
+	MACKAS_PROJECT="$TESTDIR"; MACKAS_WORK="$TESTDIR"; SHIM_DIR="$TESTDIR"
+	KAS_CONTAINER_BIN="$okkas"; KAS_IMAGE="img"
+	MACKAS_GITCONFIG="$TESTDIR/no-such-gitconfig"; GITCONFIG_FILE=""
+	kas_runtime_args() { echo "-c 2"; }
+	out="$( (run_kas "" build foo) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'missing or incomplete'
+	[ ! -e "$TESTDIR/KAS_RAN" ]
+}
+
+@test "run_kas: refuses when the resolved gitconfig exists but lacks safe.directory" {
+	local badconf="$TESTDIR/incomplete.gitconfig"
+	printf '[user]\n\tname = someone\n' > "$badconf"
+	local okkas="$TESTDIR/okkas"
+	printf '#!/bin/bash\ntouch %s/KAS_RAN\nexit 0\n' "$TESTDIR" > "$okkas"; chmod +x "$okkas"
+	MACKAS_PROJECT="$TESTDIR"; MACKAS_WORK="$TESTDIR"; SHIM_DIR="$TESTDIR"
+	KAS_CONTAINER_BIN="$okkas"; KAS_IMAGE="img"
+	MACKAS_GITCONFIG="$badconf"; GITCONFIG_FILE=""
+	kas_runtime_args() { echo "-c 2"; }
+	out="$( (run_kas "" build foo) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'missing or incomplete'
+	[ ! -e "$TESTDIR/KAS_RAN" ]
+}
+
 @test "gitconfig: check_gitconfig reports missing vs present without writing anything" {
 	# check_gitconfig() called directly (function-level, MACKAS_LIB_ONLY=1),
 	# NOT via 'mackas check': cmd_check() also runs check_container_runtime(),
@@ -907,8 +972,9 @@ auto_fstrim_doubles() {
 	# And behaviourally, the happy path: both trims run and rc is 0.
 	local okkas="$TESTDIR/okkas"
 	printf '#!/bin/bash\nexit 0\n' > "$okkas"; chmod +x "$okkas"
+	printf '[safe]\n\tdirectory = *\n' > "$TESTDIR/gitconfig"
 	MACKAS_PROJECT="$TESTDIR"; MACKAS_WORK="$TESTDIR"; SHIM_DIR="$TESTDIR"
-	KAS_CONTAINER_BIN="$okkas"; KAS_IMAGE="img"; MACKAS_GITCONFIG=""; GITCONFIG_FILE=""
+	KAS_CONTAINER_BIN="$okkas"; KAS_IMAGE="img"; MACKAS_GITCONFIG="$TESTDIR/gitconfig"; GITCONFIG_FILE=""
 	PHASES="$TESTDIR/phases"; : > "$PHASES"
 	auto_fstrim() { echo "$1" >> "$PHASES"; }
 	kas_runtime_args() { echo "-c 2"; }

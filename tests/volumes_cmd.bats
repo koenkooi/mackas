@@ -549,6 +549,11 @@ install_fake_kas() {
 	export MACKAS_PROJECT_DIR=meta-ai
 	mkdir -p "$ROOT/bin" "$ROOT/work/meta-ai/.git" "$ROOT/work/meta-ai/kas"
 	touch "$ROOT/work/meta-ai/kas/macos-local.yml"
+	# run_kas refuses before ever reaching kas-container if the gitconfig it
+	# would forward is missing/incomplete -- matching what a real 'setup'
+	# run leaves behind at $ROOT/gitconfig.
+	mkdir -p "$ROOT"
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	cat > "$ROOT/bin/kas-container" <<'EOF'
 #!/usr/bin/env bash
 {
@@ -623,10 +628,10 @@ EOF
 @test "shell: forwards GITCONFIG_FILE pointing at the generated gitconfig (bug 5: dubious ownership)" {
 	# THE blocker: without this, git inside the container refuses /repo with
 	# "detected dubious ownership", and kas's get_root_path() silently falls
-	# back to the wrong directory instead of failing loudly. kas-container
-	# only forwards GITCONFIG_FILE if it names a file that exists, so this
-	# also proves 'setup' must run first for the real thing to work -- this
-	# test only pins that mackas PASSES the variable, not that the file exists.
+	# back to the wrong directory instead of failing loudly. run_kas() itself
+	# now refuses before ever reaching kas-container if this file is missing
+	# or incomplete (install_fake_kas's fixture provides a valid one at
+	# $ROOT/gitconfig, matching what a real 'setup' run leaves behind).
 	install_fake_kas
 	unset GITCONFIG_FILE
 	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
@@ -639,6 +644,7 @@ EOF
 	# setup_gitconfig() never overwrites a GITCONFIG_FILE the user already
 	# has; run_kas() must honour that same rule when it invokes kas-container.
 	install_fake_kas
+	printf '[safe]\n\tdirectory = *\n' > "$TESTDIR/mine.gitconfig"
 	GITCONFIG_FILE="$TESTDIR/mine.gitconfig" \
 		run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
 		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
