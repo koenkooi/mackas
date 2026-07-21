@@ -148,3 +148,43 @@ fake_shasum() {
 	# The early-return path: no download happened.
 	[ ! -f "$CURL_MARKER" ]
 }
+
+# ---------------------------------------------------------------------------
+# ensure_kas_container_installed -- smoketest/shell's own offer to install
+# kas-container (via this exact setup_kas_container gate) instead of just
+# refusing, when it is missing.
+# ---------------------------------------------------------------------------
+
+@test "ensure_kas_container_installed: already installed is a silent no-op, no prompt" {
+	mkdir -p "$MACKAS_BIN"
+	printf '#!/bin/bash\nexit 0\n' > "$KAS_CONTAINER_BIN"
+	chmod +x "$KAS_CONTAINER_BIN"
+	fake_curl                       # would touch CURL_MARKER if ever called
+	ASSUME_YES=0
+
+	out="$( (ensure_kas_container_installed) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ]
+	[ ! -f "$CURL_MARKER" ]
+	[ -z "$out" ]
+}
+
+@test "ensure_kas_container_installed: accepting the offer installs it via the real sha256 gate" {
+	fake_curl
+	fake_shasum "$KAS_CONTAINER_SHA256"
+	ASSUME_YES=1
+
+	out="$( (ensure_kas_container_installed) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ]
+	[ -x "$KAS_CONTAINER_BIN" ]
+	printf '%s\n' "$out" | grep -qi 'installed'
+}
+
+@test "ensure_kas_container_installed: declining refuses with the same message as before" {
+	fake_curl                       # would touch CURL_MARKER if ever called
+	ASSUME_YES=0
+
+	out="$( (ensure_kas_container_installed) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'kas-container not installed'
+	[ ! -f "$CURL_MARKER" ]
+}
