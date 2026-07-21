@@ -146,12 +146,12 @@ Plus two files `setup` **generates** rather than ships:
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | Work with buildstats already retrieved, e.g. `buildstats analyze`. |
 | `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
-| `destroy` | Remove all three volumes, `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
-| `volume` | Manage the ext4 volumes: `list`, `fstrim` (reclaim disk from a sparse image), `duplicate`, `destroy` one, `move` one to another disk, `recover` a hand-moved one. |
+| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
+| `volume` | Manage the ext4 volumes: `list`, `fstrim` (reclaim disk from a sparse image; `all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or every volume (`--all`/`-a`), `move` one to another disk, `recover` a hand-moved one. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
 
-Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes`,
-`-v/--verbose`, `--version`, `--help`.
+Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes` (or
+`-f/--force`), `-v/--verbose`, `--version`, `--help`.
 
 ### The smoketest ladder
 
