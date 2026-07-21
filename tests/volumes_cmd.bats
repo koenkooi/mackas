@@ -73,6 +73,15 @@ case "$1 $2" in
 		rm -rf "$HOME/Library/Application Support/com.apple.container/volumes/$3" 2>/dev/null || true
 		;;
 	"system status") echo "status running" ;;
+	"system restart")
+		# Simulate a REAL restart: the daemon re-scans volumes/*/entity.json
+		# into its index -- exactly what refuse_if_stale_entity relies on.
+		for d in "$HOME/Library/Application Support/com.apple.container/volumes"/*/; do
+			[ -e "${d}entity.json" ] || continue
+			n="$(basename "$d")"
+			grep -qxF "$n" "$VSTATE" 2>/dev/null || printf '%s\n' "$n" >> "$VSTATE"
+		done
+		;;
 	"image ls")
 		# MOCK_NO_IMAGE simulates a fresh machine where the kas image has not
 		# been pulled yet, so `check` must not boot-probe (which auto-fetches).
@@ -200,18 +209,37 @@ refute_call() {
 	refute_call "[volume] [create]"
 }
 
-@test "setup: refuses to create a volume when the daemon's index is stale (entity.json on disk it doesn't know about)" {
+@test "setup: declining the restart offer refuses cleanly instead of creating over a stale entity" {
 	# Simulate a stale container-daemon index: entity.json is on disk (as it
 	# would be right after relocating CONTAINER_VOLUMES_DIR, or attaching a
 	# disk carried over from another Mac) but 'volume ls' does not list it --
 	# 'volume create' would otherwise reformat the existing volume.img BEFORE
 	# erroring "entity already exists", destroying whatever was in it.
+	# Deliberately no -y here (unlike mackas_setup's default): confirm()
+	# declines non-interactively, which is the path under test.
 	mkdir -p "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp"
 	: > "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp/entity.json"
-	mackas_setup setup
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 setup
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'stale'
 	refute_call "[volume] [create]"
+	refute_call "[system] [restart]"
+}
+
+@test "setup: accepting the restart offer picks up the stale entity instead of creating over it" {
+	# -y (via mackas_setup) auto-accepts "restart the daemon now?" -- a real
+	# restart re-scans entity.json into the index (simulated in the fake
+	# container's own 'system restart' handler), so the volume is found
+	# afterward and never (re-)created.
+	mkdir -p "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp"
+	: > "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp/entity.json"
+	mackas_setup setup
+	[ "$status" -eq 0 ]
+	assert_call "[system] [restart]"
+	refute_call "[volume] [create] [-s] [120G] [oe-build-tmp]"
+	printf '%s\n' "$output" | grep -qi 'found after restarting'
 }
 
 # ---------------------------------------------------------------------------

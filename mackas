@@ -1276,7 +1276,10 @@ volume_exists() {
 }
 
 # refuse_if_stale_entity NAME -- guard every 'container volume create' against
-# a stale daemon index.
+# a stale daemon index. Returns 0 if it is safe to proceed with create (no
+# stale entry found). Returns 1 if NAME turned out to already exist once the
+# daemon caught up -- the caller must NOT create it, only treat it as already
+# there.
 #
 # Apple's container daemon (apiserver) scans volumes/*/entity.json into an
 # in-memory index ONCE, at its own startup; 'container volume ls' / the
@@ -1292,11 +1295,29 @@ volume_exists() {
 # silently destroying whatever was in it. volume_exists() alone is therefore
 # never sufficient license to create; call this immediately before every
 # 'container volume create' as well.
+#
+# 'container system restart' is what actually clears the stale index (a
+# real, safe, mackas-issuable command, not a manual instruction) -- offer it
+# instead of just refusing.
 refuse_if_stale_entity() {
 	local name="$1"
 	[ -e "$CONTAINER_VOLUMES_DIR/$name/entity.json" ] || return 0
-	die "volume '$name' has on-disk data the container daemon's index does not know about" \
-		"the daemon's volume index is likely stale (e.g. after relocating $CONTAINER_VOLUMES_DIR, or attaching a disk carried over from another Mac) -- restart it first: container system restart"
+
+	warn "      volume '$name' has on-disk data the container daemon's index doesn't know about."
+	warn "      This is usually a stale index -- right after relocating"
+	warn "      $CONTAINER_VOLUMES_DIR, or attaching a disk carried over from another Mac."
+	if ! confirm "      Restart the container daemon now to pick it up?"; then
+		die "volume '$name' has on-disk data the container daemon's index does not know about" \
+			"restart it yourself, then re-run: container system restart"
+	fi
+	run container system restart
+	[ "$DRY_RUN" -eq 1 ] && return 1
+	if volume_exists "$name"; then
+		did "container daemon restarted; '$name' is now recognized"
+		return 1
+	fi
+	die "restarted the container daemon, but '$name' is still not recognized" \
+		"investigate by hand: container system status; container volume ls; check $CONTAINER_VOLUMES_DIR/$name/entity.json"
 }
 
 # Remove one volume, tolerating both spellings of the subcommand and a volume
@@ -2809,10 +2830,11 @@ ensure_volume() {
 
 	if volume_exists "$name"; then
 		skip "volume '$name' exists ($role)"
-	else
-		refuse_if_stale_entity "$name"
+	elif refuse_if_stale_entity "$name"; then
 		run container volume create -s "$size" "$name"
 		did "created ext4 volume '$name' ($size, $role, sparse until used)"
+	else
+		skip "volume '$name' exists ($role) -- found after restarting the container daemon"
 	fi
 
 	# The chown attaches the volume. If a build still holds it, that would be a
@@ -4519,7 +4541,8 @@ volume_duplicate() {
 	info "${C_BLD}mackas volume duplicate $src -> $dst${C_RST}"
 	info "  size: $size (matched from the source)"
 
-	refuse_if_stale_entity "$dst"
+	refuse_if_stale_entity "$dst" || die "destination volume '$dst' already exists" \
+		"pick a new name, or remove it: $SCRIPT_CMD volume destroy $dst"
 
 	# 1. Create dst at the SAME size. This writes a valid entity.json we must
 	#    NOT edit -- only its volume.img gets swapped underneath it.
