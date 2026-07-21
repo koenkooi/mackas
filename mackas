@@ -3388,16 +3388,103 @@ own kas config default. \`auto-fstrim\` reclaims the sparse ext4 volumes
 before and after. Logs land in \$MACKAS_LOGS/smoketest-*.log; host CPU/RSS
 overhead is sampled around each rung.
 
+If no project is configured at all, smoketest OFFERS the qualcomm-linux/
+meta-ai example for that one run only -- never persisted, never the default,
+removed again (checkout + generated kas fragment) once the ladder finishes.
+Declining exits smoketest without running anything.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
 EOF
+}
+
+# The example project smoketest offers when NOTHING is configured -- the
+# same qualcomm-linux/meta-ai coordinates that used to be mackas's baked-in
+# default, before that was removed. Never written to set_defaults(), never
+# persisted anywhere, not a real SETTING_NAMES entry (no --set/config-file
+# override -- the example's identity is fixed): offer_example_project
+# assigns these in-memory for ONE smoketest invocation, and
+# cleanup_example_project removes every trace again afterward.
+#
+# The ${VAR:-default} form (an undocumented test seam, cf. MACKAS_OVERHEAD_BIN)
+# lets a test point this at a local fixture repo instead of the real GitHub
+# URL, without making it a real user-facing setting.
+MACKAS_EXAMPLE_PROJECT_URL="${MACKAS_EXAMPLE_PROJECT_URL:-https://github.com/qualcomm-linux/meta-ai.git}"
+MACKAS_EXAMPLE_PROJECT_BRANCH="${MACKAS_EXAMPLE_PROJECT_BRANCH:-wrynose}"
+MACKAS_EXAMPLE_PROJECT_DIR="${MACKAS_EXAMPLE_PROJECT_DIR:-meta-ai}"
+MACKAS_EXAMPLE_KAS_CONFIG="${MACKAS_EXAMPLE_KAS_CONFIG:-kas/base.yml:kas/qemuarm64.yml}"
+
+# offer_example_project -- smoketest's fallback when no project is configured
+# at all. Confirms with the user (same confirm() semantics as everywhere
+# else: --dry-run auto-yeses and prints, -y/-f auto-yeses for real, a
+# declined/non-interactive answer returns 1), wires the example project's
+# settings in for THIS invocation only, and clones it / writes its kas
+# fragment right here -- setup() skips both of those steps when no project
+# is configured, so smoketest has to do them itself for an ephemeral run.
+offer_example_project() {
+	confirm "No project is configured. Use the qualcomm-linux/meta-ai example (branch $MACKAS_EXAMPLE_PROJECT_BRANCH) for THIS smoketest only? It is removed again afterward and never becomes the default." \
+		|| return 1
+
+	MACKAS_PROJECT_URL="$MACKAS_EXAMPLE_PROJECT_URL"
+	MACKAS_PROJECT_BRANCH="$MACKAS_EXAMPLE_PROJECT_BRANCH"
+	MACKAS_PROJECT_DIR="$MACKAS_EXAMPLE_PROJECT_DIR"
+	[ -n "$MACKAS_KAS_CONFIG" ] || MACKAS_KAS_CONFIG="$MACKAS_EXAMPLE_KAS_CONFIG"
+	# MACKAS_PROJECT/MACKAS_KAS_FRAGMENT_*/KAS_FILES_ARG all derive from the
+	# settings just assigned above.
+	derive_paths
+
+	hdr "Cloning the meta-ai example (this invocation only)"
+	setup_project
+	setup_kas_fragment
+	return 0
+}
+
+# cleanup_example_project -- undo offer_example_project(), success or failure
+# alike. Only ever called when offer_example_project just returned 0, so
+# MACKAS_PROJECT/MACKAS_KAS_FRAGMENT_SRC genuinely name what it just created,
+# never a real project the user configured (that path never reaches here --
+# see cmd_smoketest).
+cleanup_example_project() {
+	info ""
+	info "Removing the meta-ai example project (never the default, not kept around)..."
+	run rm -rf "$MACKAS_PROJECT"
+	run rm -f "$MACKAS_KAS_FRAGMENT_SRC"
+	did "removed $MACKAS_PROJECT and $MACKAS_KAS_FRAGMENT_SRC"
 }
 
 cmd_smoketest() {
 	require_mackas_root
 	[ -x "$KAS_CONTAINER_BIN" ] || die "kas-container not installed" "$SCRIPT_CMD setup"
-	[ -d "$MACKAS_PROJECT/.git" ] || die "project not checked out at $MACKAS_PROJECT" "$SCRIPT_CMD setup"
+
+	# A checkout already on disk (a real project, however it got there) always
+	# wins -- only fall back to offering the example when there is genuinely
+	# nothing to build: no checkout AND no project configured at all. A
+	# project configured but not yet cloned keeps the existing "run setup"
+	# refusal; that case is not what the offer is for.
+	local example_active=0
+	if [ ! -d "$MACKAS_PROJECT/.git" ]; then
+		if [ -n "$MACKAS_PROJECT_URL" ]; then
+			die "project not checked out at $MACKAS_PROJECT" "$SCRIPT_CMD setup"
+		fi
+		if offer_example_project; then
+			example_active=1
+		else
+			info "  Declined -- smoketest needs a project to build against."
+			info "  Set MACKAS_PROJECT_URL/_BRANCH/_DIR (see mackas.conf.example) to configure your own, or answer yes next time to use the example."
+			return 1
+		fi
+	fi
 	[ -f "$MACKAS_KAS_FRAGMENT_REPO" ] || die "kas fragment missing at $MACKAS_KAS_FRAGMENT_REPO" "$SCRIPT_CMD setup"
 
+	local rc=0
+	smoketest_ladder || rc=$?
+	[ "$example_active" -eq 1 ] && cleanup_example_project
+	return "$rc"
+}
+
+# The ladder itself, split out from cmd_smoketest so the latter can run
+# cleanup_example_project afterward -- success or failure alike -- without
+# losing the ladder's own exit code.
+smoketest_ladder() {
 	# The ladder is rung 1 (parse-only, universal) followed by one build rung
 	# per target in MACKAS_SMOKETEST_TARGETS. When that list is empty (the
 	# default), there is still exactly one build rung, but it passes no
