@@ -991,6 +991,18 @@ compose_kas_files() {
 	fi
 }
 
+# strip_trailing_slash VALUE -- print VALUE with trailing slash(es) removed,
+# keeping a bare "/" intact. A path can carry a trailing slash from a user
+# typing or tab-completing one, or from a symlink recorded by an OLDER
+# mackas that predates this normalization -- comparing such a path against a
+# freshly-normalized one with plain string equality reads as "different"
+# even though they name the same directory. Used both to normalize
+# MACKAS_ROOT itself and to normalize a symlink's `readlink` target before
+# comparing it against MACKAS_ROOT (derive_paths, setup_short_link).
+strip_trailing_slash() {
+	printf '%s' "$1" | sed 's:\(.\)/*$:\1:'
+}
+
 # Values that depend on other values, resolved once everything else is final.
 #
 # This runs for EVERY command, including `help` and a `status` on a machine
@@ -1019,6 +1031,13 @@ derive_paths() {
 		return 0
 	fi
 
+	# Strip a trailing slash a user-supplied root (typed by hand, or
+	# tab-completed, which appends one for a directory) would otherwise
+	# double up in every "$MACKAS_ROOT/bin"-style concatenation below --
+	# .../Angstrom//bin, not a real bug (a double slash resolves fine), but
+	# ugly enough in --dry-run/-v output and status/check to read as one.
+	MACKAS_ROOT="$(strip_trailing_slash "$MACKAS_ROOT")"
+
 	[ -n "$MACKAS_NFS_MOUNT" ] || MACKAS_NFS_MOUNT="$MACKAS_ROOT/nfs"
 	[ -n "$MACKAS_SSTATE_MIRROR_PATH" ] || MACKAS_SSTATE_MIRROR_PATH="$MACKAS_NFS_MOUNT/angstrom-2026.06/build/sstate-cache"
 	[ -n "$MACKAS_DL_MIRROR_PATH" ] || MACKAS_DL_MIRROR_PATH="$MACKAS_NFS_MOUNT/angstrom-2026.06/build/downloads"
@@ -1042,7 +1061,12 @@ derive_paths() {
 	local link_target=""
 	MACKAS_BASE="$MACKAS_ROOT"
 	if [ -L "$MACKAS_SHORT_LINK" ]; then
-		link_target="$(readlink "$MACKAS_SHORT_LINK" 2>/dev/null || true)"
+		# strip_trailing_slash: a link recorded by an older mackas (before
+		# MACKAS_ROOT normalization existed) can still carry a trailing slash
+		# baked into its target -- compare normalized, or a perfectly valid
+		# link reads as "does not resolve to MACKAS_ROOT" on a bare string
+		# mismatch.
+		link_target="$(strip_trailing_slash "$(readlink "$MACKAS_SHORT_LINK" 2>/dev/null || true)")"
 		if [ "$link_target" = "$MACKAS_ROOT" ] && [ -d "$MACKAS_SHORT_LINK" ]; then
 			# -d follows the link, so this is also what rules out a dangling one.
 			MACKAS_BASE="$MACKAS_SHORT_LINK"
@@ -1765,7 +1789,10 @@ check_short_link() {
 
 	if [ -L "$MACKAS_SHORT_LINK" ]; then
 		local tgt
-		tgt="$(readlink "$MACKAS_SHORT_LINK")"
+		# strip_trailing_slash: see setup_short_link's own comment -- a link
+		# recorded by an older mackas can carry a trailing slash baked into
+		# its target.
+		tgt="$(strip_trailing_slash "$(readlink "$MACKAS_SHORT_LINK")")"
 		if [ "$tgt" = "$MACKAS_ROOT" ]; then
 			ck_pass "short link $MACKAS_SHORT_LINK -> $MACKAS_ROOT (${len_short} chars for the socket path)"
 		else
@@ -2360,7 +2387,11 @@ setup_short_link() {
 	step "Short symlink: $MACKAS_SHORT_LINK -> $MACKAS_ROOT"
 	if [ -L "$MACKAS_SHORT_LINK" ]; then
 		local tgt
-		tgt="$(readlink "$MACKAS_SHORT_LINK")"
+		# strip_trailing_slash: a link recorded by an older mackas can still
+		# carry a trailing slash baked into its target (MACKAS_ROOT wasn't
+		# normalized at the time it was created) -- compare normalized, or a
+		# perfectly correct link is misreported as pointing elsewhere.
+		tgt="$(strip_trailing_slash "$(readlink "$MACKAS_SHORT_LINK")")"
 		if [ "$tgt" = "$MACKAS_ROOT" ]; then
 			skip "$MACKAS_SHORT_LINK -> $MACKAS_ROOT"
 		else

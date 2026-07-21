@@ -149,6 +149,34 @@ teardown() {
 	[ "$MACKAS_WORK" = "/tmp/mackas-unit/work" ]
 }
 
+@test "derive_paths strips a trailing slash from MACKAS_ROOT (no doubled // in derived paths)" {
+	# A user-typed or tab-completed root ("...Angstrom/") must not double up
+	# in every "$MACKAS_ROOT/bin"-style concatenation below.
+	set_defaults
+	MACKAS_ROOT="/tmp/mackas-unit/"
+	MACKAS_SHORT_LINK="/nonexistent-short-link-xyzzy"
+	derive_paths
+	[ "$MACKAS_ROOT" = "/tmp/mackas-unit" ]
+	[ "$MACKAS_BASE" = "/tmp/mackas-unit" ]
+	[ "$MACKAS_WORK" = "/tmp/mackas-unit/work" ]
+}
+
+@test "derive_paths strips multiple trailing slashes from MACKAS_ROOT" {
+	set_defaults
+	MACKAS_ROOT="/tmp/mackas-unit///"
+	MACKAS_SHORT_LINK="/nonexistent-short-link-xyzzy"
+	derive_paths
+	[ "$MACKAS_ROOT" = "/tmp/mackas-unit" ]
+}
+
+@test "derive_paths leaves a bare / as MACKAS_ROOT intact" {
+	set_defaults
+	MACKAS_ROOT="/"
+	MACKAS_SHORT_LINK="/nonexistent-short-link-xyzzy"
+	derive_paths
+	[ "$MACKAS_ROOT" = "/" ]
+}
+
 @test "derive_paths prefers the short link when it RESOLVES to MACKAS_ROOT" {
 	# This test used to point MACKAS_SHORT_LINK at a bare directory unrelated
 	# to MACKAS_ROOT and assert it was adopted anyway -- it pinned the bug
