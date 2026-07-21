@@ -2722,11 +2722,25 @@ setup_relocate_volumes() {
 		warn "      $CONTAINER_VOLUMES_DIR is a symlink to a DIFFERENT root's volumes:"
 		warn "        $cur"
 		warn "      not this root's own $dest."
-		if ! confirm "      Move its contents to $dest and re-point the symlink here?"; then
-			warn "      Leaving it as-is. This root's volumes will live at $cur too,"
-			warn "      not under $MACKAS_ROOT, until you re-run and accept, or move them"
-			warn "      by hand."
-			return
+		if [ -d "$cur" ]; then
+			if ! confirm "      Move its contents to $dest and re-point the symlink here?"; then
+				warn "      Leaving it as-is. This root's volumes will live at $cur too,"
+				warn "      not under $MACKAS_ROOT, until you re-run and accept, or move them"
+				warn "      by hand."
+				return
+			fi
+		else
+			# Nothing left at the old location -- almost always a renamed
+			# volume/mountpoint: the real data never moved, it is just
+			# reachable under a different path now (which, if MACKAS_ROOT was
+			# updated to match, is exactly $dest already). Nothing to copy;
+			# just fix the symlink -- "move its contents" would be a lie here.
+			if ! confirm "      Re-point the symlink to $dest? (nothing exists at the old location any more)"; then
+				warn "      Leaving the symlink pointing at a location that no longer exists."
+				warn "      Re-run and accept, or fix it by hand:"
+				warn "        ln -sfn $(printf '%q' "$dest") $(printf '%q' "$CONTAINER_VOLUMES_DIR")"
+				return
+			fi
 		fi
 		[ -d "$dest" ] || { run mkdir -p "$dest"; did "created $dest"; }
 		if [ -d "$cur" ]; then
