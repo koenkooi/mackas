@@ -80,6 +80,39 @@ Requirements: Apple silicon, Apple `container` v1.1.0
 (`brew install container`), and a case-sensitive filesystem with room for the
 build.
 
+### Directory layout
+
+Everything lives under `MACKAS_ROOT` (reached through the short-link alias
+`MACKAS_BASE`, normally `~/oe`, when one resolves):
+
+```
+$MACKAS_ROOT/
+├── bin/          the docker->container shim, kas-container, GNU realpath
+├── kas/          the canonical generated tuning fragment (macos.yml)
+├── logs/         smoketest/build logs
+├── env.sh        generated; source this
+├── gitconfig     generated; forwarded as GITCONFIG_FILE
+└── work/         <- every layer checkout lives HERE, as a sibling
+    ├── meta-angstrom/
+    ├── meta-ti/
+    ├── meta-openembedded/
+    └── ...
+```
+
+**`work/` is the one directory that matters for multi-layer work.** It's
+what `KAS_WORK_DIR` is set to, and kas-container bind-mounts it whole into
+the container — so any layer checkout sitting under it, whether `setup`
+cloned it (`MACKAS_PROJECT_URL`/`_DIR`) or you put it there yourself, is
+visible to kas and reusable across builds with nothing re-cloned. `bin/`,
+`kas/` and `logs/` don't participate in this at all; only `work/` is what
+kas sees.
+
+If you already have a multi-layer BSP checkout — a real Angstrom-style
+layer set with a dozen `meta-*` repos, not just the single project `setup`
+clones by default — put all of them under `work/` as siblings. See
+["Driving kas directly"](#driving-kas-directly) below for composing kas
+configs that reference more than one of them at once.
+
 ### Driving kas directly
 
 `mackas smoketest` and `mackas shell` are wrappers; underneath this is ordinary
@@ -100,9 +133,30 @@ kas-container shell meta-ai/kas/base.yml:meta-ai/kas/qemuarm64.yml -c 'bitbake -
 kas-container shell meta-ai/kas/base.yml:meta-ai/kas/qemuarm64.yml   # interactive
 ```
 
-Compose `:kas/macos-local.yml` onto the end for the tuning fragment
-(parallelism, `BB_DISKMON_DIRS`, `BB_HASHSERVE_DB_DIR`, mirrors) that mackas
-passes for you when it drives kas.
+**The `cd` is not optional.** `kas-container` mounts your current directory
+at `/repo` inside the container and resolves every kas config path relative
+to it — it does not know about `MACKAS_BASE`/`MACKAS_PROJECT` and will not
+`cd` anywhere for you (`mackas shell`/`smoketest` do this step internally,
+which is the only reason they don't need it spelled out). Running it from
+anywhere else — most importantly, from `MACKAS_ROOT` itself rather than
+`MACKAS_BASE` (the short link) if the two differ, since `MACKAS_ROOT` is
+usually the one with spaces in it — reintroduces exactly the argument
+word-splitting kas-container has no defense against.
+
+Because `work/` (not the single project) is the `cd` target here, composing
+**multiple layers in one build is just more colon-separated paths** — every
+layer under `work/` is an equally-reachable sibling, kas config chain or
+not:
+
+```sh
+kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml:meta-angstrom/kas/macos-local.yml
+```
+
+Compose `:kas/macos-local.yml` (relative to whichever layer you generated it
+into — `mackas setup` writes it inside the single `MACKAS_PROJECT_DIR` it
+manages) onto the end for the tuning fragment (parallelism,
+`BB_DISKMON_DIRS`, `BB_HASHSERVE_DB_DIR`, mirrors) that mackas passes for
+you when it drives kas.
 
 > **`kas-container` here is a shell function, not the program on your
 > `PATH`.** `env.sh` defines it to supply `--runtime-args` (the ext4 volumes
