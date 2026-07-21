@@ -187,7 +187,9 @@
 # mackas builds whatever git repo + kas config you point it at -- and there is
 # no built-in default: with all four of these left unset, 'setup' still does
 # its whole job (volumes, kas-container, the shim, gitconfig) and just skips
-# the project checkout step.
+# the project checkout step; 'smoketest' offers the meta-ai example below for
+# one ephemeral run instead (never persisted, removed again afterward) if you
+# run it with nothing configured at all.
 #
 # The values commented out below are the EXAMPLE, qualcomm-linux/meta-ai -- it
 # is what has actually been tested end to end: the whole smoketest ladder
