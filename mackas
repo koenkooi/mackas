@@ -817,7 +817,7 @@ cmd_set() {
 	for a in "$@"; do
 		case "$a" in
 			--dry-run)     DRY_RUN=1 ;;
-			-y|--yes)      ASSUME_YES=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
@@ -855,7 +855,7 @@ cmd_get() {
 			# anywhere, so a habitual '-v' after any command does not
 			# suddenly become "unknown option" on this one.
 			--dry-run)     DRY_RUN=1 ;;
-			-y|--yes)      ASSUME_YES=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help|help) want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
@@ -878,7 +878,7 @@ cmd_unset() {
 	for a in "$@"; do
 		case "$a" in
 			--dry-run)     DRY_RUN=1 ;;
-			-y|--yes)      ASSUME_YES=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help|help) want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
@@ -3242,8 +3242,8 @@ ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matte
 ${C_BLD}OPTIONS${C_RST}
   --dest DIR      Where to copy (default \$MACKAS_BASE/artifacts).
 
-Options: --dry-run, -y/--yes and -v/--verbose work here too; put them before
-or after 'retrieve', e.g. '$SCRIPT_CMD --dry-run retrieve buildstats'.
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after 'retrieve', e.g. '$SCRIPT_CMD --dry-run retrieve buildstats'.
 
 ${C_BLD}ONE-VM RULE${C_RST}
   Only one VM may access an ext4 image at a time. retrieve refuses while a
@@ -3259,7 +3259,7 @@ cmd_retrieve() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--dry-run)     DRY_RUN=1; shift ;;
-			-y|--yes)      ASSUME_YES=1; shift ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1; shift ;;
 			-v|--verbose)  VERBOSE=1; shift ;;
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
@@ -3351,8 +3351,8 @@ ${C_BLD}SUBCOMMANDS${C_RST}
                    defaults to \$MACKAS_BASE/artifacts/buildstats -- the
                    default '$SCRIPT_CMD retrieve buildstats' destination.
 
-Options: --dry-run, -y/--yes and -v/--verbose work here too; put them before
-or after the subcommand.
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after the subcommand.
 EOF
 }
 
@@ -3381,7 +3381,7 @@ cmd_buildstats() {
 	for a in "$@"; do
 		case "$a" in
 			--dry-run)     DRY_RUN=1 ;;
-			-y|--yes)      ASSUME_YES=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
@@ -3873,8 +3873,11 @@ volume_fstrim_one() {
 }
 
 # volume fstrim <name> | all -- reclaim host disk from sparse ext4 image(s).
-# "all" is a positional keyword (object), not a flag -- 'volume fstrim' already
-# reads as verb+object, so a second object value is consistent, not --all.
+# "all" is the primary, documented form of this command's object -- 'volume
+# fstrim' already reads as verb+object, so a second object value is more
+# consistent than a flag. --all/-a are ALSO accepted, as synonyms for 'all',
+# purely for consistency with 'volume destroy --all' -- not because the
+# verb+object reasoning above was wrong.
 volume_fstrim() {
 	# fstrim ATTACHES each volume (via volume_fstrim_one), so it is a mutating
 	# command and needs a root like the rest. Without one, `all` would expand
@@ -3886,9 +3889,9 @@ volume_fstrim() {
 	local do_all=0 names=() a
 	for a in "$@"; do
 		case "$a" in
-			all) do_all=1 ;;
+			all|-a|--all) do_all=1 ;;
 			-*) die "unknown option for 'volume fstrim': $a" \
-				"$SCRIPT_CMD volume fstrim <name> | all" ;;
+				"$SCRIPT_CMD volume fstrim <name> | all | --all" ;;
 			*) names+=("$a") ;;
 		esac
 	done
@@ -3899,8 +3902,8 @@ volume_fstrim() {
 		names=("$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE")
 	fi
 
-	[ "${#names[@]}" -ge 1 ] || die "'volume fstrim' needs a volume name (or 'all')" \
-		"$SCRIPT_CMD volume fstrim <name> | all"
+	[ "${#names[@]}" -ge 1 ] || die "'volume fstrim' needs a volume name (or 'all'/--all)" \
+		"$SCRIPT_CMD volume fstrim <name> | all | --all"
 
 	local n rc=0
 	for n in "${names[@]}"; do
@@ -3967,15 +3970,44 @@ volume_duplicate() {
 	return 0
 }
 
-# volume destroy <name> -- remove ONE arbitrary volume. Distinct from the
-# top-level `destroy`, which removes the THREE mackas volumes plus MACKAS_ROOT
-# and the short symlink. This is the counterpart to `duplicate`: remove a clone,
-# or a stray zztest-* volume, without touching anything else.
+# volume destroy <name> | --all -- remove ONE arbitrary volume, or (--all/-a)
+# every mackas-managed volume: the three active ones plus the legacy
+# pre-split leftover, if present. Distinct from the top-level `destroy`,
+# which ALSO removes MACKAS_ROOT and the short symlink -- this only ever
+# touches volumes. Single-name mode is the counterpart to `duplicate`: remove
+# a clone, or a stray zztest-* volume, without touching anything else.
 volume_destroy() {
-	local name="${1:-}"
+	local name="" do_all=0 a
+	for a in "$@"; do
+		case "$a" in
+			# 'all' is accepted bare too, matching volume_fstrim()'s own
+			# 'all|-a|--all' precedent -- the two --all-capable subcommands
+			# read the same way, not just the flag-spelled one.
+			all|-a|--all) do_all=1 ;;
+			-*) die "unknown option for 'volume destroy': $a" \
+				"$SCRIPT_CMD volume destroy <name> | all | --all" ;;
+			*)
+				[ -z "$name" ] || die "'volume destroy' removes one volume at a time" \
+					"$SCRIPT_CMD volume destroy <name>"
+				name="$a"
+				;;
+		esac
+	done
+
+	if [ "$do_all" -eq 1 ]; then
+		[ -z "$name" ] || die "'volume destroy --all' takes no volume name" \
+			"$SCRIPT_CMD volume destroy --all"
+		# Same reasoning as volume_fstrim()'s root gate: --all expands to
+		# names DERIVED from MACKAS_VOLUME_NAME, so an unset MACKAS_ROOT could
+		# otherwise mean deleting whatever install happens to share those
+		# default names. Destroying is a stronger reason for this gate than
+		# fstrim's own attach-only risk, not a weaker one.
+		require_mackas_root
+		volume_destroy_all
+		return $?
+	fi
+
 	[ -n "$name" ] || die "'volume destroy' needs a volume name" "$SCRIPT_CMD volume destroy <name>"
-	[ "$#" -le 1 ] || die "'volume destroy' removes one volume at a time" \
-		"$SCRIPT_CMD volume destroy <name>"
 
 	volume_exists "$name" || die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
 
@@ -3993,6 +4025,48 @@ volume_destroy() {
 	delete_volume "$name" || die "could not delete volume '$name'" \
 		"stop whatever is using it (container ls) and re-run"
 	return 0
+}
+
+# volume destroy --all's worker. Unlike the single-name path above, a volume
+# that does not exist is normal here (not every install has all four), not an
+# error -- and a busy one is skipped with a warning, mirroring
+# volume_fstrim_one()'s from_all shape, rather than aborting the whole run.
+volume_destroy_all() {
+	local names=("$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" "$MACKAS_VOL_LEGACY")
+	local n present=() total_kb=0 kb img
+
+	for n in "${names[@]}"; do
+		volume_exists "$n" || continue
+		present+=("$n")
+		img="$CONTAINER_VOLUMES_DIR/$n/volume.img"
+		kb="$(volume_img_kb "$img")"
+		total_kb=$((total_kb + ${kb:-0}))
+	done
+
+	if [ "${#present[@]}" -eq 0 ]; then
+		info "no mackas volumes exist -- nothing to destroy"
+		return 0
+	fi
+
+	confirm "Delete ${#present[@]} volume(s) (${present[*]}) -- $(fmt_kb "$total_kb") total? This cannot be undone." \
+		|| { info "Aborted. Nothing was removed."; return 1; }
+
+	local rc=0 removed=()
+	for n in "${present[@]}"; do
+		if volume_in_use "$n"; then
+			warn "  volume '$n' is attached to a running container; skipping (one-VM rule)"
+			rc=1
+			continue
+		fi
+		if delete_volume "$n"; then
+			removed+=("$n")
+		else
+			rc=1
+		fi
+	done
+
+	[ "${#removed[@]}" -eq 0 ] || did "removed ${#removed[@]} volume(s): ${removed[*]}"
+	return "$rc"
 }
 
 # The real on-disk directory that backs a volume. Normally this is just
@@ -4288,9 +4362,9 @@ ${C_BLD}$SCRIPT_CMD volume${C_RST} -- manage the ext4 container volumes.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD volume list
-  $SCRIPT_CMD volume fstrim <name> | all
+  $SCRIPT_CMD volume fstrim <name> | all | --all
   $SCRIPT_CMD volume duplicate <source> <duplicate>
-  $SCRIPT_CMD volume destroy <name>
+  $SCRIPT_CMD volume destroy <name> | all | --all
   $SCRIPT_CMD volume move <name> <dir>
   $SCRIPT_CMD volume recover [<name>]
 
@@ -4300,14 +4374,18 @@ ${C_BLD}SUBCOMMANDS${C_RST}
   fstrim <name>        Reclaim host disk from a sparse ext4 image. Deleting
   (trim)               files inside the guest never shrinks volume.img; fstrim
                        inside the guest issues the discards that hole-punch it
-                       on the host. 'all' does the three mackas volumes,
-                       skipping any that are in use.
+                       on the host. 'all' (or --all/-a) does the three active
+                       mackas volumes, skipping any that are in use.
   duplicate <source> <duplicate>  Clone a volume via APFS copy-on-write
   (dup, clone)         (near-free; the clone shares blocks with its source
                        until written). <duplicate> is a name you choose.
-  destroy <name>       Remove ONE volume. Unlike the top-level '$SCRIPT_NAME
-  (delete, rm)         destroy' (which removes all three mackas volumes,
-                       $MACKAS_ROOT and the symlink), this touches only <name>.
+  destroy <name>       Remove ONE volume, or ('all'/--all/-a) every mackas-managed
+  (delete, rm)         volume: the three active ones plus the legacy
+                       pre-split leftover, if present -- skipping any that are
+                       missing or in use rather than aborting. Unlike the
+                       top-level '$SCRIPT_NAME destroy' (which ALSO removes
+                       $MACKAS_ROOT and the symlink), this only ever touches
+                       volumes.
   move <name> <dir>    Relocate one volume's on-disk image to <dir>/<name> and
   (relocate)           leave a symlink behind so the engine still finds it --
                        e.g. put a big TMPDIR on a roomier disk. Refuses an
@@ -4322,14 +4400,16 @@ ${C_BLD}SUBCOMMANDS${C_RST}
   container's own vocabulary (this is a volume manager sitting right next to
   'container volume ls'); the rest are contractions.
 
-Options: --dry-run, -y/--yes and -v/--verbose work here too; before or after
-the subcommand, e.g. '$SCRIPT_CMD --dry-run volume fstrim oe-build-tmp' or
-'$SCRIPT_CMD volume fstrim oe-build-tmp --dry-run' both work.
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+before or after the subcommand, e.g. '$SCRIPT_CMD --dry-run volume fstrim oe-build-tmp'
+or '$SCRIPT_CMD volume fstrim oe-build-tmp --dry-run' both work.
 
 ${C_BLD}ONE-VM RULE${C_RST}
   Only one VM may access an ext4 image at a time. fstrim, duplicate and destroy
   all refuse a volume a running container holds -- for duplicate, that guard is
-  on the SOURCE, since a clone of a live (mid-write) image is inconsistent.
+  on the SOURCE, since a clone of a live (mid-write) image is inconsistent. In
+  --all/-a mode (fstrim or destroy), a busy volume is skipped with a warning
+  instead of aborting the whole run; naming a volume explicitly still refuses.
 EOF
 }
 
@@ -4338,7 +4418,7 @@ cmd_volume() {
 	for a in "$@"; do
 		case "$a" in
 			--dry-run)     DRY_RUN=1 ;;
-			-y|--yes)      ASSUME_YES=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
 			-v|--verbose)  VERBOSE=1 ;;
 			# -h/--help anywhere means help, whether it comes before the
 			# subcommand ('volume --help') or after it ('volume fstrim --help').
@@ -4411,6 +4491,8 @@ ${C_BLD}OPTIONS${C_RST}
                   '$SCRIPT_CMD status' lists the valid names.
   --dry-run       Print every mutating command; change nothing.
   -y, --yes       Assume yes; never prompt (required for non-interactive destroy).
+                  -f/--force is an accepted synonym, for anyone used to
+                  'docker system prune -f'.
   -v, --verbose   Echo commands as they run.
   -h, --help      This message.
 

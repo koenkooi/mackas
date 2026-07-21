@@ -343,6 +343,32 @@ refute_call() {
 	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
 }
 
+@test "volume fstrim: --all is accepted as a synonym for the positional 'all'" {
+	have_volume oe-build-tmp    120G 8192
+	have_volume oe-build-dl     40G  8192
+	have_volume oe-build-sstate 40G  8192
+	vol fstrim --all
+	[ "$status" -eq 0 ]
+	assert_call "[-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+	assert_call "[-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+}
+
+@test "volume fstrim: -a is accepted as a synonym for the positional 'all'" {
+	have_volume oe-build-tmp    120G 8192
+	have_volume oe-build-dl     40G  8192
+	have_volume oe-build-sstate 40G  8192
+	vol fstrim -a
+	[ "$status" -eq 0 ]
+	assert_call "[-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+}
+
+@test "volume fstrim: --all takes no volume name" {
+	vol fstrim --all some-name
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "takes no volume name"
+}
+
 # ---------------------------------------------------------------------------
 # duplicate
 # ---------------------------------------------------------------------------
@@ -415,6 +441,77 @@ refute_call() {
 	vol -y destroy no-such-volume
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi "does not exist"
+}
+
+@test "volume destroy --all: removes all four mackas volumes" {
+	have_volume oe-build-tmp    120G 8192
+	have_volume oe-build-dl     40G  8192
+	have_volume oe-build-sstate 40G  8192
+	have_volume oe-build        1G   4096   # the legacy pre-split volume
+	vol -y destroy --all
+	[ "$status" -eq 0 ]
+	assert_call "[volume] [delete] [oe-build-tmp]"
+	assert_call "[volume] [delete] [oe-build-dl]"
+	assert_call "[volume] [delete] [oe-build-sstate]"
+	assert_call "[volume] [delete] [oe-build]"
+	[ ! -e "$(VOLDIR)/oe-build-tmp" ]
+	[ ! -e "$(VOLDIR)/oe-build" ]
+}
+
+@test "volume destroy -a: same as --all" {
+	have_volume oe-build-tmp 120G 8192
+	vol -y destroy -a
+	[ "$status" -eq 0 ]
+	assert_call "[volume] [delete] [oe-build-tmp]"
+}
+
+@test "volume destroy all: bare positional works too, matching fstrim's precedent" {
+	have_volume oe-build-tmp 120G 8192
+	vol -y destroy all
+	[ "$status" -eq 0 ]
+	assert_call "[volume] [delete] [oe-build-tmp]"
+}
+
+@test "volume destroy --all: silently skips a volume that does not exist, warns and skips one that is in use" {
+	have_volume oe-build-tmp    120G 8192
+	have_volume oe-build-sstate 40G  8192
+	# oe-build-dl and oe-build (legacy) were never created -- silently absent.
+	MOCK_INUSE=oe-build-tmp vol -y destroy --all
+	[ "$status" -ne 0 ]   # a busy volume survives, so the run is non-zero
+	printf '%s\n' "$output" | grep -qi "oe-build-tmp.*skipping"
+	refute_call "[volume] [delete] [oe-build-tmp]"
+	assert_call "[volume] [delete] [oe-build-sstate]"
+	refute_call "[volume] [delete] [oe-build-dl]"
+	refute_call "[volume] [delete] [oe-build]"
+}
+
+@test "volume destroy --all <name>: refused (takes no volume name)" {
+	vol -y destroy --all some-name
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "takes no volume name"
+	refute_call "[volume] [delete]"
+}
+
+@test "volume destroy --all --dry-run: removes nothing" {
+	have_volume oe-build-tmp 120G 8192
+	vol --dry-run -y destroy --all
+	[ "$status" -eq 0 ]
+	refute_call "[volume] [delete]"
+	[ -e "$(VOLDIR)/oe-build-tmp" ]
+}
+
+@test "volume destroy --all -f: force is accepted as a synonym for -y" {
+	have_volume oe-build-tmp 120G 8192
+	vol -f destroy --all
+	[ "$status" -eq 0 ]
+	assert_call "[volume] [delete] [oe-build-tmp]"
+}
+
+@test "volume destroy --all: a quiet no-op when nothing exists yet" {
+	vol -y destroy --all
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "nothing to destroy"
+	refute_call "[volume] [delete]"
 }
 
 # ---------------------------------------------------------------------------
@@ -641,6 +738,18 @@ refute_call() {
 @test "volume --help: flag-placement wording says before OR after (it undersold its own behaviour)" {
 	vol --help
 	printf '%s\n' "$output" | grep -qi 'before or after'
+}
+
+@test "volume --help: documents --all/-a under both destroy and fstrim" {
+	vol --help
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--all/-a'
+}
+
+@test "volume --help: documents -f/--force alongside -y/--yes" {
+	vol --help
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '-f/--force'
 }
 
 # ---------------------------------------------------------------------------
