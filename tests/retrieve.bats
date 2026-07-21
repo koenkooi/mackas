@@ -220,10 +220,9 @@ refute_call() {
 	# destination after the mackas-facing object key ("deploy"), not whatever
 	# basename the resolved guest path happens to have.
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
-	# bitbake_getvar cd's into MACKAS_PROJECT before invoking kas-container;
-	# with no project configured (this session's factory default) that's just
-	# $MACKAS_WORK itself -- it must exist for the cd to succeed.
-	mkdir -p "$ROOT/work"
+	# bitbake_getvar refuses up front unless MACKAS_PROJECT is a real checkout
+	# (MACKAS_PROJECT_DIR must be set, not just MACKAS_KAS_CONFIG) -- give it one.
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
 	cat > "$ROOT/bin/kas-container" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
@@ -235,7 +234,7 @@ EOF
 	mkdir -p "$FIXTURE/renamed-output/images"
 	echo bin > "$FIXTURE/renamed-output/images/fake2.img"
 
-	MOCK_TMP_HAS="renamed-output" mk retrieve deploy
+	MOCK_TMP_HAS="renamed-output" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
 	[ "$status" -eq 0 ]
 	assert_call "test] [-d] [/build/some/renamed-output]"
 	# Named after the object key, not the resolved path's own basename.
