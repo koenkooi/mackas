@@ -242,6 +242,65 @@ EOF
 	[ ! -d "$ROOT/artifacts/renamed-output" ]
 }
 
+@test "retrieve: bitbake_getvar passes -k once a parseable state already exists" {
+	# kas's own 'shell' unconditionally re-runs repo checkout/patch-apply/
+	# write_bbconfig every invocation unless told '-k' to skip them. retrieve
+	# can call bitbake_getvar once per object in a single invocation -- a
+	# read-only variable query, not a build -- so it must pass -k once the
+	# checkout already has conf/local.conf + conf/bblayers.conf (kas defaults
+	# its build dir to $MACKAS_PROJECT itself here, since KAS_BUILD_DIR is
+	# blanked), or every call needlessly churns every declared repo's state.
+	mkdir -p "$ROOT/work/meta-angstrom/.git" "$ROOT/work/meta-angstrom/conf"
+	touch "$ROOT/work/meta-angstrom/conf/local.conf" "$ROOT/work/meta-angstrom/conf/bblayers.conf"
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	KREC="$TESTDIR/kas-argv.log"
+	export KREC
+	cat > "$ROOT/bin/kas-container" <<'EOF'
+#!/usr/bin/env bash
+{
+	for a in "$@"; do printf '[%s] ' "$a"; done
+	printf '\n'
+} >> "$KREC"
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR "*) echo "/build/deploy" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container"
+
+	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
+	[ "$status" -eq 0 ]
+	grep -qF "[shell] [-k] [" "$KREC"
+}
+
+@test "retrieve: bitbake_getvar omits -k on a checkout with no parseable state yet" {
+	# -k also skips write_bbconfig -- a checkout that has never had
+	# local.conf/bblayers.conf written would have nothing to parse if -k
+	# were forced unconditionally. Omitting it lets kas do that one-time
+	# setup so the query can actually succeed.
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	KREC="$TESTDIR/kas-argv.log"
+	export KREC
+	cat > "$ROOT/bin/kas-container" <<'EOF'
+#!/usr/bin/env bash
+{
+	for a in "$@"; do printf '[%s] ' "$a"; done
+	printf '\n'
+} >> "$KREC"
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR "*) echo "/build/deploy" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container"
+
+	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
+	[ "$status" -eq 0 ]
+	! grep -qF "[-k]" "$KREC"
+	grep -qF "[shell] [" "$KREC"
+}
+
 @test "retrieve: falls back to the OE-core default with a warning when bitbake-getvar fails" {
 	# No gitconfig set up here (the base setup()'s kas-container is an empty
 	# stub too) -- bitbake_getvar must fail closed and retrieve must still work.
