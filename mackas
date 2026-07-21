@@ -79,6 +79,8 @@ MACKAS_FSTRIM_AUTO
 MACKAS_FREE_SPACE_MARGIN_GB
 MACKAS_REQUIRE_CASE_SENSITIVE
 MACKAS_WORKSPACE_SIZE
+MACKAS_MONITOR
+MACKAS_MONITOR_PORT
 "
 
 # ---------------------------------------------------------------------------
@@ -94,7 +96,7 @@ ASSUME_YES=0
 OVERHEAD_PID=""
 OVERHEAD_OUT=""
 
-# The `volume`/`retrieve`/`buildstats`/`sstate` subcommands' tails (everything after
+# The `volume`/`retrieve`/`buildstats`/`sstate`/`monitor` subcommands' tails (everything after
 # the command word), captured verbatim by main()'s flag loop and handed to the
 # matching cmd_*(). Declared empty here so `${FOO_ARGS+...}` is safe under
 # `set -u` when that command never ran.
@@ -102,6 +104,7 @@ VOLUME_ARGS=()
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
 SSTATE_ARGS=()
+MONITOR_ARGS=()
 ADOPT_ARGS=()
 SET_ARGS=()
 GET_ARGS=()
@@ -321,7 +324,7 @@ is_setting_name() {
 }
 
 # die_on_misplaced_global_flag ARG CMD -- every verb-object command
-# (volume/retrieve/buildstats/sstate/set/get/unset) owns everything after its own
+# (volume/retrieve/buildstats/sstate/monitor/set/get/unset) owns everything after its own
 # command word, captured verbatim by main() before cmd_CMD ever runs -- so
 # --config/--set typed AFTER the command word are silently never seen by the
 # code that would act on them (main()'s own arg loop, and load_config/
@@ -437,6 +440,14 @@ validate_settings() {
 		''|[!0-9]*|*[!0-9gGmM]*)
 			die "MACKAS_MEMORY='$MACKAS_MEMORY' is not a size like 8g, 512m or 16" \
 				"set MACKAS_MEMORY to <digits> optionally followed by g or m (no spaces) in $(config_hint)"
+			;;
+	esac
+	# MACKAS_MONITOR_PORT is also word-split into --runtime-args (as -p
+	# PORT:PORT), same injection risk as MACKAS_CPUS/MACKAS_MEMORY above.
+	case "$MACKAS_MONITOR_PORT" in
+		''|*[!0-9]*)
+			die "MACKAS_MONITOR_PORT='$MACKAS_MONITOR_PORT' is not a positive integer" \
+				"set MACKAS_MONITOR_PORT to a whole port number (no spaces) in $(config_hint)"
 			;;
 	esac
 }
@@ -633,6 +644,14 @@ set_defaults() {
 	MACKAS_WORKSPACE_SIZE="40G"
 
 	MACKAS_FREE_SPACE_MARGIN_GB=20
+
+	# Bitbake progress bridge (TODO.md item 22): OFF by default. Enabling it
+	# bind-mounts mackas-uibridge/ into the container, shadows PATH so bitbake
+	# resolves to its wrapper first, and publishes a port to the host -- real
+	# cost on every build, so it stays opt-in until proven, not a default like
+	# MACKAS_OVERHEAD/MACKAS_FSTRIM_AUTO (which cost near nothing).
+	MACKAS_MONITOR=0
+	MACKAS_MONITOR_PORT=8801
 }
 
 CONFIG_FILE_USED=""
@@ -1174,6 +1193,56 @@ validate_nfs_mirror_paths() {
 # Small utilities
 # ---------------------------------------------------------------------------
 
+# monitor_runtime_args -- the extra --runtime-args tokens that activate the
+# bitbake progress bridge (TODO.md item 22) when MACKAS_MONITOR=1. Prints
+# nothing (best-effort, never fatal -- MACKAS_MONITOR is opt-in extra
+# visibility, not something a build should fail over) when there is nothing
+# to mount yet (no project checked out) or when a path involved has a space
+# in it: kas-container word-splits --runtime-args on whitespace (see
+# kas_runtime_args's own comment), so a spacey path would silently corrupt
+# every OTHER token in the string, not just this one.
+#
+# Finds the real bitbake to mount over from the HOST side: the checkout is a
+# plain bind-mount under MACKAS_WORK, not inside an ext4 volume, so a host
+# `find` sees it directly, and does not depend on a specific checkout
+# directory NAME (kas lets a project's kas.yml name it anything).
+monitor_runtime_args() {
+	local real_bitbake rel
+
+	case "$SCRIPT_DIR" in
+		*' '*)
+			vrb "MACKAS_MONITOR=1 but mackas's own path has a space in it ($SCRIPT_DIR); skipping the bridge this run"
+			return
+			;;
+	esac
+
+	[ -d "$MACKAS_WORK" ] || return
+	real_bitbake="$(find "$MACKAS_WORK" -maxdepth 3 -type f -path '*/bin/bitbake' 2>/dev/null | head -1)"
+	[ -n "$real_bitbake" ] || {
+		vrb "MACKAS_MONITOR=1 but no bitbake checkout found yet under $MACKAS_WORK; skipping the bridge this run"
+		return
+	}
+	case "$real_bitbake" in
+		*' '*)
+			vrb "MACKAS_MONITOR=1 but the bitbake checkout's path has a space in it; skipping the bridge this run"
+			return
+			;;
+	esac
+
+	rel="${real_bitbake#"$MACKAS_WORK"/}"
+	# Both mounted as INDIVIDUAL files, never one whole-directory mount plus
+	# a second mount targeting a file inside that same directory -- verified
+	# live: Apple's container silently fails the FIRST mount whenever a
+	# second -v's HOST source path is nested inside the first -v's host
+	# source directory, even when their container-side targets are
+	# unrelated. Two single-file mounts from the same host directory (as
+	# used here) coexist fine; a directory mount plus a file-inside-it mount
+	# does not.
+	printf ' -v %s/mackasjson.py:/mackas-uibridge/mackasjson.py:ro -v %s/bitbake:/work/%s:ro -p %s:%s -e MACKAS_MONITOR_PORT=%s' \
+		"$SCRIPT_DIR/mackas-uibridge" "$SCRIPT_DIR/mackas-uibridge" "$rel" \
+		"$MACKAS_MONITOR_PORT" "$MACKAS_MONITOR_PORT" "$MACKAS_MONITOR_PORT"
+}
+
 # The one string that makes the whole tool work. See README's "The ext4
 # volumes".
 #
@@ -1210,6 +1279,8 @@ kas_runtime_args() {
 		rt_str="$rt_str -v $MACKAS_SSTATE_MIRROR_PATH:/sstate-mirror:ro"
 		rt_str="$rt_str -v $MACKAS_DL_MIRROR_PATH:/downloads-mirror:ro"
 	fi
+
+	[ "$MACKAS_MONITOR" = "1" ] && rt_str="$rt_str $(monitor_runtime_args)"
 
 	printf '%s' "$rt_str"
 }
@@ -4621,6 +4692,67 @@ cmd_sstate() {
 	esac
 }
 
+monitor_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build
+started with MACKAS_MONITOR=1 (TODO.md item 22).
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD monitor [--port N] [--once]
+
+Polls the in-container progress bridge and prints one line per update:
+'[status] done/total  recipe:task'. This only polls an already-published
+port -- it does not start a build. Enable the bridge for the build you
+want to watch first, e.g.:
+
+  $SCRIPT_CMD --set MACKAS_MONITOR=1 smoketest &
+  $SCRIPT_CMD monitor
+
+${C_BLD}OPTIONS${C_RST}
+  --port N   Poll this port instead of MACKAS_MONITOR_PORT.
+  --once     Print a single snapshot and exit, instead of following until
+             the build reports success/failed.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+EOF
+}
+
+cmd_monitor() {
+	local port="$MACKAS_MONITOR_PORT" once=0 want_help=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help|help) want_help=1; shift ;;
+			--port)    port="${2:-}"
+				[ -n "$port" ] || die "--port needs a value" "$SCRIPT_CMD monitor --help"
+				shift 2 ;;
+			--port=*)  port="${1#*=}"; shift ;;
+			--once)    once=1; shift ;;
+			--dry-run) DRY_RUN=1; shift ;;
+			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
+			-v|--verbose) VERBOSE=1; shift ;;
+			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
+			-*) die "unknown option for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
+			*) die "unexpected argument for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		monitor_usage
+		return 0
+	fi
+
+	local tool="$SCRIPT_DIR/tools/mackas-monitor"
+	if [ ! -f "$tool" ] || [ ! -x /usr/bin/python3 ]; then
+		warn "monitor tool not found at $tool; skipping"
+		return 1
+	fi
+
+	local args=(--port "$port")
+	[ "$once" -eq 1 ] && args+=(--once)
+	/usr/bin/python3 "$tool" "${args[@]}"
+}
+
 show() { printf '  %-24s %s\n' "$1" "$2"; }
 
 # One line per volume: name, what it backs, cap, and what it costs today.
@@ -5760,6 +5892,8 @@ ${C_BLD}COMMANDS${C_RST}
              '$SCRIPT_CMD buildstats --help'.
   sstate     Prune sstate objects bitbake hasn't reused in a while.
              '$SCRIPT_CMD sstate --help'.
+  monitor    Show live bitbake progress from a build started with
+             MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
   clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the checkout.
   destroy    Remove all three volumes, $MACKAS_ROOT and the short symlink.
              Makes you type DESTROY.
@@ -5910,6 +6044,13 @@ main() {
 				cmd="sstate"; shift
 				if [ "$want_help" -eq 1 ]; then SSTATE_ARGS=("$@" "--help"); else SSTATE_ARGS=("$@"); fi
 				break ;;
+			monitor)
+				# Same shape again: monitor owns everything after it
+				# (--port/--once), captured verbatim for cmd_monitor.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="monitor"; shift
+				if [ "$want_help" -eq 1 ]; then MONITOR_ARGS=("$@" "--help"); else MONITOR_ARGS=("$@"); fi
+				break ;;
 			set)
 				# Same shape again: set owns everything after it (NAME and
 				# VALUE), captured verbatim for cmd_set. Persists to the config
@@ -5948,7 +6089,7 @@ main() {
 			check|smoketest|status|shell|clean|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats sstate clean destroy volume set get unset help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats sstate monitor clean destroy volume set get unset help)" ;;
 		esac
 	done
 
@@ -5978,7 +6119,7 @@ main() {
 	derive_paths
 
 	# A bare 'help'/'-h' (no command named at all) shows the general usage.
-	# volume/retrieve/buildstats/sstate/set/get/unset handle their OWN --help
+	# volume/retrieve/buildstats/sstate/monitor/set/get/unset handle their OWN --help
 	# internally (via the "--help" appended to their *_ARGS above), so they
 	# are dispatched normally either way, below.
 	if [ "$want_help" -eq 1 ] && [ -z "$cmd" ]; then
@@ -5999,6 +6140,7 @@ main() {
 		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
 		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;
 		sstate)     cmd_sstate ${SSTATE_ARGS+"${SSTATE_ARGS[@]}"} ;;
+		monitor)    cmd_monitor ${MONITOR_ARGS+"${MONITOR_ARGS[@]}"} ;;
 		set)        cmd_set ${SET_ARGS+"${SET_ARGS[@]}"} ;;
 		get)        cmd_get ${GET_ARGS+"${GET_ARGS[@]}"} ;;
 		unset)      cmd_unset ${UNSET_ARGS+"${UNSET_ARGS[@]}"} ;;

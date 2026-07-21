@@ -126,6 +126,87 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# MACKAS_MONITOR -- the bitbake progress bridge (TODO.md item 22). OFF by
+# default; when on, mounts mackasjson.py and the wrapper file (each as its
+# OWN individual -v mount, never one whole-directory mount alongside a
+# second mount targeting a file inside that same directory -- confirmed
+# live that Apple's container silently drops the first mount when two -v
+# HOST source paths overlap that way) over the real bitbake checkout's own
+# bin/bitbake, discovered from the host side.
+# ---------------------------------------------------------------------------
+
+@test "runtime-args: MACKAS_MONITOR=0 (the default) adds nothing" {
+	args="$(kas_runtime_args)"
+	! printf '%s\n' "$args" | grep -q 'mackas-uibridge'
+	! printf '%s\n' "$args" | grep -qE -- '(^| )-p '
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 mounts the bridge over a real bitbake checkout" {
+	MACKAS_MONITOR=1
+	mkdir -p "$MACKAS_WORK/bitbake/bin"
+	touch "$MACKAS_WORK/bitbake/bin/bitbake"
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-v $REPO_ROOT/mackas-uibridge/mackasjson.py:/mackas-uibridge/mackasjson.py:ro"
+	printf '%s\n' "$args" | grep -qF -- "-v $REPO_ROOT/mackas-uibridge/bitbake:/work/bitbake/bin/bitbake:ro"
+	printf '%s\n' "$args" | grep -qF -- "-p 8801:8801"
+	printf '%s\n' "$args" | grep -qF -- "-e MACKAS_MONITOR_PORT=8801"
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 never whole-directory-mounts mackas-uibridge/" {
+	# Regression guard for a bug that actually shipped and was caught live:
+	# Apple's container silently drops a -v mount whenever a LATER -v's host
+	# source path is nested inside an EARLIER -v's host source directory --
+	# even when their container targets are unrelated (e.g. one whole-dir
+	# mount at /mackas-uibridge alongside a second mount of
+	# mackas-uibridge/bitbake onto /work/.../bitbake made the FIRST mount
+	# vanish; nothing said so). mackasjson.py must be mounted as its own
+	# individual file, matching the bitbake wrapper's own mount shape.
+	MACKAS_MONITOR=1
+	mkdir -p "$MACKAS_WORK/bitbake/bin"
+	touch "$MACKAS_WORK/bitbake/bin/bitbake"
+	args="$(kas_runtime_args)"
+	! printf '%s\n' "$args" | grep -qE -- "-v [^ ]*mackas-uibridge:/mackas-uibridge:ro"
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 honours a custom MACKAS_MONITOR_PORT" {
+	MACKAS_MONITOR=1
+	MACKAS_MONITOR_PORT=9100
+	mkdir -p "$MACKAS_WORK/bitbake/bin"
+	touch "$MACKAS_WORK/bitbake/bin/bitbake"
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-p 9100:9100"
+	printf '%s\n' "$args" | grep -qF -- "-e MACKAS_MONITOR_PORT=9100"
+	! printf '%s\n' "$args" | grep -qF -- "8801"
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 finds bitbake regardless of the checkout's directory name" {
+	# kas lets a project's kas.yml name the checkout anything; discovery must
+	# not assume the literal name 'bitbake'.
+	MACKAS_MONITOR=1
+	mkdir -p "$MACKAS_WORK/some-custom-name/bin"
+	touch "$MACKAS_WORK/some-custom-name/bin/bitbake"
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-v $REPO_ROOT/mackas-uibridge/bitbake:/work/some-custom-name/bin/bitbake:ro"
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 with no bitbake checkout yet is a silent no-op" {
+	MACKAS_MONITOR=1
+	# MACKAS_WORK exists (derive_paths created it in spirit, but not on disk
+	# here) -- create it empty, matching "project not cloned yet".
+	mkdir -p "$MACKAS_WORK"
+	args="$(kas_runtime_args)"
+	! printf '%s\n' "$args" | grep -q 'mackas-uibridge'
+	! printf '%s\n' "$args" | grep -qE -- '(^| )-p '
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 with MACKAS_WORK not existing yet is a silent no-op" {
+	MACKAS_MONITOR=1
+	rm -rf "$MACKAS_WORK"
+	args="$(kas_runtime_args)"
+	! printf '%s\n' "$args" | grep -q 'mackas-uibridge'
+}
+
+# ---------------------------------------------------------------------------
 # NFS mirrors + whitespace. Not a corner case: an ordinary MACKAS_ROOT with a
 # space in it -- "/Volumes/My Build Disk/oe" -- has the mirror paths derive
 # from it, and kas-container word-splits --runtime-args, so turning NFS mirrors
