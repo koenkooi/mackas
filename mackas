@@ -3487,10 +3487,22 @@ run_kas() {
 # best-guess default rather than treating this as fatal, matching
 # 'retrieve's existing best-effort, per-object style.
 bitbake_getvar() {
-	local var="$1" rt_args gitconfig out rc
+	local var="$1" rt_args gitconfig out rc errfile errmsg
 	rt_args="$(kas_runtime_args)"
 	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
 	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
+
+	# MACKAS_KAS_CONFIG alone does not say WHERE to run kas-container from --
+	# that is MACKAS_PROJECT_DIR's job (it is what MACKAS_PROJECT derives
+	# from). Setting only the former, a real and easy mistake, leaves
+	# MACKAS_PROJECT at whatever it already was -- kas-container then looks
+	# for the configured kas files relative to the WRONG directory and fails
+	# outright. Caught here, up front, with a specific diagnostic, rather
+	# than only surfacing as a generic "could not resolve" from the caller.
+	if [ ! -d "$MACKAS_PROJECT/.git" ]; then
+		warn "  bitbake-getvar needs a real checkout at MACKAS_PROJECT ($MACKAS_PROJECT) -- set MACKAS_PROJECT_DIR too, not just MACKAS_KAS_CONFIG"
+		return 1
+	fi
 
 	# The real workflow this project supports -- 'mackas setup' once for
 	# shared infra (volumes, kas-container, shim), then plain 'git clone' plus
@@ -3500,11 +3512,19 @@ bitbake_getvar() {
 	# exist yet for THIS project even though the shared kas/macos.yml does.
 	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
 	# regenerating unconditionally, and setup_kas_fragment() already honours
-	# --dry-run itself (prints the plan, writes nothing).
-	if [ -d "$MACKAS_PROJECT/.git" ] && [ ! -f "$MACKAS_KAS_FRAGMENT_REPO" ]; then
-		setup_kas_fragment
+	# --dry-run itself (prints the plan, writes nothing). Redirected to
+	# stderr: every caller of bitbake_getvar captures its stdout via command
+	# substitution as the resolved value, and setup_kas_fragment's own
+	# step/did progress lines would otherwise leak into that value.
+	if [ ! -f "$MACKAS_KAS_FRAGMENT_REPO" ]; then
+		setup_kas_fragment 1>&2
 	fi
 
+	# kas-container's own stderr (e.g. "configuration file '...' not found",
+	# the exact symptom of the MACKAS_KAS_CONFIG-without-MACKAS_PROJECT_DIR
+	# mistake above surviving some OTHER way) is captured, not discarded --
+	# a bare "could not resolve" with no reason was hard to debug live.
+	errfile="$(mktemp "${TMPDIR:-/tmp}/mackas-getvar.XXXXXX" 2>/dev/null)" || errfile=/dev/null
 	out="$(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
 		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
@@ -3518,10 +3538,16 @@ bitbake_getvar() {
 		BB_NUMBER_THREADS="$MACKAS_CPUS" \
 		PARALLEL_MAKE="-j $MACKAS_CPUS" \
 		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell "$KAS_FILES_ARG" \
-			-c "bitbake-getvar --value -q $(printf '%q' "$var")" 2>/dev/null
-	)"
+			-c "bitbake-getvar --value -q $(printf '%q' "$var")"
+	)" 2>"$errfile"
 	rc=$?
-	[ "$rc" -eq 0 ] && [ -n "$out" ] || return 1
+	if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+		errmsg="$(tail -1 "$errfile" 2>/dev/null)"
+		rm -f "$errfile"
+		[ -n "$errmsg" ] && warn "  bitbake-getvar failed for $var: $errmsg"
+		return 1
+	fi
+	rm -f "$errfile"
 	# BUILDSTATS_BASE's own OE-core default carries a trailing slash
 	# ("${TMPDIR}/buildstats/") -- strip it so callers get a plain path to
 	# join with, the same shape DEPLOY_DIR/LOG_DIR already resolve to.
