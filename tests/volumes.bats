@@ -901,6 +901,58 @@ auto_fstrim_doubles() {
 	[ "$(readlink "$dest_root/container-volumes/oe-build-dl")" = "$TESTDIR/elsewhere/oe-build-dl" ]
 }
 
+@test "setup relocate: a symlink to a DIFFERENT root's volumes is not silently treated as done" {
+	# Apple's container has exactly ONE volumes directory for the whole
+	# machine, not one per MACKAS_ROOT. A symlink left over from an earlier
+	# setup against a DIFFERENT root used to be treated as "already a
+	# symlink -> skip" with no comparison at all -- every volume this run
+	# then created/used would silently live on that OTHER disk.
+	other_root="$TESTDIR/other-root"
+	this_root="$TESTDIR/this-root"
+	link="$TESTDIR/cvd3"
+	mkdir -p "$other_root/container-volumes/oe-build-tmp"
+	: > "$other_root/container-volumes/oe-build-tmp/volume.img"
+	ln -s "$other_root/container-volumes" "$link"
+
+	CONTAINER_VOLUMES_DIR="$link"
+	MACKAS_ROOT="$this_root"
+	MACKAS_RELOCATE_VOLUMES=1
+	ASSUME_YES=1
+	DRY_RUN=0
+
+	setup_relocate_volumes >/dev/null 2>&1
+
+	# Re-pointed at THIS root's own container-volumes, not left alone.
+	[ -L "$link" ]
+	[ "$(readlink "$link")" = "$this_root/container-volumes" ]
+	# The volume that lived at the old location travelled to the new one.
+	[ -f "$this_root/container-volumes/oe-build-tmp/volume.img" ]
+}
+
+@test "setup relocate: declining to move a mismatched symlink leaves it exactly as-is" {
+	other_root="$TESTDIR/other-root2"
+	this_root="$TESTDIR/this-root2"
+	link="$TESTDIR/cvd4"
+	mkdir -p "$other_root/container-volumes/oe-build-tmp"
+	: > "$other_root/container-volumes/oe-build-tmp/volume.img"
+	ln -s "$other_root/container-volumes" "$link"
+
+	CONTAINER_VOLUMES_DIR="$link"
+	MACKAS_ROOT="$this_root"
+	MACKAS_RELOCATE_VOLUMES=1
+	ASSUME_YES=0
+	DRY_RUN=0
+
+	# confirm() declines non-interactively (no -y, not a terminal) -- exactly
+	# the same "declining" path used everywhere else in the CLI.
+	setup_relocate_volumes >/dev/null 2>&1
+
+	[ -L "$link" ]
+	[ "$(readlink "$link")" = "$other_root/container-volumes" ]
+	[ ! -e "$this_root/container-volumes" ]
+	[ -f "$other_root/container-volumes/oe-build-tmp/volume.img" ]
+}
+
 @test "setup relocate: with RELOCATE=0 it leaves the volumes dir untouched" {
 	src="$TESTDIR/cvd2"
 	CONTAINER_VOLUMES_DIR="$src"
