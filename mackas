@@ -3467,6 +3467,67 @@ run_kas() {
 	return "$rc"
 }
 
+# bitbake_getvar VAR -- resolve VAR's REAL, distro-configured value by asking
+# bitbake itself (bitbake-getvar), instead of assuming OE-core's own textbook
+# default. Found live: DEPLOY_DIR's OE-core default is ${TMPDIR}/deploy, but
+# a distro is free to -- and Angstrom's own conf/distro/angstrom.conf does --
+# redefine it (to ${TOPDIR}/deploy, a completely different location), and
+# 'retrieve' used to just assume the textbook default, silently retrieving
+# nothing (or the wrong thing) for any distro that redefines it.
+#
+# Always runs, dry-run or not: a read-only query, not a mutation, and
+# 'retrieve --dry-run' needs the REAL path to report accurately. Goes
+# through the exact same kas-container invocation shape run_kas's own
+# _kas_exec uses (never raw `container` -- see the project's own hard rule
+# on that), just without run_kas's tee/auto_fstrim machinery, which a fast
+# metadata query has no use for.
+#
+# Prints the resolved value on stdout and returns 0, or prints nothing and
+# returns 1 if the query itself failed -- callers fall back to their own
+# best-guess default rather than treating this as fatal, matching
+# 'retrieve's existing best-effort, per-object style.
+bitbake_getvar() {
+	local var="$1" rt_args gitconfig out rc
+	rt_args="$(kas_runtime_args)"
+	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
+	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
+
+	# The real workflow this project supports -- 'mackas setup' once for
+	# shared infra (volumes, kas-container, shim), then plain 'git clone' plus
+	# a directly-driven kas-container per project under work/ -- never runs
+	# 'setup' again for each newly-cloned project. So KAS_FILES_ARG's
+	# always-appended kas/macos-local.yml (compose_kas_files) may simply not
+	# exist yet for THIS project even though the shared kas/macos.yml does.
+	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
+	# regenerating unconditionally, and setup_kas_fragment() already honours
+	# --dry-run itself (prints the plan, writes nothing).
+	if [ -d "$MACKAS_PROJECT/.git" ] && [ ! -f "$MACKAS_KAS_FRAGMENT_REPO" ]; then
+		setup_kas_fragment
+	fi
+
+	out="$(
+		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE=docker \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		BB_NUMBER_THREADS="$MACKAS_CPUS" \
+		PARALLEL_MAKE="-j $MACKAS_CPUS" \
+		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell "$KAS_FILES_ARG" \
+			-c "bitbake-getvar --value -q $(printf '%q' "$var")" 2>/dev/null
+	)"
+	rc=$?
+	[ "$rc" -eq 0 ] && [ -n "$out" ] || return 1
+	# BUILDSTATS_BASE's own OE-core default carries a trailing slash
+	# ("${TMPDIR}/buildstats/") -- strip it so callers get a plain path to
+	# join with, the same shape DEPLOY_DIR/LOG_DIR already resolve to.
+	printf '%s\n' "${out%/}"
+}
+
 # ---------------------------------------------------------------------------
 # Host-side overhead sampling, folded into `smoketest`
 # ---------------------------------------------------------------------------
@@ -3825,7 +3886,15 @@ cmd_shell() {
 # no build has run, so there is no tmp/buildstats -- rather than letting a raw
 # `cp` error surface. Idempotent: re-copying overwrites in place.
 fetch_tmp_subdir() {
-	local sub="$1" dest="$2" guest="/build/tmp/$1"
+	local sub="$1" dest="$2" var="$3" guest
+
+	# Distros can redefine where these actually land (e.g. Angstrom sets
+	# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
+	# ask bitbake itself rather than assume the OE-core default layout.
+	guest="$(bitbake_getvar "$var")" || {
+		guest="/build/tmp/$sub"
+		warn "  could not resolve $var via bitbake-getvar; assuming the OE-core default ($guest)"
+	}
 
 	# Existence probe first, so "no build has run yet" is a clear message and
 	# not an obscure cp failure. Under --dry-run run() prints and returns 0, so
@@ -3842,7 +3911,7 @@ fetch_tmp_subdir() {
 	run mkdir -p "$dest"
 	run container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "cp -r '$guest' /out/"
+		sh -c "mkdir -p '/out/$sub' && cp -r '$guest/.' '/out/$sub/'"
 	did "retrieved $sub -> $dest/$sub"
 	return 0
 }
@@ -3935,12 +4004,16 @@ cmd_retrieve() {
 	info "  dest    : $dest"
 	info ""
 
-	local it sub fetched=0 got_buildstats=0
+	local it sub var fetched=0 got_buildstats=0
 	for it in "${objects[@]}"; do
 		sub="$it"
-		[ "$it" = "logs" ] && sub="log"
+		var="DEPLOY_DIR"
+		case "$it" in
+			logs)       sub="log"; var="LOG_DIR" ;;
+			buildstats) var="BUILDSTATS_BASE" ;;
+		esac
 		[ "$it" = "deploy" ] && warn "  deploy can be large (tens of GB); this may take a while and fill $dest"
-		if fetch_tmp_subdir "$sub" "$dest"; then
+		if fetch_tmp_subdir "$sub" "$dest" "$var"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
 		fi

@@ -114,15 +114,20 @@ for a in "$@"; do
 	fi
 done
 
-# The copy: `... sh -c "cp -r '/build/tmp/<sub>' /out/"`. Emulate it against
-# the host fixture so --dest ends up with real files.
+# The copy: `... sh -c "mkdir -p '/out/<sub>' && cp -r '<guest>/.' '/out/<sub>/'"`.
+# destsub (the mackas-facing object key, e.g. "deploy") and guestsub (the
+# resolved guest path's own basename) are extracted independently -- they can
+# differ when bitbake-getvar resolves a distro-redefined path, and the
+# destination must be named after destsub regardless.
 last="${@: -1}"
 case "$last" in
 	*"cp -r"*)
-		sub="$(printf '%s\n' "$last" | sed -E "s#.*/build/tmp/([^']*)'.*#\1#")"
-		if [ -n "$outdir" ] && [ -d "$FIXTURE/$sub" ]; then
-			mkdir -p "$outdir"
-			cp -r "$FIXTURE/$sub" "$outdir/"
+		destsub="$(printf '%s\n' "$last" | sed -E "s#.*mkdir -p '/out/([^']*)'.*#\1#")"
+		guestdir="$(printf '%s\n' "$last" | sed -E "s#.*cp -r '([^']*)/\.'.*#\1#")"
+		guestsub="${guestdir##*/}"
+		if [ -n "$outdir" ] && [ -d "$FIXTURE/$guestsub" ]; then
+			mkdir -p "$outdir/$destsub"
+			cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
 		fi
 		exit 0
 		;;
@@ -206,6 +211,45 @@ refute_call() {
 	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
 	[ -d "$ROOT/artifacts/log" ]
 	[ -d "$ROOT/artifacts/deploy" ]
+}
+
+@test "retrieve: asks bitbake-getvar for the real path, not the OE-core default" {
+	# Angstrom's own conf/distro/angstrom.conf redefines DEPLOY_DIR away from
+	# OE-core's ${TMPDIR}/deploy textbook default. retrieve must resolve it via
+	# bitbake-getvar rather than assume the default, and must still name the
+	# destination after the mackas-facing object key ("deploy"), not whatever
+	# basename the resolved guest path happens to have.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	# bitbake_getvar cd's into MACKAS_PROJECT before invoking kas-container;
+	# with no project configured (this session's factory default) that's just
+	# $MACKAS_WORK itself -- it must exist for the cd to succeed.
+	mkdir -p "$ROOT/work"
+	cat > "$ROOT/bin/kas-container" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR "*) echo "/build/some/renamed-output" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container"
+	mkdir -p "$FIXTURE/renamed-output/images"
+	echo bin > "$FIXTURE/renamed-output/images/fake2.img"
+
+	MOCK_TMP_HAS="renamed-output" mk retrieve deploy
+	[ "$status" -eq 0 ]
+	assert_call "test] [-d] [/build/some/renamed-output]"
+	# Named after the object key, not the resolved path's own basename.
+	[ -d "$ROOT/artifacts/deploy/images" ]
+	[ ! -d "$ROOT/artifacts/renamed-output" ]
+}
+
+@test "retrieve: falls back to the OE-core default with a warning when bitbake-getvar fails" {
+	# No gitconfig set up here (the base setup()'s kas-container is an empty
+	# stub too) -- bitbake_getvar must fail closed and retrieve must still work.
+	mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'could not resolve BUILDSTATS_BASE'
+	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
 }
 
 @test "retrieve: deploy warns it can be large" {
