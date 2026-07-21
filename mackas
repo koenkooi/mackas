@@ -101,6 +101,7 @@ OVERHEAD_OUT=""
 VOLUME_ARGS=()
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
+ADOPT_ARGS=()
 SET_ARGS=()
 GET_ARGS=()
 UNSET_ARGS=()
@@ -1001,6 +1002,36 @@ compose_kas_files() {
 # comparing it against MACKAS_ROOT (derive_paths, setup_short_link).
 strip_trailing_slash() {
 	printf '%s' "$1" | sed 's:\(.\)/*$:\1:'
+}
+
+# resolve_path PATH -- print PATH's canonical, symlink-free absolute form.
+# Falls back to PATH itself (just trailing-slash-stripped) when it doesn't
+# exist yet -- a location that will be CREATED can't be resolved, and the
+# literal value is already the right comparison target in that case. Plain
+# `cd && pwd -P` rather than GNU realpath's `-e`/`--relative-base` (see
+# find_gnu_realpath's own comment on why those specific flags need GNU) --
+# this only ever needs "what does this path really point at", which BSD's
+# own realpath/pwd -P already answer correctly.
+#
+# Exists because a bare string compare between a symlink path (e.g.
+# MACKAS_SHORT_LINK) and a resolved target (e.g. MACKAS_ROOT) reads as
+# "different" even when they name the same directory -- confirmed live: this
+# exact mismatch made setup_relocate_volumes() conclude a root's own
+# relocation symlink belonged to "a different root" and offer to move a
+# live project's volumes onto the wrong disk.
+resolve_path() {
+	local p
+	p="$(strip_trailing_slash "$1")"
+	if [ -d "$p" ]; then
+		(cd -- "$p" 2>/dev/null && pwd -P) || printf '%s\n' "$p"
+	elif [ -e "$p" ]; then
+		local dir base
+		dir="$(dirname -- "$p")"
+		base="$(basename -- "$p")"
+		(cd -- "$dir" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$base") || printf '%s\n' "$p"
+	else
+		printf '%s\n' "$p"
+	fi
 }
 
 # Values that depend on other values, resolved once everything else is final.
@@ -2778,7 +2809,12 @@ setup_relocate_volumes() {
 	if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
 		local cur
 		cur="$(strip_trailing_slash "$(readlink "$CONTAINER_VOLUMES_DIR")")"
-		if [ "$cur" = "$dest" ]; then
+		# Resolved comparison, not a bare string compare: MACKAS_ROOT can
+		# itself be a symlink (e.g. set to MACKAS_SHORT_LINK's own path
+		# rather than its target) -- confirmed live, this made a root's own
+		# relocation symlink read as "belongs to a different root" and
+		# offered to move a live project's volumes onto the wrong disk.
+		if [ "$(resolve_path "$cur")" = "$(resolve_path "$dest")" ]; then
 			skip "already a symlink -> $dest"
 			return
 		fi
@@ -3359,6 +3395,285 @@ cmd_setup() {
 		info "    sudo mount -t nfs -o resvport,vers=3,ro,nolocks,locallocks ${MACKAS_NFS_SERVER}:${MACKAS_NFS_EXPORT} $(printf '%q' "$MACKAS_NFS_MOUNT")"
 		info "    (vers=3 is PINNED: '-o vers=4' kernel-panics macOS -- see docs/storage.md)"
 	fi
+}
+
+# ---------------------------------------------------------------------------
+# adopt -- bring a foreign MACKAS_ROOT (another Mac's mackas set it up) back
+# to a working build on THIS Mac, without clobbering anything this Mac
+# already has for an unrelated project. See TODO.md item 23 for the full
+# design/risk writeup this implements.
+# ---------------------------------------------------------------------------
+
+adopt_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD adopt${C_RST} -- bring a foreign MACKAS_ROOT (set up by a
+different Mac's mackas -- an external drive moved over, or a network share)
+back to a working build on THIS Mac.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD adopt <path> [--project-dir NAME] [--write-config FILE]
+
+Reuses whatever survived the move (an existing project checkout, relocated
+volume images '$SCRIPT_CMD volume recover' can find), regenerates whatever is
+host-specific (env.sh, gitconfig, the short link, the kas fragment), and
+gives the adopted root its own volume name and short link so it never
+collides with anything this Mac already has for an unrelated project.
+Refuses outright if <path> turns out to already BE this Mac's own root --
+that is '$SCRIPT_CMD setup'/'$SCRIPT_CMD check' territory, not adopt.
+
+${C_BLD}OPTIONS${C_RST}
+  --project-dir NAME   Which checkout under <path>/work/ to adopt, when more
+                       than one exists (or none can be found automatically).
+  --write-config FILE  Where to persist the new, per-project config (NOT
+                       the global --config, which loads an EXISTING one).
+                       Default: derived under ~/.config/mackas/projects/.
+
+Ends by handing off to '$SCRIPT_CMD setup', with the new config in scope, for
+everything setup already does correctly on its own (project checkout,
+volumes, kas-container, the shim, gitconfig).
+
+If this Mac's machine-wide volume-relocation symlink already belongs to a
+different, still-live local project, '$SCRIPT_CMD setup' (via
+setup_relocate_volumes) will detect that and offer -- never silently do --
+to switch it to this adopted root, leaving that other project's volumes
+un-relocated until it is itself re-adopted/re-setup.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after 'adopt'.
+EOF
+}
+
+# adopt_introspect_project PATH [PROJECT_DIR] -- print three lines (dir name,
+# git remote URL, current branch) for the one project checkout to adopt, or
+# die with a clear message when none/more than one is found and no
+# PROJECT_DIR was given to disambiguate. Prints nothing (silently) when PATH
+# has no work/ at all or no checkout inside it -- adopting infra only, no
+# project, is a valid outcome (see cmd_setup's own "no project configured"
+# path), not an error.
+adopt_introspect_project() {
+	local root="$1" want="${2:-}" dir candidates=() chosen=""
+
+	if [ -n "$want" ]; then
+		chosen="$root/work/$want"
+		[ -d "$chosen/.git" ] || die "no git checkout at $chosen" \
+			"check the directory name under $root/work/"
+	else
+		if [ -d "$root/work" ]; then
+			for dir in "$root"/work/*/; do
+				[ -d "${dir}.git" ] || continue
+				candidates+=("${dir%/}")
+			done
+		fi
+		case "${#candidates[@]}" in
+			0) return 0 ;;
+			1) chosen="${candidates[0]}" ;;
+			*)
+				warn "  more than one checkout under $root/work/:"
+				for dir in "${candidates[@]}"; do warn "    $(basename "$dir")"; done
+				die "'adopt' needs to know which one" \
+					"$SCRIPT_CMD adopt $(printf '%q' "$root") --project-dir <name>"
+				;;
+		esac
+	fi
+
+	printf '%s\n' "$(basename "$chosen")"
+	git -C "$chosen" remote get-url origin 2>/dev/null || printf '\n'
+	git -C "$chosen" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '\n'
+}
+
+# adopt_unique_volume_name BASE -- BASE disambiguated against every volume
+# name already in use for something else, machine-wide (no per-root ownership
+# record exists to check against, so collision-avoidance, not "is this
+# already mine", is the honest guarantee here).
+adopt_unique_volume_name() {
+	local base="$1" n=2
+	local candidate="mackas-$base"
+	while volume_exists "${candidate}-tmp" || volume_exists "${candidate}-dl" \
+	   || volume_exists "${candidate}-sstate"; do
+		candidate="mackas-$base-$n"
+		n=$((n + 1))
+	done
+	printf '%s\n' "$candidate"
+}
+
+# adopt_unique_short_link BASE REAL_TARGET -- a short link name distinct from
+# anything else on this Mac, unless an existing one already points at
+# REAL_TARGET itself (a re-adopt of the same root), in which case reuse it.
+adopt_unique_short_link() {
+	local base="$1" real_target="$2" n=2
+	local candidate="$HOME/oe-$base"
+	while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+		if [ -L "$candidate" ] && \
+		   [ "$(resolve_path "$(readlink "$candidate")")" = "$real_target" ]; then
+			break
+		fi
+		candidate="$HOME/oe-$base-$n"
+		n=$((n + 1))
+	done
+	printf '%s\n' "$candidate"
+}
+
+# adopt_check_ownership ROOT -- Gap B. setup_oe_root's own chown offer (run
+# later, via cmd_setup) only ever fixes ROOT's own top-level ownership, never
+# what is underneath -- an adopted tree's work/ can carry files owned by the
+# OTHER Mac's account throughout. macOS commonly mounts external volumes
+# 'noowners' (every file already reads as the current user; nothing to
+# fix) -- checked first so this never bothers asking when it plainly does
+# not need to.
+adopt_check_ownership() {
+	local root="$1" mountpoint
+	mountpoint="$(df -P "$root" 2>/dev/null | awk 'NR==2 {print $NF}')"
+	if [ -n "$mountpoint" ] && mount 2>/dev/null | grep -qF " on $mountpoint (" \
+		&& mount 2>/dev/null | grep -F " on $mountpoint (" | grep -q 'noowners'; then
+		return 0
+	fi
+
+	[ -d "$root/work" ] || return 0
+	local foreign
+	foreign="$(find "$root/work" ! -user "$(id -u)" -print -quit 2>/dev/null)"
+	[ -n "$foreign" ] || return 0
+
+	warn "  files under $root/work are owned by a different user (e.g. $foreign)."
+	warn "  Likely the other Mac's account -- a recursive chown is a much bigger"
+	warn "  blast radius than setup's own single-directory one (this can take a"
+	warn "  while over a large checkout tree)."
+	if confirm "  Recursively chown $root/work to $(id -un):$(id -gn) now?"; then
+		run_sudo chown -R "$(id -un):$(id -gn)" "$root/work"
+		did "chowned $root/work recursively"
+	else
+		warn "  Leaving ownership as-is. Fix later with:"
+		warn "    sudo chown -R $(id -un):$(id -gn) $(printf '%q' "$root/work")"
+	fi
+}
+
+cmd_adopt() {
+	local path="" project_dir_opt="" config_opt="" want_help=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help|help) want_help=1; shift ;;
+			--project-dir)   project_dir_opt="${2:-}"
+				[ -n "$project_dir_opt" ] || die "--project-dir needs a value" "$SCRIPT_CMD adopt --help"
+				shift 2 ;;
+			--project-dir=*) project_dir_opt="${1#*=}"; shift ;;
+			# NOT --config: that is the EXISTING global flag (an EXISTING
+			# file to load, only valid before the command word -- see
+			# die_on_misplaced_global_flag). This one names a NEW file
+			# adopt is about to WRITE; reusing the same name would mean
+			# two conflicting things depending only on word order.
+			--write-config)   config_opt="${2:-}"
+				[ -n "$config_opt" ] || die "--write-config needs a value" "$SCRIPT_CMD adopt --help"
+				shift 2 ;;
+			--write-config=*) config_opt="${1#*=}"; shift ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" adopt ;;
+			-*) die "unknown option for 'adopt': $1" "$SCRIPT_CMD adopt --help" ;;
+			*)
+				[ -z "$path" ] || die "'adopt' takes one path" "$SCRIPT_CMD adopt --help"
+				path="$1"; shift ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		adopt_usage
+		return 0
+	fi
+
+	[ -n "$path" ] || die "'adopt' needs a path" "$SCRIPT_CMD adopt <path>"
+	[ -d "$path" ] || die "not a directory: $path" "$SCRIPT_CMD adopt <path>"
+	local real_target
+	real_target="$(resolve_path "$path")"
+
+	# Refuse a path that is already THIS Mac's own root -- via MACKAS_ROOT
+	# directly, or via the short link -- before touching anything. That is
+	# 'setup'/'mackas doctor' (item 6) territory, not adopt.
+	if [ -n "$MACKAS_ROOT" ] && [ "$real_target" = "$(resolve_path "$MACKAS_ROOT")" ]; then
+		die "'$path' is already this Mac's own MACKAS_ROOT" \
+			"nothing to adopt here -- use '$SCRIPT_CMD setup'/'$SCRIPT_CMD check' instead"
+	fi
+	if [ -L "$MACKAS_SHORT_LINK" ] && \
+	   [ "$real_target" = "$(resolve_path "$(readlink "$MACKAS_SHORT_LINK")")" ]; then
+		die "'$path' is already this Mac's own root (via $MACKAS_SHORT_LINK)" \
+			"nothing to adopt here -- use '$SCRIPT_CMD setup'/'$SCRIPT_CMD check' instead"
+	fi
+
+	if [ ! -d "$real_target/work" ] && [ ! -d "$real_target/bin" ] \
+	   && [ ! -d "$real_target/container-volumes" ]; then
+		die "'$path' does not look like a mackas root (no work/, bin/ or container-volumes/)" \
+			"point adopt at the directory 'setup' originally created there"
+	fi
+
+	hdr "mackas adopt: $real_target"
+
+	local proj_name="" proj_url="" proj_branch="" base_name derived_name derived_link
+	local introspected
+	introspected="$(adopt_introspect_project "$real_target" "$project_dir_opt")"
+	if [ -n "$introspected" ]; then
+		proj_name="$(printf '%s\n' "$introspected" | sed -n '1p')"
+		proj_url="$(printf '%s\n' "$introspected" | sed -n '2p')"
+		proj_branch="$(printf '%s\n' "$introspected" | sed -n '3p')"
+		info "  project    : $proj_name"
+		info "    url      : ${proj_url:-<none: no 'origin' remote>}"
+		info "    branch   : ${proj_branch:-<none: detached HEAD>}"
+	else
+		warn "  no git checkout found under $real_target/work/ -- adopting infra only,"
+		warn "  no project (matches '$SCRIPT_CMD setup's own \"no project configured\" path)."
+	fi
+
+	base_name="$(printf '%s' "${proj_name:-$(basename "$real_target")}" | tr -c 'A-Za-z0-9-' '-')"
+	derived_name="$(adopt_unique_volume_name "$base_name")"
+	derived_link="$(adopt_unique_short_link "$base_name" "$real_target")"
+	info "  volume name: $derived_name"
+	info "  short link : $derived_link"
+
+	local config_file="${config_opt:-$HOME/.config/mackas/projects/$base_name.conf}"
+	if [ -f "$config_file" ]; then
+		confirm "  $config_file already exists -- overwrite its settings with this adoption?" \
+			|| die "declined -- nothing written" \
+				"pick a different destination: $SCRIPT_CMD adopt $(printf '%q' "$path") --write-config <file>"
+	fi
+	run mkdir -p "$(dirname "$config_file")"
+	config_write_setting "$config_file" MACKAS_ROOT "$real_target"
+	config_write_setting "$config_file" MACKAS_SHORT_LINK "$derived_link"
+	config_write_setting "$config_file" MACKAS_VOLUME_NAME "$derived_name"
+	if [ -n "$proj_name" ]; then
+		config_write_setting "$config_file" MACKAS_PROJECT_URL "$proj_url"
+		config_write_setting "$config_file" MACKAS_PROJECT_BRANCH "$proj_branch"
+		config_write_setting "$config_file" MACKAS_PROJECT_DIR "$proj_name"
+	fi
+	did "wrote $config_file"
+
+	# Apply for THIS invocation too, so setup can run in the same command --
+	# main() already ran validate_settings/derive_paths once, against the OLD
+	# values (same reasoning as cmd_setup's own positional-root handling).
+	MACKAS_ROOT="$real_target"; __EXPLICIT_MACKAS_ROOT=1
+	MACKAS_SHORT_LINK="$derived_link"
+	MACKAS_VOLUME_NAME="$derived_name"
+	if [ -n "$proj_name" ]; then
+		MACKAS_PROJECT_URL="$proj_url"
+		MACKAS_PROJECT_BRANCH="$proj_branch"
+		MACKAS_PROJECT_DIR="$proj_name"
+	fi
+	CONFIG_FILE_USED="$config_file"
+	validate_settings
+	derive_paths
+
+	# Gap-C guard is setup_relocate_volumes() itself (now resolved-path-aware,
+	# see resolve_path's own comment) -- it already detects "the machine-wide
+	# symlink belongs to a different root" and OFFERS (never silently does)
+	# to move that root's volumes here, which is exactly this project's
+	# chosen behaviour for this scenario. No separate check needed.
+
+	# Before setup_volumes ever gets a chance to treat "not found" as "create
+	# fresh": if a relocated volume under this NEW name is Spotlight-findable
+	# (adopted from the source Mac), re-point it now.
+	volume_recover
+
+	adopt_check_ownership "$real_target"
+
+	cmd_setup
+
+	hdr "Adopted"
+	info "  config file : $config_file"
+	info "  from now on : $SCRIPT_CMD --config $(printf '%q' "$config_file") ..."
 }
 
 # ---------------------------------------------------------------------------
@@ -5441,10 +5756,18 @@ main() {
 				cmd="setup"; shift
 				if [ "$want_help" -eq 1 ]; then SETUP_ARGS=("$@" "--help"); else SETUP_ARGS=("$@"); fi
 				break ;;
+			adopt)
+				# Same shape again: adopt owns everything after it (its
+				# positional path and --project-dir/--config), captured
+				# verbatim for cmd_adopt.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="adopt"; shift
+				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
+				break ;;
 			check|smoketest|status|shell|clean|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup smoketest status shell retrieve buildstats clean destroy volume set get unset help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats clean destroy volume set get unset help)" ;;
 		esac
 	done
 
@@ -5485,6 +5808,7 @@ main() {
 	case "${cmd:-check}" in
 		check)     if [ "$want_help" -eq 1 ]; then check_usage;     else cmd_check;     fi ;;
 		setup)     if [ "$want_help" -eq 1 ]; then setup_usage;     else cmd_setup ${SETUP_ARGS+"${SETUP_ARGS[@]}"}; fi ;;
+		adopt)      cmd_adopt ${ADOPT_ARGS+"${ADOPT_ARGS[@]}"} ;;
 		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
