@@ -2395,12 +2395,52 @@ setup_short_link() {
 		if [ "$tgt" = "$MACKAS_ROOT" ]; then
 			skip "$MACKAS_SHORT_LINK -> $MACKAS_ROOT"
 		else
-			die "$MACKAS_SHORT_LINK already points at '$tgt'" \
-				"rm $(printf '%q' "$MACKAS_SHORT_LINK") && $SCRIPT_CMD setup"
+			# A DIFFERENT root than the one just configured -- almost always
+			# MACKAS_ROOT changed since this link was made (a renamed
+			# volume, a new disk), not a mistake. Offer to fix it rather
+			# than just refusing: this used to be a hard die requiring a
+			# manual `rm` first, which is needless ceremony for the common
+			# case.
+			warn "      $MACKAS_SHORT_LINK points at a DIFFERENT root:"
+			warn "        $tgt"
+			warn "      not this root's own $MACKAS_ROOT."
+			if confirm "      Re-point $MACKAS_SHORT_LINK -> $MACKAS_ROOT?"; then
+				local parent
+				parent="$(dirname "$MACKAS_SHORT_LINK")"
+				if [ -w "$parent" ]; then
+					run rm -f "$MACKAS_SHORT_LINK"
+					run ln -s "$MACKAS_ROOT" "$MACKAS_SHORT_LINK"
+				else
+					info "      $parent is not writable by $(id -un); re-pointing needs sudo."
+					run_sudo rm -f "$MACKAS_SHORT_LINK"
+					run_sudo ln -s "$MACKAS_ROOT" "$MACKAS_SHORT_LINK"
+				fi
+				did "re-pointed $MACKAS_SHORT_LINK -> $MACKAS_ROOT (was -> $tgt)"
+			else
+				die "$MACKAS_SHORT_LINK still points at '$tgt'" \
+					"rm $(printf '%q' "$MACKAS_SHORT_LINK") && $SCRIPT_CMD setup"
+			fi
 		fi
 	elif [ -e "$MACKAS_SHORT_LINK" ]; then
-		die "$MACKAS_SHORT_LINK exists and is not a symlink" \
-			"move it aside, then re-run '$SCRIPT_CMD setup'"
+		warn "      $MACKAS_SHORT_LINK exists and is not a symlink (a real file or directory)."
+		local backup
+		backup="$MACKAS_SHORT_LINK.bak.$(date +%Y%m%d%H%M%S)"
+		if confirm "      Move it aside to $backup and continue?"; then
+			local parent
+			parent="$(dirname "$MACKAS_SHORT_LINK")"
+			if [ -w "$parent" ]; then
+				run mv "$MACKAS_SHORT_LINK" "$backup"
+				run ln -s "$MACKAS_ROOT" "$MACKAS_SHORT_LINK"
+			else
+				info "      $parent is not writable by $(id -un); this needs sudo."
+				run_sudo mv "$MACKAS_SHORT_LINK" "$backup"
+				run_sudo ln -s "$MACKAS_ROOT" "$MACKAS_SHORT_LINK"
+			fi
+			did "moved $MACKAS_SHORT_LINK aside -> $backup, linked -> $MACKAS_ROOT"
+		else
+			die "$MACKAS_SHORT_LINK exists and is not a symlink" \
+				"move it aside, then re-run '$SCRIPT_CMD setup'"
+		fi
 	else
 		local parent
 		parent="$(dirname "$MACKAS_SHORT_LINK")"

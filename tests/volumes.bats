@@ -293,6 +293,59 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# setup_short_link -- offering to FIX a mismatch/obstruction rather than just
+# refusing and telling the user to `rm` it by hand. Found live: a renamed
+# volume (or a new MACKAS_ROOT) leaves the short link pointing at the OLD
+# root, and the old behaviour was a hard die every single time until the
+# user removed it manually -- needless ceremony for what is almost always
+# just "MACKAS_ROOT changed since this link was made."
+# ---------------------------------------------------------------------------
+
+@test "setup_short_link: offers to re-point a link at a DIFFERENT root, and does so on accept" {
+	MACKAS_ROOT="$TESTDIR/newroot"
+	mkdir -p "$MACKAS_ROOT"
+	oldroot="$TESTDIR/oldroot"
+	mkdir -p "$oldroot"
+	MACKAS_SHORT_LINK="$TESTDIR/oe"
+	ln -sfn "$oldroot" "$MACKAS_SHORT_LINK"
+	ASSUME_YES=1
+	setup_short_link >/dev/null 2>&1
+	[ -L "$MACKAS_SHORT_LINK" ]
+	[ "$(readlink "$MACKAS_SHORT_LINK")" = "$MACKAS_ROOT" ]
+}
+
+@test "setup_short_link: declining the re-point offer leaves the old link exactly as-is" {
+	MACKAS_ROOT="$TESTDIR/newroot"
+	mkdir -p "$MACKAS_ROOT"
+	oldroot="$TESTDIR/oldroot"
+	mkdir -p "$oldroot"
+	MACKAS_SHORT_LINK="$TESTDIR/oe"
+	ln -sfn "$oldroot" "$MACKAS_SHORT_LINK"
+	ASSUME_YES=0
+	# confirm() declines non-interactively (no -y, not a terminal).
+	out="$( (setup_short_link) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'still points at'
+	[ "$(readlink "$MACKAS_SHORT_LINK")" = "$oldroot" ]
+}
+
+@test "setup_short_link: offers to move a non-symlink obstruction aside, and does so on accept" {
+	MACKAS_ROOT="$TESTDIR/newroot"
+	mkdir -p "$MACKAS_ROOT"
+	MACKAS_SHORT_LINK="$TESTDIR/oe"
+	mkdir -p "$MACKAS_SHORT_LINK"
+	: > "$MACKAS_SHORT_LINK/somefile"
+	ASSUME_YES=1
+	setup_short_link >/dev/null 2>&1
+	[ -L "$MACKAS_SHORT_LINK" ]
+	[ "$(readlink "$MACKAS_SHORT_LINK")" = "$MACKAS_ROOT" ]
+	# The original directory's content survived, moved aside, not deleted.
+	moved="$(find "$TESTDIR" -maxdepth 1 -name 'oe.bak.*' | head -1)"
+	[ -n "$moved" ]
+	[ -f "$moved/somefile" ]
+}
+
+# ---------------------------------------------------------------------------
 # env.sh -- what it must NOT say. This is where bugs 1 and 2 lived.
 # ---------------------------------------------------------------------------
 
