@@ -225,9 +225,9 @@ CONF
 }
 
 @test "get --config on a config file that still does not exist resolves to the built-in default, not an error" {
-	run "$MACKAS" --config "$TESTDIR/never-created.conf" get MACKAS_PROJECT_DIR
+	run "$MACKAS" --config "$TESTDIR/never-created.conf" get MACKAS_VOLUME_SIZE_TMP
 	[ "$status" -eq 0 ]
-	[ "$output" = "meta-ai" ]
+	[ "$output" = "120G" ]
 }
 
 @test "a genuinely missing --config still refuses OTHER commands (not a typo silently ignored)" {

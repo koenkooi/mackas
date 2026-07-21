@@ -297,9 +297,17 @@ the logs. Low-risk, independent of buildstats.
 
 ### 14. First-class projects: build any layer's kas config, share downloads by convention
 
-mackas is one-project-at-a-time today, and the one project is baked in:
-`set_defaults` hardcodes meta-ai (`MACKAS_PROJECT_URL/BRANCH/DIR`,
-`MACKAS_KAS_CONFIG`), and there is exactly one volume set, named by
+**Partially landed**: `set_defaults` no longer hardcodes meta-ai --
+`MACKAS_PROJECT_URL/_BRANCH/_DIR`/`MACKAS_KAS_CONFIG` all default to empty,
+`setup` completes its whole job and just skips the project checkout step
+with none of them set, and `smoketest` offers the meta-ai example for one
+ephemeral run (never persisted) when nothing is configured at all. That was
+this item's own first phasing bullet ("meta-ai demoted to example"), pulled
+forward on its own. The rest below --- multiple projects side by side,
+per-project volume naming, a shared downloads convention --- is still
+undone.
+
+mackas is one-project-at-a-time today. There is exactly one volume set, named by
 `MACKAS_VOLUME_NAME` → `oe-build-{tmp,dl,sstate}`. Building a second repo
 means hand-overriding `MACKAS_PROJECT_*` **and** inventing a distinct
 `MACKAS_VOLUME_NAME` yourself — which is exactly how the meta-qcom and

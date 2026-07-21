@@ -78,6 +78,7 @@ smoketest() {
 	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
 		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
 		--set MACKAS_RELOCATE_VOLUMES=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai \
 		--set "MACKAS_SMOKETEST_TARGETS=" "$@" smoketest
 }
 

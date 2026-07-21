@@ -95,6 +95,7 @@ smoketest() {
 		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
 		--set MACKAS_RELOCATE_VOLUMES=0 \
 		--set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai \
 		--set MACKAS_KAS_CONFIG=kas/base.yml \
 		--set "MACKAS_SMOKETEST_TARGETS=a b c" "$@" smoketest
 }
