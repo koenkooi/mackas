@@ -23,6 +23,26 @@ setup() {
 	# Point HOME at the throwaway dir so ~/.config/mackas/config and
 	# ~/.mackas.conf cannot be picked up from the real home directory.
 	export HOME="$TESTDIR"
+
+	# `status` now queries the real container daemon for a volume's live cap
+	# (Configuration shows it in place of MACKAS_VOLUME_SIZE_* once a volume
+	# exists -- see display_volume_setting). MACKAS_VOLUME_NAME defaults to
+	# "oe-build" regardless of MACKAS_ROOT/HOME, so on a dev Mac that already
+	# has real oe-build-* volumes from actual use, an unfaked `container`
+	# would answer with THAT real cap here -- these tests are about setting
+	# PRECEDENCE, not live disk state, so make sure none ever exist.
+	mkdir -p "$TESTDIR/fakebin"
+	cat > "$TESTDIR/fakebin/container" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+	"system status") echo "status running"; exit 0 ;;
+	"volume ls") echo "NAME TYPE DRIVER OPTIONS"; exit 0 ;;
+esac
+exit 0
+EOF
+	chmod +x "$TESTDIR/fakebin/container"
+	PATH="$TESTDIR/fakebin:$PATH"
+	export PATH
 }
 
 teardown() {
