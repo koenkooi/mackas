@@ -1308,6 +1308,26 @@ total_volume_gb() {
 		+ $(size_to_gb "$MACKAS_VOLUME_SIZE_SSTATE") ))
 }
 
+# Same total, but for `status`'s post-hoc report: real cap (container daemon)
+# for any of the three volumes that already exist, configured size for ones
+# that don't yet -- same real-over-configured preference as status_volume(),
+# so the total printed there matches the per-volume caps printed above it
+# instead of silently reverting to what setup would create today.
+status_total_cap_gb() {
+	local tmp="$MACKAS_VOLUME_SIZE_TMP" dl="$MACKAS_VOLUME_SIZE_DL" \
+		sstate="$MACKAS_VOLUME_SIZE_SSTATE" real
+	if volume_exists "$MACKAS_VOL_TMP"; then
+		real="$(volume_size "$MACKAS_VOL_TMP")"; [ -n "$real" ] && tmp="$real"
+	fi
+	if volume_exists "$MACKAS_VOL_DL"; then
+		real="$(volume_size "$MACKAS_VOL_DL")"; [ -n "$real" ] && dl="$real"
+	fi
+	if volume_exists "$MACKAS_VOL_SSTATE"; then
+		real="$(volume_size "$MACKAS_VOL_SSTATE")"; [ -n "$real" ] && sstate="$real"
+	fi
+	echo $(( $(size_to_gb "$tmp") + $(size_to_gb "$dl") + $(size_to_gb "$sstate") ))
+}
+
 # Nearest ancestor of $1 that actually exists. This is what decides whether
 # we can mkdir $1 -- NOT the filesystem mount point, which can be far above
 # it (e.g. /tmp/a/b's mount point is /System/Volumes/Data).
@@ -4758,7 +4778,20 @@ show() { printf '  %-24s %s\n' "$1" "$2"; }
 # One line per volume: name, what it backs, cap, and what it costs today.
 status_volume() {
 	local name="$1" size="$2" role="$3" img used="" moved="" near_cap=0
+	local real_cap="" cap_display="$size"
 	img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+	# The configured MACKAS_VOLUME_SIZE_* is only ever what a FUTURE `setup`
+	# would request -- ensure_volume() never resizes an existing volume, so
+	# once one exists its real cap can permanently diverge from whatever the
+	# setting happens to say right now (e.g. `setup --tmpdir-size 1T`'s size
+	# flags are one-shot and are not written to the config file, so the very
+	# next invocation reports the factory default again). Prefer the real,
+	# live cap from the container daemon (same source `volume list` uses)
+	# whenever the volume actually exists.
+	if volume_exists "$name"; then
+		real_cap="$(volume_size "$name")"
+		[ -n "$real_cap" ] && cap_display="$real_cap"
+	fi
 	# du -h already reports actual disk BLOCKS allocated (sparse-aware on
 	# APFS), not volume.img's logical/apparent size -- this is real usage,
 	# not the cap, even when it reads the same as the cap. See the note
@@ -4769,7 +4802,7 @@ status_volume() {
 	if [ -n "$used" ]; then
 		local used_gb cap_gb
 		used_gb="$(size_to_gb "$used")"
-		cap_gb="$(size_to_gb "$size")"
+		cap_gb="$(size_to_gb "$cap_display")"
 		[ "$cap_gb" -gt 0 ] && [ "$((used_gb * 100 / cap_gb))" -ge 90 ] && near_cap=1
 	fi
 	# A per-volume symlink here means `volume move` (or `recover`) relocated it;
@@ -4777,10 +4810,16 @@ status_volume() {
 	[ -L "$CONTAINER_VOLUMES_DIR/$name" ] && moved="$(readlink "$CONTAINER_VOLUMES_DIR/$name")"
 	if volume_exists "$name"; then
 		printf '  %s[yes]%s %-22s %-22s cap %-5s %s\n' "$C_GRN" "$C_RST" \
-			"$name" "$role" "$size" "${used:+on disk: $used}"
+			"$name" "$role" "$cap_display" "${used:+on disk: $used}"
 	else
 		printf '  %s[ no]%s %-22s %-22s cap %-5s (%s setup)\n' "$C_DIM" "$C_RST" \
 			"$name" "$role" "$size" "$SCRIPT_NAME"
+	fi
+	if [ -n "$real_cap" ] && [ "$(size_to_gb "$real_cap")" != "$(size_to_gb "$size")" ]; then
+		printf '        %sconfigured size is %s, but setup never resizes an existing volume\n' \
+			"$C_YEL" "$size"
+		printf '        (create %s fresh under a different %s to get %s instead)%s\n' \
+			"$name" "MACKAS_VOLUME_NAME" "$size" "$C_RST"
 	fi
 	if [ -n "$moved" ]; then
 		printf '        %smoved to: %s%s\n' "$C_BLU" "$moved" "$C_RST"
@@ -4874,7 +4913,7 @@ cmd_status() {
 		printf '        %sremove with: container volume delete %s%s\n' \
 			"$C_BLU" "$(printf '%q' "$MACKAS_VOL_LEGACY")" "$C_RST"
 	fi
-	show "total cap" "$(total_volume_gb) GiB (sparse: costs only what is used)"
+	show "total cap" "$(status_total_cap_gb) GiB (sparse: costs only what is used)"
 	info ""
 	info "  \"on disk\" is REAL usage (du, sparse-aware), never the cap. It only"
 	info "  drops after an explicit fstrim hole-punches freed ext4 blocks back out"
