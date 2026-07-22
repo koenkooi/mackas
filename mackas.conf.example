@@ -254,6 +254,18 @@
 #MACKAS_FSTRIM_AUTO=1
 
 
+# Clear tmp/buildstats in the TMPDIR volume before every kas run. ON by
+# default: buildstats.bbclass opens build_stats in APPEND mode and never
+# clears a BUILDNAME dir itself, so a project whose BUILDNAME does not vary
+# per build (e.g. Angstrom's `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`)
+# would otherwise silently accumulate every build it has ever run into one
+# build_stats file, inflating `mackas buildstats analyze`'s numbers. Set to 1
+# to keep accumulating instead (you'll manage cleanup yourself -- `mackas
+# retrieve buildstats` also warns and offers a one-off clear when it detects
+# this). See docs/storage.md#buildstats-and-a-constant-buildname.
+#MACKAS_BUILDSTATS_ACCUMULATE=0
+
+
 # Live bitbake progress bridge (OPTIONAL, opt-in). With MACKAS_MONITOR=1 a build
 # publishes its progress as JSON over HTTP from inside its own container, and
 # `mackas monitor` polls it and prints one line per update. OFF by default: it

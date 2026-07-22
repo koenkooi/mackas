@@ -81,6 +81,7 @@ MACKAS_REQUIRE_CASE_SENSITIVE
 MACKAS_WORKSPACE_SIZE
 MACKAS_MONITOR
 MACKAS_MONITOR_PORT
+MACKAS_BUILDSTATS_ACCUMULATE
 "
 
 # ---------------------------------------------------------------------------
@@ -652,6 +653,18 @@ set_defaults() {
 	# MACKAS_OVERHEAD/MACKAS_FSTRIM_AUTO (which cost near nothing).
 	MACKAS_MONITOR=0
 	MACKAS_MONITOR_PORT=8801
+
+	# buildstats.bbclass opens build_stats in APPEND mode and never clears a
+	# BUILDNAME dir itself (mkdir -p, not a truncate) -- a project whose
+	# BUILDNAME does not vary per build (e.g. Angstrom's
+	# `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`, confirmed live) silently
+	# accumulates every build it has ever run into one build_stats file, which
+	# inflates 'buildstats analyze's numbers (see
+	# check_buildstats_accumulation/clear_buildstats_before_build). OFF by
+	# default -- i.e. mackas clears tmp/buildstats before each build unless
+	# this is set to 1. Set to 1 only if you want raw accumulation and will
+	# manage it yourself.
+	MACKAS_BUILDSTATS_ACCUMULATE=0
 }
 
 CONFIG_FILE_USED=""
@@ -3805,6 +3818,35 @@ auto_fstrim() {
 	return 0
 }
 
+# clear_buildstats_before_build [LOG] -- delete tmp/buildstats in the TMPDIR
+# volume right before a build starts, unless MACKAS_BUILDSTATS_ACCUMULATE=1.
+# ON by default: buildstats.bbclass opens build_stats in APPEND mode and never
+# clears a BUILDNAME dir itself (mkdir -p, not a truncate), so a project whose
+# BUILDNAME does not vary per build (confirmed live: Angstrom's distro conf
+# hardcodes `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`) would otherwise
+# accumulate every build it has ever run into one build_stats file, inflating
+# 'buildstats analyze's numbers -- see check_buildstats_accumulation, the
+# same symptom caught after the fact, for a project where this was left off
+# or was only just turned on. Safe with the one-VM rule: runs before the kas
+# container starts, the same window auto_fstrim's own "before" step uses, so
+# nothing holds the volume yet. STRICTLY non-fatal, like auto_fstrim -- a
+# clear failing here must never change a build's exit status.
+clear_buildstats_before_build() {
+	[ "${MACKAS_BUILDSTATS_ACCUMULATE:-0}" != "1" ] || return 0
+	local log="${1:-}"
+	volume_exists "$MACKAS_VOL_TMP" || return 0
+	info "clearing tmp/buildstats (MACKAS_BUILDSTATS_ACCUMULATE=0)"
+	vrb "+ $(quote_cmd container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" rm -rf /build/tmp/buildstats)"
+	if [ -n "$log" ]; then
+		container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+			rm -rf /build/tmp/buildstats >>"$log" 2>&1 || true
+	else
+		container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+			rm -rf /build/tmp/buildstats || true
+	fi
+	return 0
+}
+
 run_kas() {
 	# run_kas <logfile|""> <kas args...>
 	# An empty logfile means "don't pipe through tee" -- required for the
@@ -3866,6 +3908,10 @@ run_kas() {
 	# and after (this run's peak is now dead space). Both happen while nothing
 	# holds the volumes -- the kas container has not started / has exited.
 	auto_fstrim before "$log"
+
+	# Same window: nothing holds the volume yet, so clearing tmp/buildstats is
+	# safe here too (see clear_buildstats_before_build for why this defaults on).
+	clear_buildstats_before_build "$log"
 
 	# Capture the exit code in a TESTED context (`|| rc=$?`). A bare
 	# `( _kas_exec ); rc=$?` would let `set -e` abort run_kas the moment kas
@@ -4355,12 +4401,22 @@ cmd_shell() {
 # mount, so files land owned by the invoking user already and a `chown -R`
 # there fails "Operation not permitted".
 
-# fetch_tmp_subdir SUB DEST -- copy /build/tmp/SUB out of the TMPDIR volume into
-# DEST/SUB. Returns non-zero (with a clear message) when SUB is absent -- e.g.
-# no build has run, so there is no tmp/buildstats -- rather than letting a raw
-# `cp` error surface. Idempotent: re-copying overwrites in place.
+# fetch_tmp_subdir SUB DEST VAR [EXTRA] -- copy /build/tmp/SUB out of the
+# TMPDIR volume into DEST/SUB[/EXTRA]. Returns non-zero (with a clear message)
+# when SUB is absent -- e.g. no build has run, so there is no tmp/buildstats
+# -- rather than letting a raw `cp` error surface. Idempotent within one
+# EXTRA: re-copying the same EXTRA overwrites in place.
+#
+# EXTRA exists for buildstats specifically (see cmd_retrieve): a fresh,
+# mackas-generated timestamp per retrieve, so successive retrievals land in
+# their OWN directory instead of merging into the same DEST/buildstats/ every
+# time. Without it, a project whose BUILDNAME does not vary (e.g. Angstrom's
+# `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`) would have every retrieval
+# overwrite/merge into the identical host path on top of what a PRIOR
+# retrieval already put there -- on top of the accumulation buildstats.bbclass
+# itself already does guest-side (see check_buildstats_accumulation).
 fetch_tmp_subdir() {
-	local sub="$1" dest="$2" var="$3" guest
+	local sub="$1" dest="$2" var="$3" extra="${4:-}" guest destsub
 
 	# Distros can redefine where these actually land (e.g. Angstrom sets
 	# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
@@ -4382,12 +4438,48 @@ fetch_tmp_subdir() {
 		return 1
 	fi
 
+	destsub="$sub${extra:+/$extra}"
 	run mkdir -p "$dest"
 	run container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p '/out/$sub' && cp -r '$guest/.' '/out/$sub/'"
-	did "retrieved $sub -> $dest/$sub"
+		sh -c "mkdir -p '/out/$destsub' && cp -r '$guest/.' '/out/$destsub/'"
+	did "retrieved $sub -> $dest/$destsub"
+
+	[ "$sub" = "buildstats" ] && check_buildstats_accumulation "$dest/$destsub" "$guest"
 	return 0
+}
+
+# check_buildstats_accumulation DIR GUEST -- DIR is what fetch_tmp_subdir just
+# retrieved (one or more BUILDNAME subdirs); GUEST is their guest-side parent
+# (e.g. /build/tmp/buildstats). buildstats.bbclass opens build_stats in
+# APPEND mode at both BuildStarted and BuildCompleted and never truncates or
+# clears a BUILDNAME dir (bb.utils.mkdirhier is mkdir -p, not a reset) -- so a
+# project whose BUILDNAME does not vary per build (confirmed live: Angstrom's
+# distro conf hardcodes `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`) silently
+# accumulates every build it has ever run into ONE build_stats file. More
+# than one "Build Started:" line in that file is an ironclad sign this has
+# happened -- ironclad because it is read directly off THIS retrieval's own
+# data, not inferred from a directory-naming coincidence across retrievals.
+# Warns, and OFFERS (confirm()-gated, never automatic -- this is a real rm -rf
+# in the volume) to clear the guest BUILDNAME dir so the next build starts
+# clean. See docs/storage.md#buildstats-and-a-constant-buildname.
+check_buildstats_accumulation() {
+	local dir="$1" guest="$2" bs n bn
+	for bs in "$dir"/*/build_stats; do
+		[ -f "$bs" ] || continue
+		n="$(grep -c '^Build Started:' "$bs" 2>/dev/null || true)"
+		[ "${n:-0}" -gt 1 ] || continue
+		bn="$(basename "$(dirname "$bs")")"
+		warn "  '$bn' has $n builds' data accumulated in one build_stats -- this"
+		warn "  project's BUILDNAME looks constant across builds, so bitbake never"
+		warn "  resets tmp/buildstats/$bn (docs/storage.md#buildstats-and-a-constant-buildname)."
+		warn "  Numbers in '$SCRIPT_CMD buildstats analyze' may be inflated by carryover."
+		if confirm "Clear tmp/buildstats/$bn in the volume so the next build starts fresh?"; then
+			run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+				rm -rf "$guest/$bn"
+			did "cleared tmp/buildstats/$bn in $MACKAS_VOL_TMP"
+		fi
+	done
 }
 
 retrieve_usage() {
@@ -4400,6 +4492,9 @@ ${C_BLD}USAGE${C_RST}
 
 ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matter)
   buildstats           tmp/buildstats -- per-task timing (bitbake -m stats).
+                       Each retrieval lands in its OWN timestamped
+                       subdirectory (buildstats/<retrieve-time>/<BUILDNAME>/)
+                       so successive retrievals never merge together.
   logs                 tmp/log -- cooker.log and friends.
   deploy               tmp/deploy -- the images and ipks. Can be tens of GB.
 
@@ -4408,6 +4503,14 @@ ${C_BLD}OPTIONS${C_RST}
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after 'retrieve', e.g. '$SCRIPT_CMD --dry-run retrieve buildstats'.
+
+${C_BLD}A CONSTANT BUILDNAME${C_RST}
+  If the retrieved build_stats shows more than one build's data accumulated
+  in it (this project's BUILDNAME does not vary per build -- bitbake never
+  resets tmp/buildstats itself when that happens), retrieve warns and offers
+  to clear it in the volume so the next build starts clean. See
+  MACKAS_BUILDSTATS_ACCUMULATE (see mackas.conf.example) to manage this
+  yourself instead, and docs/storage.md#buildstats-and-a-constant-buildname.
 
 ${C_BLD}ONE-VM RULE${C_RST}
   Only one VM may access an ext4 image at a time. retrieve refuses while a
@@ -4478,16 +4581,26 @@ cmd_retrieve() {
 	info "  dest    : $dest"
 	info ""
 
-	local it sub var fetched=0 got_buildstats=0
+	# One retrieve-generated timestamp for buildstats specifically (see
+	# fetch_tmp_subdir's own comment): every OTHER object overwrites its dest
+	# in place on purpose (latest logs, latest deploy IS what you want), but
+	# buildstats needs a fresh subdirectory per retrieval so successive
+	# retrievals never merge into the same host path -- MACKAS_RETRIEVE_TS is
+	# an undocumented test seam (cf. MACKAS_OVERHEAD_BIN) for a deterministic
+	# value in tests.
+	local retrieve_ts="${MACKAS_RETRIEVE_TS:-$(date +%Y%m%d%H%M%S)}"
+
+	local it sub var extra fetched=0 got_buildstats=0
 	for it in "${objects[@]}"; do
 		sub="$it"
 		var="DEPLOY_DIR"
+		extra=""
 		case "$it" in
 			logs)       sub="log"; var="LOG_DIR" ;;
-			buildstats) var="BUILDSTATS_BASE" ;;
+			buildstats) var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
 		esac
 		[ "$it" = "deploy" ] && warn "  deploy can be large (tens of GB); this may take a while and fill $dest"
-		if fetch_tmp_subdir "$sub" "$dest" "$var"; then
+		if fetch_tmp_subdir "$sub" "$dest" "$var" "$extra"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
 		fi
@@ -4514,14 +4627,146 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD buildstats analyze [PATH]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
-  analyze [PATH]   Summarise a buildstats directory (wall time, parallelism,
-                   io-bound tasks) via tools/mackas-buildstats-analyze. PATH
-                   defaults to \$MACKAS_BASE/artifacts/buildstats -- the
-                   default '$SCRIPT_CMD retrieve buildstats' destination.
+  analyze [PATH]   Summarise the NEWEST build in a buildstats directory (wall
+                   time, parallelism, io-bound tasks) via
+                   tools/mackas-buildstats-analyze, then render pybootchartgui's
+                   bootchart SVG for EVERY build under PATH not already charted
+                   -- one <BUILDNAME>.svg per build, next to it. PATH defaults
+                   to \$MACKAS_BASE/artifacts/buildstats -- the default
+                   '$SCRIPT_CMD retrieve buildstats' destination.
+
+The SVG needs pycairo, which this Mac's own Python does not have, so it runs
+INSIDE a throwaway kas-image container instead -- best-effort: silently
+skipped (not an error) with no checkout yet, or if pybootchartgui.py cannot
+be found under it. A build with a chart already on disk is skipped, so
+re-running 'analyze' after one more build only charts the new one.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after the subcommand.
 EOF
+}
+
+# resolve_buildstats_dir PATH -- print the BUILDNAME dir PATH itself resolves
+# to: PATH unchanged if it directly has a build_stats file, else every
+# directory AT ANY DEPTH under PATH that does, sorted by full path and the
+# lexically last one taken (see list_buildstats_dirs for why this searches
+# recursively rather than one fixed level: `retrieve buildstats` nests each
+# retrieval under its own timestamp, so a build_stats file can sit one level
+# deeper than it used to). Prints nothing if none matches.
+resolve_buildstats_dir() {
+	list_buildstats_dirs "$1" | tail -1
+}
+
+# list_buildstats_dirs PATH -- print every directory AT ANY DEPTH under PATH
+# with a real build_stats file in it, one per line, oldest first (both
+# BUILDNAME and the retrieve timestamp `retrieve buildstats` now wraps it in
+# sort lexically as plain digit strings). PATH itself counts as one build dir
+# when it directly has build_stats. Recursive, not one fixed level, because
+# the retrieved shape can be PATH/<BUILDNAME>/build_stats (older data, or any
+# other tool that hands this a flat dir) OR
+# PATH/<retrieve-timestamp>/<BUILDNAME>/build_stats (what `retrieve
+# buildstats` produces now -- see fetch_tmp_subdir/cmd_retrieve) -- and should
+# not need to hardcode a depth at all. Unlike a single "newest wins" pick, the
+# SVG chart is cheap and per-build charts should not be merged into one
+# answer -- each build gets its own SVG, named after it.
+list_buildstats_dirs() {
+	local path="$1"
+	if [ -f "$path/build_stats" ]; then
+		printf '%s\n' "$path"
+		return 0
+	fi
+	[ -d "$path" ] || return 0
+	find "$path" -type f -name build_stats 2>/dev/null | sed 's#/build_stats$##' | sort
+}
+
+# buildstats_render_svg PATH -- best-effort: render pybootchartgui's bootchart
+# SVG for every BUILDNAME dir under PATH into a throwaway container, next to
+# the build_stats each was read from -- one SVG per build (list_buildstats_dirs),
+# skipping any build already charted so re-running 'buildstats analyze' after
+# a fresh build does not re-render history. Never fatal -- buildstats_analyze's
+# JSON/text summary is the useful part on its own (see TODO.md item 12):
+# pybootchartgui needs pycairo, a native dependency this Mac's host Python does
+# not have and mackas is not going to require via Homebrew (item 9), so this
+# only ever runs INSIDE the kas image, which is assumed to carry it. Silently
+# skips (one info line, never a warning) when there is no checkout yet, no
+# pybootchartgui.py, or no BUILDNAME dir at all -- all ordinary, not error,
+# states for a fresh retrieve or an empty fixture.
+buildstats_render_svg() {
+	local path="$1" bsdir pbc dirs pending=() svg_dir svg_base svg_name stage rc=0
+
+	dirs="$(list_buildstats_dirs "$path")"
+	[ -n "$dirs" ] || { info "  no BUILDNAME dir with build_stats under $path; skipping the SVG chart"; return 0; }
+
+	[ -d "$MACKAS_WORK" ] || { info "  no checkout under $MACKAS_WORK yet; skipping the SVG chart"; return 0; }
+	pbc="$(find "$MACKAS_WORK" -maxdepth 4 -type f -name pybootchartgui.py 2>/dev/null | head -1)"
+	[ -n "$pbc" ] || { info "  pybootchartgui.py not found under $MACKAS_WORK; skipping the SVG chart"; return 0; }
+	pbc="$(dirname "$pbc")"
+
+	# Skip builds already charted -- re-running 'buildstats analyze' after
+	# one more build should only render the new one, not redo every past run.
+	while IFS= read -r bsdir; do
+		[ -n "$bsdir" ] || continue
+		if [ -f "${bsdir%/*}/${bsdir##*/}.svg" ]; then
+			info "  ${bsdir##*/}.svg already exists; skipping"
+		else
+			pending+=("$bsdir")
+		fi
+	done <<-EOF
+	$dirs
+	EOF
+	[ "${#pending[@]}" -gt 0 ] || { info "  every build under $path is already charted; nothing to do"; return 0; }
+
+	for bsdir in "${pending[@]}"; do
+		# pybootchartgui's own main() does `f = filename + "." + options.format`
+		# UNCONDITIONALLY (main.py's _get_filename) -- it always appends
+		# ".svg" itself, so -o must get the BARE base name or the result is
+		# "<name>.svg.svg".
+		svg_base="${bsdir##*/}"
+		svg_name="$svg_base.svg"
+		svg_dir="${bsdir%/*}"
+
+		# _get_filename ALSO does `os.path.isdir(-o's value)` to decide
+		# filename vs. output-DIRECTORY mode. Mounting svg_dir (bsdir's own
+		# parent) straight as /out means "/out/$svg_base" is bsdir itself --
+		# an existing directory, right there under the same mount -- so
+		# pybootchartgui silently takes its directory branch and writes
+		# "$svg_base/bootchart.svg" instead of "$svg_base.svg" (confirmed
+		# live: reported path and real path disagreed). An empty staging dir
+		# has no such collision; move its one output file into place after.
+		stage="$(mktemp -d "$svg_dir/.mackas-svg.XXXXXX" 2>/dev/null)" || {
+			warn "  could not create a staging dir under $svg_dir; skipping $svg_base"
+			rc=1
+			continue
+		}
+
+		# Three host bind-mounts, no named volume: bsdir, svg_dir and stage
+		# are already plain host directories (buildstats analyze works on
+		# what `retrieve buildstats` already copied out), so unlike
+		# fetch_tmp_subdir this never touches oe-build-tmp and needs no
+		# one-VM check.
+		if ! run container run --rm \
+			-v "$pbc:/pbc:ro" -v "$bsdir:/in:ro" -v "$stage:/out" \
+			"$KAS_IMAGE" python3 /pbc/pybootchartgui.py -f svg -M -T \
+				-o "/out/$svg_base" /in
+		then
+			warn "  pybootchartgui failed on $svg_base (non-fatal); the kas image may be missing pycairo"
+			rm -rf "$stage"
+			rc=1
+			continue
+		fi
+
+		if ! run mv "$stage/$svg_name" "$svg_dir/$svg_name"; then
+			warn "  pybootchartgui ran but did not produce $svg_name (non-fatal)"
+			rm -rf "$stage"
+			rc=1
+			continue
+		fi
+		rm -rf "$stage"
+
+		did "chart: $svg_dir/$svg_name"
+	done
+
+	return "$rc"
 }
 
 # buildstats analyze [PATH] -- summarise a buildstats dir already on disk
@@ -4533,15 +4778,32 @@ buildstats_analyze() {
 
 	local path="${1:-$MACKAS_BASE/artifacts/buildstats}"
 
-	local analyzer="$SCRIPT_DIR/tools/mackas-buildstats-analyze"
+	# A relative PATH would be read as a NAMED VOLUME source, not a host
+	# directory, the moment buildstats_render_svg bind-mounts it -- same
+	# footgun cmd_retrieve's --dest guards against. Absolutise against $PWD.
+	case "$path" in
+		/*) ;;
+		*)  path="$PWD/$path" ;;
+	esac
+	case "$path" in
+		*:*) die "buildstats analyze PATH must not contain ':' (it becomes a bind-mount path)" \
+			"choose a path without a colon" ;;
+	esac
+
+	local analyzer="$SCRIPT_DIR/tools/mackas-buildstats-analyze" rc=0
 	if [ ! -f "$analyzer" ] || [ ! -x /usr/bin/python3 ]; then
 		warn "analyzer not found at $analyzer; skipping"
-		return 1
+		rc=1
+	else
+		hdr "buildstats summary"
+		/usr/bin/python3 "$analyzer" "$path" --summary \
+			|| { warn "analyze failed (non-fatal); check $path"; rc=1; }
 	fi
 
-	hdr "buildstats summary"
-	/usr/bin/python3 "$analyzer" "$path" --summary \
-		|| { warn "analyze failed (non-fatal); check $path"; return 1; }
+	hdr "bootchart SVG"
+	buildstats_render_svg "$path" || true
+
+	return "$rc"
 }
 
 cmd_buildstats() {

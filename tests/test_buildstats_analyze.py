@@ -311,5 +311,143 @@ class ChildRusageDriftGuardTest(TmpTest):
         self.assertGreater(guest["cpu_s"], 100.0)  # not 0.1 (own rusage only)
 
 
+def write_two_level_build(root, ts, buildname, tasks):
+    """Write buildstats/<ts>/<buildname>/ -- the shape `mackas retrieve
+    buildstats` now produces (each retrieval nested under its own timestamp;
+    see fetch_tmp_subdir/cmd_retrieve in mackas). Returns the buildstats
+    parent dir (two levels above the BUILDNAME dir)."""
+    parent = os.path.join(root, "buildstats")
+    bsdir = os.path.join(parent, ts, buildname)
+    os.makedirs(bsdir)
+    with open(os.path.join(bsdir, "build_stats"), "w") as fh:
+        fh.write("Build Started: 1000.00\nElapsed time: 42.00 seconds\n")
+    for recipe, taskfiles in tasks.items():
+        rdir = os.path.join(bsdir, recipe)
+        os.makedirs(rdir)
+        for name, contents in taskfiles.items():
+            with open(os.path.join(rdir, name), "w") as fh:
+                fh.write(contents)
+    return parent
+
+
+class TwoLevelNestingTest(TmpTest):
+    """`retrieve buildstats` nests each retrieval under its own timestamp
+    (fetch_tmp_subdir's EXTRA param), so a real BUILDNAME dir can now sit two
+    levels under the path `buildstats analyze` is pointed at -- resolution
+    must be recursive, not hardcode one fixed level."""
+
+    def test_resolve_finds_a_build_stats_two_levels_deep(self):
+        parent = write_two_level_build(
+            self.tmp, "20260101120000", "Angstrom v2026.06",
+            {"busybox": {"do_compile": task(1000, 1002)}})
+        got = bs.resolve_buildstats_dir(parent)
+        self.assertEqual(
+            got, os.path.join(parent, "20260101120000", "Angstrom v2026.06"))
+
+    def test_newest_retrieve_timestamp_wins_across_two_retrievals(self):
+        parent = write_two_level_build(
+            self.tmp, "20260101120000", "Angstrom v2026.06",
+            {"busybox": {"do_compile": task(1000, 1002)}})
+        write_two_level_build(
+            self.tmp, "20260601090000", "Angstrom v2026.06",
+            {"busybox": {"do_compile": task(1000, 1002)}})
+        got = bs.resolve_buildstats_dir(parent)
+        self.assertEqual(
+            got, os.path.join(parent, "20260601090000", "Angstrom v2026.06"))
+
+    def test_analyze_works_on_a_two_level_nested_dir(self):
+        parent = write_two_level_build(
+            self.tmp, "20260101120000", "Angstrom v2026.06",
+            {"busybox": {"do_compile": TASK_WITH_CHILD}})
+        resolved = bs.resolve_buildstats_dir(parent)
+        rep = bs.analyze(resolved)
+        self.assertAlmostEqual(rep["build"]["cpu_s"], 150.1, places=1)
+
+
+def write_accumulated_build_stats(root, n_builds, latest_started,
+                                   old_task, new_task):
+    """A BUILDNAME dir whose build_stats has N_BUILDS "Build Started:" lines
+    appended (the constant-BUILDNAME symptom: buildstats.bbclass opens
+    build_stats in append mode and never truncates it -- see the module
+    docstring), plus one task file predating LATEST_STARTED (a carryover from
+    an earlier build sharing this directory) and one task file at or after it
+    (this build's own). Returns the BUILDNAME dir."""
+    bsdir = os.path.join(root, "buildstats", "Angstrom v2026.06")
+    os.makedirs(bsdir)
+    with open(os.path.join(bsdir, "build_stats"), "w") as fh:
+        for i in range(n_builds - 1):
+            fh.write("Build Started: %.2f\n" % (latest_started - 1000 * (n_builds - i)))
+            fh.write("Elapsed time: 5.00 seconds\nCPU usage: 90.0%\n")
+        fh.write("Build Started: %.2f\n" % latest_started)
+        fh.write("Elapsed time: 4.50 seconds\nCPU usage: 95.0%\n")
+    rdir = os.path.join(bsdir, "somerecipe")
+    os.makedirs(rdir)
+    with open(os.path.join(rdir, "do_compile_old"), "w") as fh:
+        fh.write(old_task)
+    with open(os.path.join(rdir, "do_compile_new"), "w") as fh:
+        fh.write(new_task)
+    return bsdir
+
+
+class BuildstatsAccumulationTest(TmpTest):
+    """A project whose BUILDNAME does not vary per build (confirmed live:
+    Angstrom's distro conf hardcodes `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`)
+    accumulates every build it has ever run into one build_stats file. More
+    than one "Build Started:" line is the ironclad, read-directly-off-the-file
+    signal this happened -- these pin the detection and the resulting task
+    filter."""
+
+    def test_single_build_started_line_is_not_flagged(self):
+        bsdir = write_buildstats(self.tmp, {"busybox": {"do_compile": task(1000, 1002)}})
+        build = bs.parse_build_stats(bsdir)
+        self.assertEqual(build["n_builds_in_file"], 1)
+
+    def test_multiple_build_started_lines_are_counted(self):
+        bsdir = write_accumulated_build_stats(
+            self.tmp, 3, latest_started=5000,
+            old_task=task(1000, 1002), new_task=task(5001, 5003))
+        build = bs.parse_build_stats(bsdir)
+        self.assertEqual(build["n_builds_in_file"], 3)
+
+    def test_carryover_task_is_dropped_when_file_is_shared(self):
+        # old_task starts at 1000 (long before the latest "Build Started:" at
+        # 5000) -- a real carryover from an earlier build under the same
+        # BUILDNAME. new_task starts at 5001, after this build actually
+        # started, and must be the only one counted.
+        bsdir = write_accumulated_build_stats(
+            self.tmp, 2, latest_started=5000,
+            old_task=task(1000, 1002, utime=999.0),
+            new_task=task(5001, 5003, utime=1.0))
+        rep = bs.analyze(bsdir)
+        self.assertEqual(rep["build"]["n_tasks"], 1)
+        self.assertAlmostEqual(rep["build"]["cpu_s"], 1.0, places=2)
+
+    def test_no_filtering_when_only_one_build_started_line(self):
+        # A normal, single-build directory: even a task with a start time
+        # BEFORE the recorded "Build Started:" (should not happen for real,
+        # but proves the filter genuinely gates on n_builds_in_file, not on
+        # the raw timestamp comparison alone) must still be counted.
+        bsdir = write_buildstats(self.tmp, {
+            "busybox": {"do_compile": task(1, 3, utime=1.0)},
+        })
+        rep = bs.analyze(bsdir)
+        self.assertEqual(rep["build"]["n_tasks"], 1)
+
+    def test_format_summary_warns_when_accumulated(self):
+        bsdir = write_accumulated_build_stats(
+            self.tmp, 4, latest_started=5000,
+            old_task=task(1000, 1002), new_task=task(5001, 5003))
+        rep = bs.analyze(bsdir)
+        out = bs.format_summary(rep)
+        self.assertIn("4 builds", out)
+        self.assertIn("accumulated", out)
+
+    def test_format_summary_silent_when_not_accumulated(self):
+        bsdir = write_buildstats(self.tmp, {"busybox": {"do_compile": task(1000, 1002)}})
+        rep = bs.analyze(bsdir)
+        out = bs.format_summary(rep)
+        self.assertNotIn("accumulated", out)
+
+
 if __name__ == "__main__":
     unittest.main()

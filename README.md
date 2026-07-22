@@ -205,7 +205,7 @@ Plus two files `setup` **generates** rather than ships:
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
-| `buildstats` | Work with buildstats already retrieved, e.g. `buildstats analyze`. |
+| `buildstats` | Work with buildstats already retrieved: `buildstats analyze [PATH]` summarises the newest build's wall time/parallelism/io and renders a pybootchartgui bootchart SVG for every build under PATH not already charted (run inside a throwaway kas-image container — pybootchartgui needs pycairo, which this Mac's Python does not have). |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in at least N days. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. `mackas monitor --help`. See [Watching a build live](#watching-a-build-live). |
 | `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
@@ -259,7 +259,20 @@ summarises what was fetched:
 
 `deploy` (the images and ipks) can be tens of GB. `buildstats analyze` runs
 [`tools/mackas-buildstats-analyze`](tools/mackas-buildstats-analyze) over the
-path given (or the default `retrieve` destination).
+newest build in the path given (or the default `retrieve` destination), then
+renders a pybootchartgui bootchart SVG for every build there not already
+charted — one `<BUILDNAME>.svg` per build, so re-running `analyze` after one
+more build only charts the new one. The SVG step runs inside a throwaway
+kas-image container (pybootchartgui needs pycairo, which this Mac's own
+Python does not have) and is best-effort: it skips quietly with no project
+checkout yet.
+
+Each `retrieve buildstats` lands in its own timestamped subdirectory
+(`buildstats/<retrieve-time>/<BUILDNAME>/`), so successive retrievals never
+merge together — important for a project whose `BUILDNAME` doesn't vary per
+build, where bitbake itself never resets `tmp/buildstats` between builds. See
+[Buildstats and a constant BUILDNAME](docs/storage.md#buildstats-and-a-constant-buildname)
+for what that means and how mackas handles it (`MACKAS_BUILDSTATS_ACCUMULATE`).
 
 Because only **one VM may hold an ext4 image at a time**, `retrieve` refuses
 while a build (`smoketest`/`shell`) still has the volume attached — stop it first.
@@ -443,6 +456,7 @@ used. `mackas.conf.example` has the full annotated list.
 | `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |
 | `MACKAS_OVERHEAD_INTERVAL` | `5` | Seconds between host-overhead samples. Spikes shorter than this are invisible. |
 | `MACKAS_FSTRIM_AUTO` | `1` | `fstrim` the three volumes before and after every kas run, so the sparse images don't ratchet up. Set `0` to disable. |
+| `MACKAS_BUILDSTATS_ACCUMULATE` | `0` | Clear `tmp/buildstats` before every kas run (default). Set `1` to let it accumulate instead — see [Getting build outputs off the volume](#getting-build-outputs-off-the-volume) for why this matters for a project whose `BUILDNAME` doesn't vary per build. |
 | `MACKAS_MONITOR` | `0` | Opt a build into the live bitbake progress bridge (see [Watching a build live](#watching-a-build-live)). Off by default: it mounts an overlay, shadows the container's `bitbake` and runs a background HTTP thread on every build. |
 | `MACKAS_MONITOR_PORT` | `8801` | Host port the bridge publishes and `mackas monitor` polls. |
 | `MACKAS_USE_HTTP_MIRRORS` | `0` | Opt in to HTTP mirrors. **Optional** — see [storage.md](docs/storage.md). |
