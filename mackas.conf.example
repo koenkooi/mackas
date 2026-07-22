@@ -211,6 +211,13 @@
 # knob: name the machine config directly here.
 #MACKAS_KAS_CONFIG="kas/base.yml:kas/qemuarm64.yml"
 
+# Whether the env.sh 'kas-container' wrapper -- a bare, hand-typed
+# 'kas-container build/shell/... <files>' -- also appends macos-local.yml onto
+# <files> itself, the same way mackas's own subcommands already do. On by
+# default; set to 0 to go back to composing it yourself (e.g. your own <files>
+# already ends with a differently-named fragment).
+#MACKAS_KAS_AUTO_FRAGMENT=1
+
 # The smoketest ladder's build rungs: space-separated bitbake targets, run in
 # order after the universal parse-only rung. Empty by default (the built-in
 # default, not what is shown commented out below): with no targets set, the
