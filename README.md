@@ -181,6 +181,8 @@ you when it drives kas.
 | `mirror-server/mackas-mirrord` | The HTTP mirror server. **Optional.** Single file, Python 3.7+, stdlib only — scp it to a mirror host, or run it locally. See [storage.md](docs/storage.md#http-mirrors--optional-and-not-just-an-nfs-bridge). |
 | `mirror-server/mackas-mirrord.service` | Hardened systemd unit for it (Debian 13). |
 | `mirror-server/mackas-mirrord.conf.example` | Annotated config for it. |
+| `mackas-uibridge/` | The live-progress bridge (`MACKAS_MONITOR=1`): a bitbake UI module (`mackasjson.py`) and the `bitbake` wrapper mounted over the checkout's own. **Optional.** See [architecture.md](docs/architecture.md#live-build-progress-the-monitor-bridge). |
+| `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller). |
 | `tests/` | bats test suite. See [testing.md](docs/testing.md). |
 | `run-tests.sh`, `Makefile` | Test entry points (`./run-tests.sh` or `make test`). |
 | `COPYING` | GPLv3. |
@@ -198,11 +200,14 @@ Plus two files `setup` **generates** rather than ships:
 |---|---|
 | `check` | Preflight only. PASS/WARN/FAIL, each with the remediation command. **Default.** |
 | `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. Takes an optional root path and `--tmpdir-size`/`--sstate-size`/`--downloads-size`; asks interactively for whichever is still unconfigured. Skips the project checkout step if none is configured. |
+| `adopt` | Bring a `MACKAS_ROOT` another Mac's mackas set up (an external drive moved over, a network share) back to a working build here, with its own volume name and short link. Writes a per-project config, then hands off to `setup`. See [Adopting a root from another Mac](#adopting-a-root-from-another-mac). |
 | `smoketest` | The validation ladder (see below). Offers the meta-ai example, for one ephemeral run only, if no project is configured at all. |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | Work with buildstats already retrieved, e.g. `buildstats analyze`. |
+| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in at least N days. `mackas sstate --help`. |
+| `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. `mackas monitor --help`. See [Watching a build live](#watching-a-build-live). |
 | `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (reclaim disk from a sparse image; `all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or every volume (`--all`/`-a`), `move` one to another disk, `recover` a hand-moved one. |
@@ -292,6 +297,84 @@ the runtime expects the volume, so nothing else needs reconfiguring; `status`
 and `volume list` resolve and report the real location. It refuses a volume
 that is in use. If you ever move an image by hand and the symlink goes stale,
 `mackas volume recover` finds it again with Spotlight and offers to re-point.
+A later `volume destroy`/`clean` of that volume also removes the per-volume
+symlink `move` planted, so a moved-then-destroyed volume leaves nothing dangling.
+
+### Pruning the sstate cache
+
+bitbake never removes an sstate object on its own — the cache only grows, and
+`mackas clean` deliberately keeps it. `mackas sstate prune --older-than N[d]`
+deletes objects bitbake hasn't reused in at least N days:
+
+```sh
+./mackas sstate prune --older-than 90d          # reports what would go, then asks
+./mackas --dry-run sstate prune --older-than 90d   # real scan, deletes nothing
+```
+
+bitbake touches (updates the mtime of) an sstate object every time it finds
+and reuses it, so "untouched for N days" genuinely means "nothing built in N
+days has needed this", not "written N days ago" — and sstate's hash-addressing
+makes a wrong guess cheap: a pruned object still needed just gets rebuilt, one
+task, never a correctness risk. It scans for real even under `--dry-run` (so the
+count/size reported are real) and deletes only after confirmation or `-y`. Like
+the other volume operations it obeys the **one-VM rule** and refuses while a
+build holds the sstate volume. For surgical pruning — keep only what one
+checkout's stamps still reference — use openembedded-core's own
+`scripts/sstate-cache-management.py` instead; `sstate prune` solves the coarser
+"nothing has touched this in months" case.
+
+### Watching a build live
+
+A build inside the container is invisible to macOS in real time beyond mackas's
+own coarse rung/log reporting. `MACKAS_MONITOR=1` opts a build into a live
+progress bridge, and `mackas monitor` polls it:
+
+```sh
+./mackas --set MACKAS_MONITOR=1 smoketest &   # run the build with the bridge on
+./mackas monitor                              # follow: [status] done/total  recipe:task
+./mackas monitor --once                       # a single snapshot, then exit
+```
+
+`monitor` only polls an already-published port (`MACKAS_MONITOR_PORT`, default
+`8801`) — it never starts a build. The bridge is a real bitbake UI module tee'd
+into the event stream, not a second observer client; it stays **off by default**
+because enabling it mounts an overlay, shadows the container's `bitbake`, and
+runs a background HTTP thread on every build. How it becomes the real UI client
+without patching bitbake is in
+[architecture.md](docs/architecture.md#live-build-progress-the-monitor-bridge).
+
+## Adopting a root from another Mac
+
+`MACKAS_ROOT` is portable — an external SSD, or a disk image on a share, can be
+physically moved to a second Mac. But that root carries a volume name, a short
+link and an `env.sh` the *first* Mac chose, and its container volumes may have
+been relocated to paths that don't exist here. `mackas adopt` bridges that gap
+without clobbering anything this Mac already has for an unrelated project:
+
+```sh
+./mackas adopt /Volumes/ExternalSSD/oe                       # introspect and set it up
+./mackas adopt /Volumes/ExternalSSD/oe --project-dir meta-ai  # pick a checkout by name
+```
+
+It introspects `work/*/` for the project checkout (remote URL and branch;
+`--project-dir` disambiguates when there is more than one, or none is found
+automatically), **refuses outright** if the path is already this Mac's own root
+(that is `setup`/`check` territory), and derives a collision-free
+`MACKAS_VOLUME_NAME` (`mackas-<name>`, suffixed if taken) and `MACKAS_SHORT_LINK`
+(`~/oe-<name>`, reused on a re-adopt of the same root).
+
+**Each adopted root gets its own config file** — by default
+`~/.config/mackas/projects/<name>.conf`, or wherever `--write-config FILE` says
+(note: `--write-config`, not the global `--config`, which loads an *existing*
+file). That is the per-project config model: from then on, drive that project
+with `mackas --config <that file> ...`. adopt then runs `volume recover` (so a
+relocated volume Spotlight can find is re-pointed before `setup` would create a
+fresh empty one over it), checks for `work/` files owned by the other Mac's
+account and offers a recursive `chown` if the drive isn't mounted `noowners`,
+and hands off to `setup` for everything it already does right. If this Mac's
+machine-wide volume-relocation symlink already belongs to a different live
+project, `setup` detects that and *offers* — never silently does — to switch it.
+`mackas adopt --help` has the full flag list.
 
 ## Configuration
 
@@ -360,6 +443,8 @@ used. `mackas.conf.example` has the full annotated list.
 | `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |
 | `MACKAS_OVERHEAD_INTERVAL` | `5` | Seconds between host-overhead samples. Spikes shorter than this are invisible. |
 | `MACKAS_FSTRIM_AUTO` | `1` | `fstrim` the three volumes before and after every kas run, so the sparse images don't ratchet up. Set `0` to disable. |
+| `MACKAS_MONITOR` | `0` | Opt a build into the live bitbake progress bridge (see [Watching a build live](#watching-a-build-live)). Off by default: it mounts an overlay, shadows the container's `bitbake` and runs a background HTTP thread on every build. |
+| `MACKAS_MONITOR_PORT` | `8801` | Host port the bridge publishes and `mackas monitor` polls. |
 | `MACKAS_USE_HTTP_MIRRORS` | `0` | Opt in to HTTP mirrors. **Optional** — see [storage.md](docs/storage.md). |
 | `MACKAS_USE_NFS_MIRRORS` | `0` | Opt in to NFS mirrors. **Optional**, and not the recommended mirror path — see [storage.md](docs/storage.md). |
 | `MACKAS_FREE_SPACE_MARGIN_GB` | `20` | Headroom `check` insists on. |

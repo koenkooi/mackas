@@ -213,6 +213,61 @@ absolute path, or an unsourced shell bypasses the wrapper and builds with no
 volumes and no limits. `mackas status` prints the exact `--runtime-args` in
 effect.
 
+## Live build progress: the monitor bridge
+
+A build inside the container reports nothing to macOS in real time beyond
+mackas's own rung/log lines. `MACKAS_MONITOR=1` (off by default) adds a live
+progress feed; `mackas monitor` polls it. Like `mackas-mirrord`, it is an HTTP
+server that only makes sense next to the build — but it runs **inside** the
+build's own container, published to the host over Apple `container`'s `-p`,
+rather than being a separate process on the Mac.
+
+The hard part is that bitbake refuses to be *observed*. Two earlier designs
+bootstrapped a bitbake server and attached a second `--observe-only` client;
+both failed structurally — a "Cooker is busy" registration race, and an
+unavoidable crash because bb's server-side readonly-command allowlist refuses an
+observer from ever calling `updateConfig`, so no client-side workaround exists.
+
+So the bridge is not an observer. It is the **first and only UI client** —
+bitbake believes it is running its normal `knotty` terminal UI. Two pieces make
+that happen, both under `mackas-uibridge/`:
+
+- **`mackasjson.py`** is a bitbake UI module (`bb.ui.mackasjson`). Its `main()`
+  does not reimplement the terminal UI: it wraps `eventHandler` in a thin tee
+  proxy — each event updates a background `ThreadingHTTPServer`'s JSON state,
+  then passes through **unchanged** to the real `bb.ui.knotty.main()`. So it is
+  a pure side-channel tap: `kas-container shell`/`mackas smoketest` look and
+  behave exactly as they do with the monitor off. The HTTP side is bare
+  `BaseHTTPRequestHandler` (same reasoning as `mackas-mirrord`: every response
+  is auditable code here, not inherited `http.server` behaviour), serving one
+  generated JSON document, no auth/TLS — a read-only, single-build status feed
+  published only for one container's lifetime. It binds `0.0.0.0`, not
+  `127.0.0.1`, because that loopback is the container's, not the Mac's.
+- **`bitbake`** is a wrapper mounted **over** the checked-out project's own
+  `bin/bitbake` for one container's lifetime, then it calls the real
+  `bitbake_main()` with `bb.ui.mackasjson` made importable and selected via
+  `BITBAKE_UI`. It has to be a *file overlay*, not a `PATH` prepend: OE-core's
+  `oe-buildenv-internal` re-prepends the real bitbake's own `bin/` onto `PATH`
+  last, so a `PATH`-shadow would always lose. This is the same per-container
+  mount-substitution technique kas-container itself uses for its `.git` overlay
+  — the real checkout on disk is never modified.
+
+`monitor_runtime_args()` (in `mackas`) assembles the mounts and the `-p` publish
+when `MACKAS_MONITOR=1`, appending them to `--runtime-args`. It is best-effort
+and never fatal — an opt-in extra, not something a build should fail over — so
+it silently skips when there is no checkout yet or a path involved contains a
+space (which would corrupt the whitespace-split `--runtime-args` string). Both
+files are mounted as **individual single-file `-v`s**, never a directory mount
+plus a mount of a file inside it: Apple `container` (verified live) silently
+drops the first mount whenever a second `-v`'s host source is nested inside the
+first's host directory, even with unrelated container-side targets.
+
+`tools/mackas-monitor` is the host-side poller `mackas monitor` runs — stdlib
+Python, polling `http://127.0.0.1:<port>/` every 2 s (`POLL_INTERVAL`) and
+printing `[status] done/total  recipe:task` until the build reports
+`success`/`failed`, or once with `--once`. It only reads an already-published
+port; it never starts a build.
+
 ## The short symlink
 
 `MACKAS_SHORT_LINK` (default `$HOME/oe`) points at `MACKAS_ROOT`, and

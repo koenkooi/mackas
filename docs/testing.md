@@ -92,10 +92,14 @@ translation fully assertable with no VM. Config tests run against a throwaway
 | `tests/test_overhead.py` | `tools/mackas-overhead`: `parse_cputime`'s four `ps -o time` wire formats, the sampler's self-exclusion and KiB→bytes conversion, and the mismatch guard that prints `UNAVAILABLE` rather than a fabricated overhead number. `unittest`, stdlib. |
 
 The table is the highlights, not the whole suite; the remaining files
-(`case_sensitivity`, `check_discard_support`, `purefns`, `require_root`,
-`set_get_unset`, `setup_e2e`, `setup_kas_container`, `smoketest_ladder`,
-`volume_mgmt`, `workspace_image_real`) follow the same patterns, and each
-file's own header says exactly what it pins.
+(`adopt`, `case_sensitivity`, `check_discard_support`, `monitor`, `purefns`,
+`require_root`, `set_get_unset`, `setup_e2e`, `setup_kas_container`,
+`smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`,
+`workspace_image_real`) follow the same patterns, and each file's own header
+says exactly what it pins. `adopt`, `sstate` and `monitor` cover the three
+newest commands: `adopt`'s foreign-root introspection and collision-free
+volume/link derivation, `sstate prune`'s age-based scan and one-VM refusal, and
+`monitor`'s `--runtime-args` mount/publish assembly and host-side poller.
 
 Not covered by the hermetic suite: anything needing a 200 GB disk, sudo, or a
 real build. See [TODO.md](../TODO.md) for the specific gaps.
