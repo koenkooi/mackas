@@ -152,24 +152,29 @@ not:
 kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml:meta-angstrom/kas/macos-local.yml
 ```
 
-Compose `:kas/macos-local.yml` (relative to whichever layer you generated it
-into — `mackas setup` writes it inside the single `MACKAS_PROJECT_DIR` it
-manages) onto the end for the tuning fragment (parallelism,
-`BB_DISKMON_DIRS`, `BB_HASHSERVE_DB_DIR`, mirrors) that mackas passes for
-you when it drives kas.
+The wrapper function itself appends `:kas/macos-local.yml` (relative to
+whichever layer you generated it into — `mackas setup` writes it inside the
+single `MACKAS_PROJECT_DIR` it manages) onto the file list you give it, so
+you can usually leave it off — `kas-container shell meta-angstrom/kas/base.yml`
+already gets the tuning fragment (parallelism, `BB_DISKMON_DIRS`,
+`BB_HASHSERVE_DB_DIR`, mirrors) composed in for you, exactly as if you had
+typed the line above by hand. Set `MACKAS_KAS_AUTO_FRAGMENT=0` to go back to
+composing it yourself instead — e.g. if your own file list already ends with
+a differently-named fragment.
 
 > **`kas-container` here is a shell function, not the program on your
 > `PATH`.** `env.sh` defines it to supply `--runtime-args` (the ext4 volumes
 > and CPU/memory limits), point `GITCONFIG_FILE` at the generated
-> `safe.directory` config, and blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`.
-> None of that is optional — see
+> `safe.directory` config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, and
+> (unless `MACKAS_KAS_AUTO_FRAGMENT=0`) append `macos-local.yml` onto the
+> file list. None of that is optional — see
 > [architecture.md](docs/architecture.md#the-ext4-volumes).
 >
 > `command kas-container`, an absolute path, or an unsourced shell bypasses
-> the function and builds wrong: no volumes, Apple's default 4 CPUs / 1 GB —
-> and, with a pipx or pip kas on `PATH`, possibly a different kas release
-> than the 5.4 mackas pins. `mackas check` reports which `kas-container`
-> wins.
+> the function and builds wrong: no volumes, Apple's default 4 CPUs / 1 GB,
+> no auto-appended fragment — and, with a pipx or pip kas on `PATH`, possibly
+> a different kas release than the 5.4 mackas pins. `mackas check` reports
+> which `kas-container` wins.
 
 ## Files
 
@@ -452,6 +457,7 @@ used. `mackas.conf.example` has the full annotated list.
 | `MACKAS_PROJECT_BRANCH` | *(empty)* | Branch to check out. |
 | `MACKAS_PROJECT_DIR` | *(empty)* | Checkout name under `work/`; also the cwd kas runs in. |
 | `MACKAS_KAS_CONFIG` | *(empty)* | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
+| `MACKAS_KAS_AUTO_FRAGMENT` | `1` | The env.sh `kas-container` wrapper also appends `macos-local.yml` onto a hand-typed file list. Set `0` to compose it yourself instead. |
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty means one build rung with no `--target`, so kas builds its own default; see [mackas.conf.example](mackas.conf.example) for meta-ai's ladder as an example override. |
 | `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |
 | `MACKAS_OVERHEAD_INTERVAL` | `5` | Seconds between host-overhead samples. Spikes shorter than this are invisible. |

@@ -206,12 +206,17 @@ supported mechanism. See
 ### Running `kas-container` by hand
 
 `env.sh` defines `kas-container` as a **shell function** that supplies
-`--runtime-args "$MACKAS_RUNTIME_ARGS"` and blanks
-`KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`. Typing `kas-container build ...` in a
-sourced shell therefore does the right thing; `command kas-container`, an
-absolute path, or an unsourced shell bypasses the wrapper and builds with no
-volumes and no limits. `mackas status` prints the exact `--runtime-args` in
-effect.
+`--runtime-args "$MACKAS_RUNTIME_ARGS"`, blanks
+`KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, and — unless `MACKAS_KAS_AUTO_FRAGMENT=0`
+— appends the generated `macos-local.yml` fragment onto the file-list
+argument of a recognized kas subcommand (`build`/`shell`/`checkout`/`dump`/
+`menu`), resolved fresh from `$PWD` on every call rather than baked in at
+generation time (the supported flow `cd`s to `work/`, the parent of every
+layer checkout, not into the project itself — see the main README). Typing
+`kas-container build ...` in a sourced shell therefore does the right thing;
+`command kas-container`, an absolute path, or an unsourced shell bypasses the
+wrapper and builds with no volumes, no limits, and no auto-appended fragment.
+`mackas status` prints the exact `--runtime-args` in effect.
 
 ## Live build progress: the monitor bridge
 

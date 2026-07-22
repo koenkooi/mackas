@@ -72,6 +72,7 @@ MACKAS_PROJECT_URL
 MACKAS_PROJECT_BRANCH
 MACKAS_PROJECT_DIR
 MACKAS_KAS_CONFIG
+MACKAS_KAS_AUTO_FRAGMENT
 MACKAS_SMOKETEST_TARGETS
 MACKAS_OVERHEAD
 MACKAS_OVERHEAD_INTERVAL
@@ -603,6 +604,18 @@ set_defaults() {
 	MACKAS_PROJECT_BRANCH=""
 	MACKAS_PROJECT_DIR=""
 	MACKAS_KAS_CONFIG=""
+
+	# Whether the env.sh 'kas-container' wrapper (a bare, hand-typed
+	# 'kas-container build/shell/... <files>' -- see setup_shim_and_env) also
+	# appends the generated macos-local.yml fragment onto <files> itself, the
+	# same way compose_kas_files() already does for every mackas subcommand
+	# that drives kas. ON by default: the fragment carries parallelism,
+	# BB_DISKMON_DIRS and BB_HASHSERVE_DB_DIR, and forgetting to compose it by
+	# hand is a silent, easy-to-miss loss of exactly those (a live-reported
+	# case: bitbake's own hash-equivalence warning at parse time, no other
+	# symptom). Set to 0 to go back to composing it yourself, e.g. if your own
+	# <files> list already ends with a differently-named fragment.
+	MACKAS_KAS_AUTO_FRAGMENT=1
 
 	# The smoketest ladder's build rungs, space-separated bitbake targets, run
 	# in order after the universal parse-only rung. Empty by default: with no
@@ -2688,6 +2701,7 @@ setup_shim_and_env() {
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
+	local q_fragrepo q_autofrag
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
 	q_work="$(shq "$MACKAS_WORK")"
@@ -2700,6 +2714,8 @@ setup_shim_and_env() {
 	q_project="$(shq "$MACKAS_PROJECT")"
 	q_cpus="$(shq "$MACKAS_CPUS")"
 	q_parallel="$(shq "-j $MACKAS_CPUS")"
+	q_fragrepo="$(shq "$MACKAS_KAS_FRAGMENT_REPO")"
+	q_autofrag="$(shq "$MACKAS_KAS_AUTO_FRAGMENT")"
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_ENV_SH" "$C_RST"
@@ -2763,12 +2779,48 @@ fi
 # instead of silently building at cpus=4/memory=1gb with no volumes.
 export MACKAS_RUNTIME_ARGS=$q_runtime_args
 
+# Absolute path to the generated fragment (empty project -> a path that
+# simply does not exist yet, which the wrapper below treats as "nothing to
+# append"), and whether the wrapper appends it automatically. See
+# MACKAS_KAS_AUTO_FRAGMENT in $SCRIPT_NAME for the full story.
+export MACKAS_KAS_FRAGMENT_REPO=$q_fragrepo
+export MACKAS_KAS_AUTO_FRAGMENT=$q_autofrag
+
 kas-container() {
 	# Prepend our bin dir so kas-container ALWAYS finds the GNU realpath shim
 	# installed there, no matter what \$PATH looks like when this is called.
 	# kas-container calls \`realpath -e\` / \`--relative-base\`, which macOS's BSD
 	# realpath rejects with "illegal option -- e"; the shim (a symlink to GNU
 	# coreutils' realpath) is what makes a bare 'kas-container ...' just work.
+	#
+	# Auto-append the macos-local.yml fragment (parallelism, BB_DISKMON_DIRS,
+	# BB_HASHSERVE_DB_DIR, mirrors) onto the file-list argument every kas
+	# subcommand below takes right after itself, the same way
+	# compose_kas_files() already does for every mackas subcommand that drives
+	# kas -- unless MACKAS_KAS_AUTO_FRAGMENT=0, the fragment is not installed
+	# yet (no project), the file-list arg is missing/a flag, or it already
+	# names macos-local.yml itself (composed by hand, per README). The
+	# relative path is resolved fresh from \$PWD every call, not baked in at
+	# generation time, because README's own supported flow cd's to work/ (the
+	# parent of every layer checkout) rather than into the project itself, so
+	# the correct relative prefix depends on where THIS call runs from.
+	local _mackas_sub="\${1:-}" _mackas_files="\${2:-}" _mackas_frag
+	if [ "\${MACKAS_KAS_AUTO_FRAGMENT:-0}" = "1" ] && [ -f "\$MACKAS_KAS_FRAGMENT_REPO" ]; then
+		case "\$_mackas_sub" in
+			build|shell|checkout|dump|menu)
+				case "\$_mackas_files" in
+					''|-*|*macos-local.yml) ;;
+					*)
+						_mackas_frag="\$(PATH=$q_shim:"\$PATH" realpath --relative-to="\$PWD" "\$MACKAS_KAS_FRAGMENT_REPO" 2>/dev/null || true)"
+						if [ -n "\$_mackas_frag" ]; then
+							shift 2
+							set -- "\$_mackas_sub" "\$_mackas_files:\$_mackas_frag" "\$@"
+						fi
+						;;
+				esac
+				;;
+		esac
+	fi
 	env PATH=$q_shim:"\$PATH" KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
 		$q_kasbin --runtime-args "\$MACKAS_RUNTIME_ARGS" "\$@"
 }

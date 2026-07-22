@@ -651,6 +651,108 @@ write_env_sh() {
 }
 
 # ---------------------------------------------------------------------------
+# env.sh -- the kas-container wrapper auto-appending macos-local.yml
+#
+# A bare, hand-typed 'kas-container shell <files>' (even through the wrapper
+# function, which only supplies --runtime-args) never composed the generated
+# fragment onto <files> -- only compose_kas_files() did that, and only
+# mackas's own subcommands call it. Reported live: bitbake's own
+# hash-equivalence warning at parse time, no other symptom, traced back to a
+# hand-typed <files> list that never carried macos-local.yml.
+# ---------------------------------------------------------------------------
+
+# fake_kas_container -- installs a fake at KAS_CONTAINER_BIN that just prints
+# its argv, one per line, so a test can inspect exactly what the wrapper
+# passed through.
+fake_kas_container() {
+	mkdir -p "$(dirname "$KAS_CONTAINER_BIN")"
+	cat > "$KAS_CONTAINER_BIN" <<'FAKE'
+#!/bin/bash
+printf '%s\n' "$@"
+FAKE
+	chmod +x "$KAS_CONTAINER_BIN"
+}
+
+# with_project_fragment -- a configured project with the fragment already
+# installed, the state 'setup' leaves behind.
+with_project_fragment() {
+	MACKAS_PROJECT_DIR="meta-angstrom"
+	derive_paths
+	mkdir -p "$MACKAS_PROJECT/kas"
+	touch "$MACKAS_KAS_FRAGMENT_REPO"
+}
+
+@test "kas-container wrapper: appends macos-local.yml when run from work/ (the documented cwd)" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'shell'
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml'
+}
+
+@test "kas-container wrapper: appends macos-local.yml when run from inside the project checkout" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_PROJECT" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell kas/base.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'kas/base.yml:kas/macos-local.yml'
+}
+
+@test "kas-container wrapper: extra kas args after <files> survive the append" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell meta-angstrom/kas/base.yml -c "bitbake foo"' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml'
+	printf '%s\n' "$out" | grep -qxF -- '-c'
+	printf '%s\n' "$out" | grep -qxF 'bitbake foo'
+}
+
+@test "kas-container wrapper: does not double up a <files> list that already names macos-local.yml" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell meta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml' _ "$MACKAS_ENV_SH")"
+	[ "$(printf '%s\n' "$out" | grep -c 'macos-local.yml')" -eq 1 ]
+}
+
+@test "kas-container wrapper: MACKAS_KAS_AUTO_FRAGMENT=0 disables the auto-append" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; MACKAS_KAS_AUTO_FRAGMENT=0 kas-container shell meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml'
+	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
+}
+
+@test "kas-container wrapper: no auto-append when no project is configured (fragment not installed)" {
+	# MACKAS_PROJECT_DIR is empty (lib_setup's default): MACKAS_KAS_FRAGMENT_REPO
+	# names a file that does not exist, so the wrapper has nothing to append.
+	write_env_sh
+	fake_kas_container
+	mkdir -p "$MACKAS_WORK"
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell some.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'some.yml'
+	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
+}
+
+@test "kas-container wrapper: a flag right after the subcommand is left alone (no <files> to append to)" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container --help' _ "$MACKAS_ENV_SH")"
+	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
+}
+
+@test "env.sh: valid bash 3.2 and zsh with a project and the auto-fragment wrapper generated" {
+	with_project_fragment
+	write_env_sh
+	/bin/bash -n "$MACKAS_ENV_SH"
+	/bin/zsh -n "$MACKAS_ENV_SH"
+}
+
+# ---------------------------------------------------------------------------
 # gitconfig -- the git "dubious ownership" workaround (THE blocker)
 # ---------------------------------------------------------------------------
 
