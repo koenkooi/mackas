@@ -455,6 +455,61 @@ An external volume's top level is typically `root:wheel`, so creating
 `$MACKAS_ROOT` needs a one-off `sudo mkdir` + `sudo chown`. `setup` prompts
 for exactly that and nothing more.
 
+## Buildstats and a constant BUILDNAME
+
+`meta/classes-global/buildstats.bbclass` writes every build's per-task timing
+under `tmp/buildstats/${BUILDNAME}/`. Two things about it matter here, both
+confirmed straight from its source: `bb.utils.mkdirhier(bsdir)` only creates
+that directory if missing — it never clears one that already exists — and
+`build_stats` (the per-build summary at the root of it) is opened in
+**append** mode at both `BuildStarted` and `BuildCompleted`, never truncated.
+
+For a project whose `BUILDNAME` genuinely varies per build (bitbake's own
+default is timestamp-based), that is harmless: each build gets a fresh,
+uniquely-named directory. It stops being harmless the moment a distro
+hardcodes `BUILDNAME` to something constant — confirmed live in this
+project's own `meta-angstrom/conf/distro/angstrom.conf`:
+
+```
+BUILDNAME = "Angstrom ${DISTRO_VERSION}"
+```
+
+Every build ever run under that distro config writes into the exact same
+`tmp/buildstats/Angstrom ${DISTRO_VERSION}/` directory, forever. Its
+`build_stats` file accumulates one "Build Started"/"Elapsed time"/"CPU usage"
+trio per build (append, never truncate), and every recipe's task files from
+every past build just sit there too, since nothing ever removes them. A naive
+read of that directory sums CPU/wall time across **every build that ever ran
+there**, not just the latest one — the parallelism figures `mackas buildstats
+analyze` reported after a real second build looked nonsensical for exactly
+this reason (the correct, tiny elapsed time for that build alongside a task-CPU
+total that was really the sum of a much larger earlier build's tasks too).
+
+mackas handles this in three places:
+
+- **`clear_buildstats_before_build`** (`MACKAS_BUILDSTATS_ACCUMULATE`, default
+  `0` i.e. clearing is ON) runs before every `smoketest`/`shell` invocation
+  and deletes `tmp/buildstats` in the TMPDIR volume first, so accumulation
+  never has a chance to happen in normal use. Best-effort, like `fstrim`
+  auto-run — a failure here can never fail the build.
+- **`mackas retrieve buildstats`** now copies each retrieval into its own
+  timestamped subdirectory (`buildstats/<retrieve-time>/<BUILDNAME>/`), so
+  even if bitbake's own directory is shared across builds, successive
+  *retrievals* never merge into the same host path on top of each other.
+  It also checks the just-retrieved `build_stats` for more than one "Build
+  Started:" line — an ironclad sign the directory it just copied really is
+  shared — and, if found, warns and offers (confirm()-gated, never automatic)
+  to clear that BUILDNAME directory in the volume.
+- **`tools/mackas-buildstats-analyze`** filters task files to
+  `start >= build["started"]` whenever the retrieved `build_stats` itself
+  shows more than one "Build Started:" line, so a summary of already-shared
+  data still reflects only the latest build, and says so explicitly in its
+  output. This is for data that predates `clear_buildstats_before_build`,
+  or for `MACKAS_BUILDSTATS_ACCUMULATE=1`.
+
+Set `MACKAS_BUILDSTATS_ACCUMULATE=1` if you actually want `tmp/buildstats` to
+keep accumulating across builds and will manage it yourself.
+
 ## Time Machine
 
 If the volume holding `MACKAS_ROOT` is an active Time Machine destination,

@@ -35,6 +35,14 @@ setup() {
 	CLOG="$TESTDIR/container.log"
 	export CLOG
 
+	# retrieve buildstats nests each retrieval under its own timestamp
+	# (fetch_tmp_subdir's EXTRA param -- see cmd_retrieve) so successive
+	# retrievals never merge into the same host path. MACKAS_RETRIEVE_TS is
+	# an undocumented test seam (cf. MACKAS_OVERHEAD_BIN) for a deterministic
+	# value here instead of the real `date +%Y%m%d%H%M%S`.
+	RETRIEVE_TS="20260722000000"
+	export MACKAS_RETRIEVE_TS="$RETRIEVE_TS"
+
 	# What the modelled TMPDIR volume contains under /build/tmp. The probe
 	# `test -d /build/tmp/<sub>` succeeds only for a listed sub. A build that
 	# has never run lists nothing -> the "no buildstats" path.
@@ -173,7 +181,7 @@ refute_call() {
 @test "retrieve: fetches buildstats into MACKAS_BASE/artifacts" {
 	mk retrieve buildstats
 	[ "$status" -eq 0 ]
-	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	printf '%s\n' "$output" | grep -qF "Retrieved to $ROOT/artifacts"
 }
 
@@ -208,7 +216,7 @@ refute_call() {
 @test "retrieve: multiple objects in one call fetch all of them" {
 	MOCK_TMP_HAS="buildstats log deploy" mk retrieve buildstats logs deploy
 	[ "$status" -eq 0 ]
-	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	[ -d "$ROOT/artifacts/log" ]
 	[ -d "$ROOT/artifacts/deploy" ]
 }
@@ -307,7 +315,7 @@ EOF
 	mk retrieve buildstats
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'could not resolve BUILDSTATS_BASE'
-	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
 @test "retrieve: deploy warns it can be large" {
@@ -318,7 +326,7 @@ EOF
 @test "retrieve: order of objects does not matter" {
 	MOCK_TMP_HAS="buildstats log deploy" mk retrieve deploy logs buildstats
 	[ "$status" -eq 0 ]
-	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	[ -d "$ROOT/artifacts/log" ]
 	[ -d "$ROOT/artifacts/deploy" ]
 }
@@ -373,7 +381,7 @@ EOF
 @test "retrieve: a container holding a DIFFERENT volume does not block the fetch" {
 	MOCK_BUSY_VOLUME="some-other-volume" mk retrieve buildstats
 	[ "$status" -eq 0 ]
-	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -401,7 +409,7 @@ EOF
 @test "retrieve: --dest overrides the default destination" {
 	mk retrieve buildstats --dest "$TESTDIR/elsewhere"
 	[ "$status" -eq 0 ]
-	[ -d "$TESTDIR/elsewhere/buildstats/20260717121723" ]
+	[ -d "$TESTDIR/elsewhere/buildstats/$RETRIEVE_TS/20260717121723" ]
 	[ ! -d "$ROOT/artifacts/buildstats" ]
 }
 
@@ -438,7 +446,53 @@ EOF
 	[ "$status" -eq 0 ]
 	mk retrieve buildstats
 	[ "$status" -eq 0 ]
-	[ -d "$ROOT/artifacts/buildstats/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+}
+
+# ---------------------------------------------------------------------------
+# BUILDNAME accumulation: buildstats.bbclass appends build_stats forever for a
+# project whose BUILDNAME does not vary per build (e.g. Angstrom's
+# `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`). More than one "Build Started:"
+# line in the JUST-RETRIEVED build_stats is read directly off that file, not
+# inferred across retrievals.
+# ---------------------------------------------------------------------------
+
+@test "retrieve: warns and offers to clear the volume's buildstats when the file shows more than one build" {
+	cat > "$FIXTURE/buildstats/20260717121723/build_stats" <<'EOF'
+Host Info: Linux
+Build Started: 500.00
+Elapsed time: 10.00 seconds
+CPU usage: 40.0%
+Host Info: Linux
+Build Started: 1000.00
+Elapsed time: 42.00 seconds
+CPU usage: 55.5%
+EOF
+	mk -y retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "2 builds' data accumulated"
+	assert_call "[rm] [-rf] [/build/tmp/buildstats/20260717121723]"
+}
+
+@test "retrieve: declining the clear offer leaves the volume's buildstats untouched" {
+	cat > "$FIXTURE/buildstats/20260717121723/build_stats" <<'EOF'
+Build Started: 500.00
+Elapsed time: 10.00 seconds
+Build Started: 1000.00
+Elapsed time: 42.00 seconds
+EOF
+	# Not a terminal and no -y/--yes: confirm() declines.
+	mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "accumulated"
+	refute_call "[rm] [-rf]"
+}
+
+@test "retrieve: no accumulation warning for a normal single-build build_stats" {
+	mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi "accumulated"
+	refute_call "[rm] [-rf]"
 }
 
 # ---------------------------------------------------------------------------

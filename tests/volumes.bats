@@ -1038,6 +1038,53 @@ auto_fstrim_doubles() {
 	[ "$(grep -c '^v-tmp$' "$CALLS")" -eq 1 ]
 }
 
+# ---------------------------------------------------------------------------
+# clear_buildstats_before_build -- MACKAS_BUILDSTATS_ACCUMULATE gates clearing
+# tmp/buildstats before every kas run (buildstats.bbclass never resets it
+# itself -- see check_buildstats_accumulation for the same symptom caught
+# after the fact). Unit-tested with volume_exists/container replaced by
+# doubles, so no container ever runs.
+# ---------------------------------------------------------------------------
+
+clear_buildstats_doubles() {
+	CALLS="$TESTDIR/clearbs.calls"; : > "$CALLS"
+	MACKAS_VOL_TMP="v-tmp"
+	volume_exists() { return 0; }
+	container() { printf '%s\n' "$*" >> "$CALLS"; return "${MOCK_RC:-0}"; }
+}
+
+@test "clear_buildstats_before_build: default on -- clears tmp/buildstats before a build" {
+	clear_buildstats_doubles
+	clear_buildstats_before_build ""
+	[ "$(grep -c . "$CALLS")" -eq 1 ]
+	grep -qF 'rm -rf /build/tmp/buildstats' "$CALLS"
+}
+
+@test "clear_buildstats_before_build: MACKAS_BUILDSTATS_ACCUMULATE=1 disables it entirely" {
+	clear_buildstats_doubles
+	MACKAS_BUILDSTATS_ACCUMULATE=1
+	clear_buildstats_before_build ""
+	[ ! -s "$CALLS" ]
+}
+
+@test "clear_buildstats_before_build: skips when the TMPDIR volume does not exist yet" {
+	clear_buildstats_doubles
+	volume_exists() { return 1; }
+	clear_buildstats_before_build ""
+	[ ! -s "$CALLS" ]
+}
+
+@test "clear_buildstats_before_build: a failure is swallowed, never fails the build" {
+	# Pin the `|| true` at the source (same reasoning as auto_fstrim's own
+	# guard) -- bats disables set -e, so a masked failure cannot be triggered
+	# behaviourally here.
+	grep -qF 'rm -rf /build/tmp/buildstats >>"$log" 2>&1 || true' "$MACKAS"
+	grep -qF 'rm -rf /build/tmp/buildstats || true' "$MACKAS"
+	clear_buildstats_doubles
+	MOCK_RC=1
+	clear_buildstats_before_build ""
+}
+
 @test "run_kas: captures kas's exit in a tested context so the after-trim is reached" {
 	# `cmd_shell` runs run_kas bare under `set -e`. A bare `( _kas_exec ); rc=$?`
 	# lets errexit abort run_kas the instant kas exits non-zero -- before rc is

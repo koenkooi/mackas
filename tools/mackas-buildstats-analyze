@@ -35,13 +35,31 @@ worker process only; do_compile's actual work happens in forked children
 The single largest recipe in a real build reports ~0.1 s of own rusage and
 hundreds of seconds of child rusage.
 
-Both directory shapes are accepted:
+Any directory shape is accepted -- a BUILDNAME dir directly, or any ancestor
+of one or more of them (recursive, not one fixed level: `mackas retrieve
+buildstats` nests each retrieval under its own timestamp, so a BUILDNAME dir
+can sit deeper than it used to). When more than one is found, the lexically
+greatest full path wins ("newest"), since both BUILDNAME and mackas's own
+retrieve timestamp are plain digit strings that sort chronologically.
 
-    .../buildstats/<BUILDNAME>/     a single build, with build_stats in it
-    .../buildstats/                 several; the newest BUILDNAME wins
-
-BUILDNAME is a timestamp (20260717121723), so lexical order is chronological
-and "newest" needs no stat() calls.
+**A project whose BUILDNAME does not vary per build** (confirmed live:
+Angstrom's distro conf hardcodes `BUILDNAME = "Angstrom ${DISTRO_VERSION}"`)
+breaks the "one BUILDNAME dir = one build" assumption at the source:
+buildstats.bbclass opens build_stats in APPEND mode and never clears a
+BUILDNAME dir itself (mkdirhier is mkdir -p, not a truncate; task files are
+opened in append mode too), so every build ever run under that BUILDNAME
+accumulates into the same directory. `parse_build_stats`'s "last line wins"
+reading of `Elapsed time`/`CPU usage`/`Build Started` still gets the LATEST
+build's own numbers right (those three lines are always written together),
+but a naive `collect_tasks` would sum CPU/wall across every recipe's task
+files ever left there, not just this build's -- so tasks are filtered to
+`start >= build["started"]` when more than one `Build Started:` line shows
+the file is shared, and the report says so explicitly. `mackas`'s own
+`clear_buildstats_before_build` (default on) prevents this ahead of time by
+clearing tmp/buildstats before each build; this module handles it
+after the fact for data that predates that, or for
+`MACKAS_BUILDSTATS_ACCUMULATE=1`. See
+docs/storage.md#buildstats-and-a-constant-buildname.
 """
 
 import argparse
@@ -90,23 +108,36 @@ def parse_task(path):
 
 
 def resolve_buildstats_dir(path):
-    """Accept either a BUILDNAME dir or the buildstats dir containing them."""
+    """Accept a BUILDNAME dir directly, or any ancestor of one or more of
+    them -- recursive, not one fixed level, since `mackas retrieve
+    buildstats` now nests each retrieval under its own timestamp (see the
+    module docstring). The lexically greatest match wins."""
     if os.path.isfile(os.path.join(path, "build_stats")):
         return path
+    builds = []
     try:
-        entries = sorted(os.listdir(path))
+        for root, _dirs, files in os.walk(path):
+            if "build_stats" in files:
+                builds.append(root)
     except OSError:
         return path
-    builds = [d for d in entries
-              if os.path.isfile(os.path.join(path, d, "build_stats"))]
     if builds:
-        return os.path.join(path, builds[-1])
+        return sorted(builds)[-1]
     return path
 
 
 def parse_build_stats(bsdir):
-    """The per-build summary bitbake writes at the root of a BUILDNAME dir."""
+    """The per-build summary bitbake writes at the root of a BUILDNAME dir.
+
+    "Last line wins" for each field is deliberate: BuildStarted/BuildCompleted
+    always append a fresh Build Started/Elapsed time/CPU usage trio together,
+    so even a build_stats file accumulated across many builds (a constant
+    BUILDNAME -- see the module docstring) has the LATEST build's own numbers
+    in its last occurrence of each. n_builds is how many "Build Started:"
+    lines are in the file at all -- more than one means it is shared.
+    """
     build = {}
+    n_builds = 0
     path = os.path.join(bsdir, "build_stats")
     if not os.path.isfile(path):
         return build
@@ -119,13 +150,24 @@ def parse_build_stats(bsdir):
                     build["cpu_pct"] = float(line.split()[2].rstrip("%"))
                 elif line.startswith("Build Started:"):
                     build["started"] = float(line.split()[2])
+                    n_builds += 1
             except (ValueError, IndexError):
                 continue
+    build["n_builds_in_file"] = n_builds
     return build
 
 
-def collect_tasks(bsdir):
-    """Every task file under bsdir, as a list of dicts."""
+def collect_tasks(bsdir, since=None):
+    """Every task file under bsdir, as a list of dicts.
+
+    SINCE, when given, is the current build's own "Build Started" epoch time
+    (see parse_build_stats). A task that started strictly before it is a
+    carryover from an EARLIER build sharing this same directory (a constant
+    BUILDNAME -- see the module docstring: buildstats.bbclass never clears a
+    BUILDNAME dir, so a prior build's task files are still sitting right
+    there) and is dropped, or its CPU/wall time would get summed into "this"
+    build's totals even though it has nothing to do with it.
+    """
     tasks = []
     for recipe in sorted(os.listdir(bsdir)):
         rdir = os.path.join(bsdir, recipe)
@@ -138,6 +180,8 @@ def collect_tasks(bsdir):
             t = parse_task(path)
             if "start" not in t or "end" not in t:
                 # Still running, or truncated. Not a data point.
+                continue
+            if since is not None and t["start"] < since:
                 continue
             # Child rusage included -- see the module docstring.
             cpu = (t.get("r_ru_utime", 0) + t.get("r_ru_stime", 0)
@@ -161,7 +205,12 @@ def collect_tasks(bsdir):
 def analyze(bsdir, topn=25):
     """Parse a BUILDNAME dir into the report dict. Raises ValueError if empty."""
     build = parse_build_stats(bsdir)
-    tasks = collect_tasks(bsdir)
+    # Only filter when the file itself proves it is shared (more than one
+    # "Build Started:" line) -- a normal, single-build directory is never
+    # filtered, so this can only ever REMOVE carryover, never a real task of
+    # the one build that dir actually holds.
+    since = build.get("started") if build.get("n_builds_in_file", 0) > 1 else None
+    tasks = collect_tasks(bsdir, since=since)
     if not tasks:
         raise ValueError(
             "no parsable task files under %s -- is this a buildstats "
@@ -208,6 +257,7 @@ def analyze(bsdir, topn=25):
             "cpu_s": round(total_cpu, 1),
             "cpu_pct_reported": build.get("cpu_pct"),
             "started": build.get("started"),
+            "n_builds_in_file": build.get("n_builds_in_file", 0),
             "parallelism": round(total_cpu / total_wall, 2) if total_wall else 0,
             "n_tasks": len(tasks),
             "n_recipes": len(by_recipe),
@@ -240,6 +290,21 @@ def format_summary(rep, topn=10):
     b = rep["build"]
     out = []
     out.append("buildstats: %s" % rep["buildstats_dir"])
+    if b["n_builds_in_file"] > 1:
+        out.append(
+            "  WARNING: this build_stats has %d builds' data accumulated in "
+            "one file --" % b["n_builds_in_file"])
+        out.append(
+            "  this project's BUILDNAME looks constant across builds (bitbake "
+            "never resets")
+        out.append(
+            "  tmp/buildstats between builds when it does not vary -- see "
+            "docs/storage.md#buildstats-and-a-constant-buildname).")
+        out.append(
+            "  Task totals below are filtered to this build's own tasks "
+            "(start >= Build Started);")
+        out.append(
+            "  wall/CPU% above are bitbake's own last-reported figures either way.")
     out.append("  wall              %.1f s (%.1f min)" % (b["wall_s"], b["wall_s"] / 60))
     out.append("  task CPU          %.1f s  (rusage + child rusage)" % b["cpu_s"])
     out.append("  parallelism       %.2fx" % b["parallelism"])
