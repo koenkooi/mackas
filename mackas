@@ -5090,22 +5090,49 @@ cmd_monitor() {
 show() { printf '  %-24s %s\n' "$1" "$2"; }
 
 # One line per volume: name, what it backs, cap, and what it costs today.
+# volume_real_cap NAME -- the real cap the container daemon reports for an
+# existing volume NAME (same source `volume list` uses), or empty if it does
+# not exist yet or the daemon query failed. The configured
+# MACKAS_VOLUME_SIZE_* is only ever what a FUTURE `setup` would request --
+# ensure_volume() never resizes an existing volume, so once one exists its
+# real cap can permanently diverge from whatever the setting happens to say
+# right now (e.g. `setup --tmpdir-size 1T`'s size flags are one-shot and are
+# not written to the config file, so the very next invocation reports the
+# factory default again). Shared by status_volume()'s per-volume display and
+# cmd_status()'s Configuration section, so the two never disagree about the
+# same volume.
+volume_real_cap() {
+	local name="$1"
+	# Always returns 0: this only ever PRINTS a cap or prints nothing, it
+	# never signals an error. A caller doing `real_cap="$(volume_real_cap ...)"`
+	# is a bare, unguarded assignment -- under `set -e` that assignment's own
+	# exit status aborts the whole script the instant it is nonzero, which is
+	# exactly what "the volume does not exist yet" (the common case) would be
+	# without this.
+	volume_exists "$name" && volume_size "$name"
+	return 0
+}
+
+# display_volume_setting NAME CONFIGURED -- what the Configuration section
+# should print for a MACKAS_VOLUME_SIZE_* setting: the real cap when NAME
+# already exists and differs from CONFIGURED (annotated, so it is clear this
+# is not what the config file says), else CONFIGURED as-is.
+display_volume_setting() {
+	local name="$1" configured="$2" real
+	real="$(volume_real_cap "$name")"
+	if [ -n "$real" ] && [ "$(size_to_gb "$real")" != "$(size_to_gb "$configured")" ]; then
+		printf '%s  (configured: %s -- see "ext4 volumes" below)\n' "$real" "$configured"
+	else
+		printf '%s\n' "$configured"
+	fi
+}
+
 status_volume() {
 	local name="$1" size="$2" role="$3" img used="" moved="" near_cap=0
 	local real_cap="" cap_display="$size"
 	img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
-	# The configured MACKAS_VOLUME_SIZE_* is only ever what a FUTURE `setup`
-	# would request -- ensure_volume() never resizes an existing volume, so
-	# once one exists its real cap can permanently diverge from whatever the
-	# setting happens to say right now (e.g. `setup --tmpdir-size 1T`'s size
-	# flags are one-shot and are not written to the config file, so the very
-	# next invocation reports the factory default again). Prefer the real,
-	# live cap from the container daemon (same source `volume list` uses)
-	# whenever the volume actually exists.
-	if volume_exists "$name"; then
-		real_cap="$(volume_size "$name")"
-		[ -n "$real_cap" ] && cap_display="$real_cap"
-	fi
+	real_cap="$(volume_real_cap "$name")"
+	[ -n "$real_cap" ] && cap_display="$real_cap"
 	# du -h already reports actual disk BLOCKS allocated (sparse-aware on
 	# APFS), not volume.img's logical/apparent size -- this is real usage,
 	# not the cap, even when it reads the same as the cap. See the note
@@ -5167,7 +5194,22 @@ cmd_status() {
 	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
 	local n
 	for n in $SETTING_NAMES; do
-		eval "show \"\$n\" \"\${$n}\""
+		# The three volume sizes: show the REAL cap once a volume already
+		# exists (ensure_volume() never resizes one), not the configured
+		# value alone -- otherwise this section and "ext4 volumes" below
+		# disagree about the same volume, which is exactly the confusing
+		# state a live report surfaced (Configuration said 120G, "ext4
+		# volumes" said cap 1T, for the same MACKAS_VOLUME_SIZE_TMP).
+		case "$n" in
+			MACKAS_VOLUME_SIZE_TMP)
+				show "$n" "$(display_volume_setting "$MACKAS_VOL_TMP" "$MACKAS_VOLUME_SIZE_TMP")" ;;
+			MACKAS_VOLUME_SIZE_DL)
+				show "$n" "$(display_volume_setting "$MACKAS_VOL_DL" "$MACKAS_VOLUME_SIZE_DL")" ;;
+			MACKAS_VOLUME_SIZE_SSTATE)
+				show "$n" "$(display_volume_setting "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE")" ;;
+			*)
+				eval "show \"\$n\" \"\${$n}\"" ;;
+		esac
 	done
 
 	# status never dies on a missing root -- it is the command you run to find
