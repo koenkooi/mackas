@@ -437,6 +437,12 @@ source only after the copy succeeds. A plain `mv` across filesystems would
 instead balloon the sparse image to its full logical size, so `mackas` never
 uses one here.
 
+Destroying a moved volume also cleans up that per-volume symlink. The runtime's
+own `volume delete` removes the volume but leaves the symlink `move` planted
+dangling at a now-nonexistent target (confirmed live) — harmless, nothing reads
+it, but confusing to find by hand — so `mackas volume destroy`/`clean` removes
+it after a successful delete.
+
 If you move an image by hand and the symlink goes stale, `mackas volume
 recover [<name>]` finds it again: it asks **Spotlight** (`mdfind`) for a
 `volume.img` under a directory named for the volume with an `entity.json`

@@ -254,6 +254,17 @@
 #MACKAS_FSTRIM_AUTO=1
 
 
+# Live bitbake progress bridge (OPTIONAL, opt-in). With MACKAS_MONITOR=1 a build
+# publishes its progress as JSON over HTTP from inside its own container, and
+# `mackas monitor` polls it and prints one line per update. OFF by default: it
+# bind-mounts an overlay, shadows the container's bitbake and runs a background
+# HTTP thread on every build, so unlike MACKAS_OVERHEAD/MACKAS_FSTRIM_AUTO (which
+# cost near nothing) it stays opt-in. See docs/architecture.md and README.
+#MACKAS_MONITOR=0
+# Host port the bridge publishes and `mackas monitor` polls.
+#MACKAS_MONITOR_PORT=8801
+
+
 # --- HTTP mirrors (OPTIONAL, opt-in) -----------------------------------------
 #
 # Mirrors of any kind are entirely optional. With MACKAS_USE_HTTP_MIRRORS=0 and
