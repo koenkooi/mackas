@@ -769,15 +769,48 @@ with_project_fragment() {
 	[ "$tail" = "$(printf 'build\n--force-checkout\n-k\nmeta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml')" ]
 }
 
-@test "kas-container wrapper: an unrecognized flag before <files> (e.g. --skip, which takes a value) backs off untouched" {
+@test "kas-container wrapper: --skip STEP (a value-taking flag) before <files> still finds <files>" {
 	# --skip STEP is a real kas option (kas/libkas.py setup_parser_common_args)
-	# that takes a separate value -- treating its value as if it were <files>
-	# would splice the fragment into the wrong token, so the wrapper must not
-	# guess here at all.
+	# that takes a separate value -- naively treating that value as <files>
+	# would splice the fragment into the wrong token, so the wrapper consumes
+	# the flag AND its value as one unit before continuing to scan.
 	with_project_fragment
 	write_env_sh
 	fake_kas_container
 	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container build --skip repos_checkout meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF -- '--skip'
+	printf '%s\n' "$out" | grep -qxF 'repos_checkout'
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml'
+}
+
+@test "kas-container wrapper: the exact reported case -- multiple --skip STEP pairs (the -k alternative) before <files>" {
+	# The real-world sequence recommended as a repo-state-preserving
+	# alternative to -k (README): every step -k bundles, skipped individually,
+	# EXCEPT write_bbconfig -- so local.conf regenerates without touching any
+	# checkout. Confirmed live to have silently failed to auto-append before
+	# this fix (each --skip's value token was mistaken for <files>, so the
+	# wrapper backed off every time).
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell --skip setup_dir --skip finish_setup_repos --skip repos_checkout --skip repos_apply_patches meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml:meta-angstrom/kas/macos-local.yml'
+}
+
+@test "kas-container wrapper: --skip=value (single-token form) before <files> still finds <files>" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container build --skip=repos_checkout meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF -- '--skip=repos_checkout'
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml'
+}
+
+@test "kas-container wrapper: a truly unrecognized flag before <files> backs off untouched" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container build --totally-unknown-flag meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
 	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml'
 	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
 }
