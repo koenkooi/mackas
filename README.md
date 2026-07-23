@@ -158,9 +158,20 @@ single `MACKAS_PROJECT_DIR` it manages) onto the file list you give it, so
 you can usually leave it off — `kas-container shell meta-angstrom/kas/base.yml`
 already gets the tuning fragment (parallelism, `BB_DISKMON_DIRS`,
 `BB_HASHSERVE_DB_DIR`, mirrors) composed in for you, exactly as if you had
-typed the line above by hand. Set `MACKAS_KAS_AUTO_FRAGMENT=0` to go back to
-composing it yourself instead — e.g. if your own file list already ends with
-a differently-named fragment.
+typed the line above by hand (it finds the file list even with a flag like
+`-k` in front of it, e.g. `kas-container shell -k meta-angstrom/kas/base.yml`).
+Set `MACKAS_KAS_AUTO_FRAGMENT=0` to go back to composing it yourself instead
+— e.g. if your own file list already ends with a differently-named fragment.
+
+> **`-k`/`--keep-config-unchanged` skips writing `conf/local.conf` and
+> `conf/bblayers.conf` entirely**, not just the repo checkout/patch steps its
+> name suggests. If a checkout was last configured *without* the tuning
+> fragment, adding it to the file list later and re-running with `-k` has NO
+> effect — kas reuses the `local.conf` already on disk, unchanged. Run once
+> **without** `-k` first (or `rm conf/local.conf conf/bblayers.conf` under the
+> checkout) so kas actually regenerates them with the fragment composed in;
+> `-k` is safe again afterward, since the fragment's settings are now baked
+> into the file it is keeping unchanged.
 
 > **`kas-container` here is a shell function, not the program on your
 > `PATH`.** `env.sh` defines it to supply `--runtime-args` (the ext4 volumes

@@ -745,6 +745,43 @@ with_project_fragment() {
 	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
 }
 
+@test "kas-container wrapper: a boolean flag (-k) between the subcommand and <files> still finds <files>" {
+	# Reported live: 'kas-container shell -k <files>' -- exactly what
+	# bitbake_getvar() itself passes -- put <files> at \$3, not \$2. kas's own
+	# config argument is nargs='?' with options allowed before it (confirmed
+	# against kas 5.4 source), so this is a real, common shape, not an edge
+	# case.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell -k meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'shell'
+	printf '%s\n' "$out" | grep -qxF -- '-k'
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml:meta-angstrom/kas/macos-local.yml'
+}
+
+@test "kas-container wrapper: multiple recognized boolean flags before <files> all survive, in order" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container build --force-checkout -k meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	tail="$(printf '%s\n' "$out" | tail -4)"
+	[ "$tail" = "$(printf 'build\n--force-checkout\n-k\nmeta-angstrom/kas/base.yml:meta-angstrom/kas/macos-local.yml')" ]
+}
+
+@test "kas-container wrapper: an unrecognized flag before <files> (e.g. --skip, which takes a value) backs off untouched" {
+	# --skip STEP is a real kas option (kas/libkas.py setup_parser_common_args)
+	# that takes a separate value -- treating its value as if it were <files>
+	# would splice the fragment into the wrong token, so the wrapper must not
+	# guess here at all.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container build --skip repos_checkout meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/base.yml'
+	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
+}
+
 @test "env.sh: valid bash 3.2 and zsh with a project and the auto-fragment wrapper generated" {
 	with_project_fragment
 	write_env_sh
