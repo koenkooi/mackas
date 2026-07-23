@@ -1156,7 +1156,7 @@ derive_paths() {
 	MACKAS_WORK="$MACKAS_BASE/work"
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
-	MACKAS_PROJECT="$MACKAS_WORK/$MACKAS_PROJECT_DIR"
+	MACKAS_PROJECT="$(strip_trailing_slash "$MACKAS_WORK/$MACKAS_PROJECT_DIR")"
 	MACKAS_ENV_SH="$MACKAS_BASE/env.sh"
 	# See setup_gitconfig() for why this file exists at all.
 	MACKAS_GITCONFIG="$MACKAS_BASE/gitconfig"
