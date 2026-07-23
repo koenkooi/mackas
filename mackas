@@ -2795,29 +2795,54 @@ kas-container() {
 	#
 	# Auto-append the macos-local.yml fragment (parallelism, BB_DISKMON_DIRS,
 	# BB_HASHSERVE_DB_DIR, mirrors) onto the file-list argument every kas
-	# subcommand below takes right after itself, the same way
-	# compose_kas_files() already does for every mackas subcommand that drives
-	# kas -- unless MACKAS_KAS_AUTO_FRAGMENT=0, the fragment is not installed
-	# yet (no project), the file-list arg is missing/a flag, or it already
-	# names macos-local.yml itself (composed by hand, per README). The
-	# relative path is resolved fresh from \$PWD every call, not baked in at
-	# generation time, because README's own supported flow cd's to work/ (the
-	# parent of every layer checkout) rather than into the project itself, so
-	# the correct relative prefix depends on where THIS call runs from.
-	local _mackas_sub="\${1:-}" _mackas_files="\${2:-}" _mackas_frag
+	# subcommand below takes, the same way compose_kas_files() already does
+	# for every mackas subcommand that drives kas -- unless
+	# MACKAS_KAS_AUTO_FRAGMENT=0, the fragment is not installed yet (no
+	# project), or the file list already names macos-local.yml itself
+	# (composed by hand, per README). The relative path is resolved fresh
+	# from \$PWD every call, not baked in at generation time, because
+	# README's own supported flow cd's to work/ (the parent of every layer
+	# checkout) rather than into the project itself, so the correct relative
+	# prefix depends on where THIS call runs from.
+	#
+	# The file-list argument is NOT always \$2: kas's own config argument is
+	# \`nargs='?'\` (kas/libkas.py setup_parser_config_arg, confirmed against
+	# real kas 5.4 source) and every subcommand accepts options before it --
+	# 'shell -k <files>' is exactly what bitbake_getvar() itself passes.
+	# Scan past a known BOOLEAN flag (kas/libkas.py setup_parser_common_args
+	# and setup_parser_keep_config_unchanged_arg, kas/plugins/shell.py's own
+	# -E) to find the real file list; any OTHER '-'-prefixed option (e.g.
+	# --skip/--target/-c, which all take a separate value) makes this back
+	# off entirely rather than guess which token is the file list and
+	# mis-splice the fragment into the wrong one. 'dump'/'menu' are
+	# deliberately not in this list: their positional argument is not a kas
+	# file list the same way (dump has many more pre-config flags; menu's
+	# positional is a kconfig file, not \`config\` at all).
+	local _mackas_sub="\${1:-}" _mackas_arg _mackas_files="" _mackas_frag
+	local _mackas_before=()
 	if [ "\${MACKAS_KAS_AUTO_FRAGMENT:-0}" = "1" ] && [ -f "\$MACKAS_KAS_FRAGMENT_REPO" ]; then
 		case "\$_mackas_sub" in
-			build|shell|checkout|dump|menu)
+			build|shell|checkout)
+				shift
+				while [ \$# -gt 0 ]; do
+					_mackas_arg="\$1"
+					case "\$_mackas_arg" in
+						-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
+							_mackas_before+=("\$_mackas_arg"); shift ;;
+						-*)
+							break ;;
+						*)
+							_mackas_files="\$_mackas_arg"; shift; break ;;
+					esac
+				done
 				case "\$_mackas_files" in
-					''|-*|*macos-local.yml) ;;
+					''|*macos-local.yml) ;;
 					*)
 						_mackas_frag="\$(PATH=$q_shim:"\$PATH" realpath --relative-to="\$PWD" "\$MACKAS_KAS_FRAGMENT_REPO" 2>/dev/null || true)"
-						if [ -n "\$_mackas_frag" ]; then
-							shift 2
-							set -- "\$_mackas_sub" "\$_mackas_files:\$_mackas_frag" "\$@"
-						fi
+						[ -n "\$_mackas_frag" ] && _mackas_files="\$_mackas_files:\$_mackas_frag"
 						;;
 				esac
+				set -- "\$_mackas_sub" "\${_mackas_before[@]}" \${_mackas_files:+"\$_mackas_files"} "\$@"
 				;;
 		esac
 	fi

@@ -209,14 +209,22 @@ supported mechanism. See
 `--runtime-args "$MACKAS_RUNTIME_ARGS"`, blanks
 `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, and — unless `MACKAS_KAS_AUTO_FRAGMENT=0`
 — appends the generated `macos-local.yml` fragment onto the file-list
-argument of a recognized kas subcommand (`build`/`shell`/`checkout`/`dump`/
-`menu`), resolved fresh from `$PWD` on every call rather than baked in at
-generation time (the supported flow `cd`s to `work/`, the parent of every
-layer checkout, not into the project itself — see the main README). Typing
-`kas-container build ...` in a sourced shell therefore does the right thing;
-`command kas-container`, an absolute path, or an unsourced shell bypasses the
-wrapper and builds with no volumes, no limits, and no auto-appended fragment.
-`mackas status` prints the exact `--runtime-args` in effect.
+argument of `build`/`shell`/`checkout`, resolved fresh from `$PWD` on every
+call rather than baked in at generation time (the supported flow `cd`s to
+`work/`, the parent of every layer checkout, not into the project itself —
+see the main README). The file-list argument is not always immediately
+after the subcommand — kas's own config argument accepts options first
+(e.g. `shell -k <files>`, exactly what `bitbake_getvar()` itself passes) —
+so the wrapper scans past known boolean flags (`-k`/`--keep-config-unchanged`,
+`--force-checkout`, `--update`, `-E`/`--preserve-env`) to find it, and backs
+off untouched if it meets any other option first (e.g. `--skip`/`--target`,
+which take a separate value) rather than guess wrong. `dump`/`menu` are
+deliberately not covered: their positional argument is not a plain kas file
+list the same way. Typing `kas-container build ...` in a sourced shell
+therefore does the right thing; `command kas-container`, an absolute path,
+or an unsourced shell bypasses the wrapper and builds with no volumes, no
+limits, and no auto-appended fragment. `mackas status` prints the exact
+`--runtime-args` in effect.
 
 ## Live build progress: the monitor bridge
 
