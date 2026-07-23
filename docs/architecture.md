@@ -213,15 +213,18 @@ argument of `build`/`shell`/`checkout`, resolved fresh from `$PWD` on every
 call rather than baked in at generation time (the supported flow `cd`s to
 `work/`, the parent of every layer checkout, not into the project itself —
 see the main README). The file-list argument is not always immediately
-after the subcommand — kas's own config argument accepts options first
-(e.g. `shell -k <files>`, exactly what `bitbake_getvar()` itself passes) —
-so the wrapper scans past known boolean flags (`-k`/`--keep-config-unchanged`,
-`--force-checkout`, `--update`, `-E`/`--preserve-env`) to find it, and backs
-off untouched if it meets any other option first (e.g. `--skip`/`--target`,
-which take a separate value) rather than guess wrong. `dump`/`menu` are
-deliberately not covered: their positional argument is not a plain kas file
-list the same way. Typing `kas-container build ...` in a sourced shell
-therefore does the right thing; `command kas-container`, an absolute path,
+after the subcommand — kas's own config argument accepts options first (e.g.
+`shell -k <files>`, exactly what `bitbake_getvar()` itself passes, or
+`--skip STEP` repeated, the repo-state-preserving alternative to `-k` this
+project's own docs recommend) — so the wrapper scans past known boolean
+flags (`-k`/`--keep-config-unchanged`, `--force-checkout`, `--update`,
+`-E`/`--preserve-env`) and known value flags (`--skip`/`--target`/`-c`/
+`--cmd`/`--task`/`--provenance`, consuming their separate argument too, the
+single-token `--x=y` form included) to find it, and backs off untouched if
+it meets any other option it does not recognize, rather than guess wrong.
+`dump`/`menu` are deliberately not covered: their positional argument is not
+a plain kas file list the same way. Typing `kas-container build ...` in a
+sourced shell therefore does the right thing; `command kas-container`, an absolute path,
 or an unsourced shell bypasses the wrapper and builds with no volumes, no
 limits, and no auto-appended fragment. `mackas status` prints the exact
 `--runtime-args` in effect.

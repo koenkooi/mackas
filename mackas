@@ -2808,16 +2808,19 @@ kas-container() {
 	# The file-list argument is NOT always \$2: kas's own config argument is
 	# \`nargs='?'\` (kas/libkas.py setup_parser_config_arg, confirmed against
 	# real kas 5.4 source) and every subcommand accepts options before it --
-	# 'shell -k <files>' is exactly what bitbake_getvar() itself passes.
-	# Scan past a known BOOLEAN flag (kas/libkas.py setup_parser_common_args
-	# and setup_parser_keep_config_unchanged_arg, kas/plugins/shell.py's own
-	# -E) to find the real file list; any OTHER '-'-prefixed option (e.g.
-	# --skip/--target/-c, which all take a separate value) makes this back
-	# off entirely rather than guess which token is the file list and
-	# mis-splice the fragment into the wrong one. 'dump'/'menu' are
-	# deliberately not in this list: their positional argument is not a kas
-	# file list the same way (dump has many more pre-config flags; menu's
-	# positional is a kconfig file, not \`config\` at all).
+	# 'shell -k <files>' is exactly what bitbake_getvar() itself passes, and
+	# '--skip STEP' (repeatable) is the surgical, repo-state-preserving
+	# alternative to -k this project's own docs now recommend. Scan past a
+	# known BOOLEAN flag (kas/libkas.py setup_parser_common_args and
+	# setup_parser_keep_config_unchanged_arg, kas/plugins/shell.py's own -E)
+	# or a known VALUE flag (consuming its separate argument too, '--x=y'
+	# single-token form included) to find the real file list; any OTHER
+	# '-'-prefixed option makes this back off entirely rather than guess
+	# which token is the file list and mis-splice the fragment into the
+	# wrong one. 'dump'/'menu' are deliberately not in this list: their
+	# positional argument is not a kas file list the same way (dump has many
+	# more pre-config flags; menu's positional is a kconfig file, not
+	# \`config\` at all).
 	local _mackas_sub="\${1:-}" _mackas_arg _mackas_files="" _mackas_frag
 	local _mackas_before=()
 	if [ "\${MACKAS_KAS_AUTO_FRAGMENT:-0}" = "1" ] && [ -f "\$MACKAS_KAS_FRAGMENT_REPO" ]; then
@@ -2829,6 +2832,14 @@ kas-container() {
 					case "\$_mackas_arg" in
 						-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
 							_mackas_before+=("\$_mackas_arg"); shift ;;
+						--skip=*|--target=*|--cmd=*|--task=*|--provenance=*)
+							_mackas_before+=("\$_mackas_arg"); shift ;;
+						--skip|--target|-c|--cmd|--task|--provenance)
+							_mackas_before+=("\$_mackas_arg"); shift
+							if [ \$# -gt 0 ]; then
+								_mackas_before+=("\$1"); shift
+							fi
+							;;
 						-*)
 							break ;;
 						*)

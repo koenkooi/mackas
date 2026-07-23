@@ -158,20 +158,36 @@ single `MACKAS_PROJECT_DIR` it manages) onto the file list you give it, so
 you can usually leave it off — `kas-container shell meta-angstrom/kas/base.yml`
 already gets the tuning fragment (parallelism, `BB_DISKMON_DIRS`,
 `BB_HASHSERVE_DB_DIR`, mirrors) composed in for you, exactly as if you had
-typed the line above by hand (it finds the file list even with a flag like
-`-k` in front of it, e.g. `kas-container shell -k meta-angstrom/kas/base.yml`).
+typed the line above by hand. It finds the file list even with a flag in
+front of it — `-k`, `--force-checkout`, `--update`, `-E`/`--preserve-env`,
+and value-taking ones like `--skip STEP`/`--target`/`-c` (its separate value
+is consumed too) are all recognized; anything else it does not know backs
+off untouched rather than guess wrong, so double-check the file list still
+got `macos-local.yml` appended (`mackas status`'s "kas files" line, or just
+look for it in the command kas itself echoes back) before assuming it did.
 Set `MACKAS_KAS_AUTO_FRAGMENT=0` to go back to composing it yourself instead
 — e.g. if your own file list already ends with a differently-named fragment.
 
 > **`-k`/`--keep-config-unchanged` skips writing `conf/local.conf` and
-> `conf/bblayers.conf` entirely**, not just the repo checkout/patch steps its
-> name suggests. If a checkout was last configured *without* the tuning
-> fragment, adding it to the file list later and re-running with `-k` has NO
-> effect — kas reuses the `local.conf` already on disk, unchanged. Run once
-> **without** `-k` first (or `rm conf/local.conf conf/bblayers.conf` under the
-> checkout) so kas actually regenerates them with the fragment composed in;
-> `-k` is safe again afterward, since the fragment's settings are now baked
-> into the file it is keeping unchanged.
+> `conf/bblayers.conf` entirely** — along with the repo checkout/patch steps
+> its name suggests, all five are bundled into one flag. If a checkout was
+> last configured *without* the tuning fragment, adding it to the file list
+> later and re-running with `-k` has NO effect — kas reuses the `local.conf`
+> already on disk, unchanged. Do **not** just drop `-k` to fix this: that
+> also re-runs `repos_checkout`/`repos_apply_patches`, which can reset repos
+> to their pinned commit and re-apply patches — genuinely disruptive if
+> anything local has diverged, not just slow. Instead skip every step `-k`
+> skips *except* `write_bbconfig`, individually:
+>
+> ```sh
+> kas-container shell --skip setup_dir --skip finish_setup_repos \
+>   --skip repos_checkout --skip repos_apply_patches meta-angstrom/kas/base.yml
+> ```
+>
+> This regenerates `local.conf`/`bblayers.conf` with the fragment composed
+> in, without touching any repo's checkout state. `-k` is safe again
+> afterward, since the fragment's settings are now baked into the file it is
+> keeping unchanged.
 
 > **`kas-container` here is a shell function, not the program on your
 > `PATH`.** `env.sh` defines it to supply `--runtime-args` (the ext4 volumes
