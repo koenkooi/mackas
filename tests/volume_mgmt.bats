@@ -67,9 +67,11 @@ voldir="$HOME/Library/Application Support/com.apple.container/volumes"
 
 case "$1 $2" in
 	"system status") echo "status running"; exit 0 ;;
-	"system restart")
-		# Simulate a REAL restart: the daemon re-scans volumes/*/entity.json
+	"system stop") exit 0 ;;
+	"system start")
+		# Simulate a REAL start: the daemon scans volumes/*/entity.json
 		# into its index -- exactly what refuse_if_stale_entity relies on.
+		# There is NO 'system restart' subcommand; mackas does stop+start.
 		for d in "$voldir"/*/; do
 			[ -e "${d}entity.json" ] || continue
 			n="$(basename "$d")"
@@ -482,7 +484,7 @@ refute_call() {
 		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
 		--set MACKAS_RELOCATE_VOLUMES=0 volume duplicate src-vol dst-vol
 	[ "$status" -ne 0 ]
-	assert_call "[system] [restart]"
+	assert_call "[system] [start]"
 	printf '%s\n' "$output" | grep -qi "already exists"
 	refute_call "[volume] [create]"
 	[ "$(du -k "$(VOLDIR)/dst-vol/volume.img" | awk '{print $1}')" -eq 4096 ]
@@ -1016,7 +1018,7 @@ apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1])
 	! grep -qF '"sizeInBytes":128849018880' "$(VOLDIR)/oe-build-tmp/entity.json"
 	# 3. the daemon was made to re-read it -- its index is built once, at
 	#    startup, so without this the attach below would use the OLD size
-	assert_call 'system] [restart'
+	assert_call 'system] [start'
 	# 4. and the filesystem was grown, with the two flags that are not optional
 	assert_call 'run] [--rm] [-u] [0:0] [--cap-add] [CAP_SYS_ADMIN] [-v] [oe-build-tmp:/mnt'
 	# ...running resize2fs against the device behind the mount, not a path
@@ -1032,7 +1034,7 @@ apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1])
 	# Nothing moved: not the image, not the record.
 	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
 	grep -qF '"size":"120G"' "$(VOLDIR)/oe-build-tmp/entity.json"
-	refute_call 'system] [restart'
+	refute_call 'system] [start'
 }
 
 @test "volume resize: the same size is a no-op, not a pointless daemon restart" {
@@ -1040,7 +1042,7 @@ apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1])
 	vol -y resize oe-build-tmp 120G
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'already that size'
-	refute_call 'system] [restart'
+	refute_call 'system] [start'
 }
 
 @test "volume resize: refuses a volume a running build holds (one-VM rule)" {
@@ -1057,7 +1059,7 @@ apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1])
 	[ "$status" -eq 0 ]
 	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
 	grep -qF '"sizeInBytes":128849018880' "$(VOLDIR)/oe-build-tmp/entity.json"
-	refute_call 'system] [restart'
+	refute_call 'system] [start'
 }
 
 @test "volume resize: rejects a size it cannot parse, before touching anything" {

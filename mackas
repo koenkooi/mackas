@@ -1546,9 +1546,47 @@ volume_exists() {
 # never sufficient license to create; call this immediately before every
 # 'container volume create' as well.
 #
-# 'container system restart' is what actually clears the stale index (a
-# real, safe, mackas-issuable command, not a manual instruction) -- offer it
-# instead of just refusing.
+# Restarting the daemon is what actually clears the stale index (a real,
+# safe, mackas-issuable action, not a manual instruction) -- offer it instead
+# of just refusing. See restart_container_daemon for why that is stop+start.
+# Restart the container daemon so it re-reads volumes/*/entity.json.
+#
+# There is NO 'container system restart' subcommand. container 1.1.0 offers
+# start/stop/status/df/dns/kernel/logs/property/version and nothing else
+# (confirmed against `container system --help`), so the obvious spelling
+# fails with: Error: Unexpected argument 'restart'. Shipped mackas called it
+# in two places and it had never worked in either -- found by the opt-in
+# tests/volume_resize_real.bats, which is exactly the class of bug a hermetic
+# suite cannot see, because the fake `container` accepts whatever it is given.
+#
+# The stop is tolerant: "already stopped" is a fine state to start from, and
+# failing there would abort the caller under set -e for no reason.
+restart_container_daemon() {
+	# A daemon stop kills EVERY running container, not just anything touching
+	# the volume in hand. The one-VM checks callers make (volume_in_use) only
+	# ask about one volume, so on their own they would happily restart the
+	# daemon out from under an unrelated build -- hours of work, gone, with no
+	# warning. Refuse instead, and name what is in the way.
+	#
+	# Fails CLOSED: if the running-container list cannot be read at all, that
+	# counts as "something might be running".
+	local listing running
+	if listing="$(container ls 2>/dev/null)"; then
+		running="$(printf '%s\n' "$listing" | awk 'NR>1 && NF {print $1}' | wc -l | tr -d ' ')"
+	else
+		running="?"
+	fi
+	if [ "$running" != "0" ]; then
+		warn "      Restarting the container daemon stops EVERY running container,"
+		warn "      not just this volume -- including any build in progress."
+		die "refusing to restart the container daemon: ${running} container(s) are running" \
+			"wait for them to finish (or stop them), then re-run -- 'container ls' shows what is running"
+	fi
+
+	run container system stop >/dev/null 2>&1 || true
+	run container system start
+}
+
 refuse_if_stale_entity() {
 	local name="$1"
 	local link="$CONTAINER_VOLUMES_DIR/$name"
@@ -1583,9 +1621,9 @@ refuse_if_stale_entity() {
 	warn "      $CONTAINER_VOLUMES_DIR, or attaching a disk carried over from another Mac."
 	if ! confirm "      Restart the container daemon now to pick it up?"; then
 		die "volume '$name' has on-disk data the container daemon's index does not know about" \
-			"restart it yourself, then re-run: container system restart"
+			"restart it yourself, then re-run: container system stop && container system start"
 	fi
-	run container system restart
+	restart_container_daemon
 	[ "$DRY_RUN" -eq 1 ] && return 1
 	if volume_exists "$name"; then
 		did "container daemon restarted; '$name' is now recognized"
@@ -6507,7 +6545,7 @@ volume_resize() {
 	# 3. Make the daemon re-read it. Its volume index is built once, at its own
 	#    startup, so without this the attach in step 4 uses the OLD size and
 	#    resize2fs would find nothing new to grow into.
-	run container system restart
+	restart_container_daemon
 
 	# 4. Grow the filesystem. Mounted (online) growth: ext4 supports it, and
 	#    'container run -v name:/mnt' is the only handle we have on the block

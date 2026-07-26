@@ -16,7 +16,7 @@
 #
 # The per-volume-placement tests at the bottom add two more seams, both of
 # which stay dormant for every other test here: the fake `container` models the
-# apiserver's index only being refreshed by `system restart` (and records its
+# apiserver's index only being (re)built at `system start` (and records its
 # argv when MOCK_CONTAINER_LOG is set), and `mdfind` is replaced via the
 # MACKAS_MDFIND seam so `volume recover` searches the test tree instead of the
 # real Spotlight index.
@@ -57,7 +57,8 @@ setup() {
 case "$1" in --version) echo "container CLI 0.0-fake"; exit 0 ;; esac
 case "$1 $2" in
 	"system status") echo "status running"; exit 0 ;;
-	"system restart")
+	"system stop") exit 0 ;;
+	"system start")
 		# The real apiserver scans volumes/*/entity.json into its in-memory
 		# index once, at ITS OWN startup, so a volume tree carried in from
 		# another Mac is invisible until it restarts (refuse_if_stale_entity's
