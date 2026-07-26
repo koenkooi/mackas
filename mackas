@@ -41,6 +41,27 @@ KAS_CONTAINER_VERSION="5.4"
 KAS_CONTAINER_URL="https://raw.githubusercontent.com/siemens/kas/${KAS_CONTAINER_VERSION}/kas-container"
 KAS_CONTAINER_SHA256="9707355d1eba19e334e663ab9fcf6881ac323aed16ff7f4fd7e217f879a3894c"
 
+# The Apple `container` releases mackas is developed and tested against, and
+# the macOS it needs.
+#
+# These are not decoration. mackas drives the `container` CLI by issuing exact
+# subcommands, and that surface MOVES between releases -- proven the hard way:
+# shipped mackas called `container system restart` in two places, and no such
+# subcommand has ever existed (1.1.0 has start/stop/status/... only), so both
+# call sites failed with "Unexpected argument 'restart'" every time they ran.
+# A hermetic suite could not catch it, because the fake `container` accepts
+# anything. Naming the tested range is how that class of drift gets noticed.
+#
+# MIN is a hard floor (below it, known-missing behaviour). TESTED is the
+# newest release actually exercised here; above it mackas still runs and just
+# says it is past what has been verified -- never a refusal, since blocking on
+# an unknown-newer version would be worse than warning about it.
+CONTAINER_MIN_VERSION="1.0.0"
+CONTAINER_TESTED_VERSION="1.1.0"
+
+# Apple `container` requires macOS 26 (Tahoe) or newer on Apple silicon.
+MACOS_MIN_MAJOR=26
+
 # Apple container's own volume storage root. There is no config knob for
 # this in container 1.1.0, so relocation is done by symlinking the dir.
 CONTAINER_VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
@@ -1357,6 +1378,33 @@ size_to_gb() {
 	esac
 }
 
+# version_ge A B -- true when dotted version A >= dotted version B.
+#
+# Field-by-field NUMERIC comparison, deliberately not `sort -V` (not in macOS's
+# BSD sort) and not a string compare, which gets 1.10.0 < 1.9.0 wrong. Missing
+# fields count as 0, so "1.1" and "1.1.0" compare equal. Non-numeric junk in a
+# field reads as 0 rather than erroring: this gates advice, and a version
+# string mackas cannot parse must never be the reason a command refuses to run.
+version_ge() {
+	local a="$1" b="$2" i av bv
+	for i in 1 2 3; do
+		av="$(printf '%s' "$a" | cut -d. -f"$i" 2>/dev/null | tr -cd '0-9')"
+		bv="$(printf '%s' "$b" | cut -d. -f"$i" 2>/dev/null | tr -cd '0-9')"
+		av="${av:-0}"; bv="${bv:-0}"
+		[ "$av" -gt "$bv" ] 2>/dev/null && return 0
+		[ "$av" -lt "$bv" ] 2>/dev/null && return 1
+	done
+	return 0
+}
+
+# The bare dotted version out of `container --version`, which prints e.g.
+# "container CLI version 1.1.0 (build: release, commit: unspeci)". Empty when
+# it cannot be parsed -- callers must treat that as "unknown", never as "old".
+container_version() {
+	container --version 2>/dev/null | head -1 \
+		| sed -n 's/.*[Vv]ersion \([0-9][0-9.]*\).*/\1/p' | head -1
+}
+
 # size_to_bytes SIZE -- SIZE ("1T", "500G", "800M", or a bare number meaning
 # GiB) as an exact byte count, or 0 if it is not a size at all.
 #
@@ -1686,10 +1734,10 @@ check_host() {
 	major="${osver%%.*}"
 	arch="$(uname -m)"
 
-	if [ "$major" -ge 26 ] 2>/dev/null; then
-		ck_pass "macOS $osver (>= 26)"
+	if [ "$major" -ge "$MACOS_MIN_MAJOR" ] 2>/dev/null; then
+		ck_pass "macOS $osver (>= $MACOS_MIN_MAJOR)"
 	else
-		ck_fail "macOS $osver -- Apple 'container' needs macOS 26 or newer" \
+		ck_fail "macOS $osver -- Apple 'container' needs macOS $MACOS_MIN_MAJOR or newer" \
 			"upgrade macOS, or run the build on a Linux host instead"
 	fi
 
@@ -1751,7 +1799,21 @@ check_container_runtime() {
 	fi
 
 	if command -v container >/dev/null 2>&1; then
-		ck_pass "$(container --version 2>&1 | head -1)"
+		local cver; cver="$(container_version)"
+		if [ -z "$cver" ]; then
+			# Unparseable is "unknown", never "too old": refusing on a version
+			# string mackas cannot read would be worse than proceeding.
+			ck_warn "container CLI present but its version could not be parsed: $(container --version 2>&1 | head -1)" \
+				"tested against $CONTAINER_TESTED_VERSION; proceed with care"
+		elif ! version_ge "$cver" "$CONTAINER_MIN_VERSION"; then
+			ck_fail "container $cver is older than the minimum $CONTAINER_MIN_VERSION" \
+				"brew upgrade container"
+		elif version_ge "$cver" "$CONTAINER_TESTED_VERSION"; then
+			ck_pass "container $cver (tested: $CONTAINER_TESTED_VERSION)"
+		else
+			ck_warn "container $cver is below the tested $CONTAINER_TESTED_VERSION" \
+				"brew upgrade container -- mackas issues exact subcommands and that surface moves between releases"
+		fi
 	else
 		ck_fail "'container' CLI not installed" "brew install container"
 		return
@@ -1801,7 +1863,7 @@ find_gnu_realpath() {
 }
 
 check_realpath() {
-	hdr "3. GNU realpath (hard requirement of kas-container)"
+	hdr "3. Host utilities (BSD vs GNU)"
 	# After setup the guaranteed answer is our own shim in MACKAS_BIN.
 	if [ -x "$SHIM_DIR/realpath" ] &&
 		"$SHIM_DIR/realpath" --version 2>/dev/null | head -1 | grep -q 'GNU coreutils'; then
@@ -1819,6 +1881,51 @@ check_realpath() {
 	else
 		ck_fail "no GNU realpath found -- macOS's BSD realpath lacks -e/--relative-base, so kas-container cannot run" \
 			"brew install coreutils"
+	fi
+
+	# The other half of the same problem, and the one that bites the other way
+	# round. mackas needs GNU realpath (above) but BSD everything-else, because
+	# it calls macOS-specific flags directly:
+	#
+	#   stat -f '%Lp' / '%u' / '%Su:%Sg'   BSD format strings. GNU stat's -f
+	#                                      means "display FILESYSTEM status" --
+	#                                      a completely different command that
+	#                                      silently answers the wrong question.
+	#   cp -c                              macOS clonefile (copy-on-write), what
+	#                                      makes 'volume duplicate' near-free.
+	#                                      GNU cp has no -c at all.
+	#
+	# `brew install coreutils` with the gnubin PATH shim is the normal way to
+	# get GNU realpath, and it is exactly what puts GNU stat/cp ahead of the
+	# BSD ones -- so the fix for one requirement is the break for the other.
+	# Worth reporting rather than leaving to be discovered mid-build.
+	local u path flavour
+	for u in stat cp; do
+		path="$(command -v "$u" 2>/dev/null)"
+		if [ -z "$path" ]; then
+			ck_fail "no '$u' on PATH" "this is a base macOS tool; check your PATH"
+			continue
+		fi
+		if "$u" --version 2>/dev/null | head -1 | grep -q 'GNU coreutils'; then
+			flavour="GNU"
+		else
+			flavour="BSD"
+		fi
+		if [ "$flavour" = "BSD" ]; then
+			ck_pass "$u is BSD ($path)"
+		else
+			ck_fail "$u is GNU ($path), but mackas needs the BSD one" \
+				"remove the coreutils gnubin dir from PATH (GNU realpath is found by path, not by shadowing $u)"
+		fi
+	done
+
+	# Informational: mackas only ever calls readlink with no flags, which BSD
+	# and GNU agree on, so either is fine. Reported because a GNU one here is
+	# the tell-tale that a gnubin PATH shim is active, which is what breaks
+	# stat/cp above.
+	path="$(command -v readlink 2>/dev/null)"
+	if [ -n "$path" ] && readlink --version 2>/dev/null | head -1 | grep -q 'GNU coreutils'; then
+		ck_info "readlink is GNU ($path) -- harmless (mackas uses it flagless), but it means a gnubin PATH shim is active"
 	fi
 }
 
