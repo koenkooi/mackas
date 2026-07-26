@@ -250,14 +250,19 @@ EOF
 	[ ! -d "$ROOT/artifacts/renamed-output" ]
 }
 
-@test "retrieve: bitbake_getvar passes -k once a parseable state already exists" {
-	# kas's own 'shell' unconditionally re-runs repo checkout/patch-apply/
-	# write_bbconfig every invocation unless told '-k' to skip them. retrieve
-	# can call bitbake_getvar once per object in a single invocation -- a
-	# read-only variable query, not a build -- so it must pass -k once the
-	# checkout already has conf/local.conf + conf/bblayers.conf (kas defaults
-	# its build dir to $MACKAS_PROJECT itself here, since KAS_BUILD_DIR is
-	# blanked), or every call needlessly churns every declared repo's state.
+@test "retrieve: bitbake_getvar skips the repo steps even WITH a parseable state" {
+	# This used to assert '-k', and that was half of a data-loss bug: -k was
+	# passed only when conf/local.conf + conf/bblayers.conf already existed,
+	# and NOTHING was passed otherwise -- so on a fresh checkout kas ran its
+	# full setup, including repos_checkout and repos_apply_patches, and reset
+	# every declared repo. Local commits in a layer under work/ were lost that
+	# way for real.
+	#
+	# The fix is unconditional: always skip the four repo-mutating steps, and
+	# never skip write_bbconfig (the one -k would also skip, and the one a
+	# checkout with no conf/ still needs). So the SAME flags must appear here,
+	# where a parseable state exists, as on a fresh checkout -- that sameness
+	# is the point, since the conditional is what made the bug possible.
 	mkdir -p "$ROOT/work/meta-angstrom/.git" "$ROOT/work/meta-angstrom/conf"
 	touch "$ROOT/work/meta-angstrom/conf/local.conf" "$ROOT/work/meta-angstrom/conf/bblayers.conf"
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
@@ -278,7 +283,9 @@ EOF
 
 	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
 	[ "$status" -eq 0 ]
-	grep -qF "[shell] [-k] [" "$KREC"
+	grep -qF "[shell] [--skip] [setup_dir] [--skip] [finish_setup_repos] [--skip] [repos_checkout] [--skip] [repos_apply_patches] [" "$KREC"
+	# -k is NOT used: it would also skip write_bbconfig.
+	assert_fails grep -qF "[-k]" "$KREC"
 }
 
 @test "retrieve: bitbake_getvar omits -k on a checkout with no parseable state yet" {
