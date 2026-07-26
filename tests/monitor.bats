@@ -368,9 +368,24 @@ loader.exec_module(mod)
 sys.stdout.write(mod.applescript_string(sys.argv[2]))
 PYEOF
 )"
-	run /usr/bin/osascript -e "return $literal"
-	[ "$status" -eq 0 ]
-	[ "$output" = "$hostile" ]
+	# osascript is invoked with a BOUNDED wait, and a timeout SKIPS rather
+	# than fails. Found the hard way: in a background/SSH session with no Aqua
+	# session, osascript writes its answer correctly and then never exits --
+	# so a plain `run` here wedges the whole suite forever rather than failing.
+	# The escaping itself is already pinned byte-exactly by the test above;
+	# this one only adds "and those bytes are valid AppleScript", which is not
+	# worth a hang when the host cannot answer.
+	/usr/bin/osascript -e "return $literal" > "$TESTDIR/osa.out" 2>/dev/null &
+	local osa=$! i
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		kill -0 "$osa" 2>/dev/null || break
+		sleep 1
+	done
+	if kill -0 "$osa" 2>/dev/null; then
+		kill -9 "$osa" 2>/dev/null
+		skip "osascript did not exit within 10s (no Aqua session -- it answers but hangs on exit here)"
+	fi
+	[ "$(cat "$TESTDIR/osa.out")" = "$hostile" ]
 }
 
 @test "monitor --notify: a notifier that fails never breaks the monitor" {
