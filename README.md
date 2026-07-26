@@ -513,6 +513,7 @@ used. `mackas.conf.example` has the full annotated list.
 | `MACKAS_PROJECT_DIR` | *(empty)* | Checkout name under `work/`; also the cwd kas runs in. |
 | `MACKAS_KAS_CONFIG` | *(empty)* | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
 | `MACKAS_KAS_AUTO_FRAGMENT` | `1` | The env.sh `kas-container` wrapper also appends `macos-local.yml` onto a hand-typed file list. Set `0` to compose it yourself instead. |
+| `MACKAS_RESIZE_IMAGE` | *(the kas image)* | Image `volume resize` runs `resize2fs` from. The kas image has **no** e2fsprogs, so in-place growth needs one you supply; without it, resize offers to copy into a new volume instead. |
 | `MACKAS_KAS_AUTO_PROJECT` | `1` | The same wrapper derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that file list and exports them into your shell (never to a config file, never over a value you set). Set `0` to disable. |
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty means one build rung with no `--target`, so kas builds its own default; see [mackas.conf.example](mackas.conf.example) for meta-ai's ladder as an example override. |
 | `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |

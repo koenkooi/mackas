@@ -498,16 +498,40 @@ the loop-device route needs `--privileged`, which Apple `container` does not
 have. A smaller volume means copying into a new one (`volume duplicate` then
 `volume destroy`).
 
-> **Not yet verified against the real runtime.** The mechanism above is derived
-> from the on-disk format observed on a live install and is covered by
-> hermetic tests, but no real volume has been grown yet. Two things are
-> genuinely unknown until someone does: whether the daemon re-reads a
-> hand-edited `entity.json` on restart exactly as `refuse_if_stale_entity`
-> already assumes it does, and whether the kas image ships `resize2fs`
-> (`e2fsprogs`) at all — mackas checks for it inside the container and says so
-> rather than failing obscurely. If step 3 fails, the volume is left intact and
-> usable at its old capacity, with steps 1–2 already done and idempotent, so a
-> retry costs nothing.
+> **`resize2fs` is not in the kas image.** Verified, not assumed: `/sbin` is
+> on its `PATH` and the binary is absent from every location in it (and from
+> `alpine`). So an in-place grow needs an image you supply via
+> `MACKAS_RESIZE_IMAGE` — mackas will not pull or install one for you.
+>
+> Without one, resize is **not** a dead end: it offers to **copy** the volume
+> into a new one of the right size. That path needs neither `resize2fs` nor a
+> hand-edited `entity.json`, so it avoids both of the in-place path's
+> assumptions — at the cost of being a real copy, twice, transiently needing
+> about double the used space. A volume that was relocated with `volume move`
+> is put back on its own drive: the replacements are moved there while still
+> empty, so the copies land on the right disk too.
+
+> **Verified against the real runtime** (opt-in suite
+> `tests/volume_resize_real.bats`, run with `MACKAS_REAL_RUNTIME=1`). Growing
+> a real volume, with data written before the grow, preserves that data
+> byte-for-byte, and the extra space is genuinely usable — not merely
+> reported. The same suite covers the shrink refusal, the no-op case, the
+> one-VM refusal, and a volume relocated to a second physical drive.
+>
+> Live testing is also what found the bugs. Three were only visible against
+> the real runtime, because the hermetic suite's fake `container` accepts
+> whatever it is handed: **`container system restart` does not exist** (1.1.0
+> has `start`/`stop`/`status`/… — shipped mackas called it in two other
+> places too, where it had never once worked); the **kas image has no
+> `resize2fs`**; and the copy fallback **silently relocated a moved volume
+> back to the default drive**, which would have quietly undone a deliberate
+> "TMPDIR on the fast disk" placement.
+>
+> One related leak is worth knowing and is *not* fixed: `container volume
+> delete` removes the per-volume symlink but not the image it points at, so
+> destroying a relocated volume orphans its data on the other drive. The
+> resize path clears it deliberately (only after the copy is verified);
+> `volume destroy` does not.
 
 ### Three drives, one build: TMPDIR, sstate and downloads apart
 
