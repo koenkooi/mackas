@@ -505,3 +505,50 @@ EOF
 	printf '%s\n' "$output" | grep -qi 'retrieve'
 	refute_call "cp -r"
 }
+
+@test "retrieve: bitbake-getvar can NEVER run kas's repo-mutating steps" {
+	# A data-loss regression, hit for real. bitbake_getvar used -k only when
+	# conf/local.conf already existed and passed NOTHING otherwise -- and with
+	# no local.conf, kas runs its full setup, including repos_checkout and
+	# repos_apply_patches, which reset every declared repo to its pinned
+	# revision. That wiped local commits in a layer checkout under work/.
+	# `mackas retrieve` calls this, so copying build output off a volume could
+	# silently destroy unpushed work.
+	#
+	# The four repo-touching steps must be skipped ALWAYS, on a fresh checkout
+	# and a configured one alike. write_bbconfig is deliberately NOT skipped
+	# (that is the one -k would also skip, and a checkout with no conf/ needs
+	# it) -- which is why this is four --skip flags rather than -k.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	# Deliberately NO conf/local.conf: this is the branch that used to run the
+	# full setup and reset the repos.
+	assert_fails test -f "$ROOT/work/meta-angstrom/conf/local.conf"
+
+	cat > "$ROOT/bin/kas-container" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$KASARGV_LOG"
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR "*) echo "/build/deploy" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container"
+	KASARGV_LOG="$ROOT/kasargv.log"; export KASARGV_LOG
+	: > "$KASARGV_LOG"
+
+	mkdir -p "$FIXTURE/deploy/images"
+	echo bin > "$FIXTURE/deploy/images/fake.img"
+	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
+	[ "$status" -eq 0 ]
+
+	# Every repo-mutating step is skipped...
+	grep -qF -- '--skip setup_dir' "$KASARGV_LOG"
+	grep -qF -- '--skip finish_setup_repos' "$KASARGV_LOG"
+	grep -qF -- '--skip repos_checkout' "$KASARGV_LOG"
+	grep -qF -- '--skip repos_apply_patches' "$KASARGV_LOG"
+	# ...and write_bbconfig is NOT, so a fresh checkout can still be parsed.
+	assert_fails grep -qF -- '--skip write_bbconfig' "$KASARGV_LOG"
+	# ...and it is never invoked bare, which is what caused the reset.
+	assert_fails grep -qE 'shell [^-]' "$KASARGV_LOG"
+}
