@@ -6,17 +6,15 @@
 OpenEmbedded builds on macOS, on Apple's native `container` runtime. No Docker
 Desktop, no Lima, no Colima.
 
-The project to build — its git repo, branch and kas config — is
-configuration (`MACKAS_PROJECT_URL` / `_BRANCH` / `_DIR` and
-`MACKAS_KAS_CONFIG`). There is no built-in default project: `setup` does its
-whole job (volumes, kas-container, the shim, gitconfig) with none of this
-set, and just skips the project checkout step until you configure one. The
-worked example throughout this README is
+The project to build is configuration (`MACKAS_PROJECT_URL` / `_BRANCH` /
+`_DIR` and `MACKAS_KAS_CONFIG`); there is no built-in default project.
+`setup` does its whole job — volumes, kas-container, the shim, gitconfig —
+with none of it set, skipping only the project checkout. The worked example
+throughout is
 [qualcomm-linux/meta-ai](https://github.com/qualcomm-linux/meta-ai) (branch
-`wrynose`, kas config `kas/base.yml:kas/qemuarm64.yml`) — the layer set the
-tool has actually been exercised against end to end — and `smoketest` will
-offer to use it for a single, ephemeral run (never persisted, removed again
-afterward) if you run it with nothing configured at all.
+`wrynose`, kas config `kas/base.yml:kas/qemuarm64.yml`), the layer set the
+tool is exercised against end to end; `smoketest` offers it for a single
+ephemeral run (never persisted, removed afterward) when nothing is configured.
 
 ## Why this exists
 
@@ -45,15 +43,17 @@ adaptation surface stays small enough to reason about.
 
 ## Quick start
 
+Requirements: Apple silicon, Apple `container` v1.1.0
+(`brew install container`), and a case-sensitive filesystem with room for the
+build.
+
 `MACKAS_ROOT` has no baked-in default. Leave it unset and every command falls
 back to the current directory, with a loud warning — fine for a quick look,
-not for a real build. Set it properly in `~/.mackas.conf` (`echo
-'MACKAS_ROOT=/Volumes/oe' >> ~/.mackas.conf`) or pass it per-invocation with
+not for a real build. Set it in `~/.mackas.conf` (`echo
+'MACKAS_ROOT=/Volumes/oe' >> ~/.mackas.conf`) or per-invocation with
 `--set MACKAS_ROOT=...`. It must be a directory on a case-sensitive volume —
-[see below](#configuration) for how to make one — and on a case-insensitive
-root `setup` offers to mount a case-sensitive workspace image at `work/` and
-**refuses to proceed** if you decline, rather than finish "Done" on a root
-that would corrupt the first build.
+[see Configuration](#configuration) for how to make one and what `setup`
+does (offer a workspace image, or refuse) on a case-insensitive root.
 
 ```sh
 ./mackas check              # feasibility report. Changes nothing. This is the default.
@@ -63,8 +63,6 @@ source ~/oe/env.sh          # setup generates this and prints the real path
 ./mackas smoketest          # parse-only, then the kas config's own default build
 ```
 
-`./mackas` with no arguments does `check`, which touches nothing.
-
 `setup` generates `env.sh` and prints its path. Source it in every shell you
 build from — the later commands assume you have. It puts the `docker` shim
 ahead of `/usr/local/bin` on `PATH` and exports the `KAS_*` variables
@@ -73,12 +71,7 @@ deliberately does **not** export `KAS_BUILD_DIR`, `DL_DIR` or `SSTATE_DIR` —
 those would make kas bind-mount an APFS directory over the ext4 volumes
 ([why](docs/architecture.md#how-they-get-mounted-and-why-kas_build_dir-must-stay-unset)).
 It lives at `~/oe/env.sh` once `setup` has made the short symlink, or in
-`MACKAS_ROOT` if you set `MACKAS_SHORT_LINK=`; `./mackas status` prints
-where.
-
-Requirements: Apple silicon, Apple `container` v1.1.0
-(`brew install container`), and a case-sensitive filesystem with room for the
-build.
+`MACKAS_ROOT` if you set `MACKAS_SHORT_LINK=`; `./mackas status` prints where.
 
 ### Directory layout
 
@@ -94,127 +87,238 @@ $MACKAS_ROOT/
 ├── gitconfig     generated; forwarded as GITCONFIG_FILE
 └── work/         <- every layer checkout lives HERE, as a sibling
     ├── meta-angstrom/
-    ├── meta-ti/
     ├── meta-openembedded/
     └── ...
 ```
 
-**`work/` is the one directory that matters for multi-layer work.** It's
+**`work/` is the one directory that matters for multi-layer work.** It is
 what `KAS_WORK_DIR` is set to, and kas-container bind-mounts it whole into
-the container — so any layer checkout sitting under it, whether `setup`
-cloned it (`MACKAS_PROJECT_URL`/`_DIR`) or you put it there yourself, is
-visible to kas and reusable across builds with nothing re-cloned. `bin/`,
-`kas/` and `logs/` don't participate in this at all; only `work/` is what
-kas sees.
+the container — any checkout under it, whether `setup` cloned it or you put
+it there, is visible to kas and reusable across builds with nothing
+re-cloned. `bin/`, `kas/` and `logs/` do not participate; only `work/` is
+what kas sees. A real multi-layer BSP — a dozen `meta-*` repos, not just the
+single project `setup` clones — goes under `work/` as siblings; see
+[Driving kas directly](#driving-kas-directly).
 
-If you already have a multi-layer BSP checkout — a real Angstrom-style
-layer set with a dozen `meta-*` repos, not just the single project `setup`
-clones by default — put all of them under `work/` as siblings. See
-["Driving kas directly"](#driving-kas-directly) below for composing kas
-configs that reference more than one of them at once.
+## Commands
 
-### Driving kas directly
+| Command | Does |
+|---|---|
+| `check` | Preflight only. PASS/WARN/FAIL, each with the remediation command. **Default.** |
+| `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. Takes an optional root path and `--tmpdir-size`/`--sstate-size`/`--downloads-size`; asks interactively for whichever is still unconfigured. |
+| `adopt` | Bring a `MACKAS_ROOT` set up by another Mac back to a working build here — see [below](#adopting-a-root-from-another-mac). |
+| `smoketest` | The validation ladder (see below). |
+| `status` | Every setting in effect, every derived path, what exists on disk. |
+| `shell` | `kas shell` for the project's kas config. |
+| `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
+| `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
+| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
+| `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
+| `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
+| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
+| `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `recover`. |
+| `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
 
-`mackas smoketest` and `mackas shell` are wrappers; underneath this is ordinary
+Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes` (or
+`-f/--force`), `-v/--verbose`, `--version`, `--help`.
+
+### The smoketest ladder
+
+Rung 1 is `bitbake -p` — parse only, proves all layers fetched and parse.
+Then one build rung per target in `MACKAS_SMOKETEST_TARGETS`, or, when that
+list is empty (the default), a single plain `kas build` with no `--target`,
+so bitbake builds whatever default the kas config itself names — nothing
+project-specific baked in. Set your own targets to go further, ordered
+smallest-first so failures stay cheap and specific; `bash` is a trivial
+fallback if your kas config has no sensible bare default.
+[mackas.conf.example](mackas.conf.example) ships meta-ai's ladder, commented
+out, as a worked example (smallest native recipe → same recipe
+cross-compiled → the real targets, **hours** cold). Each rung streams to
+`$MACKAS_ROOT/logs/` and stops the ladder on failure. See
+[testing.md](docs/testing.md#the-smoketest-ladder).
+
+### Getting build outputs off the volume
+
+`TMPDIR` is inside the `oe-build-tmp` ext4 image, so `tmp/buildstats`,
+`tmp/log` and `tmp/deploy` are invisible from macOS. `mackas retrieve`
+copies them out with a throwaway container:
+
+```sh
+./mackas retrieve buildstats                # -> $MACKAS_BASE/artifacts/
+./mackas retrieve buildstats logs deploy    # also tmp/log and tmp/deploy; deploy can be tens of GB
+./mackas retrieve buildstats --dest ~/out   # elsewhere
+./mackas buildstats analyze [PATH]          # summarise what was fetched
+```
+
+`buildstats analyze` runs
+[`tools/mackas-buildstats-analyze`](tools/mackas-buildstats-analyze) over
+the newest build in the path (default: the `retrieve` destination), then
+renders a pybootchartgui bootchart SVG per build not already charted — in a
+throwaway kas-image container (pybootchartgui needs pycairo, which the Mac's
+own Python lacks), best-effort, skipped quietly with no checkout yet. Each
+`retrieve buildstats` lands in its own timestamped subdirectory, so
+retrievals never merge — important for a project whose `BUILDNAME` doesn't
+vary per build, where bitbake never resets `tmp/buildstats` between builds
+([storage.md](docs/storage.md#buildstats-and-a-constant-buildname),
+`MACKAS_BUILDSTATS_ACCUMULATE`). Because only **one VM may hold an ext4
+image at a time**, `retrieve` refuses while a build still has the volume
+attached — stop it first. That constraint is also why the copy runs through
+a container rather than a second mount ([TODO.md](TODO.md) item 5).
+
+### Managing the volumes
+
+```sh
+./mackas volume list                        # every volume: cap, on-disk cost, in-use
+./mackas volume fstrim oe-build-tmp         # reclaim host disk from the sparse image ('all' for every volume)
+./mackas volume duplicate oe-build-sstate sstate-backup   # CoW clone under a new name you choose
+./mackas volume destroy sstate-backup       # remove ONE volume
+./mackas volume move oe-build-tmp /Volumes/Fast/oe   # relocate one image to another disk
+./mackas volume resize oe-build-tmp 1T      # GROW one in place, keeping its contents
+```
+
+A sparse ext4 image only ever grows: deleting files inside the guest never
+shrinks `volume.img`. `volume list`'s **on-disk** column shows one that has
+ratcheted up; `volume fstrim` hands the space back via guest `fstrim`, whose
+discards become host hole-punches — on APFS hosts only
+([storage.md](docs/storage.md#reclaiming-disk-from-a-grown-volume-mackas-volume-fstrim)).
+`duplicate` is a near-free APFS copy-on-write clone. Everything here obeys
+the **one-VM rule** — a volume a running build holds is refused
+([storage.md](docs/storage.md#managing-the-volumes)).
+
+`volume move` relocates one image (big TMPDIR on a roomier disk, sstate
+stays put), leaving a symlink where the runtime expects it; `volume recover`
+re-points a symlink gone stale after a hand-move, finding the image with
+Spotlight
+([storage.md](docs/storage.md#relocating-a-volume-and-recovering-a-hand-moved-one)).
+`volume resize` **grows** a volume in place, keeping its contents;
+**shrinking is refused** (`resize2fs` cannot shrink a mounted filesystem,
+and a container volume can only be attached mounted), so shrink by
+`duplicate` + `destroy`. In-place growth needs an e2fsprogs image
+(`MACKAS_RESIZE_IMAGE`; the kas image ships none — without one, resize
+offers a copy into a new volume instead):
+[storage.md](docs/storage.md#growing-a-volume-mackas-volume-resize).
+
+### Pruning the sstate cache
+
+bitbake never removes an sstate object on its own — the cache only grows,
+and `mackas clean` deliberately keeps it. `mackas sstate prune
+--older-than N[d]` deletes objects bitbake hasn't reused in at least N days.
+bitbake touches an object's mtime every time it reuses it, so "untouched for
+N days" genuinely means "nothing built in N days has needed this", not
+"written N days ago" — and hash-addressing makes a wrong guess cheap: a
+pruned object still needed just gets rebuilt, one task, never a correctness
+risk. The scan is real even under `--dry-run` (so the reported count/size
+are real); deletion happens only after confirmation or `-y`, and the one-VM
+rule applies. For surgical pruning — keep only what one checkout's stamps
+still reference — use openembedded-core's own
+`scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
+"nothing has touched this in months" case.
+
+### Watching a build live
+
+A build inside the container is invisible to macOS in real time beyond
+mackas's own coarse rung/log reporting. `MACKAS_MONITOR=1` opts a build into
+a live progress bridge; `mackas monitor` polls it (`--once` for a single
+snapshot) on `MACKAS_MONITOR_PORT` (default `8801`) — it never starts a
+build. With `MACKAS_MONITOR_NOTIFY=1` (or `--notify`) it also posts a native
+macOS notification on build start/success/failure, after a one-time
+Notification Center grant (`mackas monitor --help`). The bridge is a real
+bitbake UI module tee'd into the event stream, not a second observer client;
+it stays **off by default** because enabling it mounts an overlay, shadows
+the container's `bitbake`, and runs a background HTTP thread on every build.
+How it becomes the real UI client without patching bitbake:
+[architecture.md](docs/architecture.md#live-build-progress-the-monitor-bridge);
+its JSON contract is a stable API ([monitor-app.md](docs/monitor-app.md)).
+
+## Driving kas directly
+
+`mackas smoketest` and `mackas shell` are wrappers; underneath is ordinary
 kas. Once `env.sh` is sourced, run kas yourself from the **work directory**
-(the parent of the layer checkouts, as upstream kas expects — the config path
-is relative to it):
+(the parent of the layer checkouts, as upstream kas expects — the config
+path is relative to it):
 
 ```sh
 source ~/oe/env.sh
-cd "$MACKAS_BASE/work"          # ~/oe/work — meta-ai and the other layers live here
-
-# build a target
+cd "$MACKAS_BASE/work"
 kas-container build meta-ai/kas/base.yml:meta-ai/kas/qemuarm64.yml --target tensorflow-lite
-
-# or get a shell and drive bitbake yourself
-kas-container shell meta-ai/kas/base.yml:meta-ai/kas/qemuarm64.yml -c 'bitbake tensorflow-lite'
 kas-container shell meta-ai/kas/base.yml:meta-ai/kas/qemuarm64.yml -c 'bitbake -c menuconfig virtual/kernel'
-kas-container shell meta-ai/kas/base.yml:meta-ai/kas/qemuarm64.yml   # interactive
 ```
 
 **The `cd` is not optional.** `kas-container` mounts your current directory
-at `/repo` inside the container and resolves every kas config path relative
-to it — it does not know about `MACKAS_BASE`/`MACKAS_PROJECT` and will not
-`cd` anywhere for you (`mackas shell`/`smoketest` do this step internally,
-which is the only reason they don't need it spelled out). Running it from
-anywhere else — most importantly, from `MACKAS_ROOT` itself rather than
-`MACKAS_BASE` (the short link) if the two differ, since `MACKAS_ROOT` is
-usually the one with spaces in it — reintroduces exactly the argument
-word-splitting kas-container has no defense against.
-
-Because `work/` (not the single project) is the `cd` target here, composing
-**multiple layers in one build is just more colon-separated paths** — every
-layer under `work/` is an equally-reachable sibling, kas config chain or
-not:
+at `/repo` and resolves every kas config path relative to it — it will not
+`cd` anywhere for you (`mackas shell`/`smoketest` do this internally).
+Running from anywhere else — most importantly from `MACKAS_ROOT` itself
+rather than `MACKAS_BASE` if the two differ, since `MACKAS_ROOT` is usually
+the one with spaces in it — reintroduces exactly the argument word-splitting
+kas-container has no defense against. Because `work/` is the `cd` target,
+composing **multiple layers is just more colon-separated paths** — every
+layer under `work/` is an equally-reachable sibling:
 
 ```sh
-kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml:meta-angstrom/kas/macos-local.yml
+kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml
 ```
 
-The wrapper function itself appends `:kas/macos-local.yml` (relative to
-whichever layer you generated it into — `mackas setup` writes it inside the
-single `MACKAS_PROJECT_DIR` it manages) onto the file list you give it, so
-you can usually leave it off — `kas-container shell meta-angstrom/kas/base.yml`
-already gets the tuning fragment (parallelism, `BB_DISKMON_DIRS`,
-`BB_HASHSERVE_DB_DIR`, mirrors) composed in for you, exactly as if you had
-typed the line above by hand. It finds the file list even with a flag in
-front of it — `-k`, `--force-checkout`, `--update`, `-E`/`--preserve-env`,
-and value-taking ones like `--skip STEP`/`--target`/`-c` (its separate value
-is consumed too) are all recognized; anything else it does not know backs
-off untouched rather than guess wrong, so double-check the file list still
-got `macos-local.yml` appended (`mackas status`'s "kas files" line, or just
-look for it in the command kas itself echoes back) before assuming it did.
-Set `MACKAS_KAS_AUTO_FRAGMENT=0` to go back to composing it yourself instead
-— e.g. if your own file list already ends with a differently-named fragment.
-
-> **`-k`/`--keep-config-unchanged` skips writing `conf/local.conf` and
-> `conf/bblayers.conf` entirely** — along with the repo checkout/patch steps
-> its name suggests, all five are bundled into one flag. If a checkout was
-> last configured *without* the tuning fragment, adding it to the file list
-> later and re-running with `-k` has NO effect — kas reuses the `local.conf`
-> already on disk, unchanged. Do **not** just drop `-k` to fix this: that
-> also re-runs `repos_checkout`/`repos_apply_patches`, which can reset repos
-> to their pinned commit and re-apply patches — genuinely disruptive if
-> anything local has diverged, not just slow. Instead skip every step `-k`
-> skips *except* `write_bbconfig`, individually:
->
-> ```sh
-> kas-container shell --skip setup_dir --skip finish_setup_repos \
->   --skip repos_checkout --skip repos_apply_patches meta-angstrom/kas/base.yml
-> ```
->
-> This regenerates `local.conf`/`bblayers.conf` with the fragment composed
-> in, without touching any repo's checkout state. `-k` is safe again
-> afterward, since the fragment's settings are now baked into the file it is
-> keeping unchanged.
-
-Driving kas by hand this way also teaches the *rest* of mackas what you are
-building: the wrapper derives `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG`
-from the file list and exports them into that shell, so a later `mackas
-retrieve` or `mackas buildstats analyze` in the same shell resolves
+`kas-container` here is a **shell function**, not the program on your
+`PATH`. `env.sh` defines it to supply `--runtime-args` (the ext4 volumes and
+CPU/memory limits), point `GITCONFIG_FILE` at the generated `safe.directory`
+config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, append the generated
+tuning fragment `:kas/macos-local.yml` (parallelism, `BB_DISKMON_DIRS`,
+`BB_HASHSERVE_DB_DIR`, mirrors) onto the file list, and derive
+`MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that list — exported into the
+shell, never written to a config file, never overriding a value you set —
+so a later `mackas retrieve` or `buildstats analyze` resolves
 `DEPLOY_DIR`/`LOG_DIR` through bitbake instead of refusing (or silently
-falling back to OE-core defaults your distro has redefined). It never writes
-them to a config file and never overrides a value you set yourself; set
-`MACKAS_KAS_AUTO_PROJECT=0` to turn it off. A chain that spans *sibling*
-layers (`meta-angstrom/…:meta-ti/…`) derives nothing, because mackas
-commands `cd` into a single checkout and a sibling would fall outside the
-`/repo` mount — keep driving those by hand from `work/`.
+falling back to OE-core defaults your distro has redefined).
+`MACKAS_KAS_AUTO_FRAGMENT=0` / `MACKAS_KAS_AUTO_PROJECT=0` disable the two
+conveniences. The wrapper finds the file list even behind known flags, but
+**backs off untouched at any flag it does not recognize** rather than guess
+— double-check the fragment got appended (`mackas status`'s "kas files"
+line, or the command kas echoes back). Flag list and mechanics:
+[architecture.md](docs/architecture.md#running-kas-container-by-hand). A
+chain spanning *sibling* layers (`meta-angstrom/…:meta-ti/…`) derives
+nothing — mackas commands `cd` into a single checkout and a sibling would
+fall outside the `/repo` mount — so keep driving those by hand from `work/`.
+Bypassing the function (`command kas-container`, an absolute path, an
+unsourced shell) builds wrong: no volumes, Apple's default 4 CPUs / 1 GB, no
+fragment — and, with a pipx/pip kas on `PATH`, possibly a different kas
+release than the 5.4 mackas pins. `mackas check` reports which
+`kas-container` wins ([architecture.md](docs/architecture.md#the-ext4-volumes)).
 
-> **`kas-container` here is a shell function, not the program on your
-> `PATH`.** `env.sh` defines it to supply `--runtime-args` (the ext4 volumes
-> and CPU/memory limits), point `GITCONFIG_FILE` at the generated
-> `safe.directory` config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`,
-> (unless `MACKAS_KAS_AUTO_FRAGMENT=0`) append `macos-local.yml` onto the
-> file list, and (unless `MACKAS_KAS_AUTO_PROJECT=0`) derive the project
-> settings above. None of that is optional — see
-> [architecture.md](docs/architecture.md#the-ext4-volumes).
->
-> `command kas-container`, an absolute path, or an unsourced shell bypasses
-> the function and builds wrong: no volumes, Apple's default 4 CPUs / 1 GB,
-> no auto-appended fragment — and, with a pipx or pip kas on `PATH`, possibly
-> a different kas release than the 5.4 mackas pins. `mackas check` reports
-> which `kas-container` wins.
+> **`-k` does more than its name suggests, and dropping it is worse.** It
+> skips writing `conf/local.conf`/`conf/bblayers.conf` as well as the repo
+> checkout and patch steps, so adding the fragment to a file list has no
+> effect on an already-configured checkout — but simply dropping `-k` re-runs
+> `repos_checkout`/`repos_apply_patches` and can reset repos to their pinned
+> commit. The safe recipe is in
+> [architecture.md](docs/architecture.md#running-kas-container-by-hand).
+
+## Adopting a root from another Mac
+
+`MACKAS_ROOT` is portable — an external SSD, or a disk image on a share, can
+be physically moved to a second Mac. But that root carries a volume name, a
+short link and an `env.sh` the *first* Mac chose, and its container volumes
+may have been relocated to paths that don't exist here.
+`mackas adopt /Volumes/ExternalSSD/oe` bridges that gap without clobbering
+anything this Mac already has for an unrelated project. It introspects
+`work/*/` for the project checkout (remote URL and branch; `--project-dir`
+disambiguates when there is more than one, or none is found), **refuses
+outright** if the path is already this Mac's own root (that is
+`setup`/`check` territory), and derives a collision-free
+`MACKAS_VOLUME_NAME` (`mackas-<name>`, suffixed if taken) and
+`MACKAS_SHORT_LINK` (`~/oe-<name>`, reused on a re-adopt of the same root).
+
+**Each adopted root gets its own config file** — by default
+`~/.config/mackas/projects/<name>.conf`, or wherever `--write-config FILE`
+says (note: `--write-config`, not the global `--config`, which loads an
+*existing* file); from then on, drive that project with
+`mackas --config <that file> ...`. adopt then runs `volume recover` (so a
+relocated volume Spotlight can find is re-pointed before `setup` would
+create a fresh empty one over it), checks for `work/` files owned by the
+other Mac's account and offers a recursive `chown` if the drive isn't
+mounted `noowners`, and hands off to `setup`. If this Mac's machine-wide
+volume-relocation symlink already belongs to a different live project,
+`setup` detects that and *offers* — never silently does — to switch it.
+`mackas adopt --help` has the full flag list.
 
 ## Files
 
@@ -226,228 +330,12 @@ commands `cd` into a single checkout and a sibling would fall outside the
 | `mirror-server/mackas-mirrord` | The HTTP mirror server. **Optional.** Single file, Python 3.7+, stdlib only — scp it to a mirror host, or run it locally. See [storage.md](docs/storage.md#http-mirrors--optional-and-not-just-an-nfs-bridge). |
 | `mirror-server/mackas-mirrord.service` | Hardened systemd unit for it (Debian 13). |
 | `mirror-server/mackas-mirrord.conf.example` | Annotated config for it. |
-| `mackas-uibridge/` | The live-progress bridge (`MACKAS_MONITOR=1`): a bitbake UI module (`mackasjson.py`) and the `bitbake` wrapper mounted over the checkout's own. **Optional.** See [architecture.md](docs/architecture.md#live-build-progress-the-monitor-bridge). |
+| `mackas-uibridge/` | The live-progress bridge (`MACKAS_MONITOR=1`): a bitbake UI module (`mackasjson.py`) and the `bitbake` wrapper mounted over the checkout's own. **Optional.** |
 | `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller). |
-| `tests/` | bats test suite. See [testing.md](docs/testing.md). |
-| `run-tests.sh`, `Makefile` | Test entry points (`./run-tests.sh` or `make test`). |
+| `tests/`, `run-tests.sh`, `Makefile` | bats test suite and its entry points (`./run-tests.sh` or `make test`). See [testing.md](docs/testing.md). |
 | `COPYING` | GPLv3. |
-
-Plus two files `setup` **generates** rather than ships:
-
-| Generated file | What it is |
-|---|---|
-| `$MACKAS_BASE/env.sh` | The environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, and a `kas-container` wrapper that supplies the volumes and limits. Defaults to `~/oe/env.sh`. |
-| `$MACKAS_BASE/gitconfig` | Forwarded into the container as `GITCONFIG_FILE` so git can operate on `/repo` despite the virtiofs ownership quirk — see [architecture.md](docs/architecture.md#git-dubious-ownership--the-blocker). Never written over a `GITCONFIG_FILE` you already export yourself. |
-
-## Commands
-
-| Command | Does |
-|---|---|
-| `check` | Preflight only. PASS/WARN/FAIL, each with the remediation command. **Default.** |
-| `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. Takes an optional root path and `--tmpdir-size`/`--sstate-size`/`--downloads-size`; asks interactively for whichever is still unconfigured. Skips the project checkout step if none is configured. |
-| `adopt` | Bring a `MACKAS_ROOT` another Mac's mackas set up (an external drive moved over, a network share) back to a working build here, with its own volume name and short link. Writes a per-project config, then hands off to `setup`. See [Adopting a root from another Mac](#adopting-a-root-from-another-mac). |
-| `smoketest` | The validation ladder (see below). Offers the meta-ai example, for one ephemeral run only, if no project is configured at all. |
-| `status` | Every setting in effect, every derived path, what exists on disk. |
-| `shell` | `kas shell` for the project's kas config. |
-| `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
-| `buildstats` | Work with buildstats already retrieved: `buildstats analyze [PATH]` summarises the newest build's wall time/parallelism/io and renders a pybootchartgui bootchart SVG for every build under PATH not already charted (run inside a throwaway kas-image container — pybootchartgui needs pycairo, which this Mac's Python does not have). |
-| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in at least N days. `mackas sstate --help`. |
-| `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. `mackas monitor --help`. See [Watching a build live](#watching-a-build-live). |
-| `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
-| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
-| `volume` | Manage the ext4 volumes: `list`, `fstrim` (reclaim disk from a sparse image; `all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or every volume (`--all`/`-a`), `move` one to another disk, `resize` (grow) one in place, `recover` a hand-moved one. |
-| `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
-
-Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes` (or
-`-f/--force`), `-v/--verbose`, `--version`, `--help`.
-
-### The smoketest ladder
-
-`mackas smoketest` runs rung 1 (universal) then either one build rung per
-target in `MACKAS_SMOKETEST_TARGETS`, or, when that list is empty (the
-built-in default), a single build rung with no `--target` at all, stopping on
-the first failure:
-
-1. `bitbake -p` — parse only. Proves all layers fetched and parse. Always run.
-2…n. `bitbake <target>` for each target in `MACKAS_SMOKETEST_TARGETS` — or, if
-the list is empty, one plain `kas build` with no target, so kas/bitbake builds
-whatever default target the kas config itself names.
-
-`MACKAS_SMOKETEST_TARGETS` is empty by default: the ladder exercises exactly
-what the kas config says to build, nothing project-specific baked in. Set your
-own project's targets to go further than that default (order the list
-smallest-first so failures stay cheap and specific), or use `bash` as a
-trivial fallback target if your kas config has no sensible bare default of its
-own. `mackas.conf.example` ships meta-ai's own ladder, commented out, as a
-worked example — `flatbuffers-tflite-native` (smallest native, proves the
-toolchain), `flatbuffers-tflite` (same recipe cross-compiled), then
-`tensorflow-lite` + `llama-cpp` (its real targets, **hours** cold).
-
-Each rung streams to `$MACKAS_ROOT/logs/` and stops the ladder on failure.
-See [testing.md](docs/testing.md#the-smoketest-ladder) for what it composes
-and why.
-
-### Getting build outputs off the volume
-
-`TMPDIR` is inside the `oe-build-tmp` ext4 image, so `tmp/buildstats`,
-`tmp/log` and `tmp/deploy` are invisible from macOS. `mackas retrieve` copies
-them out with a throwaway container; `mackas buildstats analyze` then
-summarises what was fetched:
-
-```sh
-./mackas retrieve buildstats                    # -> $MACKAS_BASE/artifacts/
-./mackas retrieve buildstats logs deploy         # also tmp/log and tmp/deploy
-./mackas retrieve buildstats --dest ~/out        # elsewhere
-./mackas buildstats analyze                      # summarise what's in artifacts/buildstats
-./mackas buildstats analyze ~/out/buildstats      # summarise an explicit path
-```
-
-`deploy` (the images and ipks) can be tens of GB. `buildstats analyze` runs
-[`tools/mackas-buildstats-analyze`](tools/mackas-buildstats-analyze) over the
-newest build in the path given (or the default `retrieve` destination), then
-renders a pybootchartgui bootchart SVG for every build there not already
-charted — one `<BUILDNAME>.svg` per build, so re-running `analyze` after one
-more build only charts the new one. The SVG step runs inside a throwaway
-kas-image container (pybootchartgui needs pycairo, which this Mac's own
-Python does not have) and is best-effort: it skips quietly with no project
-checkout yet.
-
-Each `retrieve buildstats` lands in its own timestamped subdirectory
-(`buildstats/<retrieve-time>/<BUILDNAME>/`), so successive retrievals never
-merge together — important for a project whose `BUILDNAME` doesn't vary per
-build, where bitbake itself never resets `tmp/buildstats` between builds. See
-[Buildstats and a constant BUILDNAME](docs/storage.md#buildstats-and-a-constant-buildname)
-for what that means and how mackas handles it (`MACKAS_BUILDSTATS_ACCUMULATE`).
-
-Because only **one VM may hold an ext4 image at a time**, `retrieve` refuses
-while a build (`smoketest`/`shell`) still has the volume attached — stop it first.
-That constraint is also why the copy runs through a container rather than a
-second mount ([TODO.md](TODO.md) item 5).
-
-### Managing the volumes
-
-`mackas volume` operates on the ext4 container volumes directly.
-
-```sh
-./mackas volume list                       # every volume: cap, on-disk cost, in-use
-./mackas volume fstrim oe-build-tmp         # reclaim host disk from the sparse image
-./mackas volume fstrim all                  # the three mackas volumes, skipping busy ones
-./mackas volume duplicate oe-build-sstate sstate-backup   # sstate-backup is a new NAME you choose, an APFS copy-on-write clone of oe-build-sstate
-./mackas volume destroy sstate-backup       # remove ONE volume
-./mackas volume move oe-build-tmp /Volumes/Fast/oe   # relocate one image to another disk
-./mackas volume resize oe-build-tmp 1T      # GROW one in place, keeping its contents
-```
-
-A sparse ext4 image only ever grows: deleting files inside the guest never
-shrinks `volume.img`. `volume list`'s **on-disk** column is where you see one
-that has ratcheted up, and `volume fstrim` hands the freed space back to the
-host — it runs guest `fstrim`, whose discards the hypervisor turns into host
-hole-punches ([storage.md](docs/storage.md#reclaiming-disk-from-a-grown-volume-mackas-volume-fstrim)).
-`duplicate` is a near-free CoW clone (it shares blocks with its source until
-written). All three refuse a volume a running build still holds — the
-**one-VM rule** — and for `duplicate` that guard is on the *source*, since
-cloning a live image is inconsistent. `volume destroy` removes one arbitrary
-volume; the top-level `destroy` removes all three plus `$MACKAS_ROOT` and the
-symlink.
-
-`volume move` relocates a single volume's image to another directory (put a
-big TMPDIR on a roomier disk while sstate stays put). It leaves a symlink where
-the runtime expects the volume, so nothing else needs reconfiguring; `status`
-and `volume list` resolve and report the real location. It refuses a volume
-that is in use. If you ever move an image by hand and the symlink goes stale,
-`mackas volume recover` finds it again with Spotlight and offers to re-point.
-A later `volume destroy`/`clean` of that volume also removes the per-volume
-symlink `move` planted, so a moved-then-destroyed volume leaves nothing dangling.
-
-`volume resize <name> <size>` **grows** a volume in place, keeping everything
-in it — the answer to a TMPDIR that turns out too small, or an sstate cap
-chosen months ago, without paying for it with the cache. It extends the sparse
-image, records the new size where the daemon reads it, restarts the daemon so
-it picks that up, then grows the ext4 filesystem to fill the new space; all
-three have to happen, since a bigger block device with the same-sized
-filesystem on it gains nothing. It reports the growth against free space on
-the drive the image *actually* lives on and warns when that drive cannot back
-it — sparse images make an over-large cap succeed now and fail later, in the
-middle of a build. **Shrinking is refused**, not merely missing: `resize2fs`
-cannot shrink a mounted filesystem and a container volume can only be attached
-mounted, so a shrink has to be copy-into-a-new-volume instead
-(`volume duplicate` + `volume destroy`).
-
-### Pruning the sstate cache
-
-bitbake never removes an sstate object on its own — the cache only grows, and
-`mackas clean` deliberately keeps it. `mackas sstate prune --older-than N[d]`
-deletes objects bitbake hasn't reused in at least N days:
-
-```sh
-./mackas sstate prune --older-than 90d          # reports what would go, then asks
-./mackas --dry-run sstate prune --older-than 90d   # real scan, deletes nothing
-```
-
-bitbake touches (updates the mtime of) an sstate object every time it finds
-and reuses it, so "untouched for N days" genuinely means "nothing built in N
-days has needed this", not "written N days ago" — and sstate's hash-addressing
-makes a wrong guess cheap: a pruned object still needed just gets rebuilt, one
-task, never a correctness risk. It scans for real even under `--dry-run` (so the
-count/size reported are real) and deletes only after confirmation or `-y`. Like
-the other volume operations it obeys the **one-VM rule** and refuses while a
-build holds the sstate volume. For surgical pruning — keep only what one
-checkout's stamps still reference — use openembedded-core's own
-`scripts/sstate-cache-management.py` instead; `sstate prune` solves the coarser
-"nothing has touched this in months" case.
-
-### Watching a build live
-
-A build inside the container is invisible to macOS in real time beyond mackas's
-own coarse rung/log reporting. `MACKAS_MONITOR=1` opts a build into a live
-progress bridge, and `mackas monitor` polls it:
-
-```sh
-./mackas --set MACKAS_MONITOR=1 smoketest &   # run the build with the bridge on
-./mackas monitor                              # follow: [status] done/total  recipe:task
-./mackas monitor --once                       # a single snapshot, then exit
-```
-
-`monitor` only polls an already-published port (`MACKAS_MONITOR_PORT`, default
-`8801`) — it never starts a build. The bridge is a real bitbake UI module tee'd
-into the event stream, not a second observer client; it stays **off by default**
-because enabling it mounts an overlay, shadows the container's `bitbake`, and
-runs a background HTTP thread on every build. How it becomes the real UI client
-without patching bitbake is in
-[architecture.md](docs/architecture.md#live-build-progress-the-monitor-bridge).
-
-## Adopting a root from another Mac
-
-`MACKAS_ROOT` is portable — an external SSD, or a disk image on a share, can be
-physically moved to a second Mac. But that root carries a volume name, a short
-link and an `env.sh` the *first* Mac chose, and its container volumes may have
-been relocated to paths that don't exist here. `mackas adopt` bridges that gap
-without clobbering anything this Mac already has for an unrelated project:
-
-```sh
-./mackas adopt /Volumes/ExternalSSD/oe                       # introspect and set it up
-./mackas adopt /Volumes/ExternalSSD/oe --project-dir meta-ai  # pick a checkout by name
-```
-
-It introspects `work/*/` for the project checkout (remote URL and branch;
-`--project-dir` disambiguates when there is more than one, or none is found
-automatically), **refuses outright** if the path is already this Mac's own root
-(that is `setup`/`check` territory), and derives a collision-free
-`MACKAS_VOLUME_NAME` (`mackas-<name>`, suffixed if taken) and `MACKAS_SHORT_LINK`
-(`~/oe-<name>`, reused on a re-adopt of the same root).
-
-**Each adopted root gets its own config file** — by default
-`~/.config/mackas/projects/<name>.conf`, or wherever `--write-config FILE` says
-(note: `--write-config`, not the global `--config`, which loads an *existing*
-file). That is the per-project config model: from then on, drive that project
-with `mackas --config <that file> ...`. adopt then runs `volume recover` (so a
-relocated volume Spotlight can find is re-pointed before `setup` would create a
-fresh empty one over it), checks for `work/` files owned by the other Mac's
-account and offers a recursive `chown` if the drive isn't mounted `noowners`,
-and hands off to `setup` for everything it already does right. If this Mac's
-machine-wide volume-relocation symlink already belongs to a different live
-project, `setup` detects that and *offers* — never silently does — to switch it.
-`mackas adopt --help` has the full flag list.
+| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`. |
+| `$MACKAS_BASE/gitconfig` | **Generated**: forwarded as `GITCONFIG_FILE` so git can operate on `/repo` despite the virtiofs ownership quirk ([architecture.md](docs/architecture.md#git-dubious-ownership--the-blocker)). Never written over a `GITCONFIG_FILE` you already export. |
 
 ## Configuration
 
@@ -457,92 +345,63 @@ Precedence, lowest to highest:
 built-in defaults  ->  config file  ->  environment  ->  command-line flags
 ```
 
-Config file, first match wins:
+Config file, first match wins: `$MACKAS_CONF`, then
+`~/.config/mackas/config`, then `~/.mackas.conf`. `./mackas.conf` is
+deliberately **not** searched: the config is sourced as shell, so a cwd
+config would let any untrusted tree you `cd` into (an unpacked tarball, a
+cloned repo) run code the moment you invoke `mackas`. To use a per-project
+config, name it out loud — `mackas --config ./mackas.conf ...` — and keep
+the file to assignments.
 
-1. `$MACKAS_CONF`
-2. `~/.config/mackas/config`
-3. `~/.mackas.conf`
+Every setting is also an environment variable of the same name, and
+`--set NAME=VALUE` overrides both for the one command it rides along with.
+For a *persistent* override use `mackas set MACKAS_MEMORY 48g` / `get`
+(resolved through the full precedence chain) / `unset`. These operate on
+whatever config file the invocation is pointed at, including one that does
+not exist yet — `mackas --config ~/other-project.conf set ...` is how you
+bootstrap a new per-project config. `./mackas status` prints what is in
+effect and which config file (if any) was used.
 
-`./mackas.conf` is deliberately **not** searched. The config is sourced as
-shell, so a cwd config would let any untrusted tree you `cd` into (an unpacked
-tarball, a cloned repo) run code the moment you invoke `mackas`. To use a
-per-project config, name it out loud: `mackas --config ./mackas.conf ...`.
-
-It is sourced as shell, so keep it to assignments. Every setting is also an
-environment variable of the same name, overridable per-invocation with
-`--set`:
-
-```sh
-MACKAS_MEMORY=48g ./mackas setup         # via the environment
-./mackas --set MACKAS_MEMORY=48g setup   # via a flag; beats the environment
-```
-
-`--set` only affects the one command it rides along with. For a *persistent*
-override — written into the config file so every future invocation picks it
-up too — use `mackas set`/`get`/`unset` instead:
-
-```sh
-./mackas set MACKAS_MEMORY 48g   # persist it
-./mackas get MACKAS_MEMORY       # 48g -- resolved through the full precedence chain
-./mackas unset MACKAS_MEMORY     # remove it again; a no-op if never persisted
-```
-
-These operate on whatever config file the invocation is actually pointed at
-(`--config`/`$MACKAS_CONF`/the default search path above), including one that
-does not exist yet — `mackas --config ~/other-project.conf set ...` is how
-you bootstrap a new per-project config, which matters if you switch between
-several projects' configs in a day.
-
-`./mackas status` prints what is in effect and which config file (if any) was
-used. `mackas.conf.example` has the full annotated list.
+The settings a new user actually needs:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MACKAS_ROOT` | *(no baked-in default; falls back to `$PWD` with a warning)* | Where everything lives. Must be a dir on a case-sensitive volume — `setup` refuses otherwise; see below. |
+| `MACKAS_ROOT` | *(none; falls back to `$PWD` with a warning)* | Where everything lives. Must be a dir on a case-sensitive volume — `setup` refuses otherwise; see below. |
 | `MACKAS_SHORT_LINK` | `$HOME/oe` | Short, space-free symlink to `MACKAS_ROOT`. |
 | `MACKAS_VOLUME_NAME` | `oe-build` | Stem for the three ext4 volumes (`-tmp`, `-dl`, `-sstate`). Must be space-free. |
 | `MACKAS_VOLUME_SIZE_TMP` | `120G` | Cap on the TMPDIR volume. |
 | `MACKAS_VOLUME_SIZE_DL` | `40G` | Cap on the downloads volume. |
 | `MACKAS_VOLUME_SIZE_SSTATE` | `40G` | Cap on the sstate volume. |
-| `MACKAS_RELOCATE_VOLUMES` | `1` | Symlink container's volume dir onto the SSD. |
 | `KAS_IMAGE` | `ghcr.io/siemens/kas/kas:5.4` | kas container image. |
 | `MACKAS_CPUS` | physical cores − 2 | Passed as `-c`. |
 | `MACKAS_MEMORY` | ⅔ of host RAM | Passed as `-m`. |
-| `MACKAS_PROJECT_URL` | *(no baked-in default)* | Repo `setup` clones. With this empty, `setup` skips the checkout step entirely; `smoketest` offers qualcomm-linux/meta-ai for one ephemeral run instead. |
+| `MACKAS_PROJECT_URL` | *(empty)* | Repo `setup` clones. Empty: `setup` skips the checkout step; `smoketest` offers meta-ai for one ephemeral run. |
 | `MACKAS_PROJECT_BRANCH` | *(empty)* | Branch to check out. |
 | `MACKAS_PROJECT_DIR` | *(empty)* | Checkout name under `work/`; also the cwd kas runs in. |
 | `MACKAS_KAS_CONFIG` | *(empty)* | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
-| `MACKAS_KAS_AUTO_FRAGMENT` | `1` | The env.sh `kas-container` wrapper also appends `macos-local.yml` onto a hand-typed file list. Set `0` to compose it yourself instead. |
-| `MACKAS_RESIZE_IMAGE` | *(the kas image)* | Image `volume resize` runs `resize2fs` from. The kas image has **no** e2fsprogs, so in-place growth needs one you supply; without it, resize offers to copy into a new volume instead. |
-| `MACKAS_KAS_AUTO_PROJECT` | `1` | The same wrapper derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that file list and exports them into your shell (never to a config file, never over a value you set). Set `0` to disable. |
-| `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty means one build rung with no `--target`, so kas builds its own default; see [mackas.conf.example](mackas.conf.example) for meta-ai's ladder as an example override. |
-| `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |
-| `MACKAS_OVERHEAD_INTERVAL` | `5` | Seconds between host-overhead samples. Spikes shorter than this are invisible. |
-| `MACKAS_FSTRIM_AUTO` | `1` | `fstrim` the three volumes before and after every kas run, so the sparse images don't ratchet up. Set `0` to disable. |
-| `MACKAS_BUILDSTATS_ACCUMULATE` | `0` | Clear `tmp/buildstats` before every kas run (default). Set `1` to let it accumulate instead — see [Getting build outputs off the volume](#getting-build-outputs-off-the-volume) for why this matters for a project whose `BUILDNAME` doesn't vary per build. |
-| `MACKAS_MONITOR` | `0` | Opt a build into the live bitbake progress bridge (see [Watching a build live](#watching-a-build-live)). Off by default: it mounts an overlay, shadows the container's `bitbake` and runs a background HTTP thread on every build. |
-| `MACKAS_MONITOR_PORT` | `8801` | Host port the bridge publishes and `mackas monitor` polls. |
-| `MACKAS_MONITOR_NOTIFY` | `0` | `mackas monitor` also posts a macOS notification on build start/success/failure (same as `--notify`). Needs a one-time Notification Center grant — see `mackas monitor --help`. |
-| `MACKAS_USE_HTTP_MIRRORS` | `0` | Opt in to HTTP mirrors. **Optional** — see [storage.md](docs/storage.md). |
-| `MACKAS_USE_NFS_MIRRORS` | `0` | Opt in to NFS mirrors. **Optional**, and not the recommended mirror path — see [storage.md](docs/storage.md). |
-| `MACKAS_FREE_SPACE_MARGIN_GB` | `20` | Headroom `check` insists on. |
+| `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty: one build rung with no `--target`. |
+| `MACKAS_MONITOR` | `0` | Opt builds into the live progress bridge ([above](#watching-a-build-live)). |
 
-`MACKAS_ROOT` has no baked-in default, deliberately: OE needs a case-sensitive
+[mackas.conf.example](mackas.conf.example) is the authoritative, annotated
+full list — mirrors, the host-overhead sampler, auto-`fstrim`, buildstats
+accumulation, monitor port/notifications, `volume resize`'s e2fsprogs image,
+volume relocation, the free-space margin, and the rest all live there.
+`MACKAS_CONTAINER_BIN` (read by `bin/docker`) overrides which `container`
+binary the shim calls; it exists so the test suite can point the shim at a
+mock.
+
+`MACKAS_ROOT` has no default deliberately: OE needs a case-sensitive
 filesystem, and a stock Mac's boot volume — so `$HOME` — is case-insensitive
-APFS, so there is no `$HOME`-based default that would actually work. Leave it
-unset and every command falls back to the current directory (with a red
-warning) rather than refuse outright — useful for a quick look, not for a real
-build. `setup` goes further: if `work/` (the layer checkouts — the only part
-that needs case sensitivity) probes case-insensitive, it offers to create a
-case-sensitive APFS sparse image (`MACKAS_WORKSPACE_SIZE`, default `40G`,
-sparse) and mount it at `work/`, preserving any existing checkout; decline,
-and it **refuses to proceed** (`die`, exit 1) rather than finish "Done" on a
-root that would corrupt the layer checkouts on the very first build. (That
-gate is `MACKAS_REQUIRE_CASE_SENSITIVE=1` by default; set it to `0` only if
-the case-sensitive parts genuinely live elsewhere.)
-
-Make a case-sensitive volume once and point `MACKAS_ROOT` at a directory on
-it:
+APFS, so no `$HOME`-based default would actually work. If `work/` (the layer
+checkouts — the only part that needs case sensitivity) probes
+case-insensitive, `setup` offers to create a case-sensitive APFS sparse
+image (`MACKAS_WORKSPACE_SIZE`, default `40G`, sparse) and mount it at
+`work/`, preserving any existing checkout; decline, and it **refuses to
+proceed** (`die`, exit 1) rather than finish "Done" on a root that would
+corrupt the layer checkouts on the first build. That gate is
+`MACKAS_REQUIRE_CASE_SENSITIVE=1` by default; set `0` only if the
+case-sensitive parts genuinely live elsewhere. Or make a case-sensitive
+volume once and point `MACKAS_ROOT` at it:
 
 ```sh
 diskutil apfs addVolume <disk> "Case-sensitive APFS" oe   # see: diskutil list
@@ -553,10 +412,6 @@ hdiutil attach ~/oe.sparseimage
 
 A space in the volume name is fully supported (the short symlink and careful
 quoting handle it); `check` still warns, since some recipes mishandle spaces.
-
-`MACKAS_CONTAINER_BIN` (read by `bin/docker`) overrides which `container`
-binary the shim calls; it exists so the test suite can point the shim at a
-mock.
 
 ### Env prefix: `MACKAS_*`
 
@@ -573,8 +428,8 @@ The design decisions, the negative results, and the reasons behind both:
 
 | Page | What is in it |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | The `docker` shim; git "dubious ownership" (the blocker that stood between a failing and a passing parse); the ext4 volumes and how they actually get mounted; the short symlink; resources; case sensitivity. |
-| [docs/storage.md](docs/storage.md) | What lives where and why; HTTP mirrors and their client config; serving local files instead of bind-mounting them; NFS inside the container (a dead end); disk images on network shares; Time Machine. |
+| [docs/architecture.md](docs/architecture.md) | The `docker` shim; git "dubious ownership" (the blocker that stood between a failing and a passing parse); the ext4 volumes and how they actually get mounted; running kas-container by hand; the short symlink; resources; case sensitivity. |
+| [docs/storage.md](docs/storage.md) | What lives where and why; HTTP mirrors and their client config; serving local files instead of bind-mounting them; NFS inside the container (a dead end); disk images on network shares; volume caps, fstrim, move, resize; Time Machine. |
 | [docs/mirror-server.md](docs/mirror-server.md) | `mackas-mirrord`'s threat model, and the bugs a review found in it. |
 | [docs/performance.md](docs/performance.md) | What a build costs the Mac, measured: host CPU/RSS overhead, local SSD vs a network share, sstate economics. |
 | [docs/homebrew.md](docs/homebrew.md) | What actually depends on Homebrew, and what it would take to stop. |
@@ -594,10 +449,10 @@ The design decisions, the negative results, and the reasons behind both:
   is [a dead end](docs/storage.md#nfs-inside-the-container--a-dead-end).
 - `container` v1.1.0 has no `container system property set`, so per-container
   cpu/memory must be passed on every run.
-- **A container volume cannot be grown after creation.** Getting
-  `MACKAS_VOLUME_SIZE_TMP`/`_DL`/`_SSTATE` badly wrong means deleting that
-  volume and recreating it. Splitting TMPDIR from the caches limits the blast
-  radius: resizing TMPDIR no longer costs you sstate.
+- **Apple `container` cannot resize a volume.** `mackas volume resize` grows
+  one anyway (sparse-image extend + daemon metadata + `resize2fs`), but only
+  grows — shrinking means copying into a new volume. Splitting TMPDIR from
+  the caches limits the blast radius: resizing TMPDIR never costs you sstate.
 - **`DL_DIR`/`SSTATE_DIR` live inside ext4 images and are not visible from
   macOS** — the deliberate cost of correct filesystem semantics. Read them
   via `mackas shell`, or serve them with `mackas-mirrord`.
@@ -610,72 +465,37 @@ The design decisions, the negative results, and the reasons behind both:
   Apple's 4 CPUs / 1 GB, and whatever kas version that install happens to
   be. `check` reports which one wins.
 
-## Status
+## Verification status
 
-What has and has not been verified. See [TODO.md](TODO.md) for the full list.
+The claim of "no aarch64-host blockers" rests on completed builds of real
+targets — all on macOS/aarch64 via Apple `container`, with the meta-ai layer
+set — not on the absence of restrictions in the recipes:
 
-**The plumbing is verified.** A real `kas-container checkout` ran end-to-end,
-git clone over HTTPS worked, and files landed on the host owned by the
-invoking user. `container volume create` produces a genuine sparse ext4 with
-working hardlinks. `setup` has run for real — including into a temporary
-`MACKAS_ROOT` *containing spaces* — producing the volumes, checkout,
-`kas-container` and `env.sh` that `mackas status` reports.
+- `setup` runs end to end, including into a `MACKAS_ROOT` *containing spaces*; `container volume create` produces a genuine sparse ext4 with working hardlinks; git clones over HTTPS land on the host owned by the invoking user.
+- `bitbake -p`: 2006 recipes parse, 0 errors — after four fixes, all encoded in `mackas`, of which git's ["dubious ownership"](docs/architecture.md#git-dubious-ownership--the-blocker) refusal on `/repo` was the actual blocker.
+- `bitbake bash`, from scratch: 4491 tasks attempted, none reused, all succeeded; 1938.9 s wall (32.3 min), 64.3% CPU.
+- `bitbake tensorflow-lite`: 4716 tasks attempted, 4468 not rerun, all succeeded — **sstate reuse across builds works**; real artifact `/build/tmp/deploy/ipk/cortexa57/tensorflow-lite-tools_2.20.0-r0_cortexa57.ipk`.
+- `bitbake llama-cpp`: 1371 tasks attempted, 1349 not rerun, all succeeded — the whole meta-ai ladder green.
+- `kas-container shell` via `env.sh`: `/dev/vdc on /build type ext4 (rw,relatime)`, `nproc` 19 (18+1) — the volumes and limits reach a real container.
 
-**The build is verified too — by observation, not inference.** All of this
-ran on macOS/aarch64 via Apple `container`:
+What that build cost the Mac, and the `do_configure` parallelism problem it
+exposes, are measured in
+[docs/performance.md](docs/performance.md#what-a-from-scratch-bash-build-costs).
 
-- **`bitbake -p`**: 2006 recipes parse, 0 errors — after four fixes, all now
-  encoded in `mackas`, of which git's ["dubious
-  ownership"](docs/architecture.md#git-dubious-ownership--the-blocker)
-  refusal on `/repo` was the actual blocker.
-- **`bitbake bash`, from scratch**: `Attempted 4491 tasks of which 0 didn't
-  need to be rerun and all succeeded.` 1938.9 s wall (32.3 min), 64.3% CPU.
-- **`bitbake tensorflow-lite`**, a real meta-ai target: `Attempted 4716 tasks
-  of which 4468 didn't need to be rerun and all succeeded` — **sstate reuse
-  across builds works**. Real artifacts, listed inside the container:
-  `/build/tmp/deploy/ipk/cortexa57/tensorflow-lite-tools_2.20.0-r0_cortexa57.ipk`.
-- **`bitbake llama-cpp`**, the last of meta-ai's smoketest targets: `Attempted
-  1371 tasks of which 1349 didn't need to be rerun and all succeeded` — so the
-  whole meta-ai ladder (`bash`, `tensorflow-lite`, `llama-cpp`) is green on
-  macOS/aarch64.
-- **`kas-container shell` via `env.sh`**: `/dev/vdc on /build type ext4
-  (rw,relatime)`, `nproc` 19 (18+1) — the volumes and limits reach a real
-  container.
-
-So "no aarch64-host blockers" rests on a completed build of a real target,
-not on the absence of restrictions in the recipes.
-
-From `bash`'s buildstats: **14.45× parallelism** (28,016 s CPU / 1939 s wall)
-against 18 allocated CPUs, and **78.9 GB written vs 4.6 GB read** — which is
-why TMPDIR is on local ext4. The same `do_configure` parallelism problem shows
-up again, measured in more detail, in
-[docs/performance.md](docs/performance.md).
-
-**The mirror server** works locally: a real process, real HTTP, auth
-accepted and rejected, traversal and symlink escapes refused,
-`Range`/`If-Modified-Since`/405/404 correct, TLS 1.2+ against an
-`openssl`-generated cert, `~/.netrc` auth, clean `SIGTERM`. An independent
-review then found real, proven exploits — TOCTOU escape via an intermediate
-directory, header-memory flood, a TLS handshake wedging the accept loop, CL.0
-smuggling, PBKDF2 as a CPU amplifier — all fixed;
-[docs/mirror-server.md](docs/mirror-server.md) describes the code as it now
-stands.
-
-A real `container run` alpine **can** reach an HTTP server on the Mac itself,
-via both the vmnet gateway (`192.168.64.1`) and the Mac's LAN IP, with Basic
-auth
+The mirror server serves real HTTP correctly (`Range`, `If-Modified-Since`,
+405/404, TLS 1.2+, `~/.netrc` auth, clean `SIGTERM`), refuses traversal and
+symlink escapes, and has survived an independent review that found — and
+fixed — proven exploits; [docs/mirror-server.md](docs/mirror-server.md)
+documents its threat model and hardening. The HTTP mirror path is verified
+against a real build, and a container can reach an HTTP server on the Mac
+via both the vmnet gateway (`192.168.64.1`) and the Mac's LAN IP
 ([details](docs/storage.md#serving-local-files-instead-of-bind-mounting-them)).
-That proves container-to-Mac reachability only, not container-to-LAN-host.
 
-**Still not verified:**
-
-- The NFS mirror path, end to end.
-- The mirror server **against a real mirror host**: it has never been pointed
-  at a populated NFS mount, and no build has ever consumed it. Whether the
-  container can reach such a host over the vmnet NAT is unconfirmed.
-- That `BB_DISKMON_DIRS`'s HALT actually fires at the 2 GiB / 100k inode
-  thresholds. The syntax is confirmed accepted by a real bitbake; the trigger
-  needs a volume driven near full, which no run has done.
+Standing unknowns — an NFS-backed mirror root, the container →
+separate-LAN-host network leg, and whether `BB_DISKMON_DIRS`'s HALT actually
+fires at its 2 GiB / 100k inode thresholds (the syntax is accepted by a real
+bitbake; the trigger needs a volume driven near full, which no run has done)
+— are tracked, with everything else unproven, in [TODO.md](TODO.md).
 
 ## Licence
 

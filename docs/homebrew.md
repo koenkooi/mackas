@@ -34,26 +34,25 @@ kas-container calls exactly three forms: `realpath -e`, `realpath -qe`, and
 `realpath -q --relative-base=DIR`. Stock macOS ships a `realpath` binary
 (`/bin/realpath`), but it is **BSD's**, and BSD's has neither `-e` nor
 `--relative-base` — kas-container fails outright against it
-(`illegal option -- e`). A working one today still comes from
-`brew install coreutils`, which is the actual reason brew stays a dependency.
+(`illegal option -- e`). A working one comes from `brew install coreutils`,
+which is the actual reason brew stays a dependency.
 
-What changed: this used to mean relying on `/opt/homebrew/bin` being on
-`PATH` in the right order, which was fragile — `brew install coreutils`
-installs **`grealpath`, not an unprefixed `realpath`** — so an unlucky PATH
-order, or a missing coreutils install with a hand-made symlink left over from
-some earlier session, could silently fall through to the BSD one. `setup`
-now makes this automatic and robust instead: `setup_shim_and_env()` finds a
-real GNU `realpath` (`find_gnu_realpath()` tries `grealpath`, then
-coreutils' `gnubin/realpath`, then any `realpath` on `PATH` that turns out to
-be GNU) and symlinks it into `$MACKAS_BIN`; the generated `env.sh` — its
-`kas-container` wrapper function specifically — then prepends `$MACKAS_BIN`
-to `PATH` on every invocation, so kas-container always finds the GNU one
+The wiring is deliberately not left to the ambient `PATH`, because that is
+fragile: `brew install coreutils` installs **`grealpath`, not an unprefixed
+`realpath`**, so an unlucky PATH order — or a hand-made symlink left over
+from an earlier session with no coreutils behind it — silently falls through
+to the BSD binary. Instead, `setup_shim_and_env()` finds a real GNU
+`realpath` (`find_gnu_realpath()` tries `grealpath`, then coreutils'
+`gnubin/realpath`, then any `realpath` on `PATH` that turns out to be GNU)
+and symlinks it into `$MACKAS_BIN`; the generated `env.sh` — its
+`kas-container` wrapper function specifically — prepends `$MACKAS_BIN` to
+`PATH` on every invocation, so kas-container always finds the GNU one
 regardless of the ambient shell's `PATH`. `check` verifies that shim exists
 and is genuinely GNU coreutils, not merely that *some* `realpath` answers. If
 no GNU realpath can be found at all, `setup` errors with
 `brew install coreutils`.
 
-This makes the WIRING bulletproof, but it does not remove the Homebrew (or
+That makes the wiring robust, but it does not remove the Homebrew (or
 MacPorts) dependency itself — `setup` still needs a GNU coreutils installed
 *somewhere* to symlink from. Actually dropping that dependency is a
 different, not-yet-done idea, tracked as

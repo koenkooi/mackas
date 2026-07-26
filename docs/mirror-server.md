@@ -2,7 +2,7 @@
 
 How to run `mackas-mirrord` and configure bitbake against it is in
 [storage.md](storage.md#http-mirrors--optional-and-not-just-an-nfs-bridge).
-This page is about what it defends against.
+This page is about what it defends against, and why it is built the way it is.
 
 `http.server`'s own documentation says it is "not recommended for production
 use ... only implements basic security checks". `mackas-mirrord` is a
@@ -16,9 +16,52 @@ partial attacker.
 **What it protects:** the rest of the mirror host's filesystem, and (weakly)
 the cache contents, which are build artefacts rather than secrets.
 
-Several rows below describe bugs that were found by review and fixed. They are
-kept as-is-now descriptions, with the disproved reasoning named, because the
-wrong reasoning was plausible enough to ship once.
+Where a defence replaced a plausible-but-wrong design that review caught,
+this page records both — the wrong reasoning was plausible enough to ship
+once, and writing it down is what keeps it from shipping twice.
+
+## Design choices
+
+**Built on `BaseHTTPRequestHandler`, never `SimpleHTTPRequestHandler`.**
+Inheriting `SimpleHTTPRequestHandler` would drag in `translate_path()` (whose
+path handling this server does not trust), the directory-listing generator
+(which leaks the cache's shape), and a `send_head()` whose behaviour would
+have to be audited anyway. `BaseHTTPRequestHandler` does request parsing and
+nothing else; every filesystem decision is made by code in this file that can
+be defended line by line.
+
+**One process, one port, many roots.** The obvious layout is two servers on
+two ports (sstate on 8100, downloads on 8101). Instead one process serves
+both caches under distinct path prefixes —
+`http://host:8100/sstate/...` and `http://host:8100/downloads/...` — because:
+
+- One process means one privilege drop, one TLS context, one credential
+  store, one rate limiter, one systemd unit to harden. Two processes means
+  two of each, and two chances to get one of them wrong.
+- The security-critical code (path resolution) is per-root anyway — it takes
+  the root as an argument — so serving N roots costs no extra attack surface,
+  just a dict lookup.
+- One port is one firewall rule and one TLS certificate.
+- bitbake does not care: `SSTATE_MIRRORS` and `SOURCE_MIRROR_URL` are
+  independent URLs, and a path prefix distinguishes them as well as a port
+  does.
+
+**Privilege drop, in the only correct order.** When started as root with
+`--user`, the drop is `setgroups()` → `setgid()` → `setuid()`, and the order
+is the whole point. `setuid()` first is the classic bug: it discards the root
+privilege that `setgid()` and `setgroups()` require, so the later calls fail
+(silently, if unchecked) and the process keeps root's group memberships —
+including the supplementary groups — while looking unprivileged; anything
+readable by group root stays readable. `setgroups()` must precede `setgid()`
+for the same reason: it needs `CAP_SETGID`, which `setgid()` to a non-root
+group gives away. The result is verified afterwards rather than trusted — a
+partial drop is worse than none, because it looks safe in `ps` and is not —
+and the drop is irreversible (`setuid`, not `seteuid`): a post-drop
+`setuid(0)` must fail, and that too is checked.
+
+**Standard library only, Python 3.7+.** The server must run on a host with no
+pip, no venv, no network install step — scp one file and go.
+(`ThreadingHTTPServer` landed in 3.7.)
 
 ## Filesystem containment
 
@@ -30,31 +73,34 @@ wrong reasoning was plausible enough to ship once.
 | TOCTOU between the check and the open | `open_under_root()` walks from a descriptor on the root, one component at a time (`O_NOFOLLOW\|O_DIRECTORY`, `dir_fd=parent`), closing each parent as it descends, then opens the leaf `O_NOFOLLOW\|O_NONBLOCK` and `fstat`s the descriptor. **The resolved path is never re-opened by string.** |
 | A FIFO or device dropped in the export | `S_ISREG` on the fstat; `O_NONBLOCK` on the leaf open so a FIFO cannot hang the thread. |
 
-The TOCTOU row used to read: *"the file is opened `O_NOFOLLOW` on the
-already-resolved path (which by construction contains no symlinks), then
-`fstat`'d on the descriptor"*. **That reasoning was the bug.** `O_NOFOLLOW`
-governs the **final** component only; the kernel resolves every intermediate
-directory, following symlinks, as normal. An attacker who can write to the
-export could swap an intermediate *directory* for a symlink between
-`realpath()` and `open()`, and the open walked straight through it —
-demonstrated, leaking a secret in four requests. On NFS the window is wide:
-`realpath` costs a round trip per component.
+### Why `O_NOFOLLOW` on a resolved path is not containment
 
-The fix makes containment structural rather than checked-and-hoped: every
-step is relative to a descriptor already held, so there is no name for the
-kernel to re-resolve and nothing to swap — a descriptor keeps pointing at its
-inode even if the directory entry that produced it is replaced a microsecond
-later. `O_NOFOLLOW` on *every* component means a symlink appearing anywhere
-in the chain is refused (ELOOP). The decode-once / refuse-`..` /
-`commonpath` gate is kept as a cheap plausibility check that rejects most
-hostile paths without an `open()`.
+The plausible design — `realpath()` the URL, check containment, then open the
+already-resolved path with `O_NOFOLLOW` (which "by construction contains no
+symlinks") and `fstat` the descriptor — is wrong, and review caught it.
+**That reasoning was the bug.** `O_NOFOLLOW` governs the **final** component
+only; the kernel resolves every intermediate directory, following symlinks,
+as normal. An attacker who can write to the export can swap an intermediate
+*directory* for a symlink between `realpath()` and `open()`, and the open
+walks straight through it — demonstrated, leaking a secret in four requests.
+On NFS the window is wide: `realpath` costs a round trip per component.
+
+The `dir_fd` walk in the table makes containment structural rather than
+checked-and-hoped: every step is relative to a descriptor already held, so
+there is no name for the kernel to re-resolve and nothing to swap — a
+descriptor keeps pointing at its inode even if the directory entry that
+produced it is replaced a microsecond later. `O_NOFOLLOW` on *every*
+component means a symlink appearing anywhere in the chain is refused
+(ELOOP). The decode-once / refuse-`..` / `commonpath` gate is kept as a
+cheap plausibility check that rejects most hostile paths without an
+`open()`.
 
 `openat2(RESOLVE_BENEATH)` would do this in one syscall, but it is Linux 5.6+
 only with no stdlib binding; the walk is pure stdlib and behaves identically
 on the Linux mirror host and on macOS, where the tests run.
 
-Symlink semantics are unchanged: the walk descends the components of the
-*realpath output*, not of the URL, so an intra-root symlink was already
+Symlink semantics are unaffected by the walk: it descends the components of
+the *realpath output*, not of the URL, so an intra-root symlink was already
 resolved and is served, an escaping one was already refused, and a symlink
 appearing *after* the check is the attack, and is refused.
 
@@ -62,11 +108,16 @@ appearing *after* the check is the attack, and is refused.
 
 The sstate **miss** is the dominant request pattern — bitbake probes
 thousands of objects that do not exist — so a miss is: walk, `ENOENT`, `404`.
-No `stat`, no `listdir`, no body. It used to be one `open()`; the `dir_fd`
-walk makes it one open **per path component** (typically three: root,
-hash-prefix directory, leaf). That is the price of containment, it is bounded
-by path depth, and it is small next to the `realpath()` the check already
-does — both are O(components) round trips on NFS.
+No `stat`, no `listdir`, no body. The `dir_fd` walk costs one open **per path
+component** (typically three: root, hash-prefix directory, leaf) rather than
+a single `open()`. That is the price of containment, it is bounded by path
+depth, and it is small next to the `realpath()` the check already does — both
+are O(components) round trips on NFS.
+
+The server speaks HTTP/1.1 with `Content-Length` set on every response so
+keep-alive works — bitbake issues its probe stream over held connections, and
+a fresh TCP (and TLS) handshake per probe would otherwise be most of a miss's
+cost.
 
 ## Credentials and auth
 
@@ -79,11 +130,14 @@ does — both are O(components) round trips on NFS.
 | Password sniffing | **Basic auth over plain HTTP sends the password in the clear.** Use `--tls-cert/--tls-key` (TLS 1.2 minimum) or rely on the IP allowlist on a trusted LAN. |
 | Unauthorized clients | HTTP Basic **and/or** an `ipaddress`-based CIDR allowlist. Allowlist-only is supported and reasonable on a trusted wired LAN. Auth runs **before any filesystem access**, so an unauthenticated client cannot even learn whether a file exists. |
 
-Every request carrying an `Authorization` header used to cost a full
-200k-iteration PBKDF2 — on the order of 0.1s of CPU — before anything was known about the
-client: one cheap HTTP request buying 0.1s of CPU, ~34 req/s to peg a core,
-with the general rate limiter off by default. The KDF being slow is its
-point; being slow on demand, for anyone, is the bug.
+### The verification cache and the KDF budget
+
+Verified naively, every request carrying an `Authorization` header costs a
+full 200k-iteration PBKDF2 — on the order of 0.1s of CPU — before anything is
+known about the client: one cheap HTTP request buying 0.1s of CPU, ~34 req/s
+to peg a core, with the general rate limiter off by default. The KDF being
+slow is its point; being slow on demand, for anyone, is the bug — and that
+naive version is what review found.
 
 The **verification cache is what makes budgeting the KDF safe.** bitbake is
 a legitimate flood: thousands of sstate probes carrying the identical
@@ -126,36 +180,37 @@ amplifier.
 
 ### TLS off the accept loop
 
-`serve()` used to do `httpd.socket = ctx.wrap_socket(httpd.socket,
-server_side=True)`, wrapping the **listening** socket. That turns
-`SSLSocket.accept()` into "accept, then run the whole handshake inline" — in
-`serve_forever`'s single accept loop. One client that completed the TCP
-handshake and then sent zero bytes blocked that loop forever, and with it
-every other client. Not slow: stopped. `--timeout` did not help (applied in
-`StreamRequestHandler.setup()`, which never ran); the connection cap did not
-help (downstream of the block).
+The natural TLS implementation — `httpd.socket = ctx.wrap_socket(httpd.socket,
+server_side=True)`, wrapping the **listening** socket — is wrong, and shipped
+once. It turns `SSLSocket.accept()` into "accept, then run the whole
+handshake inline" — in `serve_forever`'s single accept loop. One client that
+completed the TCP handshake and then sent zero bytes blocked that loop
+forever, and with it every other client. Not slow: stopped. `--timeout` did
+not help (applied in `StreamRequestHandler.setup()`, which never ran); the
+connection cap did not help (downstream of the block).
 
-The handshake now runs in the worker thread — not in `get_request()`, which
-still runs on the accept thread. The accept loop only ever does `accept()`,
-and the handshake happens under the semaphore, already counted against
-`--max-connections`, so a flood of open-and-go-silent clients costs the same
-as any other slow client instead of being a server-wide off switch. The
-accept-time socket timeout arms the deadline before `wrap_socket()` starts
-talking.
+The handshake therefore runs in the worker thread — not in `get_request()`,
+which still runs on the accept thread. The accept loop only ever does
+`accept()`, and the handshake happens under the semaphore, already counted
+against `--max-connections`, so a flood of open-and-go-silent clients costs
+the same as any other slow client instead of being a server-wide off switch.
+The accept-time socket timeout arms the deadline before `wrap_socket()`
+starts talking.
 
 ### Bodies on bodyless methods
 
-No method here takes a body, so nothing ever called `rfile.read()`. A GET
+No method here takes a body, so no handler ever calls `rfile.read()` — and a
+handler that simply ignores bodies is exploitable, as review found. A GET
 with `Content-Length: 6` and a body was answered normally, keep-alive stayed
 on, and the six unread bytes sat in the socket buffer — where the next loop
 of `handle_one_request()` parsed them as a **brand-new request line**. One
 request in, two responses out: a smuggling primitive — a proxy or load
-balancer in front counts one request where we count two, and the attacker
-chooses what the second says. `do_OPTIONS` was worst: 204, no body read,
-connection kept alive.
+balancer in front counts one request where the server counts two, and the
+attacker chooses what the second says. `do_OPTIONS` was the worst case: 204,
+no body read, connection kept alive.
 
-The rule is now that nothing reaches a response until the body is off the
-socket or the connection is closed:
+The rule is that nothing reaches a response until the body is off the socket
+or the connection is closed:
 
 | Request | Answer |
 |---|---|
@@ -170,13 +225,13 @@ status ≥ 400, so a smuggled body dies with the connection.
 
 ### Header memory
 
-The limits used to be checked in `parse_request()`, and the comment claimed
-that bounded our memory. It did not: by the time `parse_request()` can look
-at `self.headers`, `http.client.parse_headers()` has already read the whole
+Checking header limits in `parse_request()` cannot bound memory, though a
+comment once claimed it did: by the time `parse_request()` can look at
+`self.headers`, `http.client.parse_headers()` has already read the whole
 header block — up to `_MAXHEADERS` (100) lines of `_MAXLINE` (65536) bytes
-each, **~6.6 MB per connection buffered before the first check ran**, ~420 MB
-an unauthenticated client could pin at `--max-connections 64`. The 431 we
-then sent was an autopsy, not a defence.
+each, **~6.6 MB per connection buffered before the first check runs**, ~420 MB
+an unauthenticated client could pin at `--max-connections 64`. A 431 sent at
+that point is an autopsy, not a defence.
 
 The limits have to be enforced by the loop doing the reading, and its only
 knobs are `http.client`'s two module globals. mackas-mirrord sets them at
@@ -201,8 +256,8 @@ Touching a private global is a real trade:
 ## The local file cache (`--cache-dir`) — the server's first write path
 
 Off by default. When `--cache-dir` is unset, none of this code runs and
-behaviour is byte-for-byte what it was before the feature existed — that is
-tested directly (`TestCacheDisabledByDefault`), not just claimed.
+behaviour is byte-for-byte that of a server without the feature — asserted by
+a regression test (`TestCacheDisabledByDefault`), not just claimed.
 
 **What it does:** once a resolved object has been requested more than
 `--cache-min-hits - 1` times today (default 3, i.e. "more than 2"), a
@@ -218,7 +273,7 @@ NFS/SMB-mounted root.
 | The cache dir cannot become a new escape route | `--cache-dir` is validated like a root (`realpath`'d, must exist or be creatable) plus checked against every `--root` with `os.path.commonpath` in both directions: a cache dir may not be inside a root (which would let a cached copy be re-served as ordinary root content) and a root may not be inside a cache dir (which would let cached copies be fetched directly, bypassing the hit-count policy). |
 | The write path itself cannot be hijacked | The cache dir gets the same discipline as the credential file: the daemon refuses to start if it is group- or world-writable, because anyone who can write there can plant a file that is served as though it were a legitimate cache hit. |
 | A partial write is never served | Every cache write is `mkstemp()` in the same day-directory as the final name, written in full, then `os.replace()` — an atomic same-filesystem rename. A reader either does not find the file yet (falls back to source) or finds it fully written; there is no window with a partial file under the final name. A crash mid-write leaves an orphaned temp file, never a corrupt one served. |
-| Caching cannot become a way to skip auth/allowlist/rate-limiting | A cache hit is served by `serve_file()`, which is reached only after `check_access()` has already run for that request — exactly the same as a source-root response. Verified directly (`test_cached_response_still_goes_through_access_control`). |
+| Caching cannot become a way to skip auth/allowlist/rate-limiting | A cache hit is served by `serve_file()`, which is reached only after `check_access()` has already run for that request — exactly the same as a source-root response. A regression test (`test_cached_response_still_goes_through_access_control`) asserts it. |
 | The dominant sstate-MISS path stays exactly as cheap | Hit-count bookkeeping happens only AFTER the source open confirms a regular file exists — never for a 404. Counting misses too would grow the hit-tracking table by one entry per distinct object bitbake ever probed for (almost all of which never exist), which is unbounded; counting only confirmed hits bounds it by the number of objects this mirror actually ever serves. |
 | Promotion never adds latency to the triggering request | The copy runs on a background thread, bounded by a small semaphore (default 4 concurrent), never on the thread answering the request that crossed the threshold. That request is served from the source root exactly as before; only later requests see the cache. |
 

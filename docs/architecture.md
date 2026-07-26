@@ -3,17 +3,32 @@
 How mackas bridges kas-container to Apple `container` without patching kas.
 See the [README](../README.md) for what mackas is and how to run it.
 
+Two macOS facts shape almost everything below. Apple `container` — the
+native container runtime built on Virtualization.framework — runs each
+container in its own lightweight Linux VM. Host directories reach that VM
+over **virtiofs**, a file-sharing protocol rather than a block device, so a
+bind-mounted directory keeps APFS semantics and picks up virtiofs's
+ownership quirks. Named volumes are different: they are sparse **ext4 disk
+images** attached to the VM as virtual block devices, with real Linux
+filesystem semantics. The mount design below is the result of choosing
+correctly between those two transports.
+
 ## The `docker` shim
 
-kas-container v5.4 picks its engine with, essentially:
+kas-container v5.4 cannot run against Apple `container` unmodified, for two
+reasons. First, engine detection: it picks its engine with, essentially,
 
 ```sh
 command -v docker && docker -v 2>/dev/null | grep -q '^Docker'
 ```
 
-There is no hook for a custom binary and no environment variable to point it
-elsewhere. So `bin/docker` masquerades as the Docker CLI and translates the
-handful of calls kas actually makes:
+and offers no hook for a custom binary and no environment variable to point
+it elsewhere. Second, it passes Docker/Podman options — `--privileged`,
+`--security-opt`, `--userns`, `--group-add` — that Apple `container` does
+not have.
+
+So `bin/docker` masquerades as the Docker CLI and translates the handful of
+calls kas actually makes:
 
 | Call | What the shim does |
 |---|---|
@@ -24,8 +39,8 @@ handful of calls kas actually makes:
 | `docker images`/`ps`/`pull`/`rmi` | Renamed to `container image ls` / `container list` / `container image pull` / `container image rm`. |
 | Anything after the IMAGE positional | Forwarded verbatim, so a `--privileged` inside the container's own command line is never touched. |
 
-Arguments are held in bash arrays throughout and never round-tripped through a
-string, so paths with spaces survive — a build volume named e.g. `My Disk`
+Arguments are held in bash arrays throughout and never round-tripped through
+a string, so paths with spaces survive — a build volume named e.g. `My Disk`
 works, and the suite tests exactly that.
 
 > **The shim must come before `/usr/local/bin` on `PATH`**, where the real
@@ -33,44 +48,45 @@ works, and the suite tests exactly that.
 > `check` reports the actual resolution order. This is the single most likely
 > thing to bite you.
 
-kas's `USER_ID`/`GROUP_ID` privilege drop works under Apple `container`: files
-land on the host owned by you, not root. Verified with a real
-`kas-container checkout` end-to-end.
+kas's `USER_ID`/`GROUP_ID` privilege drop works under Apple `container`:
+files land on the host owned by you, not root, all the way through a full
+`kas-container checkout`.
 
 ## git "dubious ownership" — the blocker
 
-The single bug standing between `bitbake -p` failing and passing, with a
-failure mode that points in entirely the wrong direction. The symptom, inside
-the container:
+Without the gitconfig forwarding described here, `bitbake -p` fails inside
+the container — and the failure mode points in entirely the wrong direction.
+The underlying symptom, inside the container:
 
 ```
 fatal: detected dubious ownership in repository at '/repo'
 ```
 
 **The cause is a virtiofs ownership artifact** — not a kas bug, not a mackas
-bug. Apple `container`'s virtiofs bind mount shows the mount **root** as
-`0:0` while everything **inside** it shows as the host user, on every path
-virtiofs crosses. git's dubious-ownership check (the CVE-2022-24765 fix)
-refuses a repository whose top-level directory it does not own, and `/repo`
-trips exactly that.
+bug. On every path virtiofs crosses, Apple `container`'s bind mount shows
+the mount **root** as `0:0` while everything **inside** it shows as the host
+user. git's dubious-ownership check (the CVE-2022-24765 fix) refuses a
+repository whose top-level directory it does not own, and `/repo` trips
+exactly that.
 
-**Why it was hard to find**: kas's `Repo.get_root_path()` (`kas/repos.py`,
-~line 354, called at ~line 322) runs `git rev-parse --show-toplevel` to
-resolve a url-less repository — meta-ai's own local `kas:` entry is one — and
-**silently falls back to the input path** when git exits non-zero. The
-refusal therefore quietly mis-resolved `BBLAYERS` to `.../kas` (the config
-file's own directory) instead of the repository root, and bitbake died far
-from the cause:
+**Why the failure mode misleads**: kas's `Repo.get_root_path()`
+(`kas/repos.py`, ~line 354, called at ~line 322) runs
+`git rev-parse --show-toplevel` to resolve a url-less repository — meta-ai's
+own local `kas:` entry is one — and **silently falls back to the input
+path** when git exits non-zero. The refusal therefore quietly mis-resolves
+`BBLAYERS` to `.../kas` (the config file's own directory) instead of the
+repository root, and bitbake dies far from the cause:
 
 ```
 file /build/../repo/kas/conf/layer.conf not found
 ```
 
-**The fix — forward `GITCONFIG_FILE`, not a kas patch.** kas-container already
-has the hook: if the host variable `GITCONFIG_FILE` names an existing file, it
-mounts that file read-only at `/var/kas/userdata/.gitconfig` and exports
-`GITCONFIG_FILE` inside the container too (v5.4, line 728). `mackas setup`
-generates `$MACKAS_BASE/gitconfig`:
+**The fix — forward `GITCONFIG_FILE`, not a kas patch.** kas-container
+already has the hook: if the host variable `GITCONFIG_FILE` names an
+existing file, it mounts that file read-only at
+`/var/kas/userdata/.gitconfig` and exports `GITCONFIG_FILE` inside the
+container too (v5.4, line 728). `mackas setup` generates
+`$MACKAS_BASE/gitconfig`:
 
 ```gitconfig
 [safe]
@@ -78,25 +94,25 @@ generates `$MACKAS_BASE/gitconfig`:
 ```
 
 `env.sh` exports `GITCONFIG_FILE` to point at it — unless your shell already
-sets one, which is never clobbered. `mackas smoketest`/`shell` do the equivalent
-directly. Verified: with this in place `git rev-parse --show-toplevel`
+sets one, which is never clobbered. `mackas smoketest`/`shell` do the
+equivalent directly. With this in place, `git rev-parse --show-toplevel`
 returns `/repo` and the full parse succeeds.
 
 `directory = *` trusts every path git is pointed at — do **not** put it in
 your own `~/.gitconfig`. It is acceptable here only because the file is
-forwarded exclusively into a throwaway, single-user container, never onto the
-host. `check` reports whether the file exists and has the entry; if you
+forwarded exclusively into a throwaway, single-user container, never onto
+the host. `check` reports whether the file exists and has the entry; if you
 export your own `GITCONFIG_FILE`, `setup`/`check` warn (without touching it)
 when `safe.directory = *` is missing.
 
 ## The ext4 volumes
 
 `container volume create -s 120G oe-build-tmp` produces a sparse ext4 image
-(`"format":"ext4"`) that the guest sees as `/dev/vdc`. TMPDIR needs it because
-**an APFS bind mount reaching the guest over virtiofs does not provide the
-semantics TMPDIR requires** — hardlinks, permissions, xattrs, case
-sensitivity, correct `rename()`. The ext4 volume does; hardlinks verified
-working inside it.
+(`"format":"ext4"`) that the guest sees as a virtual block device
+(`/dev/vdc`). TMPDIR needs one because **an APFS bind mount reaching the
+guest over virtiofs does not provide the semantics TMPDIR requires** —
+hardlinks, permissions, xattrs, case sensitivity, correct `rename()`. The
+ext4 volume does; hardlinks work inside it.
 
 **TMPDIR on the local ext4 volume is non-negotiable.** See
 [storage.md](storage.md) for what may live elsewhere.
@@ -109,18 +125,15 @@ working inside it.
 | `${MACKAS_VOLUME_NAME}-dl` | `/downloads` | `DL_DIR` | `MACKAS_VOLUME_SIZE_DL=40G` |
 | `${MACKAS_VOLUME_NAME}-sstate` | `/sstate` | `SSTATE_DIR` | `MACKAS_VOLUME_SIZE_SSTATE=40G` |
 
-200G total, the budget this SSD can spare. All three are sparse — ~1.2 MB each
-until used — and independently capped, so a runaway build cannot eat the free
-space Time Machine needs.
+200G total, the budget this SSD can spare. All three are sparse — ~1.2 MB
+each until used — and independently capped, so a runaway build cannot eat
+the free space Time Machine needs.
 
-They are separate so that **`mackas clean` can throw TMPDIR away and keep the
-caches**: TMPDIR is big, churny and rebuildable; downloads and sstate are
-expensive to refill. `mackas destroy` removes all three.
+They are separate so that **`mackas clean` can throw TMPDIR away and keep
+the caches**: TMPDIR is big, churny and rebuildable; downloads and sstate
+are expensive to refill. `mackas destroy` removes all three.
 
 ### How they get mounted, and why `KAS_BUILD_DIR` must stay unset
-
-mackas shipped this wrong for a while: it set `KAS_BUILD_DIR` to an APFS path
-and created the volume without ever mounting it.
 
 kas-container's `forward_dir()` **bind-mounts the host directory** that
 `KAS_BUILD_DIR` / `DL_DIR` / `SSTATE_DIR` name:
@@ -130,9 +143,11 @@ kas-container's `forward_dir()` **bind-mounts the host directory** that
 forward_dir KAS_BUILD_DIR "/build" "rw"     # -v $KAS_BUILD_DIR:/build:rw -e KAS_BUILD_DIR=/build
 ```
 
-So pointing those at a Mac directory puts TMPDIR straight back on APFS over
-virtiofs. `forward_dir()` returns early on an **empty** value, so mackas
-leaves all three blank and mounts the volumes itself:
+Setting any of them to a Mac path therefore puts TMPDIR straight back on
+APFS over virtiofs — the exact thing the volumes exist to avoid. So all
+three **must stay unset**. `forward_dir()` returns early on an **empty**
+value, and that is the hook mackas uses: it leaves all three blank and
+mounts the volumes itself:
 
 ```sh
 kas-container --runtime-args "-c 18 -m 42g \
@@ -141,28 +156,29 @@ kas-container --runtime-args "-c 18 -m 42g \
   -v oe-build-sstate:/sstate -e SSTATE_DIR=/sstate" build ...
 ```
 
-The `-v` supplies a real ext4 at the guest path; the `-e` tells kas to use it
-without kas ever seeing a host path to bind-mount. `--runtime-args` (alias
-`--docker-args`) is a supported kas-container flag, so no kas patch.
+The `-v` supplies a real ext4 at the guest path; the `-e` tells kas to use
+it without kas ever seeing a host path to bind-mount. `--runtime-args`
+(alias `--docker-args`) is a supported kas-container flag, so no kas patch.
 
 > **`KAS_EXTRA_RUNTIME_ARGS` is not an environment variable.** kas-container
 > sets it to `""` unconditionally *before* parsing arguments (v5.4, line
 > 332). Exporting it does nothing — the value is discarded and every
 > container silently runs at Apple's defaults of **cpus=4, memory=1gb**,
 > which bitbake will thrash or OOM on. The `--runtime-args` flag is the only
-> way in. mackas exported it for a while; that is how this shipped once.
+> way in.
 
 `mackas` word-splits nothing itself, but kas-container expands
 `${KAS_EXTRA_RUNTIME_ARGS}` unquoted, so no value inside that string may
-contain a space. That is why `MACKAS_VOLUME_NAME` must be space-free, and why
-`setup` refuses a name that isn't.
+contain a space. That is why `MACKAS_VOLUME_NAME` must be space-free, and
+why `setup` refuses a name that isn't.
 
 ### The chown — a fresh volume is `root:root`
 
-A named volume is a real Linux filesystem, so its root is really `root:root`
-— invisible with a bind mount, where virtiofs forces host-user ownership onto
-everything, which is exactly why this bug hid behind the dubious-ownership
-one. kas drops to `USER_ID`/`GROUP_ID` and dies:
+A named volume is a real Linux filesystem, so its root really is
+`root:root`. A bind mount can never show this — virtiofs forces host-user
+ownership onto everything it crosses — which makes the failure specific to
+named volumes and easy to misattribute to the dubious-ownership quirk above.
+kas drops to `USER_ID`/`GROUP_ID` and dies:
 
 ```
 PermissionError: [Errno 13] Permission denied: '/build/CACHEDIR.TAG'
@@ -179,22 +195,22 @@ container run --rm -u 0:0 -v oe-build-tmp:/mnt ghcr.io/siemens/kas/kas:5.4 \
 
 `check` reports each volume's actual ownership and the command to fix it.
 
-This chown is also the reason `setup`'s volumes step can sit there for a few
-seconds with no output: `container volume create` itself is near-instant
-(measured: 0.21s for a 120 GiB sparse image), but the chown boots a
-throwaway VM per volume, and that boot is the real, opaque wait. Rather than
-look hung, `setup` wraps it in a live elapsed-time spinner (`spin()` in
-`mackas`) — honestly just ticking seconds, not a fake percentage, since the
-VM boot streams no real progress to show. It degrades to plain output when
-not attached to a terminal (piped, `nohup`, CI), so test output is
-unaffected. The one place `setup` *can* show a genuine bar with an ETA is the
-relocate step's `rsync` (a real byte-for-byte copy with a known total) —
-`--info=progress2` on a terminal, when the host's `rsync` supports it.
+The chown is also why `setup`'s volumes step can sit there for a few seconds
+with no output: `container volume create` itself is near-instant (~0.2 s for
+a 120 GiB sparse image), but the chown boots a throwaway VM per volume, and
+that boot is the real, opaque wait. Rather than look hung, `setup` wraps it
+in a live elapsed-time spinner (`spin()` in `mackas`) — honestly just
+ticking seconds, not a fake percentage, since the VM boot streams no real
+progress to show. It degrades to plain output when not attached to a
+terminal (piped, `nohup`, CI), so test output is unaffected. The one place
+`setup` *can* show a genuine bar with an ETA is the relocate step's `rsync`
+(a real byte-for-byte copy with a known total) — `--info=progress2` on a
+terminal, when the host's `rsync` supports it.
 
 ### The consequence: the caches are not host-visible
 
-Being ext4 images rather than directories, `DL_DIR` and `SSTATE_DIR` cannot be
-browsed, backed up, rsynced or grepped from macOS. A deliberate trade:
+Being ext4 images rather than directories, `DL_DIR` and `SSTATE_DIR` cannot
+be browsed, backed up, rsynced or grepped from macOS. A deliberate trade:
 correctness beats convenience for a cache bitbake owns. To look inside, go
 through the guest — `mackas shell`, then `ls /downloads`.
 
@@ -203,45 +219,56 @@ mount: `mackas-mirrord` serves them read-only over HTTP, bitbake's own
 supported mechanism. See
 [storage.md](storage.md#serving-local-files-instead-of-bind-mounting-them).
 
-### Running `kas-container` by hand
+## Running `kas-container` by hand
 
-`env.sh` defines `kas-container` as a **shell function** that supplies
-`--runtime-args "$MACKAS_RUNTIME_ARGS"`, blanks
-`KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, and — unless `MACKAS_KAS_AUTO_FRAGMENT=0`
-— appends the generated `macos-local.yml` fragment onto the file-list
-argument of `build`/`shell`/`checkout`, resolved fresh from `$PWD` on every
-call rather than baked in at generation time (the supported flow `cd`s to
-`work/`, the parent of every layer checkout, not into the project itself —
-see the main README). The file-list argument is not always immediately
-after the subcommand — kas's own config argument accepts options first (e.g.
-`shell -k <files>`, exactly what `bitbake_getvar()` itself passes, or
-`--skip STEP` repeated, the repo-state-preserving alternative to `-k` this
-project's own docs recommend) — so the wrapper scans past known boolean
-flags (`-k`/`--keep-config-unchanged`, `--force-checkout`, `--update`,
+`env.sh` defines `kas-container` as a **shell function**, so a hand-typed
+kas command in a sourced shell builds against the same volumes, limits and
+config fragment as mackas's own commands. The wrapper:
+
+- supplies `--runtime-args "$MACKAS_RUNTIME_ARGS"` (the volume mounts and
+  the `-c`/`-m` limits);
+- blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`;
+- unless `MACKAS_KAS_AUTO_FRAGMENT=0`, appends the generated
+  `macos-local.yml` fragment onto the file-list argument of
+  `build`/`shell`/`checkout`, resolved fresh from `$PWD` on every call
+  rather than baked in at generation time (the supported flow `cd`s to
+  `work/`, the parent of every layer checkout, not into the project itself —
+  see the main README).
+
+The file-list argument is not always immediately after the subcommand —
+kas's own config argument accepts options first (e.g. `shell -k <files>`,
+exactly what `bitbake_getvar()` itself passes, or `--skip STEP` repeated,
+the repo-state-preserving alternative to `-k` this project's own docs
+recommend). So the wrapper scans past known boolean flags
+(`-k`/`--keep-config-unchanged`, `--force-checkout`, `--update`,
 `-E`/`--preserve-env`) and known value flags (`--skip`/`--target`/`-c`/
 `--cmd`/`--task`/`--provenance`, consuming their separate argument too, the
 single-token `--x=y` form included) to find it, and backs off untouched if
 it meets any other option it does not recognize, rather than guess wrong.
 `dump`/`menu` are deliberately not covered: their positional argument is not
-a plain kas file list the same way. Typing `kas-container build ...` in a
-sourced shell therefore does the right thing; `command kas-container`, an absolute path,
-or an unsourced shell bypasses the wrapper and builds with no volumes, no
-limits, and no auto-appended fragment. `mackas status` prints the exact
-`--runtime-args` in effect.
+a plain kas file list the same way.
 
-That same argument scan feeds a second job: unless `MACKAS_KAS_AUTO_PROJECT=0`,
-`_mackas_derive_project()` turns the file list into `MACKAS_PROJECT_DIR` and
-`MACKAS_KAS_CONFIG` and **exports them into the calling shell**. This exists
-because driving kas by hand sets neither, and `bitbake_getvar()` refuses
-without `MACKAS_PROJECT_DIR` (it is what `MACKAS_PROJECT` — the directory kas
-is run from — derives from), which in turn makes `retrieve` and `buildstats
-analyze` fail or fall back to OE-core default paths a distro has redefined.
-That failure was hit repeatedly in real use, and the file list already
-contains the answer.
+Typing `kas-container build ...` in a sourced shell therefore does the right
+thing. `command kas-container`, an absolute path, or an unsourced shell
+bypasses the wrapper and builds with no volumes, no limits, and no
+auto-appended fragment. `mackas status` prints the exact `--runtime-args` in
+effect.
 
-The rules are deliberately narrow, because a *wrong* derivation is worse than
-none — it produces a config that parses and then resolves against the wrong
-tree:
+### Deriving `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG`
+
+The same argument scan feeds a second job: unless
+`MACKAS_KAS_AUTO_PROJECT=0`, `_mackas_derive_project()` turns the file list
+into `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG` and **exports them into
+the calling shell**. Driving kas by hand sets neither, and
+`bitbake_getvar()` refuses without `MACKAS_PROJECT_DIR` (it is what
+`MACKAS_PROJECT` — the directory kas is run from — derives from), which in
+turn makes `retrieve` and `buildstats analyze` fail or fall back to OE-core
+default paths a distro has redefined. The file list already contains the
+answer, so the wrapper derives it.
+
+The rules are deliberately narrow, because a *wrong* derivation is worse
+than none — it produces a config that parses and then resolves against the
+wrong tree:
 
 - **From `work/`** (the documented cwd), the first colon-entry's leading path
   component names the checkout; it is stripped from every entry to give the
@@ -256,32 +283,68 @@ tree:
   different build.
 - **Any other cwd** derives nothing.
 
-Derivation runs *before* the fragment is appended, so `macos-local.yml` never
-lands in the derived `MACKAS_KAS_CONFIG` (`compose_kas_files()` adds it back
-itself, and a doubled entry is a kas parse error). Values already set in the
-environment always win, and nothing is ever written to a config file — the
-same ephemeral philosophy as `setup`'s own size flags. Since env beats the
-config file in mackas's precedence order, the next `mackas` command in that
-shell picks the derived values up with no further plumbing.
+Derivation runs *before* the fragment is appended, so `macos-local.yml`
+never lands in the derived `MACKAS_KAS_CONFIG` (`compose_kas_files()` adds
+it back itself, and a doubled entry is a kas parse error). Values already
+set in the environment always win, and nothing is ever written to a config
+file — the same ephemeral philosophy as `setup`'s own size flags. Since env
+beats the config file in mackas's precedence order, the next `mackas`
+command in that shell picks the derived values up with no further plumbing.
+
+### `-k` bundles five steps, and dropping it resets repos
+
+`-k`/`--keep-config-unchanged` is not the narrow flag its name suggests. It
+skips five steps at once (`kas/libkas.py`,
+`setup_parser_keep_config_unchanged_arg`): `setup_dir`,
+`finish_setup_repos`, `repos_checkout`, `repos_apply_patches` **and**
+`write_bbconfig`. Two consequences follow, and they pull in opposite
+directions.
+
+Because `write_bbconfig` is skipped, a checkout configured *without* the
+`macos-local.yml` fragment does not pick it up by adding it to the file list
+and re-running with `-k`: kas reuses the `conf/local.conf` already on disk.
+
+Because the repo steps are also skipped, simply dropping `-k` to force that
+rewrite re-runs `repos_checkout` and `repos_apply_patches`, which reset every
+declared repo to its pinned revision and re-apply patches. On a checkout with
+local commits that is destructive, not merely slow.
+
+Skip the four repo-touching steps individually and leave `write_bbconfig`
+alone:
+
+```sh
+kas-container shell --skip setup_dir --skip finish_setup_repos \
+  --skip repos_checkout --skip repos_apply_patches meta-angstrom/kas/base.yml
+```
+
+That regenerates `local.conf`/`bblayers.conf` with the fragment composed in
+without touching any repo. `-k` is safe afterwards, since the fragment's
+settings are then baked into the file it keeps unchanged.
+
+This is the same rule mackas follows internally: `bitbake_getvar()` is a
+read-only query and passes exactly those four `--skip` flags unconditionally,
+so no variable lookup — and therefore no `mackas retrieve` or `buildstats
+analyze` — can ever reset a checkout.
 
 ## Live build progress: the monitor bridge
 
 A build inside the container reports nothing to macOS in real time beyond
 mackas's own rung/log lines. `MACKAS_MONITOR=1` (off by default) adds a live
-progress feed; `mackas monitor` polls it. Like `mackas-mirrord`, it is an HTTP
-server that only makes sense next to the build — but it runs **inside** the
-build's own container, published to the host over Apple `container`'s `-p`,
-rather than being a separate process on the Mac.
+progress feed; `mackas monitor` polls it. Like `mackas-mirrord`, it is an
+HTTP server that only makes sense next to the build — but it runs **inside**
+the build's own container, published to the host over Apple `container`'s
+`-p`, rather than being a separate process on the Mac.
 
-The hard part is that bitbake refuses to be *observed*. Two earlier designs
-bootstrapped a bitbake server and attached a second `--observe-only` client;
-both failed structurally — a "Cooker is busy" registration race, and an
-unavoidable crash because bb's server-side readonly-command allowlist refuses an
-observer from ever calling `updateConfig`, so no client-side workaround exists.
+**The bridge is a UI client, not an observer, because bitbake refuses to be
+observed.** Bootstrapping a bitbake server and attaching a second
+`--observe-only` XMLRPC client is a structural dead end, twice over:
+registration races the busy cooker ("Cooker is busy"), and bb's server-side
+readonly-command allowlist refuses an observer from ever calling
+`updateConfig`, so the resulting crash has no client-side workaround.
 
-So the bridge is not an observer. It is the **first and only UI client** —
-bitbake believes it is running its normal `knotty` terminal UI. Two pieces make
-that happen, both under `mackas-uibridge/`:
+So the bridge is the **first and only UI client** — bitbake believes it is
+running its normal `knotty` terminal UI. Two pieces make that happen, both
+under `mackas-uibridge/`:
 
 - **`mackasjson.py`** is a bitbake UI module (`bb.ui.mackasjson`). Its `main()`
   does not reimplement the terminal UI: it wraps `eventHandler` in a thin tee
@@ -303,21 +366,22 @@ that happen, both under `mackas-uibridge/`:
   mount-substitution technique kas-container itself uses for its `.git` overlay
   — the real checkout on disk is never modified.
 
-`monitor_runtime_args()` (in `mackas`) assembles the mounts and the `-p` publish
-when `MACKAS_MONITOR=1`, appending them to `--runtime-args`. It is best-effort
-and never fatal — an opt-in extra, not something a build should fail over — so
-it silently skips when there is no checkout yet or a path involved contains a
-space (which would corrupt the whitespace-split `--runtime-args` string). Both
-files are mounted as **individual single-file `-v`s**, never a directory mount
-plus a mount of a file inside it: Apple `container` (verified live) silently
-drops the first mount whenever a second `-v`'s host source is nested inside the
-first's host directory, even with unrelated container-side targets.
+`monitor_runtime_args()` (in `mackas`) assembles the mounts and the `-p`
+publish when `MACKAS_MONITOR=1`, appending them to `--runtime-args`. It is
+best-effort and never fatal — an opt-in extra, not something a build should
+fail over — so it silently skips when there is no checkout yet or a path
+involved contains a space (which would corrupt the whitespace-split
+`--runtime-args` string). Both files are mounted as **individual single-file
+`-v`s**, never a directory mount plus a mount of a file inside it: Apple
+`container` silently drops the first mount whenever a second `-v`'s host
+source is nested inside the first's host directory, even with unrelated
+container-side targets.
 
-`tools/mackas-monitor` is the host-side poller `mackas monitor` runs — stdlib
-Python, polling `http://127.0.0.1:<port>/` every 2 s (`POLL_INTERVAL`) and
-printing `[status] done/total  recipe:task` until the build reports
-`success`/`failed`, or once with `--once`. It only reads an already-published
-port; it never starts a build.
+`tools/mackas-monitor` is the host-side poller `mackas monitor` runs —
+stdlib Python, polling `http://127.0.0.1:<port>/` every 2 s
+(`POLL_INTERVAL`) and printing `[status] done/total  recipe:task` until the
+build reports `success`/`failed`, or once with `--once`. It only reads an
+already-published port; it never starts a build.
 
 ## The short symlink
 
@@ -326,11 +390,12 @@ everything runs through it. Two reasons:
 
 - **Spaces.** A long tail of recipes and third-party build scripts mishandle
   spaces in paths.
-- **Path length.** macOS caps AF_UNIX socket paths at ~104 chars, and bitbake
-  puts `${TOPDIR}/bitbake.sock` there (kas issue #38). Under Apple
-  `container` the bind actually lands inside the guest at
-  `/build/bitbake.sock`, so the limit rarely bites, but short host paths cost
-  nothing. `check` computes the real number.
+- **Path length.** macOS caps AF_UNIX socket paths at ~104 characters (the
+  size of `sockaddr_un.sun_path` in its BSD userland), and bitbake puts
+  `${TOPDIR}/bitbake.sock` there (kas issue #38). Under Apple `container`
+  the bind actually lands inside the guest at `/build/bitbake.sock`, so the
+  limit rarely bites, but short host paths cost nothing. `check` computes
+  the real number.
 
 `$HOME/oe` over `/opt/oe`: `/opt` is `root:wheel` and needs sudo. Set
 `MACKAS_SHORT_LINK=/opt/oe` for the extra six characters.
@@ -338,15 +403,16 @@ everything runs through it. Two reasons:
 ## Resources
 
 Apple `container` defaults to **cpus=4, memory=1gb per container** — nowhere
-near enough for bitbake — and v1.1.0 has no `container system property set` to
-change the default. So `-c`/`-m` are passed on every run via `--runtime-args`.
-Defaults: physical cores − 2, and two thirds of RAM.
+near enough for bitbake — and v1.1.0 has no `container system property set`
+to change the default. So `-c`/`-m` are passed on every run via
+`--runtime-args`. Defaults: physical cores − 2, and two thirds of RAM.
 
 Quirk: `nproc` inside the container reports one more than the `-c` value.
 
 ## Case sensitivity
 
-OpenEmbedded breaks in baffling ways on case-insensitive filesystems. `check`
-probes this empirically — it creates files and looks — rather than trusting
-`diskutil`. If nothing is writable yet it falls back to `diskutil` and says
-so.
+macOS formats APFS case-insensitive (case-preserving) by default, and
+OpenEmbedded breaks in baffling ways on case-insensitive filesystems.
+`check` probes this empirically — it creates files and looks — rather than
+trusting `diskutil`. If nothing is writable yet it falls back to `diskutil`
+and says so.

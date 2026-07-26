@@ -92,8 +92,8 @@ downloads (`kas-container`) is hash-checked on every fetch.
 
 ## Hardening you own
 
-- Keep TMPDIR/sstate on local storage you trust — a network-backed volume is
-  slower *and* corruptible on a link drop (see [storage.md](storage.md)).
+- Keep TMPDIR/sstate on local storage you trust — an SMB-backed working volume
+  is slower *and* has corrupted real builds (see [storage.md](storage.md)).
 - Do not enable the mirror on an untrusted network.
 - Treat the OE layers and image contents you build as their own supply-chain
   review; that is out of mackas's scope.
