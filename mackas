@@ -95,6 +95,7 @@ MACKAS_PROJECT_DIR
 MACKAS_KAS_CONFIG
 MACKAS_KAS_AUTO_FRAGMENT
 MACKAS_KAS_AUTO_PROJECT
+MACKAS_RESIZE_IMAGE
 MACKAS_SMOKETEST_TARGETS
 MACKAS_OVERHEAD
 MACKAS_OVERHEAD_INTERVAL
@@ -656,6 +657,20 @@ set_defaults() {
 	# precedence, so a derived value is picked up by the next mackas command
 	# in that shell with no further plumbing.
 	MACKAS_KAS_AUTO_PROJECT=1
+
+	# The image 'volume resize' runs resize2fs from, when growing a volume in
+	# place. Empty means "use KAS_IMAGE".
+	#
+	# It exists because the kas image does NOT ship e2fsprogs -- verified, not
+	# assumed: /sbin is on its PATH and resize2fs is absent from every location
+	# in it (alpine has none either). So an in-place grow needs an image you
+	# supply. mackas will not install one for you: pulling or apt-getting
+	# something behind your back to grow a volume is a bigger surprise than
+	# saying it cannot.
+	#
+	# With no such image, resize is not a dead end -- it offers to copy into a
+	# new volume of the right size instead, which needs no resize2fs at all.
+	MACKAS_RESIZE_IMAGE=""
 
 	# The smoketest ladder's build rungs, space-separated bitbake targets, run
 	# in order after the universal parse-only rung. Empty by default: with no
@@ -6435,6 +6450,107 @@ volume_move() {
 # Apple container does not have (see TODO.md's non-goals). A shrink would have
 # to be copy-and-destroy through a temp volume, which is a different feature.
 # Refuse clearly rather than half-do it.
+# The image an in-place resize runs resize2fs from.
+resize_image() {
+	printf '%s' "${MACKAS_RESIZE_IMAGE:-$KAS_IMAGE}"
+}
+
+# True when that image actually carries resize2fs. Probed by running it, not
+# assumed: the kas image mackas otherwise uses does NOT have e2fsprogs, which
+# is exactly the thing an in-place grow cannot do without.
+image_has_resize2fs() {
+	container run --rm -u 0:0 "$(resize_image)" \
+		sh -c 'command -v resize2fs >/dev/null 2>&1' >/dev/null 2>&1
+}
+
+# Grow by COPYING into a fresh volume, for when no resize2fs is available.
+#
+# Uses only operations already proven to work, and notably needs neither of
+# the two things the in-place path depends on: no hand-edited entity.json (the
+# daemon makes a correct one itself for a new volume) and no resize2fs.
+#
+# Apple container has no volume rename, so keeping NAME costs two copies:
+# NAME -> temp, destroy NAME, recreate NAME at the new size, temp -> NAME.
+# The old volume is never destroyed until its copy has been verified to exist,
+# so an interrupted run leaves data in the temp volume rather than nowhere.
+volume_resize_by_copy() {
+	local name="$1" want="$2"
+	local tmpvol="${name}-mackas-resizing"
+
+	volume_exists "$tmpvol" && die "leftover volume '$tmpvol' from an interrupted resize" \
+		"inspect it, then remove it with '$SCRIPT_CMD volume destroy $tmpvol' before retrying"
+
+	# A volume that was RELOCATED with 'volume move' lives behind a per-volume
+	# symlink, and 'container volume create' always creates in the default
+	# location. Destroying and recreating would therefore silently drag the
+	# volume back off the disk it was deliberately put on -- someone who put
+	# TMPDIR on a fast NVMe would quietly get it back on the slow one. Record
+	# where it really lives and put every new volume there BEFORE copying into
+	# it, so the copies land on the right drive too (and so the space they need
+	# is demanded of that drive, not of MACKAS_ROOT's).
+	local relocated_parent=""
+	if [ -L "$CONTAINER_VOLUMES_DIR/$name" ]; then
+		relocated_parent="$(dirname "$(volume_real_dir "$name")")"
+		info "  '$name' lives on another drive; the replacement will be put back there:"
+		info "    $relocated_parent"
+	fi
+
+	info "  Copying into a new $want volume (no resize2fs needed)."
+	info "  This is a real copy, twice -- it needs about twice the used space while it runs."
+
+	# 1. A new volume at the target size, made by the daemon itself.
+	run container volume create -s "$want" "$tmpvol" \
+		|| die "could not create the temporary volume '$tmpvol'" "check free space and 'container volume ls'"
+	# Move it while it is still EMPTY -- near-free, and it means the copy below
+	# writes straight to the destination drive instead of via MACKAS_ROOT's.
+	if [ -n "$relocated_parent" ]; then
+		volume_move "$tmpvol" "$relocated_parent" >/dev/null \
+			|| die "could not place the temporary volume on $relocated_parent" \
+				"'$name' is untouched; free space there, or resize with MACKAS_RESIZE_IMAGE instead"
+	fi
+
+	# 2. Copy everything across, preserving ownership/permissions/times. tar
+	#    rather than cp -a: it is the portable way to move a whole tree between
+	#    two mounts with hardlinks and sparse files intact.
+	if ! run container run --rm -u 0:0 -v "$name:/from" -v "$tmpvol:/to" "$KAS_IMAGE" \
+		sh -c 'cd /from && tar -cf - . | (cd /to && tar -xf -)'; then
+		delete_volume "$tmpvol" || true
+		die "copying '$name' into the new volume failed" "nothing was destroyed; '$name' is untouched"
+	fi
+
+	# 3. Only now is it safe to drop the original.
+	delete_volume "$name" || die "could not remove the old volume '$name'" \
+		"your data is safe in '$tmpvol'; remove '$name' by hand, then rename by re-running the copy"
+
+	# A daemon-level delete removes the per-volume SYMLINK, not what it pointed
+	# at, so a relocated volume leaves its whole image directory behind on the
+	# other drive -- which then blocks volume_move below with "destination
+	# already exists and is not an empty directory". Clear it, but only the
+	# exact path recorded above, and only now: the contents were verified copied
+	# into $tmpvol in step 2, so this is deleting a second copy, not the data.
+	if [ -n "$relocated_parent" ] && [ -d "$relocated_parent/$name" ]; then
+		run rm -rf "${relocated_parent:?}/${name:?}"
+	fi
+
+	# 4. Recreate under the original name, and copy back.
+	run container volume create -s "$want" "$name" \
+		|| die "could not recreate '$name'" "your data is in '$tmpvol' -- do not delete it"
+	# Put it back on its own drive, again while empty.
+	if [ -n "$relocated_parent" ]; then
+		volume_move "$name" "$relocated_parent" >/dev/null \
+			|| die "recreated '$name' but could not put it back on $relocated_parent" \
+				"your data is in '$tmpvol' -- do not delete it"
+	fi
+	if ! run container run --rm -u 0:0 -v "$tmpvol:/from" -v "$name:/to" "$KAS_IMAGE" \
+		sh -c 'cd /from && tar -cf - . | (cd /to && tar -xf -)'; then
+		die "copying back into '$name' failed" "your data is still in '$tmpvol' -- do not delete it"
+	fi
+
+	delete_volume "$tmpvol" || warn "      could not remove the temporary volume '$tmpvol'; remove it by hand"
+	did "grew '$name' to $want by copying (contents preserved)"
+	return 0
+}
+
 volume_resize() {
 	# Mutating, and it attaches the volume -- same root gate as fstrim, and for
 	# the same reason: without a root, a bare name would resolve against
@@ -6508,6 +6624,24 @@ volume_resize() {
 
 	confirm "  Grow '$name' to $want?" || { info "  Left unchanged."; return 1; }
 
+	# resize2fs has to exist BEFORE anything is touched. The first version of
+	# this checked inside the container at step 4, by which point the image had
+	# already been truncated and entity.json rewritten -- a safe state, but a
+	# pointlessly confusing one to land in. Probe first, and when it is missing
+	# offer the copy route rather than dead-ending: that path needs no
+	# resize2fs, and no hand-edited entity.json either.
+	if ! image_has_resize2fs; then
+		warn "      $(resize_image) has no resize2fs (e2fsprogs), so the ext4"
+		warn "      filesystem inside cannot be grown in place."
+		info "      Set MACKAS_RESIZE_IMAGE to an image that has it, or:"
+		if confirm "  Copy '$name' into a new $want volume instead?"; then
+			volume_resize_by_copy "$name" "$want"
+			return "$?"
+		fi
+		die "cannot grow '$name': no resize2fs in $(resize_image)" \
+			"set MACKAS_RESIZE_IMAGE to an image with e2fsprogs, or re-run and accept the copy"
+	fi
+
 	# 1. Extend the sparse image. python3 rather than truncate(1), which macOS
 	#    does not ship (only GNU coreutils' gtruncate, and shedding Homebrew
 	#    dependencies is the direction of travel -- see TODO.md item 9).
@@ -6558,7 +6692,7 @@ dev=$(grep " /mnt " /proc/mounts | cut -d" " -f1 | head -1)
 [ -n "$dev" ] || { echo "MACKAS-ERR: could not identify the device behind /mnt" >&2; exit 91; }
 resize2fs "$dev"'
 	if run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" \
-		"$KAS_IMAGE" sh -c "$inner"; then
+		"$(resize_image)" sh -c "$inner"; then
 		[ "$DRY_RUN" -eq 1 ] && return 0
 		did "grew the ext4 filesystem on '$name' to $want"
 		info "  '$SCRIPT_CMD status' now reports the new cap."

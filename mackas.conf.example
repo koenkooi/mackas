@@ -232,6 +232,21 @@
 # checkout-relative form of a sibling, since mackas cd's into one checkout).
 #MACKAS_KAS_AUTO_PROJECT=1
 
+# The image `mackas volume resize` runs resize2fs from when growing a volume in
+# place. Empty (the default) means the kas image.
+#
+# The kas image does NOT ship e2fsprogs -- verified, not assumed: /sbin is on
+# its PATH and resize2fs is absent from every location in it. So growing a
+# volume in place needs an image you supply. mackas will not pull or apt-get
+# one behind your back.
+#
+# Without such an image resize is still not a dead end: it offers to COPY the
+# volume into a new one of the right size instead, which needs no resize2fs at
+# all (and no hand-edited daemon metadata either). That path is slower and
+# transiently needs about twice the used space, but it only uses operations
+# already proven to work.
+#MACKAS_RESIZE_IMAGE=""
+
 # The smoketest ladder's build rungs: space-separated bitbake targets, run in
 # order after the universal parse-only rung. Empty by default (the built-in
 # default, not what is shown commented out below): with no targets set, the
