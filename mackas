@@ -4420,10 +4420,25 @@ bitbake_getvar() {
 	# becomes os.path.abspath('') = cwd = /repo = $MACKAS_PROJECT here). So
 	# conf/local.conf and conf/bblayers.conf under $MACKAS_PROJECT are the
 	# real, host-visible signal for "has this ever been configured before".
-	local kflag="-k"
-	if [ ! -f "$MACKAS_PROJECT/conf/local.conf" ] || [ ! -f "$MACKAS_PROJECT/conf/bblayers.conf" ]; then
-		kflag=""
-	fi
+	# NEVER let kas touch the checkouts. This is a read-only variable query,
+	# and it must not be capable of modifying a single repo.
+	#
+	# The old form used -k when conf/local.conf existed and NOTHING otherwise.
+	# That "otherwise" was a data-loss bug, hit for real: with no local.conf
+	# yet, kas ran its full setup -- including repos_checkout and
+	# repos_apply_patches -- which resets every declared repo to its pinned
+	# revision and wipes local commits in the layer checkouts under work/.
+	# `mackas retrieve` calls this, so merely copying build output off a
+	# volume could destroy unpushed work in a layer, silently.
+	#
+	# Skipping the four repo-touching steps INDIVIDUALLY is the fix, and is
+	# strictly better than either old branch: -k also skips write_bbconfig,
+	# which is exactly what a checkout with no conf/ yet still needs, while
+	# these four are the only ones that mutate a repo. So this is safe on a
+	# fresh checkout AND on a configured one, with no conditional at all.
+	# (kas/libkas.py's setup_parser_keep_config_unchanged_arg lists the five
+	# steps -k bundles; write_bbconfig is the one deliberately left in.)
+	local kflag="--skip setup_dir --skip finish_setup_repos --skip repos_checkout --skip repos_apply_patches"
 
 	# kas-container's own stderr (e.g. "configuration file '...' not found",
 	# the exact symptom of the MACKAS_KAS_CONFIG-without-MACKAS_PROJECT_DIR
