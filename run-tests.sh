@@ -14,12 +14,16 @@
 # The mirror-server tests bind 127.0.0.1 on port 0, which is an ephemeral port
 # the kernel picks and nothing else can already hold.
 #
-# The two exceptions, tests/real_runtime.bats (real Apple container) and
-# tests/workspace_image_real.bats (real hdiutil), self-SKIP unless
-# MACKAS_REAL_RUNTIME=1, so `bats tests/` discovers them here but runs none of
-# their bodies. They are dev-Mac-only, non-hermetic, and never CI-gated; enable
-# them by hand with `MACKAS_REAL_RUNTIME=1 bats tests/real_runtime.bats`
-# (see docs/testing.md).
+# The exceptions are the *_real.bats suites -- real_runtime (real Apple
+# container), volume_resize_real (real volume grow), diskmon_real (real
+# bitbake driving a volume near-full) and workspace_image_real (real hdiutil).
+# All self-SKIP unless MACKAS_REAL_RUNTIME=1, so `bats tests/` discovers them
+# here but runs none of their bodies. They are dev-Mac-only, non-hermetic and
+# never CI-gated; enable one by hand with
+# `MACKAS_REAL_RUNTIME=1 bats tests/real_runtime.bats` (see docs/testing.md).
+# They also need a QUIET machine: each refuses while any container holds a
+# mackas volume, and fails closed on an inspect race, so a busy runtime turns
+# them into skips.
 #
 #   ./run-tests.sh              # everything (real_runtime.bats stays skipped)
 #   ./run-tests.sh tests/shim.bats   # just one bats file
