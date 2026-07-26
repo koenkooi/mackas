@@ -83,6 +83,7 @@ MACKAS_REQUIRE_CASE_SENSITIVE
 MACKAS_WORKSPACE_SIZE
 MACKAS_MONITOR
 MACKAS_MONITOR_PORT
+MACKAS_MONITOR_NOTIFY
 MACKAS_BUILDSTATS_ACCUMULATE
 "
 
@@ -684,6 +685,19 @@ set_defaults() {
 	# MACKAS_OVERHEAD/MACKAS_FSTRIM_AUTO (which cost near nothing).
 	MACKAS_MONITOR=0
 	MACKAS_MONITOR_PORT=8801
+
+	# Native macOS notification on exactly three transitions -- build started,
+	# succeeded, failed -- from 'monitor'. OFF by default: it is a
+	# notification, and one nobody asked for is worse than none. Costs nothing
+	# when on (one osascript/terminal-notifier exec per transition, never per
+	# task) and never affects the build.
+	#
+	# The honest caveat, which 'monitor --help' repeats: with no Notification
+	# Center permission entry for the terminal app, osascript notifications
+	# are dropped SILENTLY -- no error, no exit code, indistinguishable from
+	# working. terminal-notifier carries its own bundle identity and is
+	# preferred automatically when installed.
+	MACKAS_MONITOR_NOTIFY=0
 
 	# buildstats.bbclass opens build_stats in APPEND mode and never clears a
 	# BUILDNAME dir itself (mkdir -p, not a truncate) -- a project whose
@@ -5171,7 +5185,7 @@ ${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build
 started with MACKAS_MONITOR=1 (TODO.md item 22).
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD monitor [--port N] [--once]
+  $SCRIPT_CMD monitor [--port N] [--once] [--notify]
 
 Polls the in-container progress bridge and prints one line per update:
 '[status] done/total  recipe:task'. This only polls an already-published
@@ -5185,6 +5199,18 @@ ${C_BLD}OPTIONS${C_RST}
   --port N   Poll this port instead of MACKAS_MONITOR_PORT.
   --once     Print a single snapshot and exit, instead of following until
              the build reports success/failed.
+  --notify   Also post a native macOS notification on exactly three
+             transitions -- build started, succeeded, failed -- never per
+             task. MACKAS_MONITOR_NOTIFY=1 turns it on without the flag.
+             Uses terminal-notifier when it is installed, else osascript.
+
+${C_BLD}NOTIFICATION PERMISSIONS${C_RST}
+If the terminal app has no Notification Center entry, osascript
+notifications are dropped SILENTLY, with no error and no exit code to
+check -- it looks identical to working. Granting it is a one-time trip
+through System Settings > Notifications that no CLI can do for you.
+Installing terminal-notifier (brew install terminal-notifier) sidesteps it
+by carrying its own bundle identity, and is preferred automatically.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
 EOF
@@ -5192,6 +5218,7 @@ EOF
 
 cmd_monitor() {
 	local port="$MACKAS_MONITOR_PORT" once=0 want_help=0
+	local notify="${MACKAS_MONITOR_NOTIFY:-0}"
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
@@ -5200,6 +5227,7 @@ cmd_monitor() {
 				shift 2 ;;
 			--port=*)  port="${1#*=}"; shift ;;
 			--once)    once=1; shift ;;
+			--notify)  notify=1; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
@@ -5223,6 +5251,7 @@ cmd_monitor() {
 
 	local args=(--port "$port")
 	[ "$once" -eq 1 ] && args+=(--once)
+	[ "$notify" = "1" ] && args+=(--notify)
 	/usr/bin/python3 "$tool" "${args[@]}"
 }
 

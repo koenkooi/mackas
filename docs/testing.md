@@ -88,18 +88,19 @@ translation fully assertable with no VM. Config tests run against a throwaway
 | `tests/buildstats_analyze.bats` | `mackas buildstats analyze`: the JSON/text summary half (no `container` involved) resolving the default `$MACKAS_BASE/artifacts/buildstats` path vs an explicit PATH, a `build_stats` nested under a retrieve-timestamp dir, and the non-fatal warning when the analyzer script is missing; the bootchart-SVG half (a fake `container` modelling pybootchartgui's own `-o`-handling quirks, same convention as `retrieve.bats`) rendering one SVG per build under PATH (not just the newest), skipping a build already charted, skipping gracefully with no checkout or no `pybootchartgui.py`, a failed render staying non-fatal, and a relative PATH getting absolutised before it reaches the `-v` mount. |
 | `tests/test_buildstats_analyze.py` | `tools/mackas-buildstats-analyze`: that a task's CPU includes its **child** rusage (or every compile looks free), `maxrss` taking the larger of own/child, a truncated task file not sinking the report, recursive `resolve_buildstats_dir` finding a `build_stats` nested under a retrieve-timestamp dir, and the constant-BUILDNAME accumulation detection/task-filtering (more than one "Build Started:" line drops carryover tasks from an earlier build sharing the directory). `unittest`, stdlib. |
 | `tests/smoketest_overhead.bats` | The overhead sampler folded into `smoketest`: that a rung starts and stops the sampler, its summary lands in the rung log and the headline host figures on the console, `MACKAS_OVERHEAD=0` and `--dry-run` disable it, and a sampler that crashes or is missing never fails the rung. A fake sampler (real Python, via the `MACKAS_OVERHEAD_BIN` seam) records to a marker file. |
+| `tests/monitor.bats` | `mackas monitor` against a real fixture bridge on an ephemeral port (no container involved): the argument surface, an unreachable port giving an error rather than a stack trace, `--once` vs following to `success`/`failed`, and the whole `--notify` half — that notifications fire on exactly the three transitions (started/succeeded/failed) and never per task across many `building` polls, that `terminal-notifier` is preferred over `osascript` when both exist, that a failing or absent notifier changes neither the output nor the exit status, and that a hostile recipe name (a `"` and a `\` plus a `do shell script` payload) stays inside one AppleScript string literal — pinned both as exact bytes and by round-tripping the quoting through the real `osascript`. Fake notifiers on a `PATH` reduced to *only* the fixture dir, so no test can reach a real one and pop a desktop notification. |
 | `tests/test_mirrord.py` | The mirror server. Mostly security properties, because those are the deliverable: traversal (with a real file outside the root, proven unreachable), symlink escape, the `/root-evil` vs `/root` case, auth ordering, allowlist, method rejection, no listing, no banner, no stack trace, log sanitization. Binds 127.0.0.1 on port 0. |
 | `tests/test_overhead.py` | `tools/mackas-overhead`: `parse_cputime`'s four `ps -o time` wire formats, the sampler's self-exclusion and KiB→bytes conversion, and the mismatch guard that prints `UNAVAILABLE` rather than a fabricated overhead number. `unittest`, stdlib. |
 
 The table is the highlights, not the whole suite; the remaining files
-(`adopt`, `case_sensitivity`, `check_discard_support`, `monitor`, `purefns`,
+(`adopt`, `case_sensitivity`, `check_discard_support`, `purefns`,
 `require_root`, `set_get_unset`, `setup_e2e`, `setup_kas_container`,
 `smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`,
 `workspace_image_real`) follow the same patterns, and each file's own header
-says exactly what it pins. `adopt`, `sstate` and `monitor` cover the three
-newest commands: `adopt`'s foreign-root introspection and collision-free
-volume/link derivation, `sstate prune`'s age-based scan and one-VM refusal, and
-`monitor`'s `--runtime-args` mount/publish assembly and host-side poller.
+says exactly what it pins. `adopt` and `sstate` cover two of the newest
+commands: `adopt`'s foreign-root introspection and collision-free
+volume/link derivation, and `sstate prune`'s age-based scan and one-VM
+refusal.
 
 Not covered by the hermetic suite: anything needing a 200 GB disk, sudo, or a
 real build. See [TODO.md](../TODO.md) for the specific gaps.

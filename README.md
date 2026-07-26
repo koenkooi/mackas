@@ -506,6 +506,7 @@ used. `mackas.conf.example` has the full annotated list.
 | `MACKAS_BUILDSTATS_ACCUMULATE` | `0` | Clear `tmp/buildstats` before every kas run (default). Set `1` to let it accumulate instead — see [Getting build outputs off the volume](#getting-build-outputs-off-the-volume) for why this matters for a project whose `BUILDNAME` doesn't vary per build. |
 | `MACKAS_MONITOR` | `0` | Opt a build into the live bitbake progress bridge (see [Watching a build live](#watching-a-build-live)). Off by default: it mounts an overlay, shadows the container's `bitbake` and runs a background HTTP thread on every build. |
 | `MACKAS_MONITOR_PORT` | `8801` | Host port the bridge publishes and `mackas monitor` polls. |
+| `MACKAS_MONITOR_NOTIFY` | `0` | `mackas monitor` also posts a macOS notification on build start/success/failure (same as `--notify`). Needs a one-time Notification Center grant — see `mackas monitor --help`. |
 | `MACKAS_USE_HTTP_MIRRORS` | `0` | Opt in to HTTP mirrors. **Optional** — see [storage.md](docs/storage.md). |
 | `MACKAS_USE_NFS_MIRRORS` | `0` | Opt in to NFS mirrors. **Optional**, and not the recommended mirror path — see [storage.md](docs/storage.md). |
 | `MACKAS_FREE_SPACE_MARGIN_GB` | `20` | Headroom `check` insists on. |
@@ -563,6 +564,7 @@ The design decisions, the negative results, and the reasons behind both:
 | [docs/homebrew.md](docs/homebrew.md) | What actually depends on Homebrew, and what it would take to stop. |
 | [docs/testing.md](docs/testing.md) | The test suite and what it deliberately does not cover; debugging against upstream kas; recovering from a crash. |
 | [docs/security.md](docs/security.md) | Security posture: dependency surface, isolation, supply-chain integrity, CRA readiness. |
+| [docs/monitor-app.md](docs/monitor-app.md) | The progress bridge's JSON contract as a stable API, for anyone building a menubar or notification app against it. |
 | [TODO.md](TODO.md) | Every known gap, prioritised. |
 
 ## Known limitations
