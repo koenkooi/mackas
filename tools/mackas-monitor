@@ -27,13 +27,54 @@ polls an already-running build's already-published bridge.
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
-POLL_INTERVAL = 2.0
+
+def _float_env(name, default):
+    """os.environ.get with the shell ${VAR:-default} semantics the rest of
+    mackas uses -- an unset OR unparseable value falls back, never raises."""
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return float(default)
+
+
+POLL_INTERVAL = _float_env("MACKAS_MONITOR_POLL_INTERVAL", 2.0)
 REQUEST_TIMEOUT = 2.0
+
+# A notifier that hangs must not stall the poll loop; it is a side-channel,
+# not the job.
+NOTIFY_TIMEOUT = 5.0
+
+# terminal-notifier coalesces on -group: a later notification with the same
+# group replaces the earlier one in Notification Center, so a build leaves
+# one current line there instead of three stale ones.
+NOTIFY_GROUP = "net.thruhere.mackas.build"
+
+NOTIFY_HELP = """\
+NOTIFICATIONS (--notify / MACKAS_MONITOR_NOTIFY=1)
+
+Fires on exactly three transitions -- build started (idle -> building),
+build succeeded, build failed -- never once per task. terminal-notifier is
+used when it is on PATH (detected, never required); otherwise osascript.
+
+THE OSASCRIPT GOTCHA: if the terminal application running this has no
+entry under System Settings > Notifications, osascript notifications are
+SILENTLY DROPPED -- exit status 0, no output, nothing on screen. The
+feature is not broken; macOS needs a one-time per-application grant that
+no CLI can perform for you. Run one build to make the entry appear (or
+`brew install terminal-notifier`, which brings its own), then enable it in
+System Settings > Notifications.
+
+A notifier that is missing, broken or slow never fails this tool: the text
+output and the exit status are unchanged either way.
+"""
 
 
 def fetch(port):
@@ -54,13 +95,137 @@ def render(state):
     print(f"[{status}] {done}/{total}  {recipe}:{task}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+
+def applescript_string(value):
+    """Quote VALUE as an AppleScript string literal, delimiters included.
+
+    This is a real injection surface, not paranoia: recipe and task names
+    come out of the build, land in `osascript -e <source>`, and osascript
+    parses that argument as AppleScript SOURCE. An unescaped double quote
+    ends the literal and everything after it is executed as script. Both
+    " and \\ are escaped; control characters (a newline would also end the
+    statement) become spaces. Note the argv is passed as a list, never
+    through a shell, so shell quoting is not part of this problem.
+    """
+    out = []
+    for ch in str(value):
+        if ch in ('"', "\\"):
+            out.append("\\" + ch)
+        elif ch == "\n" or ch == "\r" or ch == "\t" or ord(ch) < 32 or ord(ch) == 127:
+            out.append(" ")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _run_quiet(argv):
+    """True only if the command ran and exited 0. Never raises for the
+    caller's benefit -- notify() treats an exception as 'did not fire'."""
+    proc = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=NOTIFY_TIMEOUT,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def _notify_terminal_notifier(title, message):
+    exe = shutil.which("terminal-notifier")
+    if not exe:
+        return False
+    return _run_quiet(
+        [exe, "-title", title, "-message", message, "-group", NOTIFY_GROUP]
+    )
+
+
+def _notify_osascript(title, message):
+    exe = shutil.which("osascript")
+    if not exe:
+        return False
+    script = "display notification {} with title {}".format(
+        applescript_string(message), applescript_string(title)
+    )
+    return _run_quiet([exe, "-e", script])
+
+
+def notify(title, message):
+    """Best-effort native notification. Tries terminal-notifier first (more
+    reliable, and it carries its own Notification Center entry), then
+    osascript. Returns True if one of them claims to have fired.
+
+    Nothing in here may propagate: a notification is a courtesy, and a
+    monitor that dies because a notifier is missing is worse than one that
+    prints its lines quietly."""
+    for send in (_notify_terminal_notifier, _notify_osascript):
+        try:
+            if send(title, message):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def describe(state):
+    """The context line for a notification: what the build was doing."""
+    current = state.get("current") or {}
+    progress = state.get("progress") or {}
+    recipe = current.get("recipe")
+    task = current.get("task")
+    done = progress.get("done", 0)
+    total = progress.get("total", 0)
+    if recipe or task:
+        return f"{recipe or '-'}:{task or '-'} ({done}/{total} tasks)"
+    if total:
+        return f"{done}/{total} tasks"
+    return "no task detail reported"
+
+
+def transition_message(prev_status, state):
+    """(title, message) for the one notification this poll warrants, or None.
+
+    Only a CHANGE of status notifies, which is what keeps a build's many
+    'building' polls to a single 'started'. prev_status is None before the
+    first poll, so attaching to a build already in progress still announces
+    it once -- a monitor started late should say what it found."""
+    status = state.get("status") or "?"
+    if status == prev_status:
+        return None
+    if status == "building" and prev_status in (None, "idle"):
+        return ("mackas: build started", describe(state))
+    if status == "success":
+        return ("mackas: build succeeded", describe(state))
+    if status == "failed":
+        return ("mackas: build failed", describe(state))
+    return None
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=NOTIFY_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--port", type=int, required=True,
                     help="port to poll (MACKAS_MONITOR_PORT)")
     p.add_argument("--once", action="store_true",
                     help="fetch and print a single snapshot, then exit")
+    p.add_argument("--notify", action="store_true",
+                    help="post a native macOS notification on build "
+                         "start/success/failure (never per task). Equivalent: "
+                         "MACKAS_MONITOR_NOTIFY=1. See NOTIFICATIONS below -- "
+                         "osascript notifications are silently dropped until "
+                         "the terminal has a Notification Center entry.")
     args = p.parse_args(argv)
+
+    want_notify = args.notify or os.environ.get("MACKAS_MONITOR_NOTIFY", "0") == "1"
+    prev_status = None
 
     try:
         while True:
@@ -71,6 +236,11 @@ def main(argv=None):
                       file=sys.stderr)
                 return 1
             render(state)
+            if want_notify:
+                message = transition_message(prev_status, state)
+                if message:
+                    notify(*message)
+            prev_status = state.get("status") or "?"
             if args.once or state.get("status") in ("success", "failed"):
                 return 0 if state.get("status") != "failed" else 1
             time.sleep(POLL_INTERVAL)

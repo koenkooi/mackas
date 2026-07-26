@@ -296,6 +296,15 @@
 #MACKAS_MONITOR=0
 # Host port the bridge publishes and `mackas monitor` polls.
 #MACKAS_MONITOR_PORT=8801
+# Have `mackas monitor` also post a native macOS notification on exactly three
+# transitions -- build started, succeeded, failed -- never per task. Same as
+# passing --notify. OFF by default: an unasked-for notification is worse than
+# none. Real caveat, repeated in `mackas monitor --help`: with no Notification
+# Center permission entry for your terminal app, osascript notifications are
+# dropped SILENTLY -- no error, indistinguishable from working. Installing
+# terminal-notifier avoids it (it carries its own bundle identity) and is
+# preferred automatically when present.
+#MACKAS_MONITOR_NOTIFY=0
 
 
 # --- HTTP mirrors (OPTIONAL, opt-in) -----------------------------------------
