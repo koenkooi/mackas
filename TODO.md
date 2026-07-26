@@ -558,9 +558,9 @@ uncommitted changes preserved exactly as-is, verified end to end with a real
 `hdiutil` in `tests/workspace_image_real.bats` (opt-in,
 `MACKAS_REAL_RUNTIME=1`), plus hermetic coverage of the offer/decline/
 reattach/migrate logic in `tests/case_sensitivity.bats`. `MACKAS_WORKSPACE_SIZE`
-(default `40G`, sparse) controls the image size. **Not yet built**: the attach
-lifecycle beyond `setup` itself (surviving a reboot, `check`/`status`
-visibility, recovery when the image file goes missing) — that is item 19.
+(default `40G`, sparse) controls the image size. The attach lifecycle
+(surviving a reboot, `check`/`status` visibility) landed as item 19 phase 1;
+recovery when the image file goes missing is still open — see item 19.
 
 ### 19a. `volume destroy`/`volume move` leave dangling per-volume symlinks behind
 
@@ -682,14 +682,23 @@ before that probe, or the probe reports the underlying drive.
 
 Phasing, smallest first, each shippable alone:
 
-1. **The fail-closed attach guard.** `MACKAS_WORKSPACE_IMAGE` knob, sentinel
-   at creation, `ensure_workspace_attached()` in `run_kas`/`setup`,
-   die-with-remediation when attach fails. Closes the silent-corruption
-   window; without it item 18's creation work is unsafe past the first
-   reboot.
+1. **The fail-closed attach guard. LANDED.** `MACKAS_WORKSPACE_IMAGE` is
+   written into the config file by the create/reattach paths (the record is
+   part of saying yes to the image — an unrecorded image is exactly the
+   silent hole), a `.mackas-workspace` sentinel is written at the mount root,
+   and `ensure_workspace_attached()` guards `run_kas` plus `smoketest`/
+   `shell` ahead of their "is the project checked out?" tests (a detached
+   image otherwise reports a checked-out project as missing). Detection is
+   `stat -L -f %d` of `work/` vs `MACKAS_ROOT` plus the sentinel; the three
+   refusals are a foreign mount, a missing/unattachable image, and a
+   NON-EMPTY plain `work/` (contents written to the case-insensitive drive
+   while detached — refuse and leave them alone rather than `rm -rf` them for
+   the mount). Hermetic coverage in `tests/workspace_attach.bats`, real
+   `hdiutil detach`-then-recover in `tests/workspace_image_real.bats`.
 2. **`check`/`status` visibility.** The attached/not-attached rung in
-   `check_target_volume`, an image line in `status` (path, attached?, size on
-   disk via `du -h` like `status_volume`).
+   `check_target_volume` and the `status` image line LANDED with phase 1
+   (both read-only, neither ever mounts). Still open: size on disk via
+   `du -h` like `status_volume`.
 3. **Recovery.** Spotlight-located, confirm-gated, move-home-first — the
    `volume recover` UX transplanted to a config-path record.
 4. **The unpushed-work status line.** Pure reporting, no new state.

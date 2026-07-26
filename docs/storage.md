@@ -7,6 +7,7 @@ Where each piece of the build lives, and why. The short version:
 | **TMPDIR** | Local ext4 container volume, on local disk | **Non-negotiable.** An APFS directory reaching the guest over virtiofs does not provide the semantics TMPDIR requires — hardlinks, permissions, xattrs, case sensitivity, correct `rename()`. See [architecture.md](architecture.md#the-ext4-volumes). |
 | **Writable `SSTATE_DIR` / `DL_DIR`** | Their own local ext4 volumes | Speed, and lifecycle: separate so `clean` can drop TMPDIR without losing them. Unlike TMPDIR, ext4 here is not a *semantic* requirement — see [Does `SSTATE_DIR` actually need ext4?](#does-sstate_dir-actually-need-ext4) |
 | **Read-only sstate + downloads mirrors** | Network, over **HTTP** | **Optional.** bitbake's own mechanism, recommended if you use one. |
+| **Layer checkouts (`work/`)** | Host directory, bind-mounted as `KAS_WORK_DIR` | Must be **case-sensitive**, and stays host-native so `git` and `bitbake -e` keep working from macOS. On a case-insensitive drive, [a workspace image](#the-workspace-image) supplies it. |
 
 `MACKAS_ROOT` is wherever you point it — a directory on a case-sensitive
 volume, e.g. `/Volumes/<your-case-sensitive-volume>/oe`. (APFS is
@@ -24,7 +25,8 @@ build requires one.
 The document is in four parts: the local volumes and their caps; managing
 those volumes (reclaiming, relocating, growing, splitting across drives);
 network storage (mirrors, NFS, disk images on shares); and macOS operational
-concerns (buildstats, buildhistory, Time Machine, Full Disk Access).
+concerns (buildstats, buildhistory, the workspace image, Time Machine, Full
+Disk Access).
 
 ## Volume caps and the disk monitor
 
@@ -899,6 +901,82 @@ everyone building it sees the same thing.
 The retrieved copy is a plain directory on the Mac, and a git repository when
 `BUILDHISTORY_COMMIT` is on — one commit per build, readable with ordinary
 `git -C $MACKAS_BASE/artifacts/buildhistory log`, no container needed.
+
+## The workspace image
+
+`work/` — `KAS_WORK_DIR`, the layer checkouts: oe-core, bitbake, the `meta-*`
+layers, the project layer — is the one part of `MACKAS_ROOT` that must be
+case-sensitive, because oe-core contains files whose names differ only by
+case. It is a plain host directory bind-mounted into the container, not an
+ext4 volume, so the host filesystem's rules apply to it directly. `bin/`,
+`kas/` and `logs/` are indifferent.
+
+A stock external SSD is case-insensitive APFS and reformatting is not always
+an option, so `setup` offers a case-sensitive APFS **sparse image** mounted at
+`work/` instead:
+
+```sh
+hdiutil create -type SPARSE -fs "Case-sensitive APFS" -size 40g \
+    -volname mackas-workspace /Volumes/<drive>/oe/workspace
+hdiutil attach /Volumes/<drive>/oe/workspace.sparseimage -nobrowse
+```
+
+That is what `setup` runs (size from `MACKAS_WORKSPACE_SIZE`, sparse, so the
+cap is not disk cost), after moving any existing `work/` aside and before
+copying it back onto the fresh mount. The image is host-native APFS, so it
+reuses the same bind-mount `/repo` already goes through — no ext4, no `mkfs` —
+and `git status` in a layer still works from a macOS terminal.
+
+`work/` becomes a **symlink** to the mount point (`/Volumes/mackas-workspace`),
+never a mount point of its own. `hdiutil attach -mountpoint` onto a directory
+that itself sits on a non-APFS volume fails with "insufficient privileges",
+while a plain attach works regardless of what `MACKAS_ROOT` sits on — so
+mackas reads the real mount point out of `hdiutil`'s output and symlinks to
+it. macOS uniquifies a colliding volume name (`mackas-workspace 2`), which is
+the other reason the reported path is read rather than assumed.
+
+### The attach lifecycle, and why it fails closed
+
+**`hdiutil attach` does not survive a reboot.** After a restart the image file
+is still on disk but nothing is mounted: `work/` is a dangling symlink, or —
+if anything recreated it — an ordinary empty directory on the case-insensitive
+drive. That is the dangerous state, because it looks like a fresh workspace. A
+command falling through to it lets kas clone oe-core onto case-insensitive
+APFS, silently, since the `setup`-time case-sensitivity gate already passed
+once.
+
+`MACKAS_WORKSPACE_IMAGE` — written by `setup` when it creates or reattaches an
+image — is what makes that recoverable. With it set, every command that
+touches `work/` first compares the device of `work/` against `MACKAS_ROOT`'s
+and looks for a `.mackas-workspace` sentinel file at the mount's root, then:
+
+| State | What happens |
+|---|---|
+| Different device, sentinel present | Already attached. Nothing to do. |
+| Same device, or `work/` missing or a dangling symlink | Reattach the image and re-point the symlink. |
+| Different device, **no** sentinel | Refuse: something is mounted at `work/`, but not the recorded image. |
+| Image file missing | Refuse, with an `mdfind` line to locate it. |
+| `hdiutil attach` fails | Refuse. |
+| `work/` is a **non-empty plain directory** | Refuse, and leave it alone: its contents were written to a case-insensitive filesystem and may already be corrupt, but they are yours to salvage. |
+
+The sentinel is what makes "something is mounted" mean "*our* image is
+mounted". Without it any coincidental mount at `work/` reads as success — and
+reattaching over it would destroy that mount's contents. An image predating
+the sentinel is adopted with a single `touch <mount>/.mackas-workspace`, which
+is what the refusal says.
+
+Refusing is deliberate and has no override flag: an unattached workspace is
+not an empty workspace, it is the wrong filesystem. `check` and `status`
+report the state without ever mounting anything, so a build that "worked
+yesterday" and now refuses has its answer in one line of `mackas check`.
+
+Losing the image costs nothing for any layer that is clean and pushed —
+`git clone` restores it byte for byte. What is genuinely at risk is
+uncommitted or unpushed work, and `git push` is the backup story: the image is
+a single file with none of its own. Time Machine cuts the opposite way here
+from the build volumes: the image is small (source checkouts, single-digit
+GiB) and holds the only copy of exactly what git cannot restore, so a
+TM-backed source volume is a feature rather than the hazard [below](#time-machine).
 
 ## Time Machine
 

@@ -91,6 +91,12 @@ teardown() {
 	# volume); work/ becomes a symlink to whatever real path hdiutil reports.
 	! printf '%s\n' "$output" | grep -qF -- '-mountpoint'
 	printf '%s\n' "$output" | grep -qF "ln -s /Volumes/mackas-workspace $TESTDIR/root/work"
+	# Creating the image must also leave the two things that make it survive a
+	# reboot: the sentinel at the mount root, and the recorded path (item 19).
+	# Without them work/ comes back as a bare case-insensitive directory and
+	# nothing downstream knows it was ever supposed to be a mount.
+	printf '%s\n' "$output" | grep -qF '.mackas-workspace'
+	printf '%s\n' "$output" | grep -qF 'MACKAS_WORKSPACE_IMAGE'
 	# The post-mount sanity re-probe must not fire a false "still not
 	# case-sensitive" die under --dry-run, where nothing was really mounted.
 	! printf '%s\n' "$output" | grep -qF 'still not case-sensitive after mounting'

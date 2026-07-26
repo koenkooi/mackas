@@ -107,11 +107,13 @@ make that possible:
 The table is the highlights, not the whole suite; the remaining hermetic
 files (`adopt`, `case_sensitivity`, `check_discard_support`, `purefns`,
 `require_root`, `set_get_unset`, `setup_e2e`, `setup_kas_container`,
-`smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`)
-follow the same patterns, and each file's own header says exactly what it
-pins. `adopt` covers `adopt`'s foreign-root introspection and collision-free
-volume/link derivation; `sstate` covers `sstate prune`'s age-based scan and
-one-VM refusal. The `*_real` files are the opt-in suites described below.
+`smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`,
+`workspace_attach`) follow the same patterns, and each file's own header says
+exactly what it pins. `adopt` covers `adopt`'s foreign-root introspection and
+collision-free volume/link derivation; `sstate` covers `sstate prune`'s
+age-based scan and one-VM refusal; `workspace_attach` covers the fail-closed
+workspace-image attach guard's whole decision table against a stubbed
+`hdiutil`. The `*_real` files are the opt-in suites described below.
 
 ### What the hermetic suite deliberately does not cover
 
@@ -288,8 +290,10 @@ of `tests/volumes.bats` and the smoketest ladder.
 The fourth opt-in file, gated by the same `MACKAS_REAL_RUNTIME=1`: it needs
 no `container` runtime at all, but does run a real `hdiutil
 create`/`attach` to prove the workspace image genuinely makes `work/`
-case-sensitive (the hermetic offer/decline/reattach logic lives in
-`tests/case_sensitivity.bats`).
+case-sensitive, and a real `hdiutil detach` — what a reboot does — to prove
+the attach guard recovers from it. The hermetic halves are
+`tests/case_sensitivity.bats` (offer/decline/reattach/migrate) and
+`tests/workspace_attach.bats` (the guard's decision table).
 
 ## Debugging against upstream kas
 

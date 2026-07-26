@@ -416,3 +416,18 @@ OpenEmbedded breaks in baffling ways on case-insensitive filesystems.
 `check` probes this empirically — it creates files and looks — rather than
 trusting `diskutil`. If nothing is writable yet it falls back to `diskutil`
 and says so.
+
+The requirement is narrower than it looks: it covers `work/`
+(`KAS_WORK_DIR`, the layer checkouts) and nothing else. `bin/`, `kas/` and
+`logs/` are indifferent, and TMPDIR, downloads and sstate are ext4 volumes
+whose case rules are the guest's. `setup` therefore probes `work/` itself
+rather than `MACKAS_ROOT`, which matters once a
+[workspace image](storage.md#the-workspace-image) is mounted there: `work/`
+is then case-sensitive while `MACKAS_ROOT`'s own filesystem is not.
+
+An image mounted at `work/` is state mackas re-establishes rather than
+assumes, because `hdiutil attach` does not survive a reboot.
+`MACKAS_WORKSPACE_IMAGE` records the image; every command that touches
+`work/` reattaches it, or refuses to run. The guard is fail-closed by
+design — a detached image leaves `work/` looking like a perfectly ordinary
+empty directory, so the failure it prevents is silent.

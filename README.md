@@ -395,6 +395,7 @@ The settings a new user actually needs:
 | `MACKAS_KAS_CONFIG` | *(empty)* | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty: one build rung with no `--target`. |
 | `MACKAS_MONITOR` | `0` | Opt builds into the live progress bridge ([above](#watching-a-build-live)). |
+| `MACKAS_WORKSPACE_IMAGE` | *(empty)* | The workspace image mounted at `work/`, once one exists. Written by `setup`, not by you: it is the record that gets `work/` reattached after a reboot. |
 
 [mackas.conf.example](mackas.conf.example) is the authoritative, annotated
 full list — mirrors, the host-overhead sampler, auto-`fstrim`, buildstats
@@ -414,8 +415,17 @@ image (`MACKAS_WORKSPACE_SIZE`, default `40G`, sparse) and mount it at
 proceed** (`die`, exit 1) rather than finish "Done" on a root that would
 corrupt the layer checkouts on the first build. That gate is
 `MACKAS_REQUIRE_CASE_SENSITIVE=1` by default; set `0` only if the
-case-sensitive parts genuinely live elsewhere. Or make a case-sensitive
-volume once and point `MACKAS_ROOT` at it:
+case-sensitive parts genuinely live elsewhere.
+
+Such an image is recorded in `MACKAS_WORKSPACE_IMAGE` and reattached on
+demand. `hdiutil attach` does not survive a reboot, so every command that
+touches `work/` checks the mount first, reattaches it if it can, and
+**refuses to run** if it cannot: a detached image leaves `work/` a plain
+case-insensitive directory, and building into one is the corruption the gate
+exists to stop. `check` and `status` report the state. See
+[storage.md](docs/storage.md#the-workspace-image).
+
+Or make a case-sensitive volume once and point `MACKAS_ROOT` at it:
 
 ```sh
 diskutil apfs addVolume <disk> "Case-sensitive APFS" oe   # see: diskutil list
