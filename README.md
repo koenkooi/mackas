@@ -190,12 +190,13 @@ stays put), leaving a symlink where the runtime expects it; `volume recover`
 re-points a symlink gone stale after a hand-move, finding the image with
 Spotlight
 ([storage.md](docs/storage.md#relocating-a-volume-and-recovering-a-hand-moved-one)).
-`volume resize` **grows** a volume in place, keeping its contents;
-**shrinking is refused** (`resize2fs` cannot shrink a mounted filesystem,
-and a container volume can only be attached mounted), so shrink by
-`duplicate` + `destroy`. In-place growth needs an e2fsprogs image
-(`MACKAS_RESIZE_IMAGE`; the kas image ships none — without one, resize
-offers a copy into a new volume instead):
+`volume resize` **grows** a volume, keeping its contents, by copying it into
+a new one of the requested size. There is no in-place grow — container
+volumes carry ext4's `sparse_super2`, which the guest kernel cannot resize
+online, and an offline resize would need the filesystem unmounted, which a
+volume never is. **Shrinking is refused**: the same copy would work, but
+silently discarding data that no longer fits is not something mackas does on
+your behalf. See
 [storage.md](docs/storage.md#growing-a-volume-mackas-volume-resize).
 
 ### Pruning the sstate cache

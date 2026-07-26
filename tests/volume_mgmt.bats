@@ -128,17 +128,6 @@ case "$1 $2" in
 		;;
 esac
 
-# `container run ... sh -c 'command -v resize2fs ...'` -- the probe `volume
-# resize` makes before touching anything. The real kas image has NO resize2fs,
-# which is the whole reason the copy fallback exists, so model both answers:
-# MOCK_NO_RESIZE2FS=1 makes the probe fail the way the kas image really does.
-case "$*" in
-	*"command -v resize2fs"*)
-		[ -n "${MOCK_NO_RESIZE2FS:-}" ] && exit 1
-		exit 0
-		;;
-esac
-
 # Fall through: a `container run ... fstrim -v /mnt`. Find the volume from the
 # `-v NAME:/mnt` bind, shrink its image, and print a bogus trimmed figure.
 is_fstrim=0
@@ -988,16 +977,15 @@ break_volume() {
 # ---------------------------------------------------------------------------
 # resize -- grow a volume in place (TODO.md item 26)
 #
-# The daemon stores a volume as entity.json (with "sizeInBytes" and
-# "options":{"size":...}) beside a SPARSE volume.img whose apparent size equals
-# sizeInBytes. Growing is therefore three separate facts that must all move
-# together -- image, daemon record, filesystem -- and the tests below pin each
-# one, because getting two of the three right is a silent no-op: a bigger block
-# device with the same-sized ext4 on it gains nothing.
+# `volume resize` grows a volume by COPYING it into a new one of the target
+# size. There is no in-place grow: container volumes carry ext4's
+# sparse_super2 feature, which the guest kernel cannot resize online, and an
+# offline resize would need the filesystem unmounted -- which a container
+# volume never is. So these tests pin the copy mechanism and the refusals
+# around it, not a truncate/entity.json/resize2fs sequence.
 #
-# Shrinking is refused rather than half-implemented: resize2fs cannot shrink a
-# MOUNTED filesystem, and a container volume can only be attached mounted.
-# ---------------------------------------------------------------------------
+# Shrinking is refused: the copy would work, but silently discarding data that
+# no longer fits is not something mackas does on the user's behalf.
 
 # Like have_volume, but also writes the entity.json the daemon really keeps --
 # minified, keys unspaced, exactly the shape observed on a live install. resize
@@ -1016,25 +1004,21 @@ have_volume_with_entity() {
 
 apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_size)' "$1"; }
 
-@test "volume resize: grows the image, the daemon record and the filesystem" {
+@test "volume resize: grows by copying into a new volume of the target size" {
 	have_volume_with_entity oe-build-tmp 120G 128849018880
 	vol -y resize oe-build-tmp 1T
 	[ "$status" -eq 0 ]
 
-	# 1. the sparse image really is bigger (apparent size, not blocks)
-	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 1099511627776 ]
-	# 2. BOTH daemon-visible fields moved, and the JSON is still one object
-	grep -qF '"sizeInBytes":1099511627776' "$(VOLDIR)/oe-build-tmp/entity.json"
-	grep -qF '"size":"1T"' "$(VOLDIR)/oe-build-tmp/entity.json"
-	! grep -qF '"sizeInBytes":128849018880' "$(VOLDIR)/oe-build-tmp/entity.json"
-	# 3. the daemon was made to re-read it -- its index is built once, at
-	#    startup, so without this the attach below would use the OLD size
-	assert_call 'system] [start'
-	# 4. and the filesystem was grown, with the two flags that are not optional
-	assert_call 'run] [--rm] [-u] [0:0] [--cap-add] [CAP_SYS_ADMIN] [-v] [oe-build-tmp:/mnt'
-	# ...running resize2fs against the device behind the mount, not a path
-	assert_call 'resize2fs'
-	assert_call '/proc/mounts'
+	# A temp volume at the TARGET size, copied through, then cleaned up...
+	assert_call 'volume] [create] [-s] [1T] [oe-build-tmp-mackas-resizing'
+	assert_call 'tar -cf - . | (cd /to && tar -xf -)'
+	assert_call 'volume] [delete] [oe-build-tmp-mackas-resizing'
+	# ...leaving the volume under its ORIGINAL name at the new size.
+	grep -qE '^oe-build-tmp\t1T$' "$VSTATE"
+	assert_fails grep -q 'oe-build-tmp-mackas-resizing' "$VSTATE"
+	# No in-place attempt: no daemon restart, no resize2fs.
+	refute_call 'system] [start'
+	refute_call 'resize2fs'
 }
 
 @test "volume resize: refuses to shrink rather than half-doing it" {
@@ -1115,42 +1099,14 @@ apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1])
 	refute_call 'system] [start'
 }
 
-@test "volume resize: with no resize2fs, offers the copy route instead of dead-ending" {
-	# The kas image genuinely has no e2fsprogs, so this is the DEFAULT path in
-	# practice, not an edge case. The copy route needs neither resize2fs nor a
-	# hand-edited entity.json, which is why it is offered rather than refused.
-	have_volume_with_entity oe-build-tmp 120G 128849018880
-	MOCK_NO_RESIZE2FS=1 vol -y resize oe-build-tmp 1T
-	[ "$status" -eq 0 ]
-	printf '%s\n' "$output" | grep -qi 'has no resize2fs'
-	printf '%s\n' "$output" | grep -qi 'Copying into a new 1T volume'
-	# A temp volume was made, copied through, and cleaned up...
-	assert_call 'volume] [create] [-s] [1T] [oe-build-tmp-mackas-resizing'
-	assert_call 'tar -cf - . | (cd /to && tar -xf -)'
-	assert_call 'volume] [delete] [oe-build-tmp-mackas-resizing'
-	# ...and the volume ends up under its ORIGINAL name at the new size.
-	grep -qE '^oe-build-tmp	1T$' "$VSTATE"
-	assert_fails grep -q 'oe-build-tmp-mackas-resizing' "$VSTATE"
-}
-
 @test "volume resize: declining the copy offer leaves everything untouched" {
 	have_volume_with_entity oe-build-tmp 120G 128849018880
 	# No -y and stdin not a tty => confirm() declines, which must be a clean
 	# refusal, not a half-done resize.
-	MOCK_NO_RESIZE2FS=1 vol resize oe-build-tmp 1T
+	vol resize oe-build-tmp 1T
 	[ "$status" -ne 0 ]
 	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
 	grep -qF '"sizeInBytes":128849018880' "$(VOLDIR)/oe-build-tmp/entity.json"
 	refute_call 'volume] [create'
 }
 
-@test "volume resize: the resize2fs probe runs BEFORE anything is mutated" {
-	# Ordering matters: the first version probed at step 4, after the image had
-	# been truncated and entity.json rewritten -- safe, but a confusing state.
-	have_volume_with_entity oe-build-tmp 120G 128849018880
-	MOCK_NO_RESIZE2FS=1 vol resize oe-build-tmp 1T
-	[ "$status" -ne 0 ]
-	# Nothing was extended or recorded before the probe refused.
-	! printf '%s\n' "$output" | grep -qi 'extended volume.img'
-	! printf '%s\n' "$output" | grep -qi 'recorded the new size'
-}
