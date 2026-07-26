@@ -455,6 +455,168 @@ An external volume's top level is typically `root:wheel`, so creating
 `$MACKAS_ROOT` needs a one-off `sudo mkdir` + `sudo chown`. `setup` prompts
 for exactly that and nothing more.
 
+### Three drives, one build: TMPDIR, sstate and downloads apart
+
+The three volumes look alike — three sparse ext4 images — but they are used in
+completely different ways, so on a Mac with more than one disk they do not all
+want the *same* disk:
+
+| Volume | Mounted as | Access pattern | What losing it costs |
+|---|---|---|---|
+| `<name>-tmp` | `/build` (`TMPDIR`) | The hot one. Every task's work directory, sysroots, packaging and compile output, written and re-written throughout a build; the image that grows fastest and peaks highest. | Nothing you can't rebuild — `mackas clean` deliberately throws this volume away and recreates it. |
+| `<name>-sstate` | `/sstate` (`SSTATE_DIR`) | Read-mostly and random: many smallish archives looked up by hash, plus the hash-equivalence database (`BB_HASHSERVE_DB_DIR` points here, see above). Latency matters more than throughput. | Hours. This is the cache that makes the *next* build fast; it survives `clean` precisely because it is expensive to rebuild. |
+| `<name>-dl` | `/downloads` (`DL_DIR`) | Write-once, read-rarely, large and mostly sequential: upstream tarballs and git mirrors, touched on a fetch and then largely idle. | Only download time — every byte in it is re-fetchable from upstream or a mirror. |
+
+Which maps onto the obvious hardware split: **TMPDIR on the fastest disk
+(NVMe), sstate on the mid-tier SSD, downloads on the big slow one.** The
+downloads volume is also the one you would happily make several hundred GB,
+which is another reason to put it where the space is.
+
+`mackas volume move` is what places them, one at a time:
+
+```sh
+# 1. The volumes have to EXIST first -- `volume move` relocates an existing
+#    volume, it never creates one. Sizes are fixed at create time and setup
+#    never resizes an existing volume, so choose the downloads cap now, while
+#    it is still about to be created on the 10 TB disk.
+mackas setup --downloads-size 500G
+
+# 2. Then place each one. <name> is $MACKAS_VOLUME_NAME (default `oe-build`);
+#    the argument is the PARENT directory -- move creates <dir>/<name> itself.
+mackas volume move oe-build-tmp    /Volumes/nvme-fast/mackas-volumes
+mackas volume move oe-build-sstate /Volumes/sata-ssd/mackas-volumes
+mackas volume move oe-build-dl     /Volumes/spinning-rust/mackas-volumes
+
+# 3. Confirm where they actually ended up.
+mackas status
+```
+
+Order matters only in that `setup` must have created a volume before you move
+it; the three moves are independent of each other and can be done at any later
+point (each one is a separate copy, so doing them one evening at a time is
+fine). Nothing needs to be re-run afterwards: the symlink each move leaves
+behind *is* the record, so a subsequent `mackas setup` — or a reboot — changes
+nothing about the placement.
+
+#### How this composes with `MACKAS_RELOCATE_VOLUMES`
+
+These are two independent mechanisms and they stack rather than fight:
+
+- `MACKAS_RELOCATE_VOLUMES=1` (the default) is **all-or-nothing**: `setup`
+  replaces the machine-wide `~/Library/Application Support/com.apple.container/volumes`
+  with a symlink to `$MACKAS_ROOT/container-volumes`, so *every* volume — this
+  project's and anyone else's on this Mac — lands on `MACKAS_ROOT`'s disk.
+- `mackas volume move` is **per volume**, and leaves its symlink one level
+  further in.
+
+Compose them and the on-disk shape is two hops:
+
+```
+~/Library/Application Support/com.apple.container/volumes
+    -> /Volumes/build-ssd/oe/container-volumes            (MACKAS_RELOCATE_VOLUMES=1)
+       ├── oe-build-tmp -> /Volumes/nvme-fast/mackas-volumes/oe-build-tmp   (volume move)
+       ├── oe-build-dl  -> /Volumes/spinning-rust/mackas-volumes/oe-build-dl
+       └── oe-build-sstate/                               (never moved: a real directory)
+```
+
+The per-volume symlinks survive relocation because `setup_relocate_volumes`
+copies with `rsync -a`, and `-a` implies `-l` — symlinks are copied *as
+symlinks*, never dereferenced — so a moved volume's image is not dragged onto
+`MACKAS_ROOT` behind your back. `volume move` resolves its source through any
+existing symlink too, so moving a volume that currently sits inside the
+relocated directory works exactly like moving one that does not.
+
+**You do not need `MACKAS_RELOCATE_VOLUMES=0` to do per-volume placement**, and
+leaving it at `1` is the better default: it decides where the volumes you have
+*not* moved live, and without it they sit on the internal boot disk. Set it to
+`0` only if you intend to place every volume explicitly and would rather the
+machine-wide symlink not point into this project's root at all (it is
+machine-wide, one per Mac — `setup` warns, and offers, when it finds one
+belonging to a *different* root).
+
+#### What survives a reboot, and what happens when a drive is not there
+
+A symlink is a plain filesystem object, so the placement survives reboots,
+`setup` re-runs and `container system restart` without any state file to drift
+out of sync.
+
+If the drive it points at is **not mounted**, the symlink dangles and the
+volume is simply unavailable — builds using it fail until the drive is back.
+`mackas status` still prints the `moved to: <path>` line for it (the symlink is
+read directly, so the target does not have to resolve), which is usually enough
+to see immediately *which* disk is missing, though it will report the volume
+itself as `[ no]` because the runtime can no longer see it. `mackas volume
+list` prints the same `-> moved to:` note. `mackas volume recover` names it
+outright: *"does not resolve to a volume.img"*.
+
+Two honest gaps here, both verified in the source rather than assumed:
+
+- **`mackas check` does not mention per-volume placement at all.** It asks the
+  container daemon whether each volume exists, so once that daemon has restarted
+  with the drive absent it reports the volume as *"not created yet"* — true from
+  the runtime's point of view, misleading from yours. Its free-space and
+  `fstrim`-support checks likewise reason only about `MACKAS_ROOT`'s filesystem
+  — correct when every image lives there, wrong once they are split across
+  drives. Read those two check lines as being about the volumes you have *not*
+  moved.
+- **Neither `setup` nor `adopt` refuses to run with a drive missing.** The
+  guard that protects an *existing* moved volume from being re-created over
+  (`refuse_if_stale_entity`, which spots the volume's `entity.json` through the
+  symlink) cannot see through a *dangling* symlink, so `setup` goes on to issue
+  a plain `container volume create` for that name. What the real runtime does
+  with that create has not been verified — do not find out; plug the drive in
+  first. `tests/adopt.bats` pins this behaviour as it currently stands.
+
+#### Adopting a root whose volumes are already split
+
+`mackas adopt <path>` handles this case deliberately: it calls `volume recover`
+*before* handing off to `setup`, so a per-volume symlink carried over from
+another Mac is re-pointed at wherever the image really is on this one, rather
+than `setup_volumes` treating "the runtime has never heard of this volume" as
+licence to create a fresh, empty one over the top. In practice:
+
+- A moved volume whose drive is mounted and whose symlink still resolves is
+  adopted **in place**. `setup` then finds its `entity.json` through the
+  symlink, restarts the container daemon so its index picks the volume up, and
+  reports it as existing — no `volume create`, so the image is never
+  reformatted.
+- A symlink that points at *the other Mac's* path for the same drive (a
+  different mount point, a renamed volume) dangles here. `recover` asks
+  Spotlight, finds the image at its real local path, and — after you confirm —
+  re-points it. This is the case worth knowing about, because it looks
+  identical to "the volume is missing" until `recover` runs.
+- Three volumes on three drives are handled independently; each keeps its own
+  placement.
+
+`tests/adopt.bats` covers all three, plus the whole-dir-relocation composition
+above.
+
+#### Caveats that do not go away
+
+- **The one-VM rule still applies**, wherever an image lives. `volume move`
+  refuses a volume a running build holds — moving the backing directory of a
+  mounted ext4 image is exactly the double-life the rule forbids. Stop the
+  build first.
+- **A cross-drive move is a real copy, not a rename**, and takes as long as
+  copying the image's current on-disk size. Only a same-filesystem move is the
+  instant atomic `mv`. The source is removed only after the copy succeeds, so
+  an interrupted move loses nothing — but budget the time, and run `mackas
+  volume fstrim` first if the image has ratcheted up well past what it still
+  holds.
+- **`fstrim` reclaim is judged per drive now.** The ExFAT finding above is a
+  property of the *filesystem holding that one `volume.img`*, so a downloads
+  volume parked on an ExFAT external will never hole-punch even though the
+  other two, on APFS, reclaim fine. Format each drive APFS if you care about
+  reclaim on it.
+- **Full Disk Access applies to every external drive you use**, not just
+  `MACKAS_ROOT`'s — see the section at the end of this document. The move
+  itself is done by `mackas` under your own account, so it is the *daemon*
+  reaching the relocated image afterwards that hits the TCC denial; a drive
+  that was never used for a volume before is exactly where that bites.
+- **Time Machine**: `check` only inspects `MACKAS_ROOT`'s volume for an active
+  destination, so a build volume parked on a disk that *is* a Time Machine
+  destination will not be flagged.
+
 ## Buildstats and a constant BUILDNAME
 
 `meta/classes-global/buildstats.bbclass` writes every build's per-task timing

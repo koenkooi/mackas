@@ -1482,7 +1482,32 @@ volume_exists() {
 # instead of just refusing.
 refuse_if_stale_entity() {
 	local name="$1"
-	[ -e "$CONTAINER_VOLUMES_DIR/$name/entity.json" ] || return 0
+	local link="$CONTAINER_VOLUMES_DIR/$name"
+
+	# A DANGLING per-volume symlink means this volume was relocated by
+	# 'volume move' onto a drive that is not mounted right now -- not that it
+	# is missing. The entity.json probe below cannot see that on its own: -e
+	# follows symlinks, so it is false through a dangling one, and the guard
+	# would report "safe to create" and let ensure_volume() run
+	# 'container volume create' straight over the link. That silently orphans
+	# whatever is on the absent drive (the symlink is the ONLY record of where
+	# the volume lives -- see volume_real_dir) and hands back an empty volume,
+	# which for sstate or downloads reads as a mysteriously cold cache.
+	#
+	# die() rather than confirm(): the fix mackas would offer -- discard the
+	# link and create fresh -- is exactly the destructive one, and the two
+	# non-destructive fixes (plug the drive in; re-point the link) are things
+	# only the user can decide between. Failing closed here costs a re-run;
+	# guessing costs a cache.
+	if [ -L "$link" ] && [ ! -e "$link" ]; then
+		local target; target="$(readlink "$link" 2>/dev/null || true)"
+		warn "      volume '$name' was moved to: ${target:-<unreadable>}"
+		warn "      That path does not resolve -- the drive holding it is not mounted."
+		die "volume '$name' lives on a drive that is not currently mounted" \
+			"plug the drive in and re-run, or '$SCRIPT_CMD volume recover $name' if it moved; to abandon that copy and start empty, remove $link first"
+	fi
+
+	[ -e "$link/entity.json" ] || return 0
 
 	warn "      volume '$name' has on-disk data the container daemon's index doesn't know about."
 	warn "      This is usually a stale index -- right after relocating"

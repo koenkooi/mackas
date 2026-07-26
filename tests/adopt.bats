@@ -13,6 +13,13 @@
 # gate passes; a real local `git init` fixture repo, cloned by real git.
 # Nothing here touches the real Apple container runtime, the network, or the
 # build SSD.
+#
+# The per-volume-placement tests at the bottom add two more seams, both of
+# which stay dormant for every other test here: the fake `container` models the
+# apiserver's index only being refreshed by `system restart` (and records its
+# argv when MOCK_CONTAINER_LOG is set), and `mdfind` is replaced via the
+# MACKAS_MDFIND seam so `volume recover` searches the test tree instead of the
+# real Spotlight index.
 
 bats_require_minimum_version 1.5.0
 
@@ -46,13 +53,29 @@ setup() {
 
 	cat > "$TESTDIR/fakebin/container" <<'EOF'
 #!/usr/bin/env bash
+[ -n "${MOCK_CONTAINER_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_CONTAINER_LOG"
 case "$1" in --version) echo "container CLI 0.0-fake"; exit 0 ;; esac
 case "$1 $2" in
 	"system status") echo "status running"; exit 0 ;;
+	"system restart")
+		# The real apiserver scans volumes/*/entity.json into its in-memory
+		# index once, at ITS OWN startup, so a volume tree carried in from
+		# another Mac is invisible until it restarts (refuse_if_stale_entity's
+		# whole reason to exist). Model that: after a restart, and only then,
+		# what is on disk shows up in 'volume ls' too.
+		: > "$HOME/.fake-container-restarted"
+		exit 0
+		;;
 	"image ls")      echo "NAME TAG"; exit 0 ;;
 	"volume ls")
 		echo "NAME"
 		for v in ${MOCK_EXISTING_VOLUMES:-}; do echo "$v"; done
+		if [ -f "$HOME/.fake-container-restarted" ]; then
+			for e in "$HOME/Library/Application Support/com.apple.container/volumes"/*/entity.json; do
+				[ -f "$e" ] || continue
+				basename "$(dirname "$e")"
+			done
+		fi
 		exit 0
 		;;
 	"container ls"|"ls "*|"ls") echo "ID"; exit 0 ;;
@@ -276,6 +299,181 @@ mk() {
 	[ -f "$FOREIGN/work/meta-ai/kas/macos-local.yml" ]
 	printf '%s\n' "$output" | grep -qF "Adopted"
 	printf '%s\n' "$output" | grep -qF "$TESTDIR/newconfig.conf"
+}
+
+# ---------------------------------------------------------------------------
+# Per-volume placement: TMPDIR/sstate/downloads each on their own drive
+#
+# `mackas volume move <name> <dir>` leaves the volume's image tree on another
+# drive and a per-volume SYMLINK at the runtime location pointing at it -- the
+# symlink IS the record of where the volume lives (volume_real_dir()). Adopting
+# a root whose volumes were split across drives that way must not undo it:
+# setup_volumes() creating a fresh, empty volume over the top would reformat a
+# perfectly good image. cmd_adopt() calls volume_recover() before setup for
+# exactly this reason.
+# ---------------------------------------------------------------------------
+
+# Where the runtime keeps its volumes for this test's fake $HOME.
+cvol_dir() {
+	printf '%s/Library/Application Support/com.apple.container/volumes' "$HOME"
+}
+
+# Plant the on-disk shape a `volume move <name> <drive>` leaves behind: the
+# image tree on $2, a per-volume symlink at the runtime location. The image
+# content is a recognizable marker so a test can prove it was never rewritten.
+plant_moved_volume() {
+	local name="$1" drive="$2"
+	mkdir -p "$drive/$name" "$(cvol_dir)"
+	printf 'PRECIOUS-%s\n' "$name" > "$drive/$name/volume.img"
+	printf '{"id":"%s"}\n' "$name" > "$drive/$name/entity.json"
+	ln -s "$drive/$name" "$(cvol_dir)/$name"
+}
+
+# The Spotlight seam (MACKAS_MDFIND). volume_spotlight_find() only needs a list
+# of volume.img paths and does its own structural filtering, so `find` over the
+# test tree is a faithful stand-in that can never reach the real index. find
+# does not follow symlinks, so it reports the image at its REAL location on the
+# fake drive -- exactly what mdfind reports for a moved volume.
+fake_mdfind() {
+	cat > "$TESTDIR/fakebin/mdfind" <<EOF
+#!/usr/bin/env bash
+find "$TESTDIR" -name volume.img 2>/dev/null
+EOF
+	chmod +x "$TESTDIR/fakebin/mdfind"
+	export MACKAS_MDFIND="$TESTDIR/fakebin/mdfind"
+}
+
+# Like mk, but with the whole-dir relocation ON -- the default in real use.
+mk_reloc() {
+	run "$MACKAS" -y \
+		--set MACKAS_RELOCATE_VOLUMES=1 \
+		--set MACKAS_OVERHEAD=0 \
+		--set MACKAS_CPUS=6 \
+		--set MACKAS_MEMORY=12g \
+		"$@"
+}
+
+@test "adopt: a volume already moved to another drive is adopted in place, not re-created" {
+	make_foreign_root_with_project
+	fake_mdfind
+	export MOCK_CONTAINER_LOG="$TESTDIR/container.log"
+	local drive="$TESTDIR/nvme"
+	plant_moved_volume mackas-meta-ai-tmp "$drive"
+
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+
+	# The symlink is still the record, still pointing at the separate drive.
+	[ -L "$(cvol_dir)/mackas-meta-ai-tmp" ]
+	[ "$(readlink "$(cvol_dir)/mackas-meta-ai-tmp")" = "$drive/mackas-meta-ai-tmp" ]
+	# And the image behind it is byte-for-byte the one that was there.
+	grep -qxF 'PRECIOUS-mackas-meta-ai-tmp' "$drive/mackas-meta-ai-tmp/volume.img"
+	# No 'volume create' for it: that is what would reformat the image
+	# (refuse_if_stale_entity spots the entity.json through the symlink and
+	# restarts the daemon to pick the volume up instead).
+	assert_fails grep -q 'volume create .*mackas-meta-ai-tmp' "$TESTDIR/container.log"
+	printf '%s\n' "$output" | grep -qi "index doesn't know about"
+	# The two that were never moved are created normally.
+	grep -q 'volume create .*mackas-meta-ai-dl' "$TESTDIR/container.log"
+	grep -q 'volume create .*mackas-meta-ai-sstate' "$TESTDIR/container.log"
+}
+
+@test "adopt: re-points a per-volume symlink left dangling by the other Mac's path" {
+	make_foreign_root_with_project
+	fake_mdfind
+	export MOCK_CONTAINER_LOG="$TESTDIR/container.log"
+	local drive="$TESTDIR/nvme"
+	plant_moved_volume mackas-meta-ai-tmp "$drive"
+	# The other Mac's own path for the same drive: the image is right here, but
+	# the symlink carried over from that machine points somewhere that does not
+	# exist on this one.
+	ln -sfn "/Volumes/gone-nvme/mackas-meta-ai-tmp" "$(cvol_dir)/mackas-meta-ai-tmp"
+
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+
+	printf '%s\n' "$output" | grep -qi "does not resolve to a volume.img"
+	printf '%s\n' "$output" | grep -qF "recovered 'mackas-meta-ai-tmp' -> $drive/mackas-meta-ai-tmp"
+	[ "$(readlink "$(cvol_dir)/mackas-meta-ai-tmp")" = "$drive/mackas-meta-ai-tmp" ]
+	grep -qxF 'PRECIOUS-mackas-meta-ai-tmp' "$drive/mackas-meta-ai-tmp/volume.img"
+	assert_fails grep -q 'volume create .*mackas-meta-ai-tmp' "$TESTDIR/container.log"
+}
+
+@test "adopt: three volumes on three different drives all keep their own placement" {
+	make_foreign_root_with_project
+	fake_mdfind
+	export MOCK_CONTAINER_LOG="$TESTDIR/container.log"
+	plant_moved_volume mackas-meta-ai-tmp    "$TESTDIR/nvme"
+	plant_moved_volume mackas-meta-ai-sstate "$TESTDIR/sata-ssd"
+	plant_moved_volume mackas-meta-ai-dl     "$TESTDIR/spinning-rust"
+
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+
+	[ "$(readlink "$(cvol_dir)/mackas-meta-ai-tmp")"    = "$TESTDIR/nvme/mackas-meta-ai-tmp" ]
+	[ "$(readlink "$(cvol_dir)/mackas-meta-ai-sstate")" = "$TESTDIR/sata-ssd/mackas-meta-ai-sstate" ]
+	[ "$(readlink "$(cvol_dir)/mackas-meta-ai-dl")"     = "$TESTDIR/spinning-rust/mackas-meta-ai-dl" ]
+	grep -qxF 'PRECIOUS-mackas-meta-ai-dl' "$TESTDIR/spinning-rust/mackas-meta-ai-dl/volume.img"
+	assert_fails grep -q 'volume create ' "$TESTDIR/container.log"
+}
+
+# A volume moved onto a drive that is NOT mounted leaves its per-volume
+# symlink dangling. refuse_if_stale_entity's entity.json probe cannot see that
+# by itself -- `-e` follows symlinks, so it is false through a dangling one and
+# reads as "nothing here, safe to create" -- which used to let setup run
+# 'container volume create' straight over the link, orphaning whatever was on
+# the absent drive and handing back an empty volume (a mysteriously cold cache
+# for sstate or downloads). It now refuses instead: the symlink is the only
+# record of where that volume lives, and choosing to discard it is the user's
+# call, not mackas's.
+@test "adopt: an unmounted drive is refused, never created over" {
+	make_foreign_root_with_project
+	fake_mdfind
+	export MOCK_CONTAINER_LOG="$TESTDIR/container.log"
+	mkdir -p "$(cvol_dir)"
+	ln -s "/Volumes/unplugged-nvme/mackas-meta-ai-tmp" "$(cvol_dir)/mackas-meta-ai-tmp"
+
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -ne 0 ]
+
+	# recover reports it and cannot fix it: the image is on a disk that is not
+	# there, so Spotlight has nothing to find.
+	printf '%s\n' "$output" | grep -qi "does not resolve to a volume.img"
+	# The refusal names the drive, and says what to do about it.
+	printf '%s\n' "$output" | grep -qi "not currently mounted"
+	printf '%s\n' "$output" | grep -qF "/Volumes/unplugged-nvme/mackas-meta-ai-tmp"
+	printf '%s\n' "$output" | grep -qi "plug the drive in"
+	# The symlink is left exactly as it was -- nothing guesses at it.
+	[ "$(readlink "$(cvol_dir)/mackas-meta-ai-tmp")" = "/Volumes/unplugged-nvme/mackas-meta-ai-tmp" ]
+	# ...and NOTHING was created over it.
+	assert_fails grep -q 'volume create .*mackas-meta-ai-tmp' "$TESTDIR/container.log"
+}
+
+@test "adopt: whole-dir relocation composes with a per-volume move, never flattens it" {
+	# MACKAS_RELOCATE_VOLUMES=1 symlinks the WHOLE volumes dir onto MACKAS_ROOT.
+	# A volume already moved to its own drive must survive that as a symlink
+	# INSIDE the relocated dir (setup_relocate_volumes rsyncs with -a, which
+	# copies symlinks AS symlinks rather than dereferencing them), leaving two
+	# hops: runtime dir -> MACKAS_ROOT/container-volumes -> the other drive.
+	make_foreign_root_with_project
+	fake_mdfind
+	export MOCK_CONTAINER_LOG="$TESTDIR/container.log"
+	local drive="$TESTDIR/nvme"
+	plant_moved_volume mackas-meta-ai-tmp "$drive"
+
+	mk_reloc adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+
+	local root; root="$(cd "$FOREIGN" && pwd -P)"
+	[ -L "$(cvol_dir)" ]
+	[ "$(readlink "$(cvol_dir)")" = "$root/container-volumes" ]
+	[ -L "$root/container-volumes/mackas-meta-ai-tmp" ]
+	[ "$(readlink "$root/container-volumes/mackas-meta-ai-tmp")" = "$drive/mackas-meta-ai-tmp" ]
+	# The image is still on the other drive, not copied into MACKAS_ROOT.
+	grep -qxF 'PRECIOUS-mackas-meta-ai-tmp' "$drive/mackas-meta-ai-tmp/volume.img"
+	assert_fails grep -q 'volume create .*mackas-meta-ai-tmp' "$TESTDIR/container.log"
+	# The unmoved volumes land in the relocated dir on MACKAS_ROOT's disk.
+	grep -q 'volume create .*mackas-meta-ai-dl' "$TESTDIR/container.log"
 }
 
 # ---------------------------------------------------------------------------
