@@ -96,11 +96,33 @@ The table is the highlights, not the whole suite; the remaining files
 (`adopt`, `case_sensitivity`, `check_discard_support`, `purefns`,
 `require_root`, `set_get_unset`, `setup_e2e`, `setup_kas_container`,
 `smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`,
-`workspace_image_real`) follow the same patterns, and each file's own header
+`volume_resize_real`, `workspace_image_real`) follow the same patterns, and each file's own header
 says exactly what it pins. `adopt` and `sstate` cover two of the newest
 commands: `adopt`'s foreign-root introspection and collision-free
 volume/link derivation, and `sstate prune`'s age-based scan and one-VM
 refusal.
+
+Two opt-in suites need the real Apple runtime and are never run by a plain
+`./run-tests.sh`: `real_runtime.bats` (sparse volume creation, fstrim) and
+`volume_resize_real.bats` (`volume resize` end to end -- data written before
+a grow surviving it, the space being genuinely usable, and a volume
+relocated to a second physical drive growing there). Both gate on
+`MACKAS_REAL_RUNTIME=1`, refuse while any `oe-build-*` volume is held, and
+only ever touch `zztest-*` volumes. The resize one takes its target
+directory from `MACKAS_REAL_VOLUME_DIR` rather than hardcoding a disk:
+
+```sh
+MACKAS_REAL_RUNTIME=1 \
+MACKAS_REAL_VOLUME_DIR="/Volumes/<disk>/mackas-volume-test" \
+    bats tests/volume_resize_real.bats
+```
+
+That suite earned its keep immediately: it found that `container system
+restart` does not exist (mackas had called it in two places where it had
+never worked), that the kas image ships no `resize2fs`, and that the copy
+fallback silently moved a relocated volume back to the default drive. A
+hermetic suite cannot find any of those, because the fake `container`
+accepts whatever it is given.
 
 Not covered by the hermetic suite: anything needing a 200 GB disk, sudo, or a
 real build. See [TODO.md](../TODO.md) for the specific gaps.
