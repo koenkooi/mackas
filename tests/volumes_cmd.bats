@@ -77,9 +77,11 @@ case "$1 $2" in
 		[ -L "$d" ] || rm -rf "$d" 2>/dev/null || true
 		;;
 	"system status") echo "status running" ;;
-	"system restart")
-		# Simulate a REAL restart: the daemon re-scans volumes/*/entity.json
+	"system stop") exit 0 ;;
+	"system start")
+		# Simulate a REAL start: the daemon scans volumes/*/entity.json
 		# into its index -- exactly what refuse_if_stale_entity relies on.
+		# There is NO 'system restart' subcommand; mackas does stop+start.
 		for d in "$HOME/Library/Application Support/com.apple.container/volumes"/*/; do
 			[ -e "${d}entity.json" ] || continue
 			n="$(basename "$d")"
@@ -229,7 +231,7 @@ refute_call() {
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'stale'
 	refute_call "[volume] [create]"
-	refute_call "[system] [restart]"
+	refute_call "[system] [start]"
 }
 
 @test "setup: accepting the restart offer picks up the stale entity instead of creating over it" {
@@ -241,7 +243,7 @@ refute_call() {
 	: > "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp/entity.json"
 	mackas_setup setup
 	[ "$status" -eq 0 ]
-	assert_call "[system] [restart]"
+	assert_call "[system] [start]"
 	refute_call "[volume] [create] [-s] [120G] [oe-build-tmp]"
 	printf '%s\n' "$output" | grep -qi 'found after restarting'
 }
