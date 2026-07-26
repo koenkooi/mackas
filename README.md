@@ -189,12 +189,25 @@ Set `MACKAS_KAS_AUTO_FRAGMENT=0` to go back to composing it yourself instead
 > afterward, since the fragment's settings are now baked into the file it is
 > keeping unchanged.
 
+Driving kas by hand this way also teaches the *rest* of mackas what you are
+building: the wrapper derives `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG`
+from the file list and exports them into that shell, so a later `mackas
+retrieve` or `mackas buildstats analyze` in the same shell resolves
+`DEPLOY_DIR`/`LOG_DIR` through bitbake instead of refusing (or silently
+falling back to OE-core defaults your distro has redefined). It never writes
+them to a config file and never overrides a value you set yourself; set
+`MACKAS_KAS_AUTO_PROJECT=0` to turn it off. A chain that spans *sibling*
+layers (`meta-angstrom/…:meta-ti/…`) derives nothing, because mackas
+commands `cd` into a single checkout and a sibling would fall outside the
+`/repo` mount — keep driving those by hand from `work/`.
+
 > **`kas-container` here is a shell function, not the program on your
 > `PATH`.** `env.sh` defines it to supply `--runtime-args` (the ext4 volumes
 > and CPU/memory limits), point `GITCONFIG_FILE` at the generated
-> `safe.directory` config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, and
+> `safe.directory` config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`,
 > (unless `MACKAS_KAS_AUTO_FRAGMENT=0`) append `macos-local.yml` onto the
-> file list. None of that is optional — see
+> file list, and (unless `MACKAS_KAS_AUTO_PROJECT=0`) derive the project
+> settings above. None of that is optional — see
 > [architecture.md](docs/architecture.md#the-ext4-volumes).
 >
 > `command kas-container`, an absolute path, or an unsourced shell bypasses
@@ -485,6 +498,7 @@ used. `mackas.conf.example` has the full annotated list.
 | `MACKAS_PROJECT_DIR` | *(empty)* | Checkout name under `work/`; also the cwd kas runs in. |
 | `MACKAS_KAS_CONFIG` | *(empty)* | kas files to compose (checkout-relative). `macos-local.yml` is appended. |
 | `MACKAS_KAS_AUTO_FRAGMENT` | `1` | The env.sh `kas-container` wrapper also appends `macos-local.yml` onto a hand-typed file list. Set `0` to compose it yourself instead. |
+| `MACKAS_KAS_AUTO_PROJECT` | `1` | The same wrapper derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that file list and exports them into your shell (never to a config file, never over a value you set). Set `0` to disable. |
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty means one build rung with no `--target`, so kas builds its own default; see [mackas.conf.example](mackas.conf.example) for meta-ai's ladder as an example override. |
 | `MACKAS_OVERHEAD` | `1` | Sample host CPU-seconds and peak RSS per smoketest rung and append it to the rung log. Set `0` to disable. See [performance.md](docs/performance.md) for what a build actually costs the Mac (measured). |
 | `MACKAS_OVERHEAD_INTERVAL` | `5` | Seconds between host-overhead samples. Spikes shorter than this are invisible. |
