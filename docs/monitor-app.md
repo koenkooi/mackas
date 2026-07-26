@@ -23,6 +23,21 @@ apart.
   `MACKAS_MONITOR_NOTIFY=1`, posts native notifications on exactly three
   transitions: build started, build succeeded, build failed. It prefers
   `terminal-notifier` when that is on `PATH` and otherwise uses `osascript`.
+  Its bodies are worth copying, because they were arrived at by discarding
+  worse ones:
+
+  ```
+  mackas: build started     console-image for beaglebone/Angstrom
+  mackas: build succeeded   console-image for beaglebone/Angstrom · 6253/6253 tasks
+  mackas: build failed      linux-yocto_6.6.bb:do_compile · beaglebone/Angstrom
+  ```
+
+  Note what is **not** there. "Started" does not name a task, because at the
+  `building` edge none is running yet. "Failed" names the task that actually
+  failed — from `failed_tasks` — not `current`, which on a parallel build is
+  merely whatever happened to be running when everything stopped, and which
+  therefore accuses an innocent recipe. Every part is omitted rather than
+  padded when the bridge does not know it.
 
 The notification half already covers the common case. An app that also
 notifies should say so, and let the user run one or the other — two things
@@ -56,8 +71,13 @@ this document.
 ```json
 {
   "status": "building",
+  "targets": ["core-image-base", "console-base-image"],
+  "machine": "beaglebone",
+  "distro": "angstrom",
   "current": {"recipe": "busybox_1.36.0.bb", "task": "do_compile"},
   "progress": {"done": 412, "total": 3170},
+  "failed_tasks": [{"recipe": "linux-yocto_6.6.bb", "task": "do_compile"}],
+  "failed_count": 1,
   "recent_events": [{"ts": 1769000000.123, "type": "runQueueTaskStarted",
                      "recipe": "busybox_1.36.0.bb", "task": "do_compile"}]
 }
@@ -66,10 +86,15 @@ this document.
 | Field | Type | Meaning, and what it is allowed to do |
 |---|---|---|
 | `status` | string | One of **`idle`**, **`building`**, **`success`**, **`failed`**. Starts `idle`; becomes `building` on the first `ParseStarted`/`*TaskStarted`; becomes `success`/`failed` from bitbake's own exit code once `knotty.main()` returns, or `failed` if it raised. Within one container's life it only ever moves forward, and never leaves `success`/`failed`. |
+| `targets` | array of string | What the build was asked to produce, from bitbake's own parsed command line (`params.options.pkgs_to_build`). Populated **before the build starts**, so it is the one useful thing to show at the `building` edge, when no task is running yet. Empty when bitbake was given no explicit target (it then builds whatever the kas config names) — treat empty as "unknown", not as "nothing". |
+| `machine` | string \| null | `MACHINE`, read from the cooker at UI startup via `server.runCommand(["getVariable", …])` — the same mechanism knotty uses for its own config. `null` if unset or unreadable. On a **multiconfig** build this is only the default `MACHINE`; per-multiconfig builds legitimately have several, so treat it as a label rather than a complete description of what was built. |
+| `distro` | string \| null | `DISTRO`, same source and same caveats. |
 | `current.recipe` | string \| null | The **basename of the task's recipe file**, e.g. `busybox_1.36.0.bb` — not a `PN`. `null` until a task has started, and left at the last known value afterwards (task-completion events carry no recipe, so this is the last *started* recipe, not necessarily the one that just finished). |
 | `current.task` | string \| null | bitbake's task name, e.g. `do_compile`. Same staleness rule. |
 | `progress.done` | int | **Phase-dependent.** During parsing it is parsed-recipe count; during the run queue it is `stats.completed`. |
 | `progress.total` | int | Same phase split. **It jumps**: the parse total is replaced by the task total, and setscene and the main run queue report their own totals. Do not assume it is monotonic, and never assume `done <= total` across a phase change. |
+| `failed_tasks` | array | Tasks that **genuinely failed**, newest last, each `{recipe, task}` with the same recipe-basename convention as `current`. **Setscene failures are deliberately excluded**: a failed setscene task is not a build failure, it only means the sstate object could not be reused and the real task runs instead — bitbake's own knotty treats `runQueueTaskFailed` as fatal and `sceneQueueTaskFailed` as a warning. Listing the latter would name innocent recipes. Capped at 20. |
+| `failed_count` | int | The **true** number of distinct failed tasks, which may exceed `len(failed_tasks)` when the cap bites (`bitbake -k` keeps going after a failure). Show this, not the array length, when reporting a total. |
 | `recent_events` | array | Newest last, **capped at 50**. Each entry has `ts` (float, Unix seconds, on the *container's* clock) and `type` (the bitbake event name), plus whatever that event carried — `recipe`, `task`. `done`/`total` are deliberately not repeated per event. |
 
 Event `type` values currently produced: `ParseStarted`, `ParseProgress`,
@@ -125,7 +150,7 @@ target — and **each rung is a separate `kas-container` invocation**, so each
 rung is a separate container, a separate bitbake, and a separate bridge
 process. Between rungs there is nothing listening on the port at all. Then a
 new bridge appears, with completely fresh state: `status` back to `idle`,
-`progress` back to `0/0`, `recent_events` empty.
+`progress` back to `0/0`, `failed_tasks` and `recent_events` empty. (`targets` is repopulated immediately, since it comes from the new invocation's own command line.)
 
 What follows for a long-running app:
 

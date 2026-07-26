@@ -239,22 +239,26 @@ notifier_calls() {
 
 @test "monitor --notify: a building bridge notifies 'build started' via osascript" {
 	fake_notifier osascript
-	start_fake_bridge '{"status": "building", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 3, "total": 10}, "recent_events": []}'
+	start_fake_bridge '{"status": "building", "targets": ["core-image-base"], "machine": "beaglebone", "distro": "Angstrom", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 3, "total": 10}, "failed_tasks": [], "recent_events": []}'
 	run_monitor --port "$FAKE_PORT" --once --notify
 	[ "$status" -eq 0 ]
-	grep -qxF 'ARG:display notification "busybox:do_compile (3/10 tasks)" with title "mackas: build started"' \
+	# The BODY is what the build was asked to produce and what for -- not the
+	# task that happens to be running, which at 'started' is usually nothing.
+	grep -qxF 'ARG:display notification "core-image-base for beaglebone/Angstrom" with title "mackas: build started"' \
 		"$TESTDIR/osascript.log"
 	[ "$(notifier_calls osascript)" -eq 1 ]
 }
 
 @test "monitor --notify: MACKAS_MONITOR_NOTIFY=1 is equivalent to the flag" {
 	fake_notifier osascript
-	start_fake_bridge '{"status": "success", "current": {"recipe": null, "task": null}, "progress": {"done": 10, "total": 10}, "recent_events": []}'
+	start_fake_bridge '{"status": "success", "targets": ["core-image-base"], "machine": "beaglebone", "distro": "Angstrom", "current": {"recipe": null, "task": null}, "progress": {"done": 10, "total": 10}, "failed_tasks": [], "recent_events": []}'
 	export MACKAS_MONITOR_NOTIFY=1
 	run_monitor --port "$FAKE_PORT"
 	[ "$status" -eq 0 ]
 	grep -qF 'with title "mackas: build succeeded"' "$TESTDIR/osascript.log"
-	grep -qF 'display notification "10/10 tasks"' "$TESTDIR/osascript.log"
+	# Success leads with WHAT was built and what for, then the counts.
+	grep -qF "core-image-base for beaglebone/Angstrom" "$TESTDIR/osascript.log"
+	grep -qF "10/10 tasks" "$TESTDIR/osascript.log"
 }
 
 @test "monitor --notify: MACKAS_MONITOR_NOTIFY=1 also works through 'mackas monitor'" {
@@ -264,12 +268,16 @@ notifier_calls() {
 	# no real notifier can be reached.
 	fake_notifier osascript
 	fake_notifier terminal-notifier
-	start_fake_bridge '{"status": "failed", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 4, "total": 10}, "recent_events": []}'
+	start_fake_bridge '{"status": "failed", "targets": ["core-image-base"], "machine": "beaglebone", "distro": "Angstrom", "current": {"recipe": "zlib", "task": "do_install"}, "progress": {"done": 4, "total": 10}, "failed_tasks": [{"recipe": "busybox_1.36.bb", "task": "do_compile"}], "failed_count": 1, "recent_events": []}'
 	PATH="$TESTDIR/bin:$PATH" MACKAS_MONITOR_NOTIFY=1 run "$MACKAS" monitor --port "$FAKE_PORT"
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qF '[failed] 4/10'
 	grep -qxF 'ARG:mackas: build failed' "$TESTDIR/terminal-notifier.log"
-	grep -qxF 'ARG:busybox:do_compile (4/10 tasks)' "$TESTDIR/terminal-notifier.log"
+	# The task that FAILED, not the one that happened to be current (zlib),
+	# plus which build it was.
+	grep -qF 'busybox_1.36.bb:do_compile' "$TESTDIR/terminal-notifier.log"
+	grep -qF 'beaglebone/Angstrom' "$TESTDIR/terminal-notifier.log"
+	assert_fails grep -qF 'zlib' "$TESTDIR/terminal-notifier.log"
 }
 
 @test "monitor --notify: terminal-notifier is preferred when both are on PATH" {
@@ -311,13 +319,13 @@ notifier_calls() {
 	start_fake_bridge_sequence \
 		'{"status": "building", "current": {"recipe": "busybox", "task": "do_fetch"}, "progress": {"done": 1, "total": 10}, "recent_events": []}' \
 		'{"status": "building", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 2, "total": 10}, "recent_events": []}' \
-		'{"status": "failed", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 2, "total": 10}, "recent_events": []}'
+		'{"status": "failed", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 2, "total": 10}, "failed_tasks": [{"recipe": "busybox_1.36.bb", "task": "do_compile"}], "failed_count": 1, "recent_events": []}'
 	run_monitor --port "$FAKE_PORT" --notify
 	[ "$status" -eq 1 ]
 	[ "$(notifier_calls osascript)" -eq 2 ]
 	[ "$(grep -cF 'mackas: build started' "$TESTDIR/osascript.log")" -eq 1 ]
-	grep -qxF 'ARG:display notification "busybox:do_compile (2/10 tasks)" with title "mackas: build failed"' \
-		"$TESTDIR/osascript.log"
+	grep -qxF 'ARG:display notification "busybox_1.36.bb:do_compile" with title "mackas: build failed"' \
+		"$TESTDIR/osascript.log"  # no machine/distro known in this fixture
 }
 
 @test "monitor --notify: a hostile recipe name cannot break out of the AppleScript" {
@@ -326,13 +334,13 @@ notifier_calls() {
 	# string literal and everything after it would run as script. `do shell
 	# script` is what that buys an attacker, hence this exact payload.
 	fake_notifier osascript
-	start_fake_bridge_sequence '{"status": "building", "current": {"recipe": "ev\"il\\pkg\"; do shell script \"touch /tmp/mackas-pwned", "task": "do_compile"}, "progress": {"done": 1, "total": 2}, "recent_events": []}'
+	start_fake_bridge_sequence '{"status": "building", "targets": ["ev\"il\\pkg\"; do shell script \"touch /tmp/mackas-pwned"], "current": {"recipe": null, "task": null}, "progress": {"done": 1, "total": 2}, "failed_tasks": [], "recent_events": []}'
 	run_monitor --port "$FAKE_PORT" --once --notify
 	[ "$status" -eq 0 ]
 	# Exact match: both the " and the \ are backslash-escaped, so the whole
 	# payload stays inside one string literal and the statement still ends
 	# with the title.
-	grep -qxF 'ARG:display notification "ev\"il\\pkg\"; do shell script \"touch /tmp/mackas-pwned:do_compile (1/2 tasks)" with title "mackas: build started"' \
+	grep -qxF 'ARG:display notification "ev\"il\\pkg\"; do shell script \"touch /tmp/mackas-pwned" with title "mackas: build started"' \
 		"$TESTDIR/osascript.log"
 	# The whole payload is one -e argument, not several: no injected statement.
 	[ "$(grep -c '^ARG:' "$TESTDIR/osascript.log")" -eq 2 ]

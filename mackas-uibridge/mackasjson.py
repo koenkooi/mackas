@@ -82,13 +82,72 @@ import bb.ui.knotty
 PORT = int(os.environ.get("MACKAS_MONITOR_PORT", "8801"))
 MAX_RECENT_EVENTS = 50
 
+# A -k build can fail a lot of tasks; keep the list bounded but report the
+# true total alongside it, so a consumer showing "3 of 47" is never lying by
+# omission.
+MAX_FAILED_TASKS = 20
+
 _lock = threading.Lock()
 _state = {
     "status": "idle",
+    # What this build was asked to produce, and what for. Both known before
+    # any event arrives (see _set_targets/_set_machine), so they are the one
+    # useful thing a "build started" notification can say -- at that moment
+    # no task is running yet.
+    "targets": [],
+    "machine": None,
+    "distro": None,
     "current": {"recipe": None, "task": None},
     "progress": {"done": 0, "total": 0},
+    # Only genuine task failures, never setscene ones -- see _observe.
+    "failed_tasks": [],
+    "failed_count": 0,
     "recent_events": [],
 }
+
+
+def _set_targets(params):
+    """Record what the build was asked to build, from bitbake's own parsed
+    command line.
+
+    Not from a BuildStarted event: knotty's event mask is matched on the
+    EXACT class name (bb/event.py's UIEventFilter.filter does
+    `str(event.__class__)[8:-2] not in self.eventmask`), and its list carries
+    "bb.event.BuildBase", not "bb.event.BuildStarted" -- so BuildStarted is
+    never delivered to a UI at all, and knotty itself never handles one.
+    params.options.pkgs_to_build (bb/cookerdata.py:31) is the real source,
+    and it has the advantage of being known before the build starts."""
+    try:
+        pkgs = getattr(getattr(params, "options", None), "pkgs_to_build", None)
+        if pkgs:
+            with _lock:
+                _state["targets"] = [str(p) for p in pkgs]
+    except Exception:
+        pass
+
+
+def _set_machine(server):
+    """Ask the cooker what MACHINE and DISTRO this build is for.
+
+    server.runCommand(["getVariable", ...]) is knotty's OWN way of reading
+    configuration (bb/ui/knotty.py reads BBINCLUDELOGS, BB_CONSOLELOG and
+    friends exactly like this), and this runs from the same place -- once, at
+    UI startup, before the event loop -- so it is not a new mechanism and it
+    does not race a busy cooker the way registering a second observer does.
+
+    Both are plain strings here. On a MULTICONFIG build MACHINE is only the
+    default one, and per-multiconfig builds legitimately have several; a
+    consumer should treat this as a label, not as a complete description of
+    what was built."""
+    for key, var in (("machine", "MACHINE"), ("distro", "DISTRO")):
+        try:
+            value, error = server.runCommand(["getVariable", var])
+            if not error and value:
+                with _lock:
+                    _state[key] = str(value)
+        except Exception:
+            # Best-effort context, never a reason to fail a build.
+            pass
 
 
 def _record(event_type, **fields):
@@ -108,6 +167,20 @@ def _record(event_type, **fields):
                 "done": fields.get("done", _state["progress"]["done"]),
                 "total": fields.get("total", _state["progress"]["total"]),
             }
+        # A REAL task failure -- runQueueTaskFailed only. Deliberately not
+        # sceneQueueTaskFailed: a failed setscene task is not a build failure,
+        # it just means the sstate object could not be reused and the real
+        # task runs instead. knotty draws exactly the same line (bb/ui/
+        # knotty.py: runQueueTaskFailed sets return_value = 1 and logs an
+        # error; sceneQueueTaskFailed only logs a warning), and listing the
+        # latter would name innocent tasks in a "build failed" notification.
+        if event_type == "runQueueTaskFailed":
+            failed = {"recipe": fields.get("recipe"), "task": fields.get("task")}
+            if failed not in _state["failed_tasks"]:
+                _state["failed_count"] += 1
+                if len(_state["failed_tasks"]) < MAX_FAILED_TASKS:
+                    _state["failed_tasks"].append(failed)
+
         entry = {"ts": time.time(), "type": event_type}
         entry.update({k: v for k, v in fields.items() if k not in ("done", "total")})
         _state["recent_events"].append(entry)
@@ -142,7 +215,13 @@ def _observe(event):
                       "runQueueTaskFailed", "sceneQueueTaskFailed",
                       "runQueueTaskSkipped"):
             stats = getattr(event, "stats", None)
-            fields = {"task": getattr(event, "taskname", None)}
+            # recipe as well as task: a failure list saying only "do_compile"
+            # names nothing useful, and every runQueue event carries taskfile
+            # (bb/runqueue.py runQueueEvent.__init__).
+            fields = {
+                "recipe": os.path.basename(getattr(event, "taskfile", "") or "") or None,
+                "task": getattr(event, "taskname", None),
+            }
             if stats is not None:
                 fields["done"] = stats.completed
                 fields["total"] = stats.total
@@ -199,6 +278,8 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def main(server, eventHandler, params):
+    _set_targets(params)
+    _set_machine(server)
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
