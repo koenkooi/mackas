@@ -4431,7 +4431,19 @@ run_kas() {
 # best-guess default rather than treating this as fatal, matching
 # 'retrieve's existing best-effort, per-object style.
 bitbake_getvar() {
-	local var="$1" rt_args gitconfig out rc errfile errmsg
+	# QUIET_UNDEFINED (2nd arg, opt-in): when bitbake-getvar's own error is
+	# exactly "The variable 'X' is not defined" -- its wording when NOTHING
+	# in the parsed config ever set X, as opposed to a real resolution
+	# failure -- swallow it and signal that specific case with return 2
+	# instead of the generic 1, rather than printing it as a warning. Only
+	# BUILDHISTORY_DIR's caller opts in: that variable is defined nowhere but
+	# inside buildhistory.bbclass itself, so "not defined" there just means
+	# "this project doesn't INHERIT buildhistory" -- the overwhelmingly
+	# common case, already explained in the caller's own follow-up message,
+	# not a bitbake-getvar problem worth a generic warning about. Every other
+	# caller queries a variable bitbake.conf itself always sets, where this
+	# exact wording would be a genuine surprise worth keeping visible.
+	local var="$1" quiet_undefined="${2:-0}" rt_args gitconfig out rc errfile errmsg
 	rt_args="$(kas_runtime_args)"
 	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
 	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
@@ -4533,6 +4545,10 @@ bitbake_getvar() {
 	if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
 		errmsg="$(tail -1 "$errfile" 2>/dev/null)"
 		rm -f "$errfile"
+		case "$errmsg" in
+			"The variable '$var' is not defined"*)
+				[ "$quiet_undefined" = "1" ] && return 2 ;;
+		esac
 		[ -n "$errmsg" ] && warn "  bitbake-getvar failed for $var: $errmsg"
 		return 1
 	fi
@@ -4881,11 +4897,11 @@ cmd_shell() {
 # buildstats -- work with buildstats already retrieved
 # ---------------------------------------------------------------------------
 #
-# tmp/buildstats, tmp/log and tmp/deploy live inside the oe-build-tmp ext4
-# image and are invisible from macOS (that is the deliberate cost of real Linux
-# filesystem semantics -- see the "Known limitations" section of the README).
-# This copies them out with a throwaway container that bind-mounts a host
-# directory as /out. The recipe is the one proven by hand:
+# tmp/buildstats, tmp/log, tmp/deploy and buildhistory live inside the
+# oe-build-tmp ext4 image and are invisible from macOS (that is the deliberate
+# cost of real Linux filesystem semantics -- see the "Known limitations"
+# section of the README). This copies them out with a throwaway container that
+# bind-mounts a host directory as /out. The recipe is the one proven by hand:
 #
 #   container run --rm -u 0:0 -v oe-build-tmp:/build -v <dest>:/out \
 #       ghcr.io/siemens/kas/kas:5.4 sh -c 'cp -r /build/tmp/buildstats /out/'
@@ -4896,11 +4912,22 @@ cmd_shell() {
 # mount, so files land owned by the invoking user already and a `chown -R`
 # there fails "Operation not permitted".
 
-# fetch_tmp_subdir SUB DEST VAR [EXTRA] -- copy /build/tmp/SUB out of the
-# TMPDIR volume into DEST/SUB[/EXTRA]. Returns non-zero (with a clear message)
-# when SUB is absent -- e.g. no build has run, so there is no tmp/buildstats
-# -- rather than letting a raw `cp` error surface. Idempotent within one
-# EXTRA: re-copying the same EXTRA overwrites in place.
+# fetch_tmp_subdir SUB DEST VAR DEFAULT [EXTRA] -- copy the guest directory VAR
+# resolves to out of the TMPDIR volume into DEST/SUB[/EXTRA]. Returns non-zero
+# (with a clear message) when that directory is absent -- e.g. no build has run,
+# so there is no tmp/buildstats -- rather than letting a raw `cp` error surface.
+# Idempotent within one EXTRA: re-copying the same EXTRA overwrites in place.
+#
+# The name is historical: nothing here requires the source to sit under
+# /build/tmp, and two objects need not. A distro may move DEPLOY_DIR anywhere
+# it likes (Angstrom points it at ${TOPDIR}/deploy), and buildhistory lives at
+# ${TOPDIR}/buildhistory -- i.e. /build/buildhistory -- by its own bbclass
+# default, a sibling of tmp/ rather than a child. Only the FALLBACK
+# used when bitbake-getvar cannot answer was ever tmp-shaped, which is why
+# DEFAULT is a parameter: hardcoding "/build/tmp/$sub" here would have sent
+# every buildhistory probe to a path that cannot exist. SUB stays the
+# mackas-facing object key and names the destination, whatever the source
+# path turns out to be.
 #
 # EXTRA exists for buildstats specifically (see cmd_retrieve): a fresh,
 # mackas-generated timestamp per retrieve, so successive retrievals land in
@@ -4911,25 +4938,53 @@ cmd_shell() {
 # retrieval already put there -- on top of the accumulation buildstats.bbclass
 # itself already does guest-side (see check_buildstats_accumulation).
 fetch_tmp_subdir() {
-	local sub="$1" dest="$2" var="$3" extra="${4:-}" guest destsub
+	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" guest destsub quiet_undefined=0 rc
+
+	# buildhistory is the one object whose variable is only ever defined by
+	# an optional bbclass (see bitbake_getvar): opt into its quiet-undefined
+	# signal so "this project doesn't INHERIT buildhistory" is explained once,
+	# below, rather than as a generic bitbake-getvar warning first.
+	[ "$sub" = "buildhistory" ] && quiet_undefined=1
 
 	# Distros can redefine where these actually land (e.g. Angstrom sets
 	# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
-	# ask bitbake itself rather than assume the OE-core default layout.
-	guest="$(bitbake_getvar "$var")" || {
-		guest="/build/tmp/$sub"
-		warn "  could not resolve $var via bitbake-getvar; assuming the OE-core default ($guest)"
-	}
+	# ask bitbake itself rather than assume the default layout.
+	guest="$(bitbake_getvar "$var" "$quiet_undefined")"; rc=$?
+	if [ "$rc" -eq 2 ]; then
+		guest="$default"
+	elif [ "$rc" -ne 0 ]; then
+		guest="$default"
+		warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
+	fi
 
 	# Existence probe first, so "no build has run yet" is a clear message and
 	# not an obscure cp failure. Under --dry-run run() prints and returns 0, so
 	# the copy command below is still shown.
 	if ! run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" test -d "$guest"; then
-		if [ "$sub" = "buildstats" ]; then
-			warn "  no $guest in '$MACKAS_VOL_TMP' -- has a build run yet? ($SCRIPT_CMD smoketest)"
-		else
-			warn "  no $guest in '$MACKAS_VOL_TMP'; skipping $sub"
-		fi
+		case "$sub" in
+			buildstats)
+				warn "  no $guest in '$MACKAS_VOL_TMP' -- has a build run yet? ($SCRIPT_CMD smoketest)"
+				;;
+			buildhistory)
+				# By far the likeliest reason, and one a bare "no such
+				# directory" hides completely: buildhistory.bbclass is NOT
+				# inherited by default, and nothing whatsoever is written
+				# until a project asks for it. BUILDHISTORY_DIR is also
+				# undefined until the class is inherited, so bitbake-getvar
+				# has nothing to return either and the probe above ran
+				# against the class default -- the same "absent" symptom
+				# from a completely different cause. Say what to add and
+				# where, so this is one edit away from working rather than
+				# a hunt through the manual.
+				warn "  no $guest in '$MACKAS_VOL_TMP' -- this project does not INHERIT buildhistory."
+				warn "  Nothing records it unless you ask: add to your kas config's local_conf_header"
+				warn "  (or conf/local.conf):  INHERIT += \"buildhistory\""
+				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
+				;;
+			*)
+				warn "  no $guest in '$MACKAS_VOL_TMP'; skipping $sub"
+				;;
+		esac
 		return 1
 	fi
 
@@ -4992,6 +5047,13 @@ ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matte
                        so successive retrievals never merge together.
   logs                 tmp/log -- cooker.log and friends.
   deploy               tmp/deploy -- the images and ipks. Can be tens of GB.
+  buildhistory         buildhistory/ -- what each build produced: package and
+                       image contents, sizes, dependencies, sysroot listings.
+                       Only exists if the project INHERITs buildhistory; most
+                       do not, and retrieve says so rather than reporting a
+                       missing directory. Note it sits at \${TOPDIR}/buildhistory
+                       -- inside the same volume '$SCRIPT_CMD clean' discards --
+                       so retrieve it before cleaning if you want to keep it.
 
 ${C_BLD}OPTIONS${C_RST}
   --dest DIR      Where to copy (default \$MACKAS_BASE/artifacts).
@@ -5013,9 +5075,11 @@ ${C_BLD}ONE-VM RULE${C_RST}
 EOF
 }
 
-# retrieve <object>... [--dest DIR] -- copy one or more tmp/ subdirs out of the
-# TMPDIR volume. Each object maps 1:1 onto a guest dir under /build/tmp,
-# except 'logs' (the CLI-facing plural) which fetches tmp/log (singular).
+# retrieve <object>... [--dest DIR] -- copy one or more build-output directories
+# out of the TMPDIR volume. Each object names a bitbake variable that resolves
+# to the real guest path (never a guessed one -- see fetch_tmp_subdir), plus the
+# name it lands under on the host: 'logs' is the CLI-facing plural of tmp/log,
+# and 'buildhistory' resolves to ${TOPDIR}/buildhistory, outside tmp/ entirely.
 cmd_retrieve() {
 	local dest="" objects=() want_help=0
 	while [ $# -gt 0 ]; do
@@ -5029,10 +5093,10 @@ cmd_retrieve() {
 			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
 			--dest)        dest="${2:-}"; [ -n "$dest" ] || die "--dest needs a DIR"; shift 2 ;;
 			--dest=*)      dest="${1#*=}"; shift ;;
-			buildstats|logs|deploy) objects+=("$1"); shift ;;
+			buildstats|logs|deploy|buildhistory) objects+=("$1"); shift ;;
 			-*) die "unknown option for 'retrieve': $1" "$SCRIPT_CMD retrieve --help" ;;
 			*) die "unknown object for 'retrieve': $1" \
-				"$SCRIPT_CMD retrieve --help  (objects: buildstats logs deploy)" ;;
+				"$SCRIPT_CMD retrieve --help  (objects: buildstats logs deploy buildhistory)" ;;
 		esac
 	done
 
@@ -5042,7 +5106,7 @@ cmd_retrieve() {
 	fi
 
 	[ "${#objects[@]}" -ge 1 ] || die "'retrieve' needs at least one object" \
-		"$SCRIPT_CMD retrieve <buildstats|logs|deploy> [<object>...] [--dest DIR]"
+		"$SCRIPT_CMD retrieve <buildstats|logs|deploy|buildhistory> [<object>...] [--dest DIR]"
 
 	require_mackas_root
 
@@ -5085,19 +5149,29 @@ cmd_retrieve() {
 	# value in tests.
 	local retrieve_ts="${MACKAS_RETRIEVE_TS:-$(date +%Y%m%d%H%M%S)}"
 
-	local it sub var extra fetched=0 got_buildstats=0
+	# default is the guest path to fall back on when bitbake-getvar cannot
+	# answer (no checkout wired up, a query that failed, a variable the project
+	# never defines). It is per-object because the objects do NOT share a
+	# layout: three are children of TMPDIR, but buildhistory.bbclass puts
+	# BUILDHISTORY_DIR at ${TOPDIR}/buildhistory, and TOPDIR inside the
+	# container is /build itself -- so its default is a SIBLING of tmp/, not a
+	# subdirectory of it.
+	local it sub var extra default fetched=0 got_buildstats=0 got_buildhistory=0
 	for it in "${objects[@]}"; do
 		sub="$it"
 		var="DEPLOY_DIR"
 		extra=""
+		default="/build/tmp/$it"
 		case "$it" in
-			logs)       sub="log"; var="LOG_DIR" ;;
-			buildstats) var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
+			logs)         sub="log"; var="LOG_DIR"; default="/build/tmp/log" ;;
+			buildstats)   var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
+			buildhistory) var="BUILDHISTORY_DIR"; default="/build/buildhistory" ;;
 		esac
 		[ "$it" = "deploy" ] && warn "  deploy can be large (tens of GB); this may take a while and fill $dest"
-		if fetch_tmp_subdir "$sub" "$dest" "$var" "$extra"; then
+		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
+			[ "$it" = "buildhistory" ] && got_buildhistory=1
 		fi
 	done
 
@@ -5109,6 +5183,15 @@ cmd_retrieve() {
 	hdr "Retrieved to $dest"
 	if [ "$got_buildstats" -eq 1 ]; then
 		info "  Summarise with: $SCRIPT_CMD buildstats analyze $(printf '%q' "$dest/buildstats")"
+	fi
+	if [ "$got_buildhistory" -eq 1 ]; then
+		# buildhistory.bbclass commits each build into the directory itself
+		# when BUILDHISTORY_COMMIT is on, so what was just copied out may well
+		# be a git repository with one commit per build -- readable on the Mac
+		# with plain git, no container needed. Phrased conditionally because
+		# that setting is a project decision, not something mackas asserts:
+		# with it off the directory is still there, just without the history.
+		info "  Inspect with: git -C $(printf '%q' "$dest/buildhistory") log --oneline   (when BUILDHISTORY_COMMIT is on)"
 	fi
 	return 0
 }
@@ -7021,8 +7104,9 @@ ${C_BLD}COMMANDS${C_RST}
   smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
   status     Show what is configured and what exists on disk.
   shell      Drop into a kas shell for the project's kas config.
-  retrieve   Copy build outputs (buildstats/logs/deploy) out of the ext4
-             TMPDIR volume, where macOS cannot see them. '$SCRIPT_CMD retrieve --help'.
+  retrieve   Copy build outputs (buildstats/logs/deploy/buildhistory) out of
+             the ext4 TMPDIR volume, where macOS cannot see them.
+             '$SCRIPT_CMD retrieve --help'.
   buildstats Work with buildstats already retrieved (currently: analyze).
              '$SCRIPT_CMD buildstats --help'.
   sstate     Prune sstate objects bitbake hasn't reused in a while.

@@ -110,7 +110,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
-| `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
+| `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
@@ -140,15 +140,28 @@ cross-compiled → the real targets, **hours** cold). Each rung streams to
 ### Getting build outputs off the volume
 
 `TMPDIR` is inside the `oe-build-tmp` ext4 image, so `tmp/buildstats`,
-`tmp/log` and `tmp/deploy` are invisible from macOS. `mackas retrieve`
-copies them out with a throwaway container:
+`tmp/log` and `tmp/deploy` — and `buildhistory`, one level up — are invisible
+from macOS. `mackas retrieve` copies them out with a throwaway container:
 
 ```sh
 ./mackas retrieve buildstats                # -> $MACKAS_BASE/artifacts/
 ./mackas retrieve buildstats logs deploy    # also tmp/log and tmp/deploy; deploy can be tens of GB
+./mackas retrieve buildhistory              # what each build produced, if the project inherits it
 ./mackas retrieve buildstats --dest ~/out   # elsewhere
 ./mackas buildstats analyze [PATH]          # summarise what was fetched
 ```
+
+Every object resolves its real guest path from bitbake itself
+(`BUILDSTATS_BASE`, `LOG_DIR`, `DEPLOY_DIR`, `BUILDHISTORY_DIR`), never from
+the textbook layout — a distro is free to move any of them, and Angstrom moves
+`DEPLOY_DIR`. `buildhistory` in particular is **not** under `tmp/`: its class
+default is `${TOPDIR}/buildhistory`, which inside the container is
+`/build/buildhistory`. Nothing writes it unless the project inherits the class
+(`INHERIT += "buildhistory"` in your kas config's `local_conf_header` or
+`conf/local.conf`), and `retrieve buildhistory` says exactly that when it finds
+nothing, instead of reporting a missing directory. Because that default sits in
+the volume `mackas clean` drops, retrieve it before cleaning, or point
+`BUILDHISTORY_DIR` somewhere that survives.
 
 `buildstats analyze` runs
 [`tools/mackas-buildstats-analyze`](tools/mackas-buildstats-analyze) over
@@ -268,8 +281,8 @@ tuning fragment `:kas/macos-local.yml` (parallelism, `BB_DISKMON_DIRS`,
 `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that list — exported into the
 shell, never written to a config file, never overriding a value you set —
 so a later `mackas retrieve` or `buildstats analyze` resolves
-`DEPLOY_DIR`/`LOG_DIR` through bitbake instead of refusing (or silently
-falling back to OE-core defaults your distro has redefined).
+`DEPLOY_DIR`/`LOG_DIR`/`BUILDHISTORY_DIR` through bitbake instead of refusing
+(or silently falling back to defaults your distro has redefined).
 `MACKAS_KAS_AUTO_FRAGMENT=0` / `MACKAS_KAS_AUTO_PROJECT=0` disable the two
 conveniences. The wrapper finds the file list even behind known flags, but
 **backs off untouched at any flag it does not recognize** rather than guess

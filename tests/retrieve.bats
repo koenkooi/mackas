@@ -63,6 +63,11 @@ EOF
 	echo hi > "$FIXTURE/log/cooker.log"
 	mkdir -p "$FIXTURE/deploy/images"
 	echo bin > "$FIXTURE/deploy/images/fake.img"
+	# buildhistory is NOT under tmp/ in the guest -- it is ${TOPDIR}/buildhistory,
+	# i.e. /build/buildhistory, a sibling of /build/tmp. The fixture is flat, so
+	# it sits alongside the others here; the probe path is what the tests pin.
+	mkdir -p "$FIXTURE/buildhistory/packages" "$FIXTURE/buildhistory/images"
+	echo 'PV = 1.36.1' > "$FIXTURE/buildhistory/packages/latest"
 	export FIXTURE
 
 	# MOCK_BUSY_VOLUME, if set, is a volume the modelled runtime reports as held
@@ -503,6 +508,140 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# buildhistory -- the one object that does NOT live under tmp/, and the one
+# that is absent for most projects because buildhistory.bbclass is not
+# inherited by default.
+# ---------------------------------------------------------------------------
+
+@test "retrieve: fetches buildhistory into MACKAS_BASE/artifacts" {
+	MOCK_TMP_HAS="buildhistory" mk retrieve buildhistory
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildhistory/packages" ]
+	[ -f "$ROOT/artifacts/buildhistory/packages/latest" ]
+	printf '%s\n' "$output" | grep -qF "Retrieved to $ROOT/artifacts"
+}
+
+@test "retrieve: buildhistory is probed at /build/buildhistory, NOT under tmp/" {
+	# BUILDHISTORY_DIR defaults to ${TOPDIR}/buildhistory, and TOPDIR inside the
+	# container is /build -- so the fallback used when bitbake-getvar cannot
+	# answer is a SIBLING of tmp/, not a child. A tmp-shaped fallback would
+	# probe a path that can never exist and report buildhistory as missing on
+	# every project that has it.
+	MOCK_TMP_HAS="buildhistory" mk retrieve buildhistory
+	[ "$status" -eq 0 ]
+	assert_call "test] [-d] [/build/buildhistory]"
+	refute_call "test] [-d] [/build/tmp/buildhistory]"
+}
+
+@test "retrieve: buildhistory asks bitbake-getvar for BUILDHISTORY_DIR, not an assumed default" {
+	# BUILDHISTORY_DIR is as redefinable as DEPLOY_DIR -- a project may point it
+	# at a directory that survives 'mackas clean', which is a sensible thing to
+	# do. The resolved path must win over the class default, and the host
+	# destination must still be named after the object key.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q BUILDHISTORY_DIR "*) echo "/build/elsewhere/bh-store" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container"
+	mkdir -p "$FIXTURE/bh-store/images"
+	echo img > "$FIXTURE/bh-store/images/files-in-image.txt"
+
+	MOCK_TMP_HAS="bh-store" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve buildhistory
+	[ "$status" -eq 0 ]
+	assert_call "test] [-d] [/build/elsewhere/bh-store]"
+	refute_call "test] [-d] [/build/buildhistory]"
+	# Named after the object key, not the resolved path's own basename.
+	[ -d "$ROOT/artifacts/buildhistory/images" ]
+	[ ! -d "$ROOT/artifacts/bh-store" ]
+}
+
+@test "retrieve: says the project does not INHERIT buildhistory when it is absent" {
+	# The common case by far: buildhistory.bbclass is not inherited by default,
+	# so there is nothing to copy and nothing wrong. A bare "no such directory"
+	# reads like a broken build; this must name the cause and the one-line fix.
+	MOCK_TMP_HAS="" mk retrieve buildhistory
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'does not INHERIT buildhistory'
+	printf '%s\n' "$output" | grep -qF 'INHERIT += "buildhistory"'
+	# Not the generic per-object "skipping" wording, and not buildstats' one.
+	! printf '%s\n' "$output" | grep -qi 'has a build run yet'
+	refute_call "cp -r"
+}
+
+@test "retrieve: buildhistory swallows bitbake-getvar's real 'not defined' wording" {
+	# bitbake-getvar's own source (bin/bitbake-getvar) does exactly this for an
+	# undefined variable: exit 1, "The variable 'X' is not defined" on stderr,
+	# not a quiet empty value. BUILDHISTORY_DIR is defined nowhere but inside
+	# buildhistory.bbclass, so a project that does not inherit it hits this
+	# exact wording on every retrieve -- a real, expected outcome, not the
+	# generic bitbake-getvar failure the OTHER "does not INHERIT" test above
+	# models via an empty stub. Both generic warnings (bitbake_getvar's own,
+	# and fetch_tmp_subdir's "assuming the default") must stay silent here:
+	# the buildhistory-specific message already says everything there is to
+	# say, and printing both would read like two things went wrong instead
+	# of one expected thing.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q BUILDHISTORY_DIR "*)
+		echo "The variable 'BUILDHISTORY_DIR' is not defined" >&2
+		exit 1
+		;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container"
+
+	MOCK_TMP_HAS="" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve buildhistory
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'does not INHERIT buildhistory'
+	! printf '%s\n' "$output" | grep -qF 'bitbake-getvar failed for BUILDHISTORY_DIR'
+	! printf '%s\n' "$output" | grep -qF 'could not resolve BUILDHISTORY_DIR'
+	assert_call "test] [-d] [/build/buildhistory]"
+}
+
+@test "retrieve: --dry-run buildhistory prints the copy but creates nothing" {
+	MOCK_TMP_HAS="buildhistory" mk --dry-run retrieve buildhistory
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF '/build/buildhistory'
+	[ ! -d "$ROOT/artifacts/buildhistory" ]
+	[ ! -d "$ROOT/artifacts" ]
+	refute_call "cp -r"
+	refute_call "[run] [--rm] [-u] [0:0]"
+}
+
+@test "retrieve: buildhistory composes with the other objects in one call" {
+	MOCK_TMP_HAS="buildstats buildhistory" mk retrieve buildstats buildhistory
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+	[ -d "$ROOT/artifacts/buildhistory/packages" ]
+	# Each object resolved its own path: buildstats keeps its tmp-shaped one.
+	assert_call "test] [-d] [/build/tmp/buildstats]"
+	assert_call "test] [-d] [/build/buildhistory]"
+	# Both hints, and buildstats still nests under the retrieve timestamp.
+	printf '%s\n' "$output" | grep -qF 'buildstats analyze'
+	printf '%s\n' "$output" | grep -qF "git -C $ROOT/artifacts/buildhistory log"
+}
+
+@test "retrieve: a missing buildhistory does not sink the other objects" {
+	# Per-object, best-effort: buildstats is retrieved and reported even though
+	# buildhistory is absent, and the exit status reflects that something was
+	# retrieved.
+	MOCK_TMP_HAS="buildstats" mk retrieve buildstats buildhistory
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+	printf '%s\n' "$output" | grep -qi 'does not INHERIT buildhistory'
+	[ ! -d "$ROOT/artifacts/buildhistory" ]
+}
+
+# ---------------------------------------------------------------------------
 # --help
 # ---------------------------------------------------------------------------
 
@@ -510,6 +649,8 @@ EOF
 	mk retrieve --help
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'retrieve'
+	# Every object is documented, buildhistory included.
+	printf '%s\n' "$output" | grep -qF 'buildhistory'
 	refute_call "cp -r"
 }
 
