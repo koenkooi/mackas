@@ -52,7 +52,7 @@ teardown() {
 	# (buildstats analyze is a read-only local summary and does not gate on a
 	# root at all -- see buildstats_analyze.bats).
 	# --dry-run so nothing is actually created/destroyed while we probe the class.
-	for cmd in setup smoketest shell clean destroy "retrieve buildstats" "volume fstrim all"; do
+	for cmd in setup smoketest shell clean destroy "retrieve buildstats" "volume fstrim all" "clean downloads"; do
 		n=$((n + 1))
 		# shellcheck disable=SC2086  # deliberate word-split for the two-word case
 		run "$MACKAS" --dry-run -y --set "MACKAS_ROOT=" $cmd
@@ -69,9 +69,9 @@ teardown() {
 			return 1
 		fi
 	done
-	# All seven were actually exercised (guards the loop against a typo that
+	# All eight were actually exercised (guards the loop against a typo that
 	# empties the list).
-	[ "$n" -eq 7 ]
+	[ "$n" -eq 8 ]
 }
 
 @test "require_mackas_root: 'volume list' works with NO root (it only reads)" {
