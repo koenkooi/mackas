@@ -5193,10 +5193,8 @@ status_volume() {
 			"$name" "$role" "$size" "$SCRIPT_NAME"
 	fi
 	if [ -n "$real_cap" ] && [ "$(size_to_gb "$real_cap")" != "$(size_to_gb "$size")" ]; then
-		printf '        %sconfigured size is %s, but setup never resizes an existing volume\n' \
-			"$C_YEL" "$size"
-		printf '        (create %s fresh under a different %s to get %s instead)%s\n' \
-			"$name" "MACKAS_VOLUME_NAME" "$size" "$C_RST"
+		printf '        %sconfigured size is %s, but setup never resizes an existing volume%s\n' \
+			"$C_YEL" "$size" "$C_RST"
 	fi
 	if [ -n "$moved" ]; then
 		printf '        %smoved to: %s%s\n' "$C_BLU" "$moved" "$C_RST"

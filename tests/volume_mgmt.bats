@@ -268,6 +268,36 @@ refute_call() {
 	! printf '%s\n' "$output" | grep -qF 'near cap'
 }
 
+@test "status: a real cap that diverged from the configured size says so, once, without a create-fresh lecture" {
+	# ensure_volume() never resizes an existing volume, so a 1T volume under a
+	# 120G setting is a permanent, legitimate state (e.g. from a one-shot
+	# 'setup --tmpdir-size 1T'). status must explain the divergence in ONE
+	# line -- the old second line telling the user to create the volume fresh
+	# under a different MACKAS_VOLUME_NAME was removed as noise (live report).
+	have_volume oe-build-tmp 1T 8192
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		status
+	[ "$status" -eq 0 ]
+	# The real cap is what the volume line reports...
+	printf '%s\n' "$output" | grep -qE 'oe-build-tmp .* cap 1T'
+	# ...the one-line explanation names the configured size...
+	printf '%s\n' "$output" | grep -qF 'configured size is 120G, but setup never resizes an existing volume'
+	# ...and the create-fresh advice is gone.
+	! printf '%s\n' "$output" | grep -qF 'fresh under a different'
+}
+
+@test "status: a volume whose real cap matches the configured size gets no divergence line" {
+	have_volume oe-build-tmp 120G 8192
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		status
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qF 'setup never resizes'
+}
+
 # ---------------------------------------------------------------------------
 # fstrim -- the headline
 # ---------------------------------------------------------------------------
