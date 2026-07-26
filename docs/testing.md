@@ -142,12 +142,12 @@ subcommand that does not exist) in two places, the kas image shipping no
 `resize2fs`, and a copy fallback that silently moved a relocated volume back
 to the default drive.
 
-Two suites need the real Apple runtime: `real_runtime.bats` and
-`volume_resize_real.bats`. Both gate on `MACKAS_REAL_RUNTIME=1` and are
-dev-Mac-only, non-hermetic, and never CI-gated (hosted runners have no
-`container` runtime). A plain `./run-tests.sh` discovers them but they
-self-skip, so the full suite stays hermetic. Their safety rules, enforced in
-`setup`/`teardown`:
+Three suites need the real Apple runtime: `real_runtime.bats`,
+`volume_resize_real.bats` and `diskmon_real.bats`. All gate on
+`MACKAS_REAL_RUNTIME=1` and are dev-Mac-only, non-hermetic, and never
+CI-gated (hosted runners have no `container` runtime). A plain
+`./run-tests.sh` discovers them but they self-skip, so the full suite stays
+hermetic. Their safety rules, enforced in `setup`/`teardown`:
 
 - run only when `MACKAS_REAL_RUNTIME=1` **and** the runtime is up;
 - **refuse** (skip) while any container holds an `oe-build-*` volume — the
@@ -191,9 +191,101 @@ MACKAS_REAL_VOLUME_DIR="/Volumes/<disk>/mackas-volume-test" \
 
 This is the suite that found all three real-runtime failures listed above.
 
+### `diskmon_real.bats` — proving `BB_DISKMON_DIRS`' HALT actually fires
+
+The generated fragment sets `BB_DISKMON_DIRS` to **HALT** the build at 2 GiB
+/ 100k inodes free on each of `${TMPDIR}`, `${DL_DIR}` and `${SSTATE_DIR}`
+(see [storage.md](storage.md#volume-caps-and-the-disk-monitor)).
+`tests/volumes.bats` pins the exact bytes of that value on disk, and a real
+bitbake was known to accept it — but nothing had ever seen it **fire**. That
+is a backstop guarding the exact failure the three-volume design exists to
+prevent, so "the syntax parses" was not enough. This suite is what closed
+that gap; the output it observed is quoted below.
+
+**Why it needs a running build.** From bitbake 2.18's own source, not from
+the manual: `lib/bb/runqueue.py` registers the monitor as a
+`bb.event.HeartbeatEvent` handler and guards it with
+`self.state in [RunQueueState.RUNNING, RunQueueState.CLEAN_UP]`, and
+`lib/bb/server/process.py` fires that heartbeat every `BB_HEARTBEAT_EVENT`
+seconds (default 1). So the check happens **only while tasks are
+executing** — never at parse time, never from `bitbake -p`, never from a
+config dump. `lib/bb/monitordisk.py` then compares `st.f_bavail *
+st.f_frsize` against the configured value and `st.f_favail` against the
+inode value; both numbers are **remaining free**, not used, and `2G`/`100K`
+are `convertGMK`'d to 2 GiB and 102400 inodes.
+
+**The construction.** A full build is hours, so the suite does not run one.
+It runs *real* bitbake — the checkout mackas already fetched, mounted
+read-only — inside the kas image against a ~30-line throwaway metadata tree
+(one recipe, one long-running task, no OE, no layers), with
+`TMPDIR`/`DL_DIR`/`SSTATE_DIR` pointed at a small throwaway `zztest-*` ext4
+volume. The `BB_DISKMON_DIRS` value is **lifted verbatim from mackas' own
+`setup_kas_fragment()`**, so there is no second copy of `2G` in the test: a
+change to the action or the thresholds changes what the suite asserts. The
+volume is pre-loaded with a `fallocate`d reservation — ext4 counts those
+blocks as used, so `f_bavail` drops while the sparse host image stays small
+— which is what keeps the run to ~200 MB of transient host disk instead of
+a couple of GB.
+
+Four tests:
+
+1. **the parse half, no container at all**: the exact generated string fed
+   to bitbake's own `bb.monitordisk.getDiskData()`, asserting it yields
+   three rules whose action is `HALT` and whose thresholds are the two
+   numbers the fragment names. This matters because `getDiskData` only
+   *logs* on a bad value and returns `None` — a typo would silently disable
+   the monitor rather than fail the build.
+2. **a control run**: same volume, same config, same recipe, filling
+   disabled — bitbake runs to completion. Without it a HALT in 3 and 4
+   would be indistinguishable from any unrelated breakage in the fixture.
+3. **free space crosses the threshold mid-build**: the recipe writes 16 MiB
+   at a time with a pause between rounds, so the crossing lands a dozen
+   heartbeats into a `RUNNING` runqueue.
+4. **free inodes cross the threshold mid-build**: the same shape with tens
+   of thousands of empty files, which consume inodes and almost no bytes.
+   The `HALT` log line is identical for both arms, so each test attributes
+   the halt by the preceding warning (`The free space of …` vs `The free
+   inode of …`) and asserts the other arm did *not* trip.
+
+```sh
+MACKAS_REAL_RUNTIME=1 bats tests/diskmon_real.bats
+```
+
+**It fires.** On a 3G volume (2.94 GiB / 196594 inodes free at the start),
+reserved down to 2348806144 bytes and then written 16 MiB at a time, bitbake
+printed:
+
+```
+FILLER: round=12 avail=2147348480 inodes=196562
+WARNING: The free space of /vol/tmp (/dev/vdc) is running low (1.984GB left)
+WARNING: The free space of /vol/downloads (/dev/vdc) is running low (1.984GB left)
+WARNING: The free space of /vol/sstate (/dev/vdc) is running low (1.984GB left)
+ERROR: Immediately halt since the disk space monitor action is "HALT"!
+NOTE: Sending SIGTERM to remaining 1 tasks
+Summary: There were 3 ERROR messages, returning a non-zero exit code.
+```
+
+2147348480 is 135168 bytes under the 2 GiB threshold — it halted on the
+first heartbeat after the crossing, on **all three** monitored directories,
+and killed the running task. The inode arm produced the same halt at
+`98.194K left`. Whole file: about a minute, four tests.
+
+Nothing is hardcoded to this machine: the bitbake checkout comes from
+`MACKAS_REAL_BITBAKE_DIR` (default `${MACKAS_ROOT:-$HOME/oe}/work/bitbake`,
+where kas puts it under a mackas root) and the volume size from
+`MACKAS_REAL_DISKMON_SIZE` (default `3G`).
+
+**What it does not prove.** It says nothing about the *margin*. An OE task
+can write far faster than the 1 s heartbeat, so a single greedy task could
+still blow through 2 GiB between two checks; whether 2 GiB is the right
+number is a separate, unmeasured question (see
+[TODO.md](../TODO.md)). It also runs bitbake standalone rather than under
+kas, so the fragment being *composed into* a real build stays the business
+of `tests/volumes.bats` and the smoketest ladder.
+
 ### `workspace_image_real.bats` — the case-sensitive workspace image
 
-The third opt-in file, gated by the same `MACKAS_REAL_RUNTIME=1`: it needs
+The fourth opt-in file, gated by the same `MACKAS_REAL_RUNTIME=1`: it needs
 no `container` runtime at all, but does run a real `hdiutil
 create`/`attach` to prove the workspace image genuinely makes `work/`
 case-sensitive (the hermetic offer/decline/reattach logic lives in
