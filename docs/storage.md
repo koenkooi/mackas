@@ -5,7 +5,7 @@ Where each piece of the build lives, and why. The short version:
 | What | Where | Why |
 |---|---|---|
 | **TMPDIR** | Local ext4 container volume, on local disk | **Non-negotiable.** APFS over virtiofs lacks the semantics — see [architecture.md](architecture.md#the-ext4-volumes). |
-| **Writable `SSTATE_DIR` / `DL_DIR`** | Their own local ext4 volumes | Correctness and speed. Separate so `clean` can drop TMPDIR without losing them. |
+| **Writable `SSTATE_DIR` / `DL_DIR`** | Their own local ext4 volumes | Speed, and lifecycle: separate so `clean` can drop TMPDIR without losing them. Unlike TMPDIR, ext4 here is not a *semantic* requirement — see [Does `SSTATE_DIR` actually need ext4?](#does-sstate_dir-actually-need-ext4-desk-check-not-yet-measured) |
 | **Read-only sstate + downloads mirrors** | Network, over **HTTP** | **Optional.** bitbake's own mechanism, recommended if you use one. |
 
 `MACKAS_ROOT` is wherever you point it — a directory on a case-sensitive
@@ -616,6 +616,80 @@ above.
 - **Time Machine**: `check` only inspects `MACKAS_ROOT`'s volume for an active
   destination, so a build volume parked on a disk that *is* a Time Machine
   destination will not be flagged.
+
+## Does `SSTATE_DIR` actually need ext4? (desk check, not yet measured)
+
+The table at the top of this document says TMPDIR on ext4 is
+*non-negotiable*, and lists sstate and downloads on their own ext4 volumes
+for "correctness and speed". That is honest about TMPDIR and vague about
+sstate — so the source was read to find out which of it is a real
+requirement. Summary: **nothing in sstate's own read/write path requires
+ext4. The hash-equivalence database mackas parks inside `SSTATE_DIR` is a
+different matter, and is the actual blocker.**
+
+What the source says (openembedded-core at `4b73d7a5c5`, bitbake alongside
+it):
+
+- **Writes stay inside `SSTATE_DIR`.** `sstate_create_and_sign_package`
+  builds the tarball into a temp file created *in the destination directory*
+  (`sstate.bbclass:875`) and publishes it with `os.link()` (`:817`). That
+  hardlink is `SSTATE_DIR` → `SSTATE_DIR`, never TMPDIR → `SSTATE_DIR`, so
+  there is no cross-filesystem hardlink to fail. `.siginfo` files go through
+  `mkstemp` + `bb.utils.rename`, which already falls back to `shutil.move`
+  on `EXDEV` (`bb/utils.py:2144`).
+- **Reads are plain extractions.** `sstate_unpack_package` is
+  `tar -I zstd -xvpf` (`sstate.bbclass:933`) into `WORKDIR`. The one
+  `copyhardlinktree` (`:331`) runs TMPDIR → TMPDIR. Nothing hardlinks *out*
+  of `SSTATE_DIR`.
+- **No xattrs.** Neither the create (`:892`) nor the extract (`:933`) passes
+  `--xattrs`.
+- **Case collisions are theoretical.** Object names are a lowercase sha256
+  plus `SSTATE_PKGSPEC` (`:14-41`); a collision needs two recipes differing
+  only in the case of `PN`/`PV`/`PR`. `MACKAS_ROOT` is required to be
+  case-sensitive anyway, which removes the question.
+- **mtime is load-bearing, and works.** Every cache *hit* touches the object
+  (`:979`, `:937-939`) — which is what makes `mackas sstate prune
+  --older-than` meaningful. Note `oe.utils.touch` swallows `PermissionError`
+  and `EROFS` silently (`oe/utils.py:542-550`), so a filesystem that refused
+  `utimes` would make pruning over-delete rather than error.
+
+### The blocker: `BB_HASHSERVE_DB_DIR`
+
+The generated fragment sets `BB_HASHSERVE_DB_DIR = "${SSTATE_DIR}"` so the
+hash-equivalence database outlives `clean` (see the section above). That
+database is SQLite opened in **WAL mode with `synchronous = OFF`**
+(`hashserv/sqlite.py:145`, `cooker.py:363`), with one connection per client
+plus a backfill worker (`hashserv/server.py:303,895`).
+
+bitbake **hard-fatals** if that directory is on NFS (`cooker.py:330-337`,
+citing SQLite's own locking FAQ) — but it detects NFS by comparing
+`stat -f -c %T` against the literal string `nfs` (`bb/utils.py:2286`).
+**virtiofs reports something else, so the guard would not fire while the
+hazard class is the same.** Moving `SSTATE_DIR` to host APFS therefore means
+giving that database its own home first — a small dedicated ext4 volume
+preserves the survives-`clean` property; the TMPDIR volume does not, since
+that is the one `clean` throws away.
+
+### The failure mode to watch for
+
+`sstate.bbclass:821` raises a loud `bb.fatal` when `os.link` fails with
+`ENOSYS` — but `EPERM`/`EACCES`/`EOPNOTSUPP` are caught by the bare `except:`
+on the next line, after which the write degrades to a **silent no-op**. A
+build would succeed while populating nothing, and the symptom would show up
+much later as a cache that never warms. Any experiment here has to check
+that `SSTATE_DIR` actually grew, not merely that the build passed.
+
+### Verdict, and what is still unmeasured
+
+**Safe with caveats, on paper. Not yet tried.** Nothing was measured: this is
+a source reading, and the two things that would decide it are both empirical
+— whether `link(2)`, `utimes` and `rename` really behave on the virtiofs
+mount (and fail loudly rather than silently if not), and what streaming
+hundreds of MB of zstd tarballs over virtiofs on every reuse costs against
+the ext4 volume. If the throughput cost is real it is paid on *every* build,
+against a usability win (browsable, `rsync`-able, Time-Machine-able sstate)
+that only matters occasionally. That trade, not correctness, is what should
+decide it — and it stays an open question until someone runs it.
 
 ## Buildstats and a constant BUILDNAME
 
