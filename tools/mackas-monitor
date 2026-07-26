@@ -57,6 +57,10 @@ NOTIFY_TIMEOUT = 5.0
 # one current line there instead of three stale ones.
 NOTIFY_GROUP = "net.thruhere.mackas.build"
 
+# The separator mackas already uses for this shape elsewhere (the build
+# summary line in the README demo reads "core-image-base . rb1-core-kit built").
+SEP = " \u00b7 "
+
 NOTIFY_HELP = """\
 NOTIFICATIONS (--notify / MACKAS_MONITOR_NOTIFY=1)
 
@@ -172,19 +176,94 @@ def notify(title, message):
     return False
 
 
-def describe(state):
-    """The context line for a notification: what the build was doing."""
-    current = state.get("current") or {}
+def _targets_of(state):
+    """The target list, capped so a 20-target build does not fill the screen."""
+    targets = state.get("targets") or []
+    if not targets:
+        return ""
+    if len(targets) <= 3:
+        return " ".join(str(t) for t in targets)
+    return f"{' '.join(str(t) for t in targets[:3])} +{len(targets) - 3} more"
+
+
+def _where_of(state):
+    """MACHINE/DISTRO, in that order, skipping whichever is unknown.
+
+    The slash is only a separator when both are present -- a bare "/angstrom"
+    would read as a path, and inventing a placeholder for the missing half
+    would be worse than saying less."""
+    return "/".join(str(v) for v in (state.get("machine"), state.get("distro")) if v)
+
+
+def describe_targets(state):
+    """What the build was asked to produce, for the 'started' notification.
+
+    At the moment status flips to 'building' no task is running yet, so the
+    old 'recipe:task' body was almost always 'no task detail reported'. The
+    targets are known before the build begins (the bridge reads them from
+    bitbake's own parsed command line), which is the one genuinely useful
+    thing to say at that point. An empty string means say nothing rather
+    than pad the notification with filler."""
+    what = _targets_of(state)
+    where = _where_of(state)
+    if what and where:
+        return f"{what} for {where}"
+    # Either alone still says something useful: MACHINE/DISTRO matters even
+    # when no explicit target was given (bitbake then builds whatever the kas
+    # config names), and targets matter even if the cooker would not say what
+    # they are for.
+    return what or where
+
+
+def describe_failures(state):
+    """The tasks that actually failed, for the 'failed' notification.
+
+    NOT the current task: on a parallel build that is merely whatever
+    happened to be running when the build stopped, so naming it reads as an
+    accusation of an innocent recipe. The bridge tracks real
+    runQueueTaskFailed events (never setscene ones, which are not failures).
+    Empty string when it has none -- better to say nothing than to guess."""
+    failed = state.get("failed_tasks") or []
+    if not failed:
+        return ""
+    shown = [
+        f"{f.get('recipe') or '?'}:{f.get('task') or '?'}"
+        for f in failed[:3]
+    ]
+    total = state.get("failed_count") or len(failed)
+    if total > len(shown):
+        return f"{', '.join(shown)} +{total - len(shown)} more"
+    return ", ".join(shown)
+
+
+def describe_success(state):
+    """What was built, and how much of it, for the 'succeeded' notification.
+
+    Leads with the targets for the same reason 'started' does: the thing you
+    want confirmed is WHAT finished, not how many tasks it took. The counts
+    follow as detail, and any part that is unknown is simply left out rather
+    than padded."""
     progress = state.get("progress") or {}
-    recipe = current.get("recipe")
-    task = current.get("task")
-    done = progress.get("done", 0)
     total = progress.get("total", 0)
-    if recipe or task:
-        return f"{recipe or '-'}:{task or '-'} ({done}/{total} tasks)"
+    done = progress.get("done", 0)
+    parts = []
+    what = describe_targets(state)
+    if what:
+        parts.append(what)
     if total:
-        return f"{done}/{total} tasks"
-    return "no task detail reported"
+        parts.append(f"{done}/{total} tasks")
+    return SEP.join(parts)
+
+
+def describe_failed(state):
+    """What failed, and which build it was -- MACHINE/DISTRO, not the targets.
+
+    The failing task is the subject here; the targets are what you were
+    trying to get, which matters less than what stopped you. MACHINE/DISTRO
+    stays because it is what tells two concurrent-ish builds apart."""
+    failures = describe_failures(state)
+    where = _where_of(state)
+    return SEP.join([p for p in (failures, where) if p])
 
 
 def transition_message(prev_status, state):
@@ -198,11 +277,11 @@ def transition_message(prev_status, state):
     if status == prev_status:
         return None
     if status == "building" and prev_status in (None, "idle"):
-        return ("mackas: build started", describe(state))
+        return ("mackas: build started", describe_targets(state))
     if status == "success":
-        return ("mackas: build succeeded", describe(state))
+        return ("mackas: build succeeded", describe_success(state))
     if status == "failed":
-        return ("mackas: build failed", describe(state))
+        return ("mackas: build failed", describe_failed(state))
     return None
 
 
