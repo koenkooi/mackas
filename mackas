@@ -146,6 +146,7 @@ GET_ARGS=()
 UNSET_ARGS=()
 SETUP_ARGS=()
 CLEAN_ARGS=()
+EXEC_ARGS=()
 
 setup_colors() {
 	if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
@@ -4644,6 +4645,119 @@ run_kas() {
 # returns 1 if the query itself failed -- callers fall back to their own
 # best-guess default rather than treating this as fatal, matching
 # 'retrieve's existing best-effort, per-object style.
+# kas_shell_ro CMDSTRING -- run CMDSTRING inside a kas shell for the project's
+# kas config, with kas's own repo-mutating setup steps always skipped. This is
+# the one place that literal --skip set lives; both callers below share it so
+# it can never drift between them the way the old conditional '-k' logic did
+# (see the data-loss history in the comment on the kflag line).
+#
+# Returns 1 (with a warn already printed) on a precondition failure -- no real
+# checkout, no readable/safe gitconfig -- rather than ever letting the
+# invocation run against a wrong or missing MACKAS_PROJECT. Otherwise runs
+# CMDSTRING with stdout/stderr inherited from the caller and returns its exit
+# status: bitbake_getvar() wraps the call in a command substitution to capture
+# stdout (with its own stderr redirect for the errfile diagnostics below);
+# cmd_exec() calls it directly so the command's own output streams straight
+# through, live, to whoever ran 'mackas exec'.
+kas_shell_ro() {
+	local cmdstring="$1" rt_args gitconfig
+	rt_args="$(kas_runtime_args)"
+	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
+	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
+
+	# MACKAS_KAS_CONFIG alone does not say WHERE to run kas-container from --
+	# that is MACKAS_PROJECT_DIR's job (it is what MACKAS_PROJECT derives
+	# from). Setting only the former, a real and easy mistake, leaves
+	# MACKAS_PROJECT at whatever it already was -- kas-container then looks
+	# for the configured kas files relative to the WRONG directory and fails
+	# outright. Caught here, up front, with a specific diagnostic, rather
+	# than only surfacing as a generic "could not resolve" from the caller.
+	if [ ! -d "$MACKAS_PROJECT/.git" ]; then
+		warn "  kas_shell_ro needs a real checkout at MACKAS_PROJECT ($MACKAS_PROJECT) -- set MACKAS_PROJECT_DIR too, not just MACKAS_KAS_CONFIG"
+		return 1
+	fi
+
+	# The real workflow this project supports -- 'mackas setup' once for
+	# shared infra (volumes, kas-container, shim), then plain 'git clone' plus
+	# a directly-driven kas-container per project under work/ -- never runs
+	# 'setup' again for each newly-cloned project. So KAS_FILES_ARG's
+	# always-appended kas/macos-local.yml (compose_kas_files) may simply not
+	# exist yet for THIS project even though the shared kas/macos.yml does.
+	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
+	# regenerating unconditionally, and setup_kas_fragment() already honours
+	# --dry-run itself (prints the plan, writes nothing). Redirected to
+	# stderr: bitbake_getvar() captures this call's stdout via command
+	# substitution as the resolved value, and setup_kas_fragment's own
+	# step/did progress lines would otherwise leak into that value.
+	if [ ! -f "$MACKAS_KAS_FRAGMENT_REPO" ]; then
+		setup_kas_fragment 1>&2
+	fi
+
+	# kas's own 'shell' (and 'build') unconditionally re-runs its repo setup
+	# steps every invocation -- checkout, patch application, writing
+	# local.conf/bblayers.conf -- unless told '-k'/--keep-config-unchanged to
+	# skip them (confirmed against the real kas source: kas/libkas.py's
+	# setup_parser_keep_config_unchanged_arg lists exactly those steps).
+	# Both callers here run this once per read-only command, not a build --
+	# without -k, every call would needlessly re-checkout/re-patch every
+	# declared repo, real cost and real risk (repo state churn) for something
+	# that only wants to read something. Never add -k to run_kas()'s own
+	# shared invocation: an actual build/shell session SHOULD go through
+	# kas's normal setup.
+	#
+	# -k also skips write_bbconfig, though, so it can only be used once a
+	# parseable state already exists -- a checkout that has never been
+	# queried before has no local.conf/bblayers.conf yet, and -k would leave
+	# it with nothing to parse. KAS_BUILD_DIR is blanked here (same reasoning
+	# as run_kas()'s own comment: kas-container's forward_dir would otherwise
+	# bind-mount a host path over the volumes), which makes kas default its
+	# build dir to $KAS_REPO_DIR itself (confirmed against the real source:
+	# Context.__init__ falls back to KAS_WORK_DIR/build only when
+	# KAS_BUILD_DIR is UNSET, not when it's blank -- os.environ.get's default
+	# never fires for an explicitly-empty value -- so build_dir becomes
+	# os.path.abspath('') = cwd = /repo = $MACKAS_PROJECT here). So
+	# conf/local.conf and conf/bblayers.conf under $MACKAS_PROJECT are the
+	# real, host-visible signal for "has this ever been configured before".
+	# NEVER let kas touch the checkouts. This is read-only by contract, and
+	# it must not be capable of modifying a single repo.
+	#
+	# The old form used -k when conf/local.conf existed and NOTHING otherwise.
+	# That "otherwise" was a data-loss bug, hit for real: with no local.conf
+	# yet, kas ran its full setup -- including repos_checkout and
+	# repos_apply_patches -- which resets every declared repo to its pinned
+	# revision and wipes local commits in the layer checkouts under work/.
+	# `mackas retrieve` calls this (via bitbake_getvar), so merely copying
+	# build output off a volume could destroy unpushed work in a layer,
+	# silently. That same manual mistake -- typing kas-container by hand
+	# without any of this -- has since reset a real checkout twice; cmd_exec()
+	# exists specifically so a one-off manual check never has to type
+	# kas-container directly again.
+	#
+	# Skipping the four repo-touching steps INDIVIDUALLY is the fix, and is
+	# strictly better than either old branch: -k also skips write_bbconfig,
+	# which is exactly what a checkout with no conf/ yet still needs, while
+	# these four are the only ones that mutate a repo. So this is safe on a
+	# fresh checkout AND on a configured one, with no conditional at all.
+	# (kas/libkas.py's setup_parser_keep_config_unchanged_arg lists the five
+	# steps -k bundles; write_bbconfig is the one deliberately left in.)
+	local kflag="--skip setup_dir --skip finish_setup_repos --skip repos_checkout --skip repos_apply_patches"
+
+	(
+		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE=docker \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		BB_NUMBER_THREADS="$MACKAS_CPUS" \
+		PARALLEL_MAKE="-j $MACKAS_CPUS" \
+		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell $kflag "$KAS_FILES_ARG" -c "$cmdstring"
+	)
+}
+
 bitbake_getvar() {
 	# QUIET_UNDEFINED (2nd arg, opt-in): when bitbake-getvar's own error is
 	# exactly "The variable 'X' is not defined" -- its wording when NOTHING
@@ -4657,104 +4771,15 @@ bitbake_getvar() {
 	# not a bitbake-getvar problem worth a generic warning about. Every other
 	# caller queries a variable bitbake.conf itself always sets, where this
 	# exact wording would be a genuine surprise worth keeping visible.
-	local var="$1" quiet_undefined="${2:-0}" rt_args gitconfig out rc errfile errmsg
-	rt_args="$(kas_runtime_args)"
-	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
-	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
-
-	# MACKAS_KAS_CONFIG alone does not say WHERE to run kas-container from --
-	# that is MACKAS_PROJECT_DIR's job (it is what MACKAS_PROJECT derives
-	# from). Setting only the former, a real and easy mistake, leaves
-	# MACKAS_PROJECT at whatever it already was -- kas-container then looks
-	# for the configured kas files relative to the WRONG directory and fails
-	# outright. Caught here, up front, with a specific diagnostic, rather
-	# than only surfacing as a generic "could not resolve" from the caller.
-	if [ ! -d "$MACKAS_PROJECT/.git" ]; then
-		warn "  bitbake-getvar needs a real checkout at MACKAS_PROJECT ($MACKAS_PROJECT) -- set MACKAS_PROJECT_DIR too, not just MACKAS_KAS_CONFIG"
-		return 1
-	fi
-
-	# The real workflow this project supports -- 'mackas setup' once for
-	# shared infra (volumes, kas-container, shim), then plain 'git clone' plus
-	# a directly-driven kas-container per project under work/ -- never runs
-	# 'setup' again for each newly-cloned project. So KAS_FILES_ARG's
-	# always-appended kas/macos-local.yml (compose_kas_files) may simply not
-	# exist yet for THIS project even though the shared kas/macos.yml does.
-	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
-	# regenerating unconditionally, and setup_kas_fragment() already honours
-	# --dry-run itself (prints the plan, writes nothing). Redirected to
-	# stderr: every caller of bitbake_getvar captures its stdout via command
-	# substitution as the resolved value, and setup_kas_fragment's own
-	# step/did progress lines would otherwise leak into that value.
-	if [ ! -f "$MACKAS_KAS_FRAGMENT_REPO" ]; then
-		setup_kas_fragment 1>&2
-	fi
-
-	# kas's own 'shell' (and 'build') unconditionally re-runs its repo setup
-	# steps every invocation -- checkout, patch application, writing
-	# local.conf/bblayers.conf -- unless told '-k'/--keep-config-unchanged to
-	# skip them (confirmed against the real kas source: kas/libkas.py's
-	# setup_parser_keep_config_unchanged_arg lists exactly those steps).
-	# retrieve can call this once per object in a single invocation, and it
-	# is a read-only variable query, not a build -- without -k, every call
-	# would needlessly re-checkout/re-patch every declared repo, real cost
-	# and real risk (repo state churn) for something that only wants one
-	# variable's value. Never add -k to run_kas()'s own shared invocation:
-	# an actual build/shell session SHOULD go through kas's normal setup.
-	#
-	# -k also skips write_bbconfig, though, so it can only be used once a
-	# parseable state already exists -- a checkout bitbake-getvar has never
-	# successfully queried before has no local.conf/bblayers.conf yet, and -k
-	# would leave it with nothing to parse. KAS_BUILD_DIR is blanked here
-	# (same reasoning as run_kas()'s own comment: kas-container's forward_dir
-	# would otherwise bind-mount a host path over the volumes), which makes
-	# kas default its build dir to $KAS_REPO_DIR itself (confirmed against
-	# the real source: Context.__init__ falls back to KAS_WORK_DIR/build only
-	# when KAS_BUILD_DIR is UNSET, not when it's blank -- os.environ.get's
-	# default never fires for an explicitly-empty value -- so build_dir
-	# becomes os.path.abspath('') = cwd = /repo = $MACKAS_PROJECT here). So
-	# conf/local.conf and conf/bblayers.conf under $MACKAS_PROJECT are the
-	# real, host-visible signal for "has this ever been configured before".
-	# NEVER let kas touch the checkouts. This is a read-only variable query,
-	# and it must not be capable of modifying a single repo.
-	#
-	# The old form used -k when conf/local.conf existed and NOTHING otherwise.
-	# That "otherwise" was a data-loss bug, hit for real: with no local.conf
-	# yet, kas ran its full setup -- including repos_checkout and
-	# repos_apply_patches -- which resets every declared repo to its pinned
-	# revision and wipes local commits in the layer checkouts under work/.
-	# `mackas retrieve` calls this, so merely copying build output off a
-	# volume could destroy unpushed work in a layer, silently.
-	#
-	# Skipping the four repo-touching steps INDIVIDUALLY is the fix, and is
-	# strictly better than either old branch: -k also skips write_bbconfig,
-	# which is exactly what a checkout with no conf/ yet still needs, while
-	# these four are the only ones that mutate a repo. So this is safe on a
-	# fresh checkout AND on a configured one, with no conditional at all.
-	# (kas/libkas.py's setup_parser_keep_config_unchanged_arg lists the five
-	# steps -k bundles; write_bbconfig is the one deliberately left in.)
-	local kflag="--skip setup_dir --skip finish_setup_repos --skip repos_checkout --skip repos_apply_patches"
+	local var="$1" quiet_undefined="${2:-0}" out rc errfile errmsg
 
 	# kas-container's own stderr (e.g. "configuration file '...' not found",
 	# the exact symptom of the MACKAS_KAS_CONFIG-without-MACKAS_PROJECT_DIR
-	# mistake above surviving some OTHER way) is captured, not discarded --
-	# a bare "could not resolve" with no reason was hard to debug live.
+	# mistake kas_shell_ro() catches surviving some OTHER way) is captured,
+	# not discarded -- a bare "could not resolve" with no reason was hard to
+	# debug live.
 	errfile="$(mktemp "${TMPDIR:-/tmp}/mackas-getvar.XXXXXX" 2>/dev/null)" || errfile=/dev/null
-	out="$(
-		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
-		KAS_CONTAINER_ENGINE=docker \
-		KAS_WORK_DIR="$MACKAS_WORK" \
-		KAS_BUILD_DIR='' \
-		DL_DIR='' \
-		SSTATE_DIR='' \
-		GITCONFIG_FILE="$gitconfig" \
-		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
-		BB_NUMBER_THREADS="$MACKAS_CPUS" \
-		PARALLEL_MAKE="-j $MACKAS_CPUS" \
-		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell $kflag "$KAS_FILES_ARG" \
-			-c "bitbake-getvar --value -q $(printf '%q' "$var")"
-	)" 2>"$errfile"
+	out="$(kas_shell_ro "bitbake-getvar --value -q $(printf '%q' "$var")")" 2>"$errfile"
 	rc=$?
 	if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
 		errmsg="$(tail -1 "$errfile" 2>/dev/null)"
@@ -5100,6 +5125,11 @@ build would use, so \`bitbake -e bash | grep ^TUNE_FEATURES\` and similar
 interactive poking see the real, mounted TMPDIR/DL_DIR/SSTATE_DIR -- not a
 bind-mounted host directory. Exits back to macOS when the shell exits.
 
+For a single read-only command instead of an interactive session, prefer
+'$SCRIPT_CMD exec CMD' -- it bakes in the repo-preserving --skip flags;
+'shell' deliberately runs kas's full setup (checkout, patch, config), which
+is what an interactive session should get.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
 though shell has nothing to confirm and nothing --dry-run would print instead
 of doing.
@@ -5113,6 +5143,132 @@ cmd_shell() {
 	ensure_project_checked_out
 	info "Dropping into a kas shell for $KAS_FILES_ARG ..."
 	run_kas "" shell "$KAS_FILES_ARG"
+}
+
+# ---------------------------------------------------------------------------
+# exec -- a one-off command against the checkout, safe by construction
+# ---------------------------------------------------------------------------
+#
+# The reason this exists: bitbake_getvar() (via kas_shell_ro(), above) has
+# always been safe for MACKAS'S OWN internal read-only queries, but nothing
+# stopped a hand-typed 'kas-container shell <files> -c "..."' for a quick
+# manual check from doing kas's normal repo-checkout/patch-apply dance --
+# exactly what -k/--skip exists to prevent, and exactly what a real checkout
+# has been reset by, more than once, from someone reaching for a raw
+# kas-container invocation under time pressure mid-investigation. Docs said
+# "use --skip" already; this makes the safe path the one you'd actually type.
+exec_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD exec${C_RST} -- run a one-off, read-only command against the
+checkout, with kas's repo-mutating setup steps always skipped.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD exec CMD [ARGS...]
+  $SCRIPT_CMD exec -- CMD [ARGS...]   (only needed if CMD itself starts with '-',
+                                     or collides with one of exec's own flags)
+
+Runs \`kas-container shell <files> --skip setup_dir --skip finish_setup_repos
+--skip repos_checkout --skip repos_apply_patches -c "CMD ARGS..."\` -- the
+exact skip set \`bitbake_getvar()\` already uses internally for retrieve/
+buildstats/clean. No flag adds '-k' back or drops a skip: that is the entire
+point. See the '-k' explanation in docs/architecture.md for why dropping
+those steps by hand, even briefly, can reset a layer to its pinned revision
+and wipe local commits.
+
+${C_BLD}WHAT THIS DOES NOT DO${C_RST}
+This protects against KAS's OWN setup steps, not against your command:
+\`$SCRIPT_CMD exec touch openembedded-core/foo\` still creates the file --
+/repo and the volumes are mounted read-write, necessarily. There is no
+sandbox here, only a guarantee that kas itself will not touch a repo.
+
+${C_BLD}EXAMPLES${C_RST}
+  $SCRIPT_CMD exec du -sh openembedded-core
+  $SCRIPT_CMD exec bitbake -e virtual/kernel
+  $SCRIPT_CMD exec git -C openembedded-core status
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
+but only BEFORE the command starts -- anything after CMD is passed to CMD
+verbatim, never parsed as a mackas flag (so e.g. \`exec du -v\` passes '-v'
+to du, not to mackas).
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. exec refuses while a
+  running build (smoketest/shell) still holds any of the three volumes --
+  stop it first.
+EOF
+}
+
+# cmd_exec [flags] CMD [ARGS...] -- see exec_usage. Parses its OWN flags only
+# until the first token that isn't one of them (or '--'); everything from
+# there on is the user's command, verbatim, never re-interpreted as a mackas
+# flag no matter what it looks like. This is deliberately NOT the same
+# parsing shape as retrieve/clean (a closed set of object/target words) --
+# CMD is arbitrary, so "stop recognizing our own flags" has to be structural,
+# not a fixed word list.
+cmd_exec() {
+	local cmd_words=() want_help=0 started=0 a
+	while [ $# -gt 0 ]; do
+		if [ "$started" -eq 1 ]; then
+			cmd_words+=("$1"); shift; continue
+		fi
+		a="$1"
+		case "$a" in
+			--dry-run)     DRY_RUN=1; shift ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1; shift ;;
+			-v|--verbose)  VERBOSE=1; shift ;;
+			-h|--help)     want_help=1; shift ;;
+			help)          want_help=1; shift ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" exec ;;
+			--)            started=1; shift ;;
+			-*) die "unknown option for 'exec': $a" "$SCRIPT_CMD exec --help" ;;
+			*)  started=1; cmd_words+=("$a"); shift ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		exec_usage
+		return 0
+	fi
+
+	[ "${#cmd_words[@]}" -ge 1 ] || die "'exec' needs a command to run" \
+		"$SCRIPT_CMD exec du -sh openembedded-core"
+
+	require_mackas_root
+	ensure_workspace_attached
+	ensure_kas_container_installed
+	ensure_project_checked_out
+
+	# One-VM rule: kas_shell_ro() attaches all three volumes via
+	# kas_runtime_args(), and unlike bitbake_getvar()'s other callers
+	# (retrieve/clean/sstate prune), nothing upstream of exec has already
+	# checked this -- so exec must, or a second attach fails with an opaque
+	# Virtualization.framework error instead of a clear refusal.
+	local v
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		if volume_in_use "$v"; then
+			die "volume '$v' is attached to a running container" \
+				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD exec'"
+		fi
+	done
+
+	local joined w
+	joined=""
+	for w in "${cmd_words[@]}"; do
+		joined="$joined $(printf '%q' "$w")"
+	done
+	joined="${joined# }"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "${C_BLD}mackas exec${C_RST} -- would run (repo-mutating steps skipped):"
+		info "  $(quote_cmd kas-container shell --skip setup_dir --skip finish_setup_repos \
+			--skip repos_checkout --skip repos_apply_patches "$KAS_FILES_ARG" -c "$joined")"
+		return 0
+	fi
+
+	local rc=0
+	kas_shell_ro "$joined" || rc=$?
+	return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -7560,6 +7716,9 @@ ${C_BLD}COMMANDS${C_RST}
   smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
   status     Show what is configured and what exists on disk.
   shell      Drop into a kas shell for the project's kas config.
+  exec       Run a one-off read-only command against the checkout, with
+             kas's repo-mutating setup steps always skipped.
+             '$SCRIPT_CMD exec --help'.
   retrieve   Copy build outputs (buildstats/logs/deploy/buildhistory) out of
              the ext4 TMPDIR volume, where macOS cannot see them.
              '$SCRIPT_CMD retrieve --help'.
@@ -7730,6 +7889,21 @@ main() {
 				cmd="clean"; shift
 				if [ "$want_help" -eq 1 ]; then CLEAN_ARGS=("$@" "--help"); else CLEAN_ARGS=("$@"); fi
 				break ;;
+			exec)
+				# Same shape again, with one deliberate difference: the
+				# arbitrary user COMMAND that follows must never be mistaken
+				# for a mackas flag, so a leading 'help'/-h/--help (from
+				# 'mackas help exec CMD...' or 'mackas -h exec CMD...') is
+				# PREPENDED, not appended like every other tail-capturer above
+				# -- appending would land "--help" at the END of the array,
+				# where cmd_exec's own parser (which stops recognizing ITS
+				# flags at the first word of CMD) would hand it to the user's
+				# command as an argument instead of treating it as a help
+				# request.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="exec"; shift
+				if [ "$want_help" -eq 1 ]; then EXEC_ARGS=("--help" "$@"); else EXEC_ARGS=("$@"); fi
+				break ;;
 			monitor)
 				# Same shape again: monitor owns everything after it
 				# (--port/--once), captured verbatim for cmd_monitor.
@@ -7775,7 +7949,7 @@ main() {
 			check|smoketest|status|shell|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats sstate monitor clean destroy volume set get unset help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset help)" ;;
 		esac
 	done
 
@@ -7822,6 +7996,7 @@ main() {
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
 		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
 		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;
+		exec)       cmd_exec ${EXEC_ARGS+"${EXEC_ARGS[@]}"} ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
 		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
 		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;
