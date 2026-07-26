@@ -145,6 +145,7 @@ SET_ARGS=()
 GET_ARGS=()
 UNSET_ARGS=()
 SETUP_ARGS=()
+CLEAN_ARGS=()
 
 setup_colors() {
 	if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
@@ -690,7 +691,8 @@ set_defaults() {
 	# Reclaim the sparse volume images around every kas run (before it starts
 	# and after it ends), so they do not ratchet up build after build. On by
 	# default; set to 0 to skip. fstrim is fast (~0.01s) and runs when nothing
-	# holds the volumes, so it neither slows nor endangers the build.
+	# holds the volumes, so it neither slows nor endangers the build. The same
+	# knob gates the fstrim `clean tmp+deploy` runs after its in-place clear.
 	MACKAS_FSTRIM_AUTO=1
 
 	# OpenEmbedded needs a case-sensitive filesystem for the layer checkouts
@@ -6096,19 +6098,51 @@ cmd_status() {
 
 clean_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD clean${C_RST} -- drop the TMPDIR volume (recreated empty). Keeps the
-downloads/sstate volumes and the project checkout.
+${C_BLD}$SCRIPT_CMD clean${C_RST} -- drop the TMPDIR volume (recreated empty), or one
+narrower target at a time. Never touches \$MACKAS_ROOT or the short symlink --
+for that, see '$SCRIPT_CMD destroy'.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD clean
+  $SCRIPT_CMD clean [TARGET...]
 
-Deletes and recreates only the TMPDIR volume, so the next build starts with a
-clean \${TMPDIR} but reuses everything already fetched/cached in DL_DIR and
-SSTATE_DIR -- having them in separate volumes is exactly why this works.
-Unlike '$SCRIPT_CMD destroy', this never touches \$MACKAS_ROOT or the short
-symlink, and only prompts once (no typed confirmation word).
+Bare '$SCRIPT_CMD clean' (no target) deletes and recreates the WHOLE TMPDIR
+volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. That drops everything
+under TOPDIR, not just tmp/: deploy, buildhistory (if the project inherits
+it), conf/ and cache/ all go too. DL_DIR and SSTATE_DIR are never touched --
+having them in separate volumes is exactly why this works. Only prompts once
+(no typed confirmation word, unlike '$SCRIPT_CMD destroy').
 
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+${C_BLD}TARGETS${C_RST} (optional, repeatable, order does not matter)
+  tmp+deploy   Clear TMPDIR and DEPLOY_DIR in place, WITHOUT deleting or
+               recreating the TMPDIR volume -- keeps buildhistory and conf/,
+               which bare '$SCRIPT_CMD clean' drops. TMPDIR and DEPLOY_DIR are
+               always cleared TOGETHER: bitbake's stamps (under TMPDIR) record
+               which tasks already wrote DEPLOY_DIR, so clearing either one
+               alone leaves the other inconsistent with it -- there is no
+               'deploy only' or 'tmp only' target. SSTATE_DIR survives, so
+               the next build refills both cheaply -- but largely by
+               RESTORING the same cached artifacts, not recompiling; to force
+               a genuinely fresh rebuild of something, use '$SCRIPT_CMD shell'
+               and e.g. 'bitbake -f -c deploy <recipe>'. Slower than bare
+               clean (an in-place rm, not a volume swap), so it also fstrims
+               TMPDIR afterward to reclaim the freed host disk that an
+               in-place rm alone would not (MACKAS_FSTRIM_AUTO=0 skips this).
+  downloads    Delete and recreate the DL_DIR volume ('$MACKAS_VOL_DL').
+               Independent of tmp/deploy/sstate -- fetched sources have no
+               stamp relationship to them. Cheap to refill if an HTTP/NFS
+               mirror is configured; otherwise everything is re-fetched over
+               the network.
+  sstate       Delete and recreate the SSTATE_DIR volume ('$MACKAS_VOL_SSTATE')
+               -- a full wipe. For age-based partial cleanup instead, see
+               '$SCRIPT_CMD sstate prune --older-than N[d]'.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after 'clean', e.g. '$SCRIPT_CMD --dry-run clean downloads'.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. Each target refuses while a
+  running build (smoketest/shell) still holds the volume it needs -- stop it
+  first.
 EOF
 }
 
@@ -6126,7 +6160,8 @@ symlink, all gone. Refuses to remove \$MACKAS_ROOT if any volume survives
 deletion (e.g. still in use), so a partial failure never silently drops the
 checkout while leaving orphaned volumes behind.
 
-For a narrower reset, see '$SCRIPT_CMD clean' (TMPDIR only) or
+For a narrower reset, see '$SCRIPT_CMD clean' (the whole TMPDIR volume),
+'$SCRIPT_CMD clean tmp+deploy|downloads|sstate' (one thing at a time), or
 '$SCRIPT_CMD volume destroy --all' (every volume, but not \$MACKAS_ROOT).
 
 Requires typing the word DESTROY to confirm, unless -y/--yes/-f/--force is
@@ -6135,120 +6170,296 @@ work here.
 EOF
 }
 
-cmd_clean() {
+cmd_destroy() {
 	require_mackas_root
-	local destroy="$1"
-	local what
-
-	if [ "$destroy" = "1" ]; then
-		what="EVERYTHING: all three ext4 volumes ($MACKAS_VOL_TMP, $MACKAS_VOL_DL,
+	local what="EVERYTHING: all three ext4 volumes ($MACKAS_VOL_TMP, $MACKAS_VOL_DL,
   $MACKAS_VOL_SSTATE -- so downloads and sstate too), $MACKAS_ROOT (the project
   checkout and logs), and the $MACKAS_SHORT_LINK symlink"
-	else
-		what="the TMPDIR volume '$MACKAS_VOL_TMP' (recreated empty) and $MACKAS_LOGS
-  (the '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' cache volumes and the project
-  checkout are KEPT -- having them in separate volumes is exactly why this works)"
-	fi
 
 	printf '\n%s%s WARNING %s\n' "$C_RED$C_BLD" "===" "===$C_RST"
 	printf '%sThis will PERMANENTLY DELETE %s%s\n\n' "$C_RED" "$what" "$C_RST"
 
-	if [ "$destroy" = "1" ]; then
-		# du fails if MACKAS_ROOT is already gone; pipefail would make the bare
-		# assignment abort the whole script under set -e.
-		local sz=""
-		sz="$(du -sh "$MACKAS_ROOT" 2>/dev/null | awk '{print $1}' || true)"
-		if [ -n "$sz" ]; then
-			printf '%s%s currently holds %s.%s\n\n' "$C_RED" "$MACKAS_ROOT" "$sz" "$C_RST"
+	# du fails if MACKAS_ROOT is already gone; pipefail would make the bare
+	# assignment abort the whole script under set -e.
+	local sz=""
+	sz="$(du -sh "$MACKAS_ROOT" 2>/dev/null | awk '{print $1}' || true)"
+	if [ -n "$sz" ]; then
+		printf '%s%s currently holds %s.%s\n\n' "$C_RED" "$MACKAS_ROOT" "$sz" "$C_RST"
+	fi
+	if [ "$DRY_RUN" -eq 1 ]; then
+		warn "--dry-run: skipping the DESTROY confirmation; nothing will be removed."
+	elif [ "$ASSUME_YES" -ne 1 ]; then
+		if [ ! -t 0 ]; then
+			die "destroy needs a terminal or --yes" "$SCRIPT_CMD destroy --yes"
 		fi
-		if [ "$DRY_RUN" -eq 1 ]; then
-			warn "--dry-run: skipping the DESTROY confirmation; nothing will be removed."
-		elif [ "$ASSUME_YES" -ne 1 ]; then
-			if [ ! -t 0 ]; then
-				die "destroy needs a terminal or --yes" "$SCRIPT_CMD destroy --yes"
-			fi
-			printf '%sType the word DESTROY to confirm: %s' "$C_BLD" "$C_RST"
-			local reply=""
-			read -r reply || true
-			[ "$reply" = "DESTROY" ] || { info "Aborted. Nothing was removed."; return 1; }
-		fi
-	else
-		confirm "Proceed?" || { info "Aborted. Nothing was removed."; return 1; }
+		printf '%sType the word DESTROY to confirm: %s' "$C_BLD" "$C_RST"
+		local reply=""
+		read -r reply || true
+		[ "$reply" = "DESTROY" ] || { info "Aborted. Nothing was removed."; return 1; }
 	fi
 
-	if [ "$destroy" = "1" ]; then
-		# Delete every volume FIRST and tally the survivors, BEFORE touching the
-		# symlink or rm -rf-ing anything. Order is the whole fix: with
-		# MACKAS_RELOCATE_VOLUMES=1 the volumes' LIVE backing images sit inside
-		# $MACKAS_ROOT/container-volumes, so removing the symlink and then
-		# rm -rf $MACKAS_ROOT while a volume refused to delete would erase that
-		# volume's image out from under a possibly-running VM -- and take any
-		# unrelated foreign volumes with it. So a survivor aborts here, before
-		# any of that runs.
-		local v survivors=0
-		for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" "$MACKAS_VOL_LEGACY"; do
-			delete_volume "$v" || survivors=$((survivors + 1))
-		done
-		if [ "$survivors" -ne 0 ]; then
-			err "$survivors volume(s) could NOT be removed (see the warnings above)"
-			die "destroy did not finish: some volumes survive -- refusing to remove $MACKAS_ROOT" \
-				"container volume ls   -- then stop whatever is using them and re-run"
-		fi
+	# Delete every volume FIRST and tally the survivors, BEFORE touching the
+	# symlink or rm -rf-ing anything. Order is the whole fix: with
+	# MACKAS_RELOCATE_VOLUMES=1 the volumes' LIVE backing images sit inside
+	# $MACKAS_ROOT/container-volumes, so removing the symlink and then
+	# rm -rf $MACKAS_ROOT while a volume refused to delete would erase that
+	# volume's image out from under a possibly-running VM -- and take any
+	# unrelated foreign volumes with it. So a survivor aborts here, before
+	# any of that runs.
+	local v survivors=0
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" "$MACKAS_VOL_LEGACY"; do
+		delete_volume "$v" || survivors=$((survivors + 1))
+	done
+	if [ "$survivors" -ne 0 ]; then
+		err "$survivors volume(s) could NOT be removed (see the warnings above)"
+		die "destroy did not finish: some volumes survive -- refusing to remove $MACKAS_ROOT" \
+			"container volume ls   -- then stop whatever is using them and re-run"
+	fi
 
-		# All our volumes are gone. If setup relocated the container volumes dir
-		# onto the SSD, its REAL directory is $MACKAS_ROOT/container-volumes and
-		# may STILL hold FOREIGN volumes that setup_relocate_volumes rsync'd in
-		# from the internal disk. Move whatever remains back to the internal disk
-		# before removing the symlink or $MACKAS_ROOT -- rm -rf must never take a
-		# volume we did not create. This is the exact inverse of setup's move.
-		if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
-			local reloc leftover=0
-			reloc="$(readlink "$CONTAINER_VOLUMES_DIR")"
-			if [ -d "$reloc" ]; then
-				# shellcheck disable=SC2012  # counting entries; names irrelevant
-				leftover="$(ls -A "$reloc" 2>/dev/null | wc -l | tr -d ' ')"
-			fi
-			run rm -f "$CONTAINER_VOLUMES_DIR"
-			if [ "$leftover" -gt 0 ]; then
-				run mv "$reloc" "$CONTAINER_VOLUMES_DIR"
-				did "moved $leftover foreign volume(s) back to $CONTAINER_VOLUMES_DIR"
-			else
-				run mkdir -p "$CONTAINER_VOLUMES_DIR"
-				did "restored $CONTAINER_VOLUMES_DIR to a real directory"
-			fi
+	# All our volumes are gone. If setup relocated the container volumes dir
+	# onto the SSD, its REAL directory is $MACKAS_ROOT/container-volumes and
+	# may STILL hold FOREIGN volumes that setup_relocate_volumes rsync'd in
+	# from the internal disk. Move whatever remains back to the internal disk
+	# before removing the symlink or $MACKAS_ROOT -- rm -rf must never take a
+	# volume we did not create. This is the exact inverse of setup's move.
+	if [ -L "$CONTAINER_VOLUMES_DIR" ]; then
+		local reloc leftover=0
+		reloc="$(readlink "$CONTAINER_VOLUMES_DIR")"
+		if [ -d "$reloc" ]; then
+			# shellcheck disable=SC2012  # counting entries; names irrelevant
+			leftover="$(ls -A "$reloc" 2>/dev/null | wc -l | tr -d ' ')"
 		fi
-		if [ -L "$MACKAS_SHORT_LINK" ]; then
-			run rm -f "$MACKAS_SHORT_LINK"
-		fi
-		# Delete through the REAL path, never through the symlink.
-		if [ -d "$MACKAS_ROOT" ]; then
-			run rm -rf "$MACKAS_ROOT"
-			did "destroyed $MACKAS_ROOT"
+		run rm -f "$CONTAINER_VOLUMES_DIR"
+		if [ "$leftover" -gt 0 ]; then
+			run mv "$reloc" "$CONTAINER_VOLUMES_DIR"
+			did "moved $leftover foreign volume(s) back to $CONTAINER_VOLUMES_DIR"
 		else
-			did "$MACKAS_ROOT was already gone"
+			run mkdir -p "$CONTAINER_VOLUMES_DIR"
+			did "restored $CONTAINER_VOLUMES_DIR to a real directory"
 		fi
-	else
-		# TMPDIR is a whole volume, so cleaning it is delete + recreate rather
-		# than rm -rf: it is faster, it cannot leave a half-deleted tree behind,
-		# and it hands back the sparse image's disk space in one go. The dl and
-		# sstate volumes are never touched here -- that is the entire reason
-		# they are separate volumes.
-		#
-		# Bail out rather than fall through to ensure_volume if the delete
-		# failed: ensure_volume would find the volume still present, skip
-		# creating it, and `clean` would report a cleaned TMPDIR over the old
-		# contents, still there.
-		if volume_exists "$MACKAS_VOL_TMP"; then
-			delete_volume "$MACKAS_VOL_TMP" || \
-				die "cannot clean TMPDIR: volume '$MACKAS_VOL_TMP' could not be removed" \
-					"stop anything still using it (mackas volume list) and re-run '$SCRIPT_CMD clean'"
-		fi
-		ensure_volume "$MACKAS_VOL_TMP" "$MACKAS_VOLUME_SIZE_TMP" "TMPDIR -> /build"
-		if [ -d "$MACKAS_LOGS" ]; then
-			run rm -rf "$MACKAS_LOGS"; run mkdir -p "$MACKAS_LOGS"
-		fi
-		did "cleaned TMPDIR; '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' kept"
 	fi
+	if [ -L "$MACKAS_SHORT_LINK" ]; then
+		run rm -f "$MACKAS_SHORT_LINK"
+	fi
+	# Delete through the REAL path, never through the symlink.
+	if [ -d "$MACKAS_ROOT" ]; then
+		run rm -rf "$MACKAS_ROOT"
+		did "destroyed $MACKAS_ROOT"
+	else
+		did "$MACKAS_ROOT was already gone"
+	fi
+}
+
+# clean_tmpdir_volume -- bare 'mackas clean' (no target): delete and recreate
+# the WHOLE TMPDIR volume. Unchanged from before targeted cleans existed --
+# see cmd_clean for how a target list routes elsewhere instead.
+clean_tmpdir_volume() {
+	local what="the TMPDIR volume '$MACKAS_VOL_TMP' (recreated empty) and $MACKAS_LOGS
+  (the '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' cache volumes and the project
+  checkout are KEPT -- having them in separate volumes is exactly why this works)"
+
+	printf '\n%s%s WARNING %s\n' "$C_RED$C_BLD" "===" "===$C_RST"
+	printf '%sThis will PERMANENTLY DELETE %s%s\n\n' "$C_RED" "$what" "$C_RST"
+
+	confirm "Proceed?" || { info "Aborted. Nothing was removed."; return 1; }
+
+	# TMPDIR is a whole volume, so cleaning it is delete + recreate rather
+	# than rm -rf: it is faster, it cannot leave a half-deleted tree behind,
+	# and it hands back the sparse image's disk space in one go. The dl and
+	# sstate volumes are never touched here -- that is the entire reason
+	# they are separate volumes.
+	#
+	# Bail out rather than fall through to ensure_volume if the delete
+	# failed: ensure_volume would find the volume still present, skip
+	# creating it, and `clean` would report a cleaned TMPDIR over the old
+	# contents, still there.
+	if volume_exists "$MACKAS_VOL_TMP"; then
+		delete_volume "$MACKAS_VOL_TMP" || \
+			die "cannot clean TMPDIR: volume '$MACKAS_VOL_TMP' could not be removed" \
+				"stop anything still using it (mackas volume list) and re-run '$SCRIPT_CMD clean'"
+	fi
+	ensure_volume "$MACKAS_VOL_TMP" "$MACKAS_VOLUME_SIZE_TMP" "TMPDIR -> /build"
+	if [ -d "$MACKAS_LOGS" ]; then
+		run rm -rf "$MACKAS_LOGS"; run mkdir -p "$MACKAS_LOGS"
+	fi
+	did "cleaned TMPDIR; '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' kept"
+}
+
+# refuse_unsafe_guest_path PATH LABEL -- die unless PATH is strictly under
+# /build with no '..' component. Guards clean_tmp_deploy()'s in-place `rm -rf`
+# against a bitbake-getvar answer this throwaway container cannot safely act
+# on: only /build (the TMPDIR volume) is mounted there, so a PATH outside it
+# would either no-op against the container's own rootfs or, if it happened to
+# exist there for some other reason, delete the wrong thing. LABEL is the
+# variable name, purely for the message.
+refuse_unsafe_guest_path() {
+	local path="$1" label="$2"
+	case "$path" in
+		/build/?*)
+			case "$path" in
+				*..*) ;;
+				*) return 0 ;;
+			esac
+			;;
+	esac
+	die "$label resolved to '${path:-<empty>}', which is not safely under /build -- refusing to rm it" \
+		"only /build (the TMPDIR volume) is mounted here; inspect the real value with '$SCRIPT_CMD shell'"
+}
+
+# clean_tmp_deploy -- clear TMPDIR and DEPLOY_DIR in place, inside the live
+# oe-build-tmp volume, WITHOUT deleting or recreating the volume itself (so
+# /build/buildhistory and /build/conf, which bare 'clean' drops along with
+# everything else under TOPDIR, survive here).
+#
+# The two are cleared TOGETHER, unconditionally, with no way to ask for just
+# one: bitbake's stamps live under TMPDIR and record which tasks already
+# wrote DEPLOY_DIR. Dropping TMPDIR alone would leave DEPLOY_DIR holding
+# output from a task graph that no longer exists, with nothing to say those
+# images are now stale; dropping DEPLOY_DIR alone leaves the stamps claiming
+# those tasks already ran, so the next build silently will not regenerate it
+# without being forced. Either half alone is the inconsistent state, not a
+# narrower version of this target.
+#
+# No mkdir+chown after the rm, unlike a fresh 'container volume create': only
+# the two resolved subdirectories are removed, never /build itself, so /build
+# keeps the ownership ensure_volume() already gave it and bitbake's own next
+# mkdir under it (running as that same uid) is correctly owned without help
+# -- see check_buildstats_accumulation() for the same reasoning applied to one
+# buildstats subdirectory.
+clean_tmp_deploy() {
+	if volume_in_use "$MACKAS_VOL_TMP"; then
+		die "volume '$MACKAS_VOL_TMP' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean tmp+deploy'"
+	fi
+	if ! volume_exists "$MACKAS_VOL_TMP"; then
+		info "Nothing to clean -- '$MACKAS_VOL_TMP' does not exist yet ($SCRIPT_CMD setup)"
+		return 0
+	fi
+
+	local tmpdir deploydir
+	tmpdir="$(bitbake_getvar TMPDIR)" || {
+		tmpdir="/build/tmp"
+		warn "  could not resolve TMPDIR via bitbake-getvar; assuming the default ($tmpdir)"
+	}
+	deploydir="$(bitbake_getvar DEPLOY_DIR)" || {
+		deploydir="/build/tmp/deploy"
+		warn "  could not resolve DEPLOY_DIR via bitbake-getvar; assuming the default ($deploydir)"
+	}
+	refuse_unsafe_guest_path "$tmpdir" TMPDIR
+	refuse_unsafe_guest_path "$deploydir" DEPLOY_DIR
+
+	# Always runs for real, dry-run or not -- a read-only probe, same
+	# reasoning as sstate_prune's scan: "nothing to clean" needs the REAL
+	# state, not --dry-run's assumed yes.
+	if ! container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+		sh -c "[ -d $(printf '%q' "$tmpdir") ] || [ -d $(printf '%q' "$deploydir") ]" 2>/dev/null
+	then
+		info "Nothing to clean -- neither $tmpdir nor $deploydir exists yet (has a build run? $SCRIPT_CMD smoketest)"
+		return 0
+	fi
+
+	confirm "Clear TMPDIR ($tmpdir) and DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP'? They are always cleared together." \
+		|| { info "Declined -- nothing cleaned."; return 1; }
+
+	run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+		sh -c "rm -rf $(printf '%q' "$tmpdir") $(printf '%q' "$deploydir")"
+	did "cleared TMPDIR and DEPLOY_DIR in '$MACKAS_VOL_TMP' -- buildhistory and conf/ untouched"
+	info "  the stamps went with TMPDIR, so the next build re-runs the whole task"
+	info "  graph -- SSTATE_DIR survives, so that is mostly cheap sstate restores"
+	info "  of the same cached artifacts. For a genuinely fresh rebuild of"
+	info "  something, use '$SCRIPT_CMD shell' and e.g. 'bitbake -f -c deploy <recipe>'."
+
+	# Unlike bare 'clean' (a fresh volume.img, already minimal), this rm was
+	# IN PLACE -- the freed ext4 blocks stay allocated on the host image until
+	# something discards them (see "Reclaiming disk" in docs/storage.md), so
+	# this target is exactly the case that needs it. MACKAS_FSTRIM_AUTO is the
+	# same knob run_kas() already uses around a build. Best-effort, like
+	# run_kas()'s own auto-fstrim: a non-hole-punching host filesystem makes
+	# fstrim warn and return nonzero, and `|| true` keeps that from turning an
+	# already-successful clean into a failure (from_all=1 likewise downgrades
+	# a vanished/busy volume to a warn-and-skip).
+	if [ "${MACKAS_FSTRIM_AUTO:-1}" = "1" ]; then
+		volume_fstrim_one "$MACKAS_VOL_TMP" 1 || true
+	fi
+}
+
+# clean_volume_target NAME SIZE ROLE -- delete and recreate ONE whole cache
+# volume (DL_DIR or SSTATE_DIR), the same delete+ensure_volume shape bare
+# 'clean' already uses for TMPDIR. Unlike clean_tmp_deploy, these two ARE
+# independent of each other and of tmp+deploy: fetched sources and sstate
+# objects carry no stamp relationship to bitbake's task graph, so either can
+# be wiped alone without leaving the other inconsistent.
+clean_volume_target() {
+	local name="$1" size="$2" role="$3" img used=""
+	if volume_in_use "$name"; then
+		die "volume '$name' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean'"
+	fi
+	if ! volume_exists "$name"; then
+		info "Nothing to clean -- '$name' does not exist yet ($SCRIPT_CMD setup)"
+		return 0
+	fi
+	img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+	used="$(volume_img_kb "$img")"
+	confirm "Delete and recreate '$name' ($role)${used:+, currently $(fmt_kb "$used")}?" \
+		|| { info "Declined -- nothing cleaned."; return 1; }
+	delete_volume "$name" || die "cannot clean '$name': it could not be removed" \
+		"stop anything still using it (mackas volume list) and re-run"
+	ensure_volume "$name" "$size" "$role"
+	did "cleaned '$name' ($role)"
+}
+
+# cmd_clean [TARGET...] -- no target: today's whole-TMPDIR-volume clean,
+# unchanged. One or more of tmp+deploy/downloads/sstate: only that narrower
+# slice, each independently confirmed. See clean_usage for what each does.
+cmd_clean() {
+	local targets=() want_help=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dry-run)     DRY_RUN=1; shift ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1; shift ;;
+			-v|--verbose)  VERBOSE=1; shift ;;
+			-h|--help)     want_help=1; shift ;;
+			help)          want_help=1; shift ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" clean ;;
+			tmp+deploy|downloads|sstate) targets+=("$1"); shift ;;
+			-*) die "unknown option for 'clean': $1" "$SCRIPT_CMD clean --help" ;;
+			*) die "unknown target for 'clean': $1" \
+				"$SCRIPT_CMD clean --help  (targets: tmp+deploy downloads sstate)" ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		clean_usage
+		return 0
+	fi
+
+	require_mackas_root
+
+	if [ "${#targets[@]}" -eq 0 ]; then
+		clean_tmpdir_volume
+		return $?
+	fi
+
+	local t rc=0
+	for t in "${targets[@]}"; do
+		case "$t" in
+			tmp+deploy)
+				clean_tmp_deploy || rc=1 ;;
+			downloads)
+				if [ "$MACKAS_USE_HTTP_MIRRORS" = "1" ] || [ "$MACKAS_USE_NFS_MIRRORS" = "1" ]; then
+					info "  a mirror is configured, so re-fetching is cheap"
+				else
+					info "  no mirror configured -- everything will be re-fetched over the network"
+				fi
+				clean_volume_target "$MACKAS_VOL_DL" "$MACKAS_VOLUME_SIZE_DL" "DL_DIR -> /downloads" || rc=1 ;;
+			sstate)
+				info "  for age-based partial cleanup instead, see '$SCRIPT_CMD sstate prune --older-than N[d]'"
+				clean_volume_target "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "SSTATE_DIR -> /sstate" || rc=1 ;;
+		esac
+	done
+	return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -7358,7 +7569,9 @@ ${C_BLD}COMMANDS${C_RST}
              '$SCRIPT_CMD sstate --help'.
   monitor    Show live bitbake progress from a build started with
              MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
-  clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the checkout.
+  clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the
+             checkout. Or one target at a time (tmp+deploy/downloads/sstate);
+             '$SCRIPT_CMD clean --help'.
   destroy    Remove all three volumes, $MACKAS_ROOT and the short symlink.
              Makes you type DESTROY.
   volume     Manage the ext4 volumes: list, fstrim (reclaim disk), duplicate,
@@ -7508,6 +7721,15 @@ main() {
 				cmd="sstate"; shift
 				if [ "$want_help" -eq 1 ]; then SSTATE_ARGS=("$@" "--help"); else SSTATE_ARGS=("$@"); fi
 				break ;;
+			clean)
+				# Same shape again: clean owns everything after it (its
+				# optional target list -- tmp+deploy/downloads/sstate --
+				# captured verbatim for cmd_clean). 'destroy' stays in the
+				# bare branch below: it takes no targets of its own.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="clean"; shift
+				if [ "$want_help" -eq 1 ]; then CLEAN_ARGS=("$@" "--help"); else CLEAN_ARGS=("$@"); fi
+				break ;;
 			monitor)
 				# Same shape again: monitor owns everything after it
 				# (--port/--once), captured verbatim for cmd_monitor.
@@ -7550,7 +7772,7 @@ main() {
 				cmd="adopt"; shift
 				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|clean|destroy)
+			check|smoketest|status|shell|destroy)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
 			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell retrieve buildstats sstate monitor clean destroy volume set get unset help)" ;;
@@ -7598,8 +7820,8 @@ main() {
 		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
-		clean)     if [ "$want_help" -eq 1 ]; then clean_usage;     else cmd_clean 0;   fi ;;
-		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_clean 1;   fi ;;
+		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
+		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
 		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
 		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;

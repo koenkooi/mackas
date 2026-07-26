@@ -92,8 +92,8 @@ is refused rather than attached to, or moved under, a second VM.
 A sparse ext4 `volume.img` is a **ceiling that only ratchets up**. It costs
 ~1.2 MB empty and grows as the guest writes, but deleting files inside the
 guest never shrinks it back: the freed blocks stay allocated on the host image.
-A TMPDIR volume that peaked mid-build stays at that peak on disk even after
-`clean` empties it logically. Whenever disk headroom is tight — a smaller SSD,
+A TMPDIR volume that peaked mid-build stays at that peak on disk however much
+the guest deletes afterwards. Whenever disk headroom is tight — a smaller SSD,
 a disk shared with other work — that reclaim matters.
 
 The fix is `mackas volume fstrim <name>` (or `mackas volume fstrim all` for
@@ -104,6 +104,14 @@ backend implements DISCARD as a host **hole-punch** (the guest's
 `discard_max_bytes` is non-zero), so the punched blocks become sparse again on
 the host `volume.img`. Measured: an 800M image with 600M deleted inside fell to
 202M in 0.01s.
+
+`mackas clean tmp+deploy` empties TMPDIR and DEPLOY_DIR **in place** rather
+than swapping the whole volume, so — unlike bare `mackas clean`, which
+replaces the volume with a fresh image and hands the space back by itself —
+it would otherwise leave those freed blocks allocated. It runs this same
+fstrim automatically afterward for exactly that reason
+(`MACKAS_FSTRIM_AUTO=1`, the default the build path already uses around a
+`smoketest`/`shell` run; set `0` to skip it and reclaim by hand later).
 
 Two details matter here — get either one wrong and the reclaim silently does
 nothing:
@@ -255,7 +263,7 @@ want the *same* disk:
 
 | Volume | Mounted as | Access pattern | What losing it costs |
 |---|---|---|---|
-| `<name>-tmp` | `/build` (`TMPDIR`) | The hot one. Every task's work directory, sysroots, packaging and compile output, written and re-written throughout a build; the image that grows fastest and peaks highest. | Nothing you can't rebuild — `mackas clean` deliberately throws this volume away and recreates it. |
+| `<name>-tmp` | `/build` (`TMPDIR`) | The hot one. Every task's work directory, sysroots, packaging and compile output, written and re-written throughout a build; the image that grows fastest and peaks highest. | Nothing you can't rebuild — bare `mackas clean` throws the whole volume away and recreates it; `mackas clean tmp+deploy` clears TMPDIR and DEPLOY_DIR in place, keeping buildhistory and conf/. |
 | `<name>-sstate` | `/sstate` (`SSTATE_DIR`) | Read-mostly and random: many smallish archives looked up by hash, plus the hash-equivalence database (`BB_HASHSERVE_DB_DIR` points here, see above). Latency matters more than throughput. | Hours. This is the cache that makes the *next* build fast; it survives `clean` precisely because it is expensive to rebuild. |
 | `<name>-dl` | `/downloads` (`DL_DIR`) | Write-once, read-rarely, large and mostly sequential: upstream tarballs and git mirrors, touched on a fetch and then largely idle. | Only download time — every byte in it is re-fetchable from upstream or a mirror. |
 
@@ -874,19 +882,22 @@ resolves the path from `bitbake-getvar BUILDHISTORY_DIR` like every other
 object, so a project that redefines it is followed correctly; the class
 default is only the fallback used when the query cannot run.
 
-**`mackas clean` drops it.** `clean` deletes and recreates the TMPDIR volume,
-and `/build/buildhistory` is inside that volume — so the entire history goes
-with it, silently, however many builds it spans. Nothing warns at `clean`
-time, because from the volume's point of view this is exactly the requested
-operation. Two ways to keep it:
+**Bare `mackas clean` drops it.** Bare `clean` deletes and recreates the whole
+TMPDIR volume, and `/build/buildhistory` is inside that volume — so the entire
+history goes with it, silently, however many builds it spans. Nothing warns at
+`clean` time, because from the volume's point of view this is exactly the
+requested operation. Three ways to keep it:
 
 ```sh
 ./mackas retrieve buildhistory      # copy it to $MACKAS_BASE/artifacts first
+./mackas clean tmp+deploy           # clears TMPDIR/DEPLOY_DIR in place instead
+                                    # of recreating the volume -- buildhistory
+                                    # (and conf/) stay put
 ```
 
 or set `BUILDHISTORY_DIR` to a path that outlives the volume — e.g. under
-`SSTATE_DIR` (`/sstate`, its own volume, untouched by `clean`) — in the same
-place you inherit the class.
+`SSTATE_DIR` (`/sstate`, its own volume, untouched by any of the above) — in
+the same place you inherit the class.
 
 **It records nothing unless you ask for it.** buildhistory is not inherited by
 default; without `INHERIT += "buildhistory"` in your kas config's

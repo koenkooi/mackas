@@ -114,7 +114,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
-| `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
+| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
@@ -160,8 +160,10 @@ default is `${TOPDIR}/buildhistory`, which inside the container is
 (`INHERIT += "buildhistory"` in your kas config's `local_conf_header` or
 `conf/local.conf`), and `retrieve buildhistory` says exactly that when it finds
 nothing, instead of reporting a missing directory. Because that default sits in
-the volume `mackas clean` drops, retrieve it before cleaning, or point
-`BUILDHISTORY_DIR` somewhere that survives.
+the same volume bare `mackas clean` drops wholesale, retrieve it before
+cleaning, point `BUILDHISTORY_DIR` somewhere that survives, or use
+`mackas clean tmp+deploy` instead of bare `clean` — it keeps buildhistory
+(and conf/) intact, clearing only TMPDIR and DEPLOY_DIR.
 
 `buildstats analyze` runs
 [`tools/mackas-buildstats-analyze`](tools/mackas-buildstats-analyze) over
@@ -226,7 +228,9 @@ are real); deletion happens only after confirmation or `-y`, and the one-VM
 rule applies. For surgical pruning — keep only what one checkout's stamps
 still reference — use openembedded-core's own
 `scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
-"nothing has touched this in months" case.
+"nothing has touched this in months" case. For a full wipe instead of
+age-based pruning, `mackas clean sstate` deletes and recreates the whole
+volume.
 
 ### Watching a build live
 

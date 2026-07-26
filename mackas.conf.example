@@ -169,6 +169,12 @@
 # --runtime-args; see "The ext4 volumes" in docs/architecture.md for why they
 # cannot be passed as KAS_BUILD_DIR/DL_DIR/SSTATE_DIR instead.
 #
+# `mackas clean downloads`/`mackas clean sstate` recreate one cache volume
+# alone, the same delete+recreate this separation already makes cheap for
+# TMPDIR; `mackas clean tmp+deploy` clears TMPDIR/DEPLOY_DIR in place instead
+# of swapping the whole volume, keeping buildhistory and conf/ -- see
+# `mackas clean --help` and docs/storage.md.
+#
 # The stem must not contain whitespace: kas-container word-splits
 # --runtime-args, so a space would split one mount into two arguments. setup
 # refuses a name with one rather than mounting something absurd.
@@ -282,7 +288,9 @@
 # so they don't ratchet up build after build (a sparse ext4 image only grows;
 # deleting files inside the guest never shrinks it -- see `mackas volume
 # fstrim`). ON by default; fstrim is ~0.01s and runs when nothing holds the
-# volumes, so it neither slows nor endangers the build. Set to 0 to turn it off.
+# volumes, so it neither slows nor endangers the build. The same knob gates the
+# fstrim `mackas clean tmp+deploy` runs after its in-place clear (see `mackas
+# clean --help`). Set to 0 to turn it off.
 # It must be exactly 0 or 1: any other value disables it (matching
 # MACKAS_OVERHEAD -- only the literal "1" turns it on).
 #MACKAS_FSTRIM_AUTO=1
