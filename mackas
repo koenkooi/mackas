@@ -95,7 +95,6 @@ MACKAS_PROJECT_DIR
 MACKAS_KAS_CONFIG
 MACKAS_KAS_AUTO_FRAGMENT
 MACKAS_KAS_AUTO_PROJECT
-MACKAS_RESIZE_IMAGE
 MACKAS_SMOKETEST_TARGETS
 MACKAS_OVERHEAD
 MACKAS_OVERHEAD_INTERVAL
@@ -658,19 +657,6 @@ set_defaults() {
 	# in that shell with no further plumbing.
 	MACKAS_KAS_AUTO_PROJECT=1
 
-	# The image 'volume resize' runs resize2fs from, when growing a volume in
-	# place. Empty means "use KAS_IMAGE".
-	#
-	# It exists because the kas image does NOT ship e2fsprogs -- verified, not
-	# assumed: /sbin is on its PATH and resize2fs is absent from every location
-	# in it (alpine has none either). So an in-place grow needs an image you
-	# supply. mackas will not install one for you: pulling or apt-getting
-	# something behind your back to grow a volume is a bigger surprise than
-	# saying it cannot.
-	#
-	# With no such image, resize is not a dead end -- it offers to copy into a
-	# new volume of the right size instead, which needs no resize2fs at all.
-	MACKAS_RESIZE_IMAGE=""
 
 	# The smoketest ladder's build rungs, space-separated bitbake targets, run
 	# in order after the universal parse-only rung. Empty by default: with no
@@ -1583,19 +1569,53 @@ restart_container_daemon() {
 	# daemon out from under an unrelated build -- hours of work, gone, with no
 	# warning. Refuse instead, and name what is in the way.
 	#
-	# Fails CLOSED: if the running-container list cannot be read at all, that
-	# counts as "something might be running".
-	local listing running
-	if listing="$(container ls 2>/dev/null)"; then
-		running="$(printf '%s\n' "$listing" | awk 'NR>1 && NF {print $1}' | wc -l | tr -d ' ')"
-	else
-		running="?"
+	# Two different risks, and they deserve different answers.
+	#
+	# A container holding one of the mackas volumes is a BUILD. Killing it
+	# loses hours of work, and no prompt makes that a reasonable trade -- so
+	# refuse outright, and fail CLOSED if the list cannot be read at all.
+	#
+	# Any OTHER running container is the user's to weigh. Apple's own
+	# `buildkit` image-builder service is the common case here: it is
+	# long-lived, holds no volume, and restarts on demand, so refusing
+	# because it exists would make resize unusable on any Mac that has ever
+	# run `container build`. Say what will be stopped and let them decide.
+	local listing ids id detail holders="" others=0
+	if ! listing="$(container ls 2>/dev/null)"; then
+		die "cannot tell what is running, so refusing to restart the container daemon" \
+			"check 'container system status'; a restart would stop every container"
 	fi
-	if [ "$running" != "0" ]; then
-		warn "      Restarting the container daemon stops EVERY running container,"
-		warn "      not just this volume -- including any build in progress."
-		die "refusing to restart the container daemon: ${running} container(s) are running" \
-			"wait for them to finish (or stop them), then re-run -- 'container ls' shows what is running"
+	ids="$(printf '%s\n' "$listing" | awk 'NR>1 && NF {print $1}')"
+	for id in $ids; do
+		[ -n "$id" ] || continue
+		if ! detail="$(container inspect "$id" 2>/dev/null)"; then
+			die "cannot inspect running container '$id', so refusing to restart the daemon" \
+				"a restart would stop it; investigate with 'container inspect $id'"
+		fi
+		if printf '%s\n' "$detail" | grep -qF "\"name\" : \"$MACKAS_VOL_TMP\"" ||
+		   printf '%s\n' "$detail" | grep -qF "\"name\" : \"$MACKAS_VOL_DL\"" ||
+		   printf '%s\n' "$detail" | grep -qF "\"name\" : \"$MACKAS_VOL_SSTATE\""; then
+			holders="${holders:+$holders }$id"
+		else
+			others=$((others + 1))
+		fi
+	done
+
+	if [ -n "$holders" ]; then
+		warn "      Restarting the container daemon stops EVERY running container."
+		warn "      These hold a mackas build volume, so they are a build in progress:"
+		warn "        $holders"
+		die "refusing to restart the container daemon while a build is running" \
+			"wait for it to finish, then re-run -- '$SCRIPT_CMD volume list' shows what holds each volume"
+	fi
+
+	if [ "$others" -gt 0 ]; then
+		warn "      Restarting the container daemon stops $others running container(s)"
+		warn "      that hold no mackas volume (Apple's 'buildkit' builder is the usual one)."
+		confirm "  Stop them and restart the daemon?" || {
+			info "  Left unchanged."
+			return 1
+		}
 	fi
 
 	run container system stop >/dev/null 2>&1 || true
@@ -6514,18 +6534,32 @@ volume_move() {
 # Apple container does not have (see TODO.md's non-goals). A shrink would have
 # to be copy-and-destroy through a temp volume, which is a different feature.
 # Refuse clearly rather than half-do it.
-# The image an in-place resize runs resize2fs from.
-resize_image() {
-	printf '%s' "${MACKAS_RESIZE_IMAGE:-$KAS_IMAGE}"
-}
-
-# True when that image actually carries resize2fs. Probed by running it, not
-# assumed: the kas image mackas otherwise uses does NOT have e2fsprogs, which
-# is exactly the thing an in-place grow cannot do without.
-image_has_resize2fs() {
-	container run --rm -u 0:0 "$(resize_image)" \
-		sh -c 'command -v resize2fs >/dev/null 2>&1' >/dev/null 2>&1
-}
+# WHY THERE IS NO IN-PLACE GROW, AND WHY THERE CANNOT BE ONE
+#
+# Extending the sparse image and rewriting entity.json works: the daemon does
+# re-read an edited entity.json across a restart, and presents the larger
+# block device. Growing the ext4 filesystem inside it does not, and the
+# blocker is structural rather than a missing tool:
+#
+#   resize2fs: kernel does not support online resize with sparse_super2
+#
+# `container volume create` formats its volumes with the sparse_super2
+# feature (`dumpe2fs -h` on a fresh volume lists it), and the guest kernel
+# (6.18.15) has no online-resize support for a filesystem carrying it. An
+# OFFLINE resize2fs would not care -- but that needs the filesystem
+# unmounted, and a container volume can only ever be attached mounted. The
+# loop-device route needs --privileged, which Apple container does not have.
+#
+# So all three of image, daemon record and filesystem cannot be made to move
+# together, and a half-grown volume (bigger device, same-sized filesystem) is
+# exactly the silent no-op worth avoiding. Copying into a correctly-sized new
+# volume is the whole mechanism. It needs no resize2fs, no hand-edited
+# entity.json and no daemon restart, so it also avoids every assumption the
+# in-place route rested on.
+#
+# This would become possible if Apple stopped setting sparse_super2, or the
+# guest kernel gained support for it. Re-test with `dumpe2fs -h` on a fresh
+# volume before believing otherwise.
 
 # Grow by COPYING into a fresh volume, for when no resize2fs is available.
 #
@@ -6570,7 +6604,7 @@ volume_resize_by_copy() {
 	if [ -n "$relocated_parent" ]; then
 		volume_move "$tmpvol" "$relocated_parent" >/dev/null \
 			|| die "could not place the temporary volume on $relocated_parent" \
-				"'$name' is untouched; free space there, or resize with MACKAS_RESIZE_IMAGE instead"
+				"'$name' is untouched; free space on that drive, or move it somewhere roomier first"
 	fi
 
 	# 2. Copy everything across, preserving ownership/permissions/times. tar
@@ -6688,90 +6722,11 @@ volume_resize() {
 
 	confirm "  Grow '$name' to $want?" || { info "  Left unchanged."; return 1; }
 
-	# resize2fs has to exist BEFORE anything is touched. The first version of
-	# this checked inside the container at step 4, by which point the image had
-	# already been truncated and entity.json rewritten -- a safe state, but a
-	# pointlessly confusing one to land in. Probe first, and when it is missing
-	# offer the copy route rather than dead-ending: that path needs no
-	# resize2fs, and no hand-edited entity.json either.
-	if ! image_has_resize2fs; then
-		warn "      $(resize_image) has no resize2fs (e2fsprogs), so the ext4"
-		warn "      filesystem inside cannot be grown in place."
-		info "      Set MACKAS_RESIZE_IMAGE to an image that has it, or:"
-		if confirm "  Copy '$name' into a new $want volume instead?"; then
-			volume_resize_by_copy "$name" "$want"
-			return "$?"
-		fi
-		die "cannot grow '$name': no resize2fs in $(resize_image)" \
-			"set MACKAS_RESIZE_IMAGE to an image with e2fsprogs, or re-run and accept the copy"
-	fi
-
-	# 1. Extend the sparse image. python3 rather than truncate(1), which macOS
-	#    does not ship (only GNU coreutils' gtruncate, and shedding Homebrew
-	#    dependencies is the direction of travel -- see TODO.md item 9).
-	#    os.truncate only moves the file's end; it allocates nothing.
-	if [ "$DRY_RUN" -eq 1 ]; then
-		printf '%s+ truncate %s to %s bytes%s\n' "$C_DIM" "$img" "$new_bytes" "$C_RST"
-	else
-		/usr/bin/python3 -c 'import os,sys; os.truncate(sys.argv[1], int(sys.argv[2]))' \
-			"$img" "$new_bytes" \
-			|| die "could not extend $img" "check permissions and free space on that drive"
-		did "extended volume.img to $(fmt_kb $((new_bytes / 1024)))"
-	fi
-
-	# 2. Tell the daemon. Both fields matter: sizeInBytes is what it attaches,
-	#    options.size is what 'container volume ls'/'inspect' report (and hence
-	#    what mackas status shows). Written via a temp file and mv so a crash
-	#    mid-write cannot leave an unparseable entity.json behind -- that file
-	#    is the daemon's only record that this volume exists at all.
-	if [ "$DRY_RUN" -eq 1 ]; then
-		printf '%s+ set sizeInBytes=%s and options.size=%s in %s%s\n' \
-			"$C_DIM" "$new_bytes" "$want" "$ent" "$C_RST"
-	else
-		local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/mackas-entity.XXXXXX")" \
-			|| die "could not create a temp file" "check ${TMPDIR:-/tmp}"
-		sed -e "s/\"sizeInBytes\":[0-9][0-9]*/\"sizeInBytes\":$new_bytes/" \
-		    -e "s/\"size\":\"[^\"]*\"/\"size\":\"$want\"/" "$ent" > "$tmp" \
-			|| { rm -f "$tmp"; die "could not rewrite $ent" "inspect it by hand"; }
-		grep -q "\"sizeInBytes\":$new_bytes" "$tmp" \
-			|| { rm -f "$tmp"; die "the rewritten entity.json does not carry the new size" \
-				"inspect $ent by hand; nothing was changed"; }
-		run mv "$tmp" "$ent"
-		did "recorded the new size in entity.json"
-	fi
-
-	# 3. Make the daemon re-read it. Its volume index is built once, at its own
-	#    startup, so without this the attach in step 4 uses the OLD size and
-	#    resize2fs would find nothing new to grow into.
-	restart_container_daemon
-
-	# 4. Grow the filesystem. Mounted (online) growth: ext4 supports it, and
-	#    'container run -v name:/mnt' is the only handle we have on the block
-	#    device. -u 0:0 and CAP_SYS_ADMIN for the same reasons fstrim needs
-	#    them -- the image's default user cannot do this, and root without the
-	#    cap still gets EPERM on the resize ioctl.
-	local inner='set -e
-command -v resize2fs >/dev/null 2>&1 || { echo "MACKAS-ERR: resize2fs is not in this image" >&2; exit 90; }
-dev=$(grep " /mnt " /proc/mounts | cut -d" " -f1 | head -1)
-[ -n "$dev" ] || { echo "MACKAS-ERR: could not identify the device behind /mnt" >&2; exit 91; }
-resize2fs "$dev"'
-	if run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" \
-		"$(resize_image)" sh -c "$inner"; then
-		[ "$DRY_RUN" -eq 1 ] && return 0
-		did "grew the ext4 filesystem on '$name' to $want"
-		info "  '$SCRIPT_CMD status' now reports the new cap."
-		return 0
-	fi
-
-	# The daemon and the image agree on the new size at this point; only the
-	# filesystem inside is still the old one. That is a safe state -- the
-	# volume mounts and works, it just has not gained the space yet -- so say
-	# exactly that rather than implying the volume is damaged.
-	warn "      The image and the daemon now agree on $want, but the ext4"
-	warn "      filesystem inside is still $(fmt_kb $((cur_bytes / 1024)))."
-	warn "      The volume is intact and usable at its old capacity."
-	die "could not grow the filesystem on '$name'" \
-		"if the image lacks resize2fs (e2fsprogs), re-run once it is available -- steps 1-3 are already done and are idempotent"
+	# Copying is the whole mechanism -- see the comment above
+	# volume_resize_by_copy for why an in-place grow is not possible on Apple
+	# container's volumes.
+	volume_resize_by_copy "$name" "$want"
+	return "$?"
 }
 
 # Ask Spotlight where a volume.img with the right shape lives. Prints one
@@ -6968,16 +6923,20 @@ ${C_BLD}SUBCOMMANDS${C_RST}
                        e.g. put a big TMPDIR on a roomier disk. Refuses an
                        in-use volume (one-VM rule). '$SCRIPT_CMD status' then
                        reports the new location.
-  resize <name> <size> GROW a volume in place, keeping its contents: extend the
-  (grow)               sparse image, record the new size, restart the daemon so
-                       it sees it, then grow the ext4 filesystem to fill it.
-                       Sizes are the usual 1T/500G/800M. Refuses an in-use
-                       volume (one-VM rule), and reports the growth against
-                       free space on the drive the image actually lives on --
-                       the image is sparse, so an over-large cap succeeds now
-                       and fails later, mid-build. SHRINKING IS REFUSED:
-                       resize2fs cannot shrink a mounted filesystem and a
-                       volume can only be attached mounted.
+  resize <name> <size> GROW a volume, keeping its contents, by copying it into
+  (grow)               a new one of the requested size. Sizes are the usual
+                       1T/500G/800M. There is no in-place grow: container
+                       volumes are formatted with sparse_super2, which the
+                       guest kernel cannot resize online, and offline resizing
+                       needs the filesystem unmounted -- which a volume never
+                       is. Copying is therefore a real copy, twice, and
+                       transiently needs about double the used space; a
+                       relocated volume is put back on its own drive. Refuses
+                       an in-use volume (one-VM rule) and reports the growth
+                       against free space on the drive the image really lives
+                       on. SHRINKING IS REFUSED: the same copy would work, but
+                       silently discarding data that no longer fits is not
+                       something mackas will do for you.
   recover [<name>]     When you have moved a volume.img by hand and the runtime
                        can no longer find it, locate it with Spotlight and
                        offer to re-point the symlink. With no name, checks all

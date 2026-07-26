@@ -193,73 +193,57 @@ for exactly that and nothing more.
 ### Growing a volume (`mackas volume resize`)
 
 A volume's size is fixed at creation — `setup` never resizes an existing one,
-and Apple `container` v1.1.0 has no grow command — so without `mackas volume
-resize <name> <size>`, a cap chosen months ago would be permanent short of
-destroy-and-recreate, which costs the whole cache. `resize` grows one in
-place instead.
+and Apple `container` v1.1.0 has no grow command — so a cap chosen months ago
+used to be permanent short of destroy-and-recreate, which costs the whole
+cache. `mackas volume resize <name> <size>` grows one by **copying it into a
+new volume of the requested size**.
 
-What the daemon actually keeps on disk is what makes this possible:
+**There is no in-place grow, and there cannot be one.** Extending the sparse
+image and rewriting `entity.json` works: the daemon re-reads an edited
+`entity.json` across a restart and presents the larger block device. Growing
+the ext4 filesystem inside it does not:
 
 ```
-$CONTAINER_VOLUMES_DIR/<name>/
-  entity.json   {…,"sizeInBytes":53687091200,…,"options":{"size":"50G"}}
-  volume.img    a SPARSE file whose apparent size equals sizeInBytes
+resize2fs: kernel does not support online resize with sparse_super2
 ```
 
-so growing is three facts that must move together:
+`container volume create` formats its volumes with ext4's `sparse_super2`
+feature — `dumpe2fs -h` on a fresh volume lists it — and the guest kernel has
+no online-resize support for a filesystem carrying it. An *offline* resize
+would not care, but that requires the filesystem unmounted, and a container
+volume can only ever be attached mounted; the loop-device route needs
+`--privileged`, which Apple `container` does not have. All three of image,
+daemon record and filesystem therefore cannot be made to move together, and a
+half-grown volume — bigger block device, same-sized filesystem — is a silent
+no-op worth avoiding. This would change only if Apple stopped setting
+`sparse_super2` or the guest kernel gained support for it.
 
-1. **Extend the sparse image.** Free — no blocks are allocated until written.
-2. **Record the new size** in `entity.json` (both `sizeInBytes`, which is what
-   gets attached, and `options.size`, which is what `container volume ls` and
-   therefore `mackas status` report), then **restart the daemon**. Its volume
-   index is built once, at its own startup, so a file edited underneath it is
-   invisible until then — the restart is part of the recipe, not a nicety.
-3. **Grow the ext4 filesystem** with `resize2fs`, online, against the mounted
-   volume.
+The copy needs no `resize2fs`, no hand-edited `entity.json` and no daemon
+restart, so it rests on none of those assumptions. Because Apple `container`
+has no volume rename, keeping the original name costs two copies: the volume
+is copied into a temporary one at the new size, the original is destroyed and
+recreated at that size, and the contents are copied back. The original is
+never destroyed until its copy has been verified, so an interrupted run
+leaves the data in the temporary volume rather than nowhere. Expect it to
+need roughly **twice the used space** while it runs, and to take as long as
+copying that much data twice.
 
-Doing only some of these is a silent no-op: truncating alone leaves the daemon
-attaching the old size, and a bigger block device with the same-sized
-filesystem on it gains exactly nothing. mackas does all three or refuses.
+**A relocated volume stays on its drive.** `container volume create` always
+creates in the default location, so a naive destroy-and-recreate would drag a
+volume off the disk it was deliberately placed on. The replacements are moved
+to the recorded drive while still empty — near-free — so the copies land
+there too, and the space they need is demanded of that drive rather than
+`MACKAS_ROOT`'s.
 
-**Free space is reported against the drive the image really lives on**
-(`volume_real_dir`, so a moved volume is measured on *its* disk, not
-`MACKAS_ROOT`'s), and a growth that drive cannot back is warned about rather
-than blocked — because sparse images make that failure arrive late. The
-truncate succeeds today; the build discovers the missing space weeks later,
-mid-task, which is the expensive moment to find out.
+**Free space is reported against the drive the image really lives on**, not
+`MACKAS_ROOT`'s, and a growth that drive cannot back is warned about rather
+than blocked: sparse images make that failure arrive late, when a build
+finally asks for the space.
 
-**Shrinking is refused**, and not just unimplemented: `resize2fs` cannot shrink
-a *mounted* filesystem, and a container volume can only be attached mounted —
-the loop-device route needs `--privileged`, which Apple `container` does not
-have. A smaller volume means copying into a new one (`volume duplicate` then
-`volume destroy`).
-
-**`resize2fs` is not in the kas image.** `/sbin` is on its `PATH` and the
-binary is absent from every location in it (and from `alpine`). So an
-in-place grow needs an image you supply via `MACKAS_RESIZE_IMAGE` — mackas
-will not pull or install one for you.
-
-Without one, resize is **not** a dead end: it offers to **copy** the volume
-into a new one of the right size. That path needs neither `resize2fs` nor a
-hand-edited `entity.json`, so it avoids both of the in-place path's
-assumptions — at the cost of being a real copy, twice, transiently needing
-about double the used space. A volume that was relocated with `volume move`
-is put back on its own drive: the replacements are moved there while still
-empty, so the copies land on the right disk too, rather than the fallback
-silently undoing a deliberate "TMPDIR on the fast disk" placement. The old
-volume and its per-volume symlink are removed only after the copy is
-verified.
-
-An opt-in suite (`tests/volume_resize_real.bats`, run with
-`MACKAS_REAL_RUNTIME=1`) exercises all of this against the real runtime, not
-a fake: growing a volume with data written before the grow preserves that
-data byte-for-byte, and the extra space is genuinely usable — not merely
-reported. The same suite covers the shrink refusal, the no-op case, the
-one-VM refusal, and a volume relocated to a second physical drive. The
-hermetic suite's fake `container` accepts whatever it is handed, so
-runtime-facing claims in this section (the missing `system restart`
-subcommand, the missing `resize2fs`, the copy fallback's placement
-preservation) are only meaningfully tested by the real-runtime suite.
+**Shrinking is refused.** The same copy would work mechanically, but it means
+deciding what to do with data that no longer fits, and silently discarding it
+is not something mackas will do on your behalf. To get a smaller volume,
+create one and copy in what you want.
 
 ### Three drives, one build: TMPDIR, sstate and downloads apart
 
