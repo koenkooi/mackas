@@ -4,7 +4,7 @@ Scoping notes for a **separate repository** — a menubar/notification app that
 watches a mackas build. Nothing here is built yet. It lives in this repo because
 the thing such an app codes against (the bridge's JSON, and how it behaves
 around a real smoketest) is defined here, and because the two sharp edges below
-cost real debugging time to find.
+are expensive to rediscover.
 
 Why a separate repo: mackas is POSIX shell plus stdlib-only Python, buildable
 and reviewable with what is already on a Mac. A Swift app drags in Xcode, a
@@ -23,8 +23,7 @@ apart.
   `MACKAS_MONITOR_NOTIFY=1`, posts native notifications on exactly three
   transitions: build started, build succeeded, build failed. It prefers
   `terminal-notifier` when that is on `PATH` and otherwise uses `osascript`.
-  Its bodies are worth copying, because they were arrived at by discarding
-  worse ones:
+  Its notification bodies encode deliberate choices and are worth copying:
 
   ```
   mackas: build started     console-image for beaglebone/Angstrom

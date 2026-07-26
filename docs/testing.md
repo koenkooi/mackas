@@ -25,13 +25,13 @@ needed.
 
 ## Host-side overhead
 
-Each smoketest rung is wrapped in `tools/mackas-overhead`, a stdlib sampler that
-records what the build costs the Mac itself — host CPU-seconds and peak RSS of
-the Virtualization.framework VM plus the container daemons — via a `ps`
-snapshot every `MACKAS_OVERHEAD_INTERVAL` seconds (default 5). The full summary
-lands in the rung log; the headline host CPU/RSS lines print to the console. On
-by default (`MACKAS_OVERHEAD`); best-effort, so a sampler failure never fails
-the build.
+Each smoketest rung is wrapped in `tools/mackas-overhead`, a stdlib sampler
+that records what the build costs the Mac itself — host CPU-seconds and peak
+RSS of the Virtualization.framework VM plus the container daemons — via a
+`ps` snapshot every `MACKAS_OVERHEAD_INTERVAL` seconds (default 5). The full
+summary lands in the rung log; the headline host CPU/RSS lines print to the
+console. On by default (`MACKAS_OVERHEAD`); best-effort, so a sampler
+failure never fails the build.
 
 What the number is, and is not:
 
@@ -41,14 +41,14 @@ What the number is, and is not:
   zero. That is correct, not a bug — the sampler prints `UNAVAILABLE` rather
   than a fabricated number when a guest comparison is asked for but the host
   window did not cover a real build.
-- **It is host cost, not isolated overhead — yet.** Subtracting the guest's own
+- **It is host cost, not isolated overhead.** Subtracting the guest's own
   CPU (from buildstats) to get pure virtiofs/virtio/vmexit overhead needs the
   guest buildstats *on the host*, which live inside the ext4 volume until
   `mackas retrieve buildstats` extracts them. Until then the rung reports
   host-side numbers only; run `mackas retrieve buildstats` and point
   `tools/mackas-overhead --buildstats DIR` at them for the differenced figure.
 
-## Tests
+## The hermetic suite
 
 The suite uses [bats-core](https://github.com/bats-core/bats-core)
 (`brew install bats-core`): the shim tests need per-case isolation and
@@ -61,18 +61,29 @@ dependencies.
 ```
 
 `run-tests.sh` runs shellcheck, a `/bin/bash` (3.2) syntax check, bats, and
-the Python `unittest` suite (the mirror server, the buildstats analyzer and
-the overhead sampler — stdlib only, to match those tools' own no-dependencies
-rule). `make pytest` runs just the Python half.
+the Python `unittest` suite (the mirror server, the buildstats analyzer, the
+overhead sampler and the monitor bridge's UI module — stdlib only, to match
+those tools' own no-dependencies rule). `make pytest` runs just the Python
+half.
 
-**Nothing in the suite touches the real Apple `container` runtime, the build
-SSD, the network, sudo, NFS, or any mirror host.** The mirror-server tests bind
-127.0.0.1 on port 0 — an ephemeral port the kernel picks — and build their
-own throwaway tree, including a file *outside* the served root that the
-traversal tests prove is unreachable. The shim tests inject a mock
-`container` via `MACKAS_CONTAINER_BIN` that echoes its argv, which makes flag
-translation fully assertable with no VM. Config tests run against a throwaway
-`HOME` and cwd so no stray config can leak in.
+### Hermetic by default
+
+**Nothing in the default suite touches the real Apple `container` runtime,
+the build SSD, the network, sudo, NFS, or any mirror host.** The seams that
+make that possible:
+
+- the shim tests inject a mock `container` via `MACKAS_CONTAINER_BIN` that
+  echoes its argv, which makes flag translation fully assertable with no VM;
+- command-level tests run against a fake `kas-container` (and fake
+  `container`) the same way, asserting the argv and environment mackas hands
+  them;
+- config tests run against a throwaway `HOME` and cwd so no stray config can
+  leak in;
+- the mirror-server tests bind 127.0.0.1 on port 0 — an ephemeral port the
+  kernel picks — and build their own throwaway tree, including a file
+  *outside* the served root that the traversal tests prove is unreachable.
+
+### Per-file coverage
 
 | File | Covers |
 |---|---|
@@ -82,34 +93,95 @@ translation fully assertable with no VM. Config tests run against a throwaway
 | `tests/cli.bats` | `--help`, `--version`, unknown command/option exit codes, flag placement, `--dry-run` mutating nothing. |
 | `tests/units.bats` | Pure helpers (`size_to_gb`, `nearest_existing_dir`, `derive_paths`, …), sourced via `MACKAS_LIB_ONLY=1`. |
 | `tests/mirrors.bats` | The generated mirror stanza: `downloadfilename=` on `http://` and not on `file://`, custom URLs, the both-enabled conflict. |
-| `tests/volumes.bats` | The `--runtime-args` string (`-c`/`-m`, each `-v vol:/path -e VAR=/path`), and what `env.sh` must **not** say: no `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, no `KAS_EXTRA_RUNTIME_ARGS`, no `BB_HASHSERVE_DB_DIR`. `BB_DISKMON_DIRS`'s *exact* multi-line form on disk (not just substring matches — that is how the mangled form shipped), `BB_HASHSERVE_DB_DIR`, the generated gitconfig (`safe.directory = *`, never overwriting one the user already set), `clear_buildstats_before_build` (`MACKAS_BUILDSTATS_ACCUMULATE` gating, skipping a not-yet-created volume, a failure never failing the build), and the `kas-container` wrapper's `macos-local.yml` auto-append (from `work/` and from inside the checkout, extra kas args surviving the append, a boolean flag like `-k` between the subcommand and `<files>` still finding `<files>`, a value-taking flag like `--skip STEP` — including the `--x=y` single-token form and the exact multi-`--skip` sequence recommended as the repo-state-preserving alternative to `-k` — also still finding `<files>`, backing off untouched on a flag it truly does not recognize, no double-append when already named, `MACKAS_KAS_AUTO_FRAGMENT=0`, and no-op when no project is configured). Plus that wrapper's `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation: from `work/` and from inside the checkout, the fragment never leaking into the derived config, deriving **nothing** for a sibling-spanning chain or a foreign cwd, still firing when no project is configured (the case it exists for), never overriding an already-set value, `MACKAS_KAS_AUTO_PROJECT=0`/`MACKAS_KAS_AUTO_FRAGMENT=0` honoured when exported *before* `env.sh` is sourced, the note printing once per shell, and zsh agreeing with bash. |
+| `tests/volumes.bats` | The `--runtime-args` string (`-c`/`-m`, each `-v vol:/path -e VAR=/path`), and what `env.sh` must **not** say: no `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, no `KAS_EXTRA_RUNTIME_ARGS`, no `BB_HASHSERVE_DB_DIR`. `BB_DISKMON_DIRS`'s *exact* multi-line form on disk (asserted as exact bytes, because substring matches cannot catch a mangled multi-line form), `BB_HASHSERVE_DB_DIR`, the generated gitconfig (`safe.directory = *`, never overwriting one the user already set), `clear_buildstats_before_build` (`MACKAS_BUILDSTATS_ACCUMULATE` gating, skipping a not-yet-created volume, a failure never failing the build), and the `kas-container` wrapper's `macos-local.yml` auto-append (from `work/` and from inside the checkout, extra kas args surviving the append, a boolean flag like `-k` between the subcommand and `<files>` still finding `<files>`, a value-taking flag like `--skip STEP` — including the `--x=y` single-token form and the exact multi-`--skip` sequence recommended as the repo-state-preserving alternative to `-k` — also still finding `<files>`, backing off untouched on a flag it truly does not recognize, no double-append when already named, `MACKAS_KAS_AUTO_FRAGMENT=0`, and no-op when no project is configured). Plus that wrapper's `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation: from `work/` and from inside the checkout, the fragment never leaking into the derived config, deriving **nothing** for a sibling-spanning chain or a foreign cwd, still firing when no project is configured (the case it exists for), never overriding an already-set value, `MACKAS_KAS_AUTO_PROJECT=0`/`MACKAS_KAS_AUTO_FRAGMENT=0` honoured when exported *before* `env.sh` is sourced, the note printing once per shell, and zsh agreeing with bash. |
 | `tests/volumes_cmd.bats` | `setup`/`clean`/`destroy` against a fake `container` that models volume create/delete: the three volumes, the chown to `$(id -u):$(id -g)` running as `-u 0:0` and **unconditionally** (including on volumes that already existed), `clean` keeping the caches, and the argv + environment (including `GITCONFIG_FILE`) that reach a fake `kas-container`. |
 | `tests/retrieve.bats` | `mackas retrieve` against a fake `container` that models the existence probe and the copy: the `-u 0:0` copy recipe, `--dest` defaulting/override, the "no build has run yet" message, `--dry-run` mutating nothing, the `buildstats`/`logs`/`deploy` objects (repeatable, at least one required), the one-VM refusal when a running container holds the volume, the `buildstats analyze` hint, buildstats landing in its own retrieve-timestamped subdirectory (`MACKAS_RETRIEVE_TS` test seam), and the BUILDNAME-accumulation warning/clear-offer (more than one "Build Started:" line in the just-retrieved `build_stats`). |
 | `tests/buildstats_analyze.bats` | `mackas buildstats analyze`: the JSON/text summary half (no `container` involved) resolving the default `$MACKAS_BASE/artifacts/buildstats` path vs an explicit PATH, a `build_stats` nested under a retrieve-timestamp dir, and the non-fatal warning when the analyzer script is missing; the bootchart-SVG half (a fake `container` modelling pybootchartgui's own `-o`-handling quirks, same convention as `retrieve.bats`) rendering one SVG per build under PATH (not just the newest), skipping a build already charted, skipping gracefully with no checkout or no `pybootchartgui.py`, a failed render staying non-fatal, and a relative PATH getting absolutised before it reaches the `-v` mount. |
 | `tests/test_buildstats_analyze.py` | `tools/mackas-buildstats-analyze`: that a task's CPU includes its **child** rusage (or every compile looks free), `maxrss` taking the larger of own/child, a truncated task file not sinking the report, recursive `resolve_buildstats_dir` finding a `build_stats` nested under a retrieve-timestamp dir, and the constant-BUILDNAME accumulation detection/task-filtering (more than one "Build Started:" line drops carryover tasks from an earlier build sharing the directory). `unittest`, stdlib. |
 | `tests/smoketest_overhead.bats` | The overhead sampler folded into `smoketest`: that a rung starts and stops the sampler, its summary lands in the rung log and the headline host figures on the console, `MACKAS_OVERHEAD=0` and `--dry-run` disable it, and a sampler that crashes or is missing never fails the rung. A fake sampler (real Python, via the `MACKAS_OVERHEAD_BIN` seam) records to a marker file. |
 | `tests/monitor.bats` | `mackas monitor` against a real fixture bridge on an ephemeral port (no container involved): the argument surface, an unreachable port giving an error rather than a stack trace, `--once` vs following to `success`/`failed`, and the whole `--notify` half — that notifications fire on exactly the three transitions (started/succeeded/failed) and never per task across many `building` polls, that `terminal-notifier` is preferred over `osascript` when both exist, that a failing or absent notifier changes neither the output nor the exit status, and that a hostile recipe name (a `"` and a `\` plus a `do shell script` payload) stays inside one AppleScript string literal — pinned both as exact bytes and by round-tripping the quoting through the real `osascript`. Fake notifiers on a `PATH` reduced to *only* the fixture dir, so no test can reach a real one and pop a desktop notification. |
+| `tests/test_uibridge.py` | `mackas-uibridge/mackasjson.py`, with bitbake's `bb.event`/`bb.ui.knotty` stubbed (they only exist inside a bitbake run) and everything else real: `_observe`/`_record`/`_set_targets` driven with event objects shaped exactly like the ones bitbake fires. The distinction it exists to pin: **a failed setscene task is not a build failure** — knotty itself treats `runQueueTaskFailed` as fatal but `sceneQueueTaskFailed` as a warning whose own message says "real task will be run instead", so a notification naming setscene failures would accuse innocent recipes on a healthy build. `unittest`, stdlib. |
 | `tests/test_mirrord.py` | The mirror server. Mostly security properties, because those are the deliverable: traversal (with a real file outside the root, proven unreachable), symlink escape, the `/root-evil` vs `/root` case, auth ordering, allowlist, method rejection, no listing, no banner, no stack trace, log sanitization. Binds 127.0.0.1 on port 0. |
 | `tests/test_overhead.py` | `tools/mackas-overhead`: `parse_cputime`'s four `ps -o time` wire formats, the sampler's self-exclusion and KiB→bytes conversion, and the mismatch guard that prints `UNAVAILABLE` rather than a fabricated overhead number. `unittest`, stdlib. |
 
-The table is the highlights, not the whole suite; the remaining files
-(`adopt`, `case_sensitivity`, `check_discard_support`, `purefns`,
+The table is the highlights, not the whole suite; the remaining hermetic
+files (`adopt`, `case_sensitivity`, `check_discard_support`, `purefns`,
 `require_root`, `set_get_unset`, `setup_e2e`, `setup_kas_container`,
-`smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`,
-`volume_resize_real`, `workspace_image_real`) follow the same patterns, and each file's own header
-says exactly what it pins. `adopt` and `sstate` cover two of the newest
-commands: `adopt`'s foreign-root introspection and collision-free
-volume/link derivation, and `sstate prune`'s age-based scan and one-VM
-refusal.
+`smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`)
+follow the same patterns, and each file's own header says exactly what it
+pins. `adopt` covers `adopt`'s foreign-root introspection and collision-free
+volume/link derivation; `sstate` covers `sstate prune`'s age-based scan and
+one-VM refusal. The `*_real` files are the opt-in suites described below.
 
-Two opt-in suites need the real Apple runtime and are never run by a plain
-`./run-tests.sh`: `real_runtime.bats` (sparse volume creation, fstrim) and
-`volume_resize_real.bats` (`volume resize` end to end -- data written before
-a grow surviving it, the space being genuinely usable, and a volume
-relocated to a second physical drive growing there). Both gate on
-`MACKAS_REAL_RUNTIME=1`, refuse while any `oe-build-*` volume is held, and
-only ever touch `zztest-*` volumes. The resize one takes its target
-directory from `MACKAS_REAL_VOLUME_DIR` rather than hardcoding a disk:
+### What the hermetic suite deliberately does not cover
+
+Anything where a mock would only test the mock. The classes of gap:
+
+- anything needing the real `container` runtime or a 200 GB disk — real
+  volume creation, ext4 semantics and reclaim belong to the opt-in suites
+  below;
+- the interactive-sudo path in `setup`;
+- a real build;
+- Time Machine destination detection, which needs a real TM destination;
+- the mirror server's privilege drop, since a test cannot become root (the
+  suite pins the `setgroups`→`setgid`→`setuid` *ordering* textually
+  instead, which guards the classic bug).
+
+See [TODO.md](../TODO.md) for the itemised gaps and what is covered by hand
+instead.
+
+## The opt-in real-runtime suites
+
+**A hermetic suite cannot catch a wrong call to the real runtime, because
+the fake `container` accepts whatever it is given.** A subcommand that does
+not exist, a tool missing from the kas image, a fallback with the wrong
+semantics — all pass against a mock and fail on the machine. The
+real-runtime suites exist for exactly that class of bug; among the failures
+only they could find: mackas calling `container system restart` (a
+subcommand that does not exist) in two places, the kas image shipping no
+`resize2fs`, and a copy fallback that silently moved a relocated volume back
+to the default drive.
+
+Two suites need the real Apple runtime: `real_runtime.bats` and
+`volume_resize_real.bats`. Both gate on `MACKAS_REAL_RUNTIME=1` and are
+dev-Mac-only, non-hermetic, and never CI-gated (hosted runners have no
+`container` runtime). A plain `./run-tests.sh` discovers them but they
+self-skip, so the full suite stays hermetic. Their safety rules, enforced in
+`setup`/`teardown`:
+
+- run only when `MACKAS_REAL_RUNTIME=1` **and** the runtime is up;
+- **refuse** (skip) while any container holds an `oe-build-*` volume — the
+  one-VM rule, since an ext4 image mounted by two VMs at once corrupts;
+- only ever create/attach/remove volumes named `zztest-*`; they never name
+  an `oe-build-*` volume;
+- `teardown` sweeps every `zztest-*` volume after each test, pass or fail.
+
+### `real_runtime.bats` — sparse volumes and fstrim
+
+Regression-tests the two things a mock cannot: that `container volume
+create` produces a **sparse** image, and that **`fstrim` inside the guest
+actually hands host disk back** — the reclaim mackas runs around every build
+(`auto_fstrim`). It writes 200 MiB into a throwaway volume, deletes it, runs
+the real recipe
+
+```sh
+container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v <vol>:/mnt <kas-image> fstrim -v /mnt
+```
+
+and asserts the backing `volume.img` **shrank on the host** (the du delta,
+not fstrim's own "N bytes trimmed" line, which is only the guest's free
+space).
+
+```sh
+MACKAS_REAL_RUNTIME=1 bats tests/real_runtime.bats
+```
+
+### `volume_resize_real.bats` — resize end to end
+
+`volume resize` against the real runtime: data written before a grow
+surviving it, the grown space being genuinely usable, and a volume relocated
+to a second physical drive growing there. It takes its target directory from
+`MACKAS_REAL_VOLUME_DIR` rather than hardcoding a disk:
 
 ```sh
 MACKAS_REAL_RUNTIME=1 \
@@ -117,54 +189,14 @@ MACKAS_REAL_VOLUME_DIR="/Volumes/<disk>/mackas-volume-test" \
     bats tests/volume_resize_real.bats
 ```
 
-That suite earned its keep immediately: it found that `container system
-restart` does not exist (mackas had called it in two places where it had
-never worked), that the kas image ships no `resize2fs`, and that the copy
-fallback silently moved a relocated volume back to the default drive. A
-hermetic suite cannot find any of those, because the fake `container`
-accepts whatever it is given.
+This is the suite that found all three real-runtime failures listed above.
 
-Not covered by the hermetic suite: anything needing a 200 GB disk, sudo, or a
-real build. See [TODO.md](../TODO.md) for the specific gaps.
+### `workspace_image_real.bats` — the case-sensitive workspace image
 
-## The opt-in real-runtime smoketest
-
-`tests/real_runtime.bats` is the one file that touches the actual Apple
-`container` runtime. It exists to regression-test the two things a mock cannot:
-that `container volume create` produces a **sparse** image, and that **`fstrim`
-inside the guest actually hands host disk back** — the reclaim mackas runs
-around every build (`auto_fstrim`). It writes 200 MiB into a throwaway volume,
-deletes it, runs the real recipe
-
-```sh
-container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v <vol>:/mnt <kas-image> fstrim -v /mnt
-```
-
-and asserts the backing `volume.img` **shrank on the host** (the du delta, not
-fstrim's own "N bytes trimmed" line, which is only the guest's free space).
-
-It is **skipped by default** and only ever runs when you ask for it, on the dev
-Mac:
-
-```sh
-MACKAS_REAL_RUNTIME=1 bats tests/real_runtime.bats
-```
-
-It is **dev-Mac-only, non-hermetic, and never CI-gated** (hosted runners have no
-`container` runtime). `./run-tests.sh` discovers it but it self-skips, so the
-full suite stays hermetic. Its own safety rules, enforced in `setup`/`teardown`:
-
-- runs only when `MACKAS_REAL_RUNTIME=1` **and** the runtime is up;
-- **refuses** (skips) while any container holds an `oe-build-*` volume — the
-  one-VM rule, since an ext4 image mounted by two VMs at once corrupts;
-- only ever creates/attaches/removes volumes named `zztest-*`; it never names an
-  `oe-build-*` volume;
-- `teardown` sweeps every `zztest-*` volume after each test, pass or fail.
-
-`tests/workspace_image_real.bats` is the other opt-in file, gated by the same
-`MACKAS_REAL_RUNTIME=1`: it needs no `container` runtime at all, but does run
-a real `hdiutil create`/`attach` to prove the workspace image genuinely makes
-`work/` case-sensitive (the hermetic offer/decline/reattach logic lives in
+The third opt-in file, gated by the same `MACKAS_REAL_RUNTIME=1`: it needs
+no `container` runtime at all, but does run a real `hdiutil
+create`/`attach` to prove the workspace image genuinely makes `work/`
+case-sensitive (the hermetic offer/decline/reattach logic lives in
 `tests/case_sensitivity.bats`).
 
 ## Debugging against upstream kas
@@ -183,9 +215,9 @@ kas](../README.md#zero-patches-to-kas--the-central-design-goal).
 
 ## Recovering from a crash
 
-Re-run `./mackas setup`. Every step detects "already done" and skips; nothing
-is destructive. Ctrl-C is safe at any point, including mid-build — bitbake
-resumes from sstate.
+Re-run `./mackas setup`. Every step detects "already done" and skips;
+nothing is destructive. Ctrl-C is safe at any point, including mid-build —
+bitbake resumes from sstate.
 
 If something looks wrong, `./mackas status` shows what exists and what
 doesn't.
