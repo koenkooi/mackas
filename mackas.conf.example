@@ -111,6 +111,18 @@
 # nothing like TMPDIR/sstate.
 #MACKAS_WORKSPACE_SIZE="40G"
 
+# Path of that workspace image, once one exists. Empty by default, and you do
+# not normally set this by hand: setup WRITES it here the moment it creates or
+# reattaches an image, because it is a record of fact, not a preference.
+#
+# It has to be recorded because `hdiutil attach` does not survive a reboot: on
+# a fresh boot work/ is an ordinary empty directory on the case-insensitive
+# drive, indistinguishable from a root that never had an image. With this set,
+# every command that touches work/ reattaches the image first -- or refuses to
+# run if it cannot. Unset it (mackas unset MACKAS_WORKSPACE_IMAGE) only when
+# you have genuinely moved the checkouts off the image.
+#MACKAS_WORKSPACE_IMAGE=""
+
 
 # --- Apple container resources -----------------------------------------------
 

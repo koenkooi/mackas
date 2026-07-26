@@ -66,6 +66,15 @@ MACOS_MIN_MAJOR=26
 # this in container 1.1.0, so relocation is done by symlinking the dir.
 CONTAINER_VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
 
+# Marker file written at the ROOT of a workspace image's filesystem when
+# mackas creates or (re)attaches one. It is what makes "work/ is a mount"
+# mean "work/ is OUR mount": st_dev alone only says something is mounted
+# there, and mounting anything else at work/ -- another sparse image, a USB
+# stick, a leftover DMG that grabbed the name -- would otherwise read as
+# "attached, carry on" and hand bitbake a filesystem nobody vetted. Its
+# presence is checked, never its contents, so it stays a one-line file.
+WORKSPACE_SENTINEL=".mackas-workspace"
+
 # ---------------------------------------------------------------------------
 # Settings. Every name here is: default -> config file -> env -> CLI flag.
 # ---------------------------------------------------------------------------
@@ -101,6 +110,7 @@ MACKAS_OVERHEAD_INTERVAL
 MACKAS_FSTRIM_AUTO
 MACKAS_FREE_SPACE_MARGIN_GB
 MACKAS_REQUIRE_CASE_SENSITIVE
+MACKAS_WORKSPACE_IMAGE
 MACKAS_WORKSPACE_SIZE
 MACKAS_MONITOR
 MACKAS_MONITOR_PORT
@@ -689,6 +699,28 @@ set_defaults() {
 	# build a doomed tree. Set to 0 only if you know the case-sensitive parts
 	# live elsewhere (e.g. a workspace image, below) or for tests.
 	MACKAS_REQUIRE_CASE_SENSITIVE=1
+
+	# Path of the case-sensitive APFS sparse image mounted at work/, or empty
+	# for the normal case: no image, work/ is a plain directory on an already
+	# case-sensitive volume. This is a RECORD, not a preference -- `setup`'s
+	# offer writes it into the config file the moment it creates or reattaches
+	# an image, because nothing else can tell later invocations that work/ is
+	# supposed to be a mount.
+	#
+	# It has to be recorded rather than derived: `hdiutil attach` is not
+	# persistent, so after every reboot work/ is an ordinary EMPTY directory
+	# on the (case-insensitive) drive, indistinguishable by inspection from a
+	# root that never had an image at all. Without this knob a post-reboot
+	# build would fall straight through to that directory and let kas re-clone
+	# oe-core onto case-insensitive APFS -- the exact corruption the setup-time
+	# gate exists to prevent, silent this time, because that gate already
+	# passed once. With it set, ensure_workspace_attached() reattaches, or
+	# refuses to touch work/ at all. See docs/storage.md.
+	#
+	# Unsetting it is the supported way to go back to a plain work/ (after
+	# moving the checkouts off the image yourself); mackas never deletes an
+	# image or edits this on its own beyond the create/reattach it just did.
+	MACKAS_WORKSPACE_IMAGE=""
 
 	# Size of the case-sensitive APFS sparse image `setup` offers to create at
 	# work/ when the root turns out to be case-insensitive (see
@@ -2161,6 +2193,30 @@ check_target_volume() {
 		fi
 	fi
 
+	# --- the workspace image, if one is configured. Reported right here
+	# because it is the answer to the rung above: a case-insensitive root is
+	# fine PROVIDED the image is attached at work/, and a detached one turns
+	# that pass back into a failure. `check` never mounts anything -- it is the
+	# command you run to find out what is wrong -- so this only looks.
+	if [ -n "${MACKAS_WORKSPACE_IMAGE:-}" ]; then
+		local wst
+		set +e; workspace_is_attached; wst=$?; set -e
+		case "$wst" in
+			0) ck_pass "workspace image attached: $MACKAS_ROOT/work -> $(readlink "$MACKAS_ROOT/work" 2>/dev/null || printf '%s' "$MACKAS_ROOT/work") (from $MACKAS_WORKSPACE_IMAGE)" ;;
+			2) ck_fail "something is mounted at $MACKAS_ROOT/work, but it is not the workspace image (no $WORKSPACE_SENTINEL at its root)" \
+				"unmount it ('mount | grep work'); builds refuse to run until $MACKAS_ROOT/work is the recorded image" ;;
+			*)
+				if [ -f "$MACKAS_WORKSPACE_IMAGE" ]; then
+					ck_fail "workspace image $MACKAS_WORKSPACE_IMAGE is NOT attached -- $MACKAS_ROOT/work is a plain, case-insensitive directory" \
+						"a reboot unmounts it; '$SCRIPT_CMD setup' (or any build command) reattaches it, or by hand: hdiutil attach $(printf '%q' "$MACKAS_WORKSPACE_IMAGE") -nobrowse"
+				else
+					ck_fail "workspace image is recorded as $MACKAS_WORKSPACE_IMAGE, but no such file exists" \
+						"mount the drive it lives on, or find it with 'mdfind -name $(printf '%q' "$(basename "$MACKAS_WORKSPACE_IMAGE")")' and move it back; '$SCRIPT_CMD unset MACKAS_WORKSPACE_IMAGE' if you no longer use an image"
+				fi
+				;;
+		esac
+	fi
+
 	# --- fstrim/discard reclaim: informational, never fatal. The three ext4
 	# volumes work regardless of this -- they just cannot SHRINK back below
 	# their peak usage on a filesystem that does not support it. mackas
@@ -2769,12 +2825,100 @@ attach_workspace_image() {
 	printf '%s\n' "$mp"
 }
 
+# path_device PATH -- the st_dev of PATH, or nothing (and non-zero) if it
+# cannot be stat'ed. -L follows symlinks deliberately: work/ IS a symlink to
+# the mount point whenever an image is attached, and BSD stat reports the
+# LINK's own device without it -- i.e. always MACKAS_ROOT's, which would make
+# the mounted case indistinguishable from the unmounted one.
+#
+# Factored out of workspace_is_attached() so the guard's decision table can be
+# exercised without a real hdiutil mount (a hermetic test cannot conjure a
+# second filesystem); tests override this one line, not the logic above it.
+path_device() { stat -L -f '%d' "$1" 2>/dev/null || return 1; }
+
+# workspace_is_attached -- is $MACKAS_ROOT/work our workspace image, right now?
+#
+#   0  yes: a different filesystem than MACKAS_ROOT, carrying our sentinel
+#   1  no: same filesystem (so nothing is mounted), or work/ is missing or a
+#      dangling symlink -- all "attach it"
+#   2  SOMETHING is mounted there, but it is not ours (no sentinel) -- neither
+#      "attached" nor safely "attach over it"; the caller must refuse
+#
+# Deliberately host-native and cheap (two stats and a test -f, no hdiutil, no
+# `mount` parsing): this runs on the way into every build, and `mount`'s
+# output is the wrong tool anyway -- macOS reports /private/var-style resolved
+# paths that a literal comparison against MACKAS_ROOT gets wrong.
+workspace_is_attached() {
+	local work="$MACKAS_ROOT/work" dev_work dev_root
+	dev_work="$(path_device "$work")" || return 1
+	dev_root="$(path_device "$MACKAS_ROOT")" || return 1
+	[ "$dev_work" != "$dev_root" ] || return 1
+	[ -f "$work/$WORKSPACE_SENTINEL" ] || return 2
+	return 0
+}
+
+# write_workspace_sentinel MP -- drop WORKSPACE_SENTINEL at the root of a
+# freshly mounted workspace image, unless it is already there (an image
+# created by an earlier mackas gets one on its next reattach).
+#
+# Not run(): run() cannot carry a redirection, and this needs to write a file,
+# so it does its own --dry-run branch the way attach_workspace_image does.
+#
+# A failure here is fatal on purpose. The sentinel is load-bearing -- without
+# it the NEXT invocation sees a mount it cannot identify and refuses to build
+# (case 2 above) -- so a mount we cannot write to is not a working workspace,
+# and saying so now beats a baffling refusal tomorrow.
+write_workspace_sentinel() {
+	local mp="$1" f="$1/$WORKSPACE_SENTINEL"
+	[ -f "$f" ] && return 0
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ (write %s)%s\n' "$C_DIM" "$(printf '%q' "$f")" "$C_RST"
+		return 0
+	fi
+	vrb "+ (write $(printf '%q' "$f"))"
+	printf '%s\n' "mackas workspace image -- do not delete: this file is how mackas tells its own case-sensitive workspace mount apart from any other volume mounted at work/. See docs/storage.md." >"$f" \
+		|| die "cannot write $f -- the workspace image mounted at $mp is not writable" \
+			"check the mount ('hdiutil info'); a read-only attach cannot hold the layer checkouts anyway"
+}
+
+# record_workspace_image IMG -- persist MACKAS_WORKSPACE_IMAGE=IMG.
+#
+# Called only from the create/reattach paths, i.e. only after the user already
+# said yes to this image. It is not separately confirm()ed on purpose: an
+# image created but never recorded is precisely the silent-corruption hole the
+# knob exists to close (the next reboot leaves work/ a bare directory nothing
+# is guarding), so "yes, mount this at work/" has to include "and remember
+# that you did".
+#
+# Writes to whatever config file this invocation loaded, or -- nothing loaded,
+# the common first-run case -- creates the same $HOME/.mackas.conf that
+# `mackas set` would. The file is named in the output either way, since this
+# is the one place setup touches the user's config.
+record_workspace_image() {
+	local img="$1" file
+	[ "${MACKAS_WORKSPACE_IMAGE:-}" = "$img" ] && return 0
+	MACKAS_WORKSPACE_IMAGE="$img"
+	file="$(set_target_config_file)"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ (record MACKAS_WORKSPACE_IMAGE=%s in %s)%s\n' \
+			"$C_DIM" "$(printf '%q' "$img")" "$(printf '%q' "$file")" "$C_RST"
+		return 0
+	fi
+	config_write_setting "$file" MACKAS_WORKSPACE_IMAGE "$img"
+	did "recorded MACKAS_WORKSPACE_IMAGE=$img in $file (so every later run reattaches it)"
+}
+
 # reattach_workspace_image IMG -- attach an EXISTING workspace image and
 # (re)point $MACKAS_ROOT/work at wherever it mounts. Shared by
-# offer_workspace_image's reattach branch and reattach_dangling_workspace_
-# symlink below, which hit the exact same "the Mac rebooted" situation from
-# two different starting states (a case-insensitive work/ vs. a dangling
-# symlink).
+# offer_workspace_image's reattach branch, reattach_dangling_workspace_symlink
+# below and ensure_workspace_attached's post-reboot path -- all the same "the
+# Mac rebooted" situation reached from different starting states (a
+# case-insensitive work/, a dangling symlink, a plain empty directory).
+#
+# The rm -rf is safe because every caller has already established that work/
+# is nothing but a stale pointer -- a dangling symlink, an empty directory, or
+# a directory whose contents were moved aside first. Nothing here decides that
+# for itself.
 reattach_workspace_image() {
 	local img="$1" mp
 	mp="$(attach_workspace_image "$img")" \
@@ -2783,7 +2927,62 @@ reattach_workspace_image() {
 		run rm -rf "$MACKAS_ROOT/work"
 	fi
 	run ln -s "$mp" "$MACKAS_ROOT/work"
+	write_workspace_sentinel "$mp"
+	record_workspace_image "$img"
 	did "reattached workspace image at $MACKAS_ROOT/work -> $mp"
+}
+
+# ensure_workspace_attached -- the fail-closed guard, called on the way into
+# anything that touches work/ (run_kas, and the build commands ahead of their
+# own "is the project checked out?" tests).
+#
+# Same idempotency shape as ensure_volume(): do nothing when the state is
+# already right, make it right when it is not, die with a remediation when it
+# cannot be made right. What makes this one different is that "cannot" must
+# never degrade into "carry on": work/ unmounted is not an empty workspace,
+# it is a case-INSENSITIVE directory on the host drive, and kas cloning
+# oe-core into it corrupts the checkout in ways that surface much later as
+# unexplainable git errors. Refusing to build is strictly better.
+ensure_workspace_attached() {
+	# No image configured is the normal case (a genuinely case-sensitive
+	# MACKAS_ROOT), and it must cost nothing. No root configured means
+	# require_mackas_root() already had its say.
+	[ -n "${MACKAS_WORKSPACE_IMAGE:-}" ] || return 0
+	[ -n "${MACKAS_ROOT:-}" ] || return 0
+
+	local work="$MACKAS_ROOT/work" st
+	set +e; workspace_is_attached; st=$?; set -e
+	case "$st" in
+	0)	vrb "workspace image already attached at $work"
+		return 0 ;;
+	2)	die "$work is a mount point, but not the mackas workspace image -- no $WORKSPACE_SENTINEL at its root" \
+			"unmount whatever is there ('mount | grep work'), then re-run; if that mount IS your workspace image (created before mackas recorded a sentinel), adopt it with: touch $(printf '%q' "$work/$WORKSPACE_SENTINEL")" ;;
+	esac
+
+	# From here on work/ is NOT a mount, and a build must not be allowed to
+	# use it as-is.
+	[ -f "$MACKAS_WORKSPACE_IMAGE" ] || die \
+		"workspace image $MACKAS_WORKSPACE_IMAGE does not exist, so $work cannot be made case-sensitive" \
+		"mount the drive it lives on, or find it with: mdfind -name $(printf '%q' "$(basename "$MACKAS_WORKSPACE_IMAGE")")   (then move it back to that path, or '$SCRIPT_CMD unset MACKAS_WORKSPACE_IMAGE' if you no longer use an image)"
+
+	# A NON-EMPTY plain directory at work/ is the damage case, not a stale
+	# pointer: something already wrote layer checkouts onto the underlying
+	# case-insensitive drive while the image was detached. Deleting it to make
+	# room for the symlink would throw away whatever that is, so stop and let
+	# a human look -- offer_workspace_image() is the code that knows how to
+	# move such a directory aside and copy it onto the image, and it only runs
+	# under `setup`, where the user is expecting exactly that.
+	if [ ! -L "$work" ] && [ -d "$work" ] && [ -n "$(ls -A "$work" 2>/dev/null)" ]; then
+		die "$work is a non-empty directory on $(volume_mount_point "$MACKAS_ROOT"), but the workspace image $MACKAS_WORKSPACE_IMAGE is not attached -- its contents were written to a CASE-INSENSITIVE filesystem and may already be corrupt" \
+			"move it aside (mv $(printf '%q' "$work") $(printf '%q' "$work.bad")) and run '$SCRIPT_CMD setup', which reattaches the image and can copy a checkout back onto it"
+	fi
+
+	# The ordinary post-reboot state: work/ is a dangling symlink (or gone).
+	# Reattaching is not a decision the user needs to confirm -- it restores
+	# the state they already configured, changes nothing on disk, and is
+	# undone by a reboot anyway.
+	info "workspace image is not attached (a reboot unmounts it) -- reattaching $MACKAS_WORKSPACE_IMAGE"
+	reattach_workspace_image "$MACKAS_WORKSPACE_IMAGE"
 }
 
 # reattach_dangling_workspace_symlink -- setup_oe_root() found work/ as a
@@ -2853,6 +3052,12 @@ offer_workspace_image() {
 			|| die "hdiutil attach failed for the workspace image just created" \
 				"check 'hdiutil info'; the image itself is at $img"
 		run ln -s "$mp" "$MACKAS_ROOT/work"
+		# The sentinel and the recorded path are what make this survive the
+		# first reboot: without them work/ comes back as a bare directory on
+		# the case-insensitive drive and nothing downstream knows it should
+		# have been a mount. See ensure_workspace_attached().
+		write_workspace_sentinel "$mp"
+		record_workspace_image "$img"
 		did "mounted workspace image at $MACKAS_ROOT/work -> $mp"
 
 		if [ -n "$preserved" ]; then
@@ -4338,6 +4543,13 @@ run_kas() {
 	# to check on that front.
 	local log="$1"; shift
 	local rt_args gitconfig rc
+
+	# Before anything else, and before --dry-run's early return: kas is about
+	# to write the layer checkouts into KAS_WORK_DIR, and if a workspace image
+	# is configured but not attached that path is a case-INSENSITIVE directory
+	# on the host drive. A no-op when no image is configured.
+	ensure_workspace_attached
+
 	rt_args="$(kas_runtime_args)"
 	# A GITCONFIG_FILE already in this shell's environment always wins; see
 	# setup_gitconfig() for why this exists and why we never override one the
@@ -4774,6 +4986,14 @@ ensure_project_checked_out() {
 
 cmd_smoketest() {
 	require_mackas_root
+	# Before anything that reads or writes the checkout, not just inside
+	# run_kas: with the workspace image detached (any reboot) $MACKAS_PROJECT
+	# points into a mount that is not there, so ensure_project_checked_out()
+	# below sees a perfectly good checkout as missing -- and offers to CLONE
+	# it onto the case-insensitive drive, which is the corruption the image
+	# exists to prevent. Idempotent, so run_kas's own call still covers every
+	# other path into it.
+	ensure_workspace_attached
 	ensure_kas_container_installed
 
 	# A checkout already on disk (a real project, however it got there) always
@@ -4886,6 +5106,7 @@ EOF
 
 cmd_shell() {
 	require_mackas_root
+	ensure_workspace_attached   # see cmd_smoketest for why this is not left to run_kas
 	ensure_kas_container_installed
 	ensure_project_checked_out
 	info "Dropping into a kas shell for $KAS_FILES_ARG ..."
@@ -5797,6 +6018,30 @@ cmd_status() {
 	local docker_path
 	docker_path="$(resolved_docker)"
 	show "docker resolves to"  "${docker_path:-<none>}"
+
+	# Only when one is configured: on a properly case-sensitive root there is
+	# no image and a permanent "workspace image: none" line would be noise.
+	# "attached?" is the whole point of the section -- it is the one piece of
+	# state here that a reboot silently changes, and "it worked yesterday" is
+	# almost always this.
+	if [ -n "${MACKAS_WORKSPACE_IMAGE:-}" ]; then
+		hdr "Workspace image (work/)"
+		show "image" "$MACKAS_WORKSPACE_IMAGE"
+		if [ ! -f "$MACKAS_WORKSPACE_IMAGE" ]; then
+			show "attached" "NO -- the image file itself is missing ($SCRIPT_CMD check explains)"
+		else
+			local wst
+			set +e; workspace_is_attached; wst=$?; set -e
+			case "$wst" in
+				0) show "attached" "yes: $MACKAS_ROOT/work -> $(readlink "$MACKAS_ROOT/work" 2>/dev/null)" ;;
+				2) show "attached" "NO -- a DIFFERENT filesystem is mounted at $MACKAS_ROOT/work" ;;
+				*) show "attached" "no  (a reboot unmounts it; '$SCRIPT_CMD setup' or any build reattaches)" ;;
+			esac
+		fi
+		info ""
+		info "  work/ holds the layer checkouts. They are git repos with real remotes,"
+		info "  so 'git push' is the backup story -- the image is one file with none."
+	fi
 
 	hdr "ext4 volumes"
 	status_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "/build      TMPDIR"

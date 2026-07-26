@@ -35,7 +35,14 @@ setup() {
 	setup_colors   # normally called from main(), which MACKAS_LIB_ONLY skips
 
 	TESTDIR="$(make_tmpdir)"
+	# HOME is redirected because creating an image now RECORDS it
+	# (record_workspace_image -> MACKAS_WORKSPACE_IMAGE in the config file
+	# set_target_config_file picks, which is $HOME/.mackas.conf when no config
+	# is loaded). Without this, running the opt-in suite would edit the
+	# maintainer's real ~/.mackas.conf.
+	export HOME="$TESTDIR"
 	MACKAS_ROOT="$TESTDIR/root"
+	MACKAS_WORKSPACE_IMAGE=""      # nothing recorded yet; the offer sets it
 	MACKAS_WORKSPACE_SIZE="256m"   # small: this test only proves the mechanism
 	DRY_RUN=0
 	ASSUME_YES=1
@@ -70,6 +77,34 @@ teardown() {
 	: > "$MACKAS_ROOT/work/File.txt"
 	: > "$MACKAS_ROOT/work/file.txt"
 	[ "$(ls "$MACKAS_ROOT/work" | grep -c '^[Ff]ile\.txt$')" -eq 2 ]
+}
+
+@test "real workspace image: a detach (i.e. a reboot) is repaired by the attach guard" {
+	# The lifecycle item 19 exists for, against real hdiutil: create, detach
+	# exactly the way a restart does, then let ensure_workspace_attached()
+	# find its way back. tests/workspace_attach.bats covers the decision table
+	# hermetically; this proves the two real hdiutil calls agree with it.
+	local precs; set +e; dir_is_case_sensitive "$MACKAS_ROOT/work"; precs=$?; set -e
+	[ "$precs" -eq 1 ] || skip "this host's tmp is already case-sensitive; nothing to prove here"
+
+	offer_workspace_image
+	# The offer must have recorded the image; without that the guard below has
+	# nothing to act on -- and neither would any command after a reboot.
+	[ "$MACKAS_WORKSPACE_IMAGE" = "$(workspace_image_base).sparseimage" ]
+	[ -f "$MACKAS_ROOT/work/.mackas-workspace" ]
+	workspace_is_attached
+
+	# A reboot leaves the image on disk and the mount gone. work/ is a symlink
+	# to the (now absent) mount point, so it reads as neither a directory nor
+	# a mount -- exactly the state the guard has to recognise.
+	hdiutil detach "$(readlink "$MACKAS_ROOT/work")" >/dev/null
+	assert_fails workspace_is_attached
+	[ ! -d "$MACKAS_ROOT/work" ]
+
+	ensure_workspace_attached
+	workspace_is_attached
+	local postcs; set +e; dir_is_case_sensitive "$MACKAS_ROOT/work"; postcs=$?; set -e
+	[ "$postcs" -eq 0 ]
 }
 
 @test "real workspace image: a pre-existing checkout survives the migration" {
