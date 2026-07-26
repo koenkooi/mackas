@@ -24,7 +24,7 @@ build requires one.
 The document is in four parts: the local volumes and their caps; managing
 those volumes (reclaiming, relocating, growing, splitting across drives);
 network storage (mirrors, NFS, disk images on shares); and macOS operational
-concerns (buildstats, Time Machine, Full Disk Access).
+concerns (buildstats, buildhistory, Time Machine, Full Disk Access).
 
 ## Volume caps and the disk monitor
 
@@ -855,6 +855,50 @@ mackas handles this in three places:
 
 Set `MACKAS_BUILDSTATS_ACCUMULATE=1` if you actually want `tmp/buildstats` to
 keep accumulating across builds and will manage it yourself.
+
+## Buildhistory, and the volume it lives in
+
+`meta/classes-global/buildhistory.bbclass` records what each build actually
+produced — package and image contents, sizes, runtime dependencies, sysroot
+listings — under `BUILDHISTORY_DIR`, which it defaults to
+`${TOPDIR}/buildhistory`. Two consequences follow from that default on this
+setup, and neither is obvious from the OpenEmbedded side.
+
+**It is not under `tmp/`.** `TOPDIR` inside the container is `/build`, the
+mount point of the whole `oe-build-tmp` volume, and `TMPDIR` is `/build/tmp`
+within it. So buildhistory lands at `/build/buildhistory` — a *sibling* of
+everything else `mackas retrieve` copies out, not a child of `tmp/`. Retrieval
+resolves the path from `bitbake-getvar BUILDHISTORY_DIR` like every other
+object, so a project that redefines it is followed correctly; the class
+default is only the fallback used when the query cannot run.
+
+**`mackas clean` drops it.** `clean` deletes and recreates the TMPDIR volume,
+and `/build/buildhistory` is inside that volume — so the entire history goes
+with it, silently, however many builds it spans. Nothing warns at `clean`
+time, because from the volume's point of view this is exactly the requested
+operation. Two ways to keep it:
+
+```sh
+./mackas retrieve buildhistory      # copy it to $MACKAS_BASE/artifacts first
+```
+
+or set `BUILDHISTORY_DIR` to a path that outlives the volume — e.g. under
+`SSTATE_DIR` (`/sstate`, its own volume, untouched by `clean`) — in the same
+place you inherit the class.
+
+**It records nothing unless you ask for it.** buildhistory is not inherited by
+default; without `INHERIT += "buildhistory"` in your kas config's
+`local_conf_header` or `conf/local.conf`, the directory never exists. That is
+the overwhelmingly likely reason `mackas retrieve buildhistory` finds nothing,
+so it says so in those terms rather than reporting a missing directory. mackas
+does **not** turn the class on for you: the generated `kas/macos-local.yml`
+fragment carries macOS and Apple-container tuning only, and what a build
+records is a project decision that belongs in the project's own config, where
+everyone building it sees the same thing.
+
+The retrieved copy is a plain directory on the Mac, and a git repository when
+`BUILDHISTORY_COMMIT` is on — one commit per build, readable with ordinary
+`git -C $MACKAS_BASE/artifacts/buildhistory log`, no container needed.
 
 ## Time Machine
 
