@@ -455,6 +455,60 @@ An external volume's top level is typically `root:wheel`, so creating
 `$MACKAS_ROOT` needs a one-off `sudo mkdir` + `sudo chown`. `setup` prompts
 for exactly that and nothing more.
 
+### Growing a volume (`mackas volume resize`)
+
+A volume's size is fixed at creation — `setup` never resizes an existing one,
+and Apple `container` v1.1.0 has no grow command — so a cap chosen months ago
+used to be permanent short of destroy-and-recreate, which costs the whole
+cache. `mackas volume resize <name> <size>` grows one in place instead.
+
+What the daemon actually keeps on disk is what makes this possible:
+
+```
+$CONTAINER_VOLUMES_DIR/<name>/
+  entity.json   {…,"sizeInBytes":53687091200,…,"options":{"size":"50G"}}
+  volume.img    a SPARSE file whose apparent size equals sizeInBytes
+```
+
+so growing is three facts that must move together:
+
+1. **Extend the sparse image.** Free — no blocks are allocated until written.
+2. **Record the new size** in `entity.json` (both `sizeInBytes`, which is what
+   gets attached, and `options.size`, which is what `container volume ls` and
+   therefore `mackas status` report), then **restart the daemon**. Its volume
+   index is built once, at its own startup, so a file edited underneath it is
+   invisible until then — the restart is part of the recipe, not a nicety.
+3. **Grow the ext4 filesystem** with `resize2fs`, online, against the mounted
+   volume.
+
+Doing only some of these is a silent no-op: truncating alone leaves the daemon
+attaching the old size, and a bigger block device with the same-sized
+filesystem on it gains exactly nothing. mackas does all three or refuses.
+
+**Free space is reported against the drive the image really lives on**
+(`volume_real_dir`, so a moved volume is measured on *its* disk, not
+`MACKAS_ROOT`'s), and a growth that drive cannot back is warned about rather
+than blocked — because sparse images make that failure arrive late. The
+truncate succeeds today; the build discovers the missing space weeks later,
+mid-task, which is the expensive moment to find out.
+
+**Shrinking is refused**, and not just unimplemented: `resize2fs` cannot shrink
+a *mounted* filesystem, and a container volume can only be attached mounted —
+the loop-device route needs `--privileged`, which Apple `container` does not
+have. A smaller volume means copying into a new one (`volume duplicate` then
+`volume destroy`).
+
+> **Not yet verified against the real runtime.** The mechanism above is derived
+> from the on-disk format observed on a live install and is covered by
+> hermetic tests, but no real volume has been grown yet. Two things are
+> genuinely unknown until someone does: whether the daemon re-reads a
+> hand-edited `entity.json` on restart exactly as `refuse_if_stale_entity`
+> already assumes it does, and whether the kas image ships `resize2fs`
+> (`e2fsprogs`) at all — mackas checks for it inside the container and says so
+> rather than failing obscurely. If step 3 fails, the volume is left intact and
+> usable at its old capacity, with steps 1–2 already done and idempotent, so a
+> retry costs nothing.
+
 ### Three drives, one build: TMPDIR, sstate and downloads apart
 
 The three volumes look alike — three sparse ext4 images — but they are used in

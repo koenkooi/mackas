@@ -1357,6 +1357,27 @@ size_to_gb() {
 	esac
 }
 
+# size_to_bytes SIZE -- SIZE ("1T", "500G", "800M", or a bare number meaning
+# GiB) as an exact byte count, or 0 if it is not a size at all.
+#
+# Separate from size_to_gb() on purpose: that one rounds to whole GiB, which is
+# right for budgeting against free space but wrong for resizing an image, where
+# the byte count is what gets written into entity.json's "sizeInBytes" and what
+# the image is truncated to. Powers of 1024 throughout, matching what the
+# container daemon itself records (a 50G volume is 53687091200 bytes).
+size_to_bytes() {
+	local s="$1" num unit
+	num="$(printf '%s' "$s" | sed 's/[^0-9].*$//')"
+	unit="$(printf '%s' "$s" | sed 's/^[0-9]*//' | tr '[:upper:]' '[:lower:]')"
+	[ -n "$num" ] || { echo 0; return; }
+	case "$unit" in
+		t|tb|tib)    echo $((num * 1024 * 1024 * 1024 * 1024)) ;;
+		g|gb|gib|"") echo $((num * 1024 * 1024 * 1024)) ;;
+		m|mb|mib)    echo $((num * 1024 * 1024)) ;;
+		*)           echo 0 ;;
+	esac
+}
+
 # Combined GiB the three volumes can grow to. They are sparse, so this is the
 # worst case, not what they cost today -- but it is exactly what has to fit on
 # the SSD alongside Time Machine.
@@ -6234,6 +6255,182 @@ volume_move() {
 	return 0
 }
 
+# volume resize <name> <size> -- GROW a volume's ext4 filesystem in place.
+#
+# A volume's size is fixed at creation: ensure_volume() never resizes one, and
+# Apple container v1.1.0 has no grow command, so until now the only route was
+# destroy-and-recreate, which costs the whole cache. That is a real cost --
+# a TMPDIR that turns out too small mid-build, or an sstate volume that
+# outgrew a cap chosen months ago.
+#
+# The mechanism, derived from what the daemon actually stores on disk:
+#
+#   $CONTAINER_VOLUMES_DIR/<name>/
+#     entity.json   {..."sizeInBytes":53687091200,..."options":{"size":"50G"}}
+#     volume.img    a SPARSE file whose apparent size == sizeInBytes
+#
+# so growing is: extend the sparse image (free -- no blocks are allocated
+# until written), tell the daemon its new size, then grow the ext4 filesystem
+# inside it to fill the space. All three have to happen, in that order:
+# truncating alone leaves the daemon attaching the old size; editing
+# entity.json alone leaves the image too small to back it; and doing both
+# without resize2fs leaves a bigger block device with the same-sized
+# filesystem on it, which is exactly nothing.
+#
+# The daemon caches its volume index at startup (see refuse_if_stale_entity),
+# so entity.json edited underneath it is not seen until 'container system
+# restart' -- which is why that restart is part of the recipe rather than an
+# optimisation. resize2fs then runs against the MOUNTED filesystem: ext4
+# supports online growth, and mounting is the only way a plain
+# 'container run -v name:/mnt' gives us the block device at all.
+#
+# SHRINKING IS NOT IMPLEMENTED, and not merely unfinished: resize2fs refuses
+# to shrink a mounted filesystem, and nothing here can attach a volume
+# *without* mounting it -- the loop-device route needs --privileged, which
+# Apple container does not have (see TODO.md's non-goals). A shrink would have
+# to be copy-and-destroy through a temp volume, which is a different feature.
+# Refuse clearly rather than half-do it.
+volume_resize() {
+	# Mutating, and it attaches the volume -- same root gate as fstrim, and for
+	# the same reason: without a root, a bare name would resolve against
+	# whatever install happens to share it.
+	require_mackas_root
+	local name="${1:-}" want="${2:-}"
+	[ -n "$name" ] && [ -n "$want" ] || die "'volume resize' needs <name> and <size>" \
+		"$SCRIPT_CMD volume resize <name> <size>   # e.g. $SCRIPT_CMD volume resize $MACKAS_VOL_TMP 1T"
+	[ "$#" -le 2 ] || die "'volume resize' takes exactly <name> <size>" \
+		"$SCRIPT_CMD volume resize <name> <size>"
+
+	local new_bytes; new_bytes="$(size_to_bytes "$want")"
+	[ "$new_bytes" -gt 0 ] || die "'$want' is not a size" \
+		"use a number with T/G/M, e.g. 1T, 500G, 800M (a bare number means GiB)"
+
+	volume_exists "$name" || die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
+
+	# One-VM rule: this attaches the volume to run resize2fs, and an ext4 image
+	# mounted by two VMs at once corrupts. Growing one underneath a running
+	# build would be a spectacular way to prove it.
+	if volume_in_use "$name"; then
+		die "volume '$name' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first ('$SCRIPT_CMD volume list'), then re-run"
+	fi
+
+	# volume_real_dir, not the runtime path: a volume moved onto another drive
+	# lives behind a symlink, and both the image and the free space that
+	# matters are over there, not on MACKAS_ROOT.
+	local dir img ent cur_bytes
+	dir="$(volume_real_dir "$name")"
+	img="$dir/volume.img"
+	ent="$dir/entity.json"
+	[ -f "$img" ] || die "no volume.img at $img" "$SCRIPT_CMD volume recover $name"
+	[ -f "$ent" ] || die "no entity.json at $ent -- this does not look like a container volume" \
+		"$SCRIPT_CMD volume list"
+	cur_bytes="$(sed -n 's/.*"sizeInBytes":\([0-9][0-9]*\).*/\1/p' "$ent" | head -1)"
+	[ -n "$cur_bytes" ] && [ "$cur_bytes" -gt 0 ] || \
+		die "could not read the current size out of $ent" \
+			"inspect it by hand; mackas will not guess at a size it cannot read"
+
+	info "${C_BLD}mackas volume resize $name${C_RST}"
+	info "  now      : $(fmt_kb $((cur_bytes / 1024)))"
+	info "  requested: $(fmt_kb $((new_bytes / 1024)))"
+	info "  image    : $img"
+
+	if [ "$new_bytes" -eq "$cur_bytes" ]; then
+		info "  already that size; nothing to do"
+		return 0
+	fi
+
+	if [ "$new_bytes" -lt "$cur_bytes" ]; then
+		die "shrinking is not supported" \
+			"resize2fs cannot shrink a mounted filesystem, and a volume can only be attached mounted -- to get a smaller volume, create a new one and copy into it ('$SCRIPT_CMD volume duplicate' then '$SCRIPT_CMD volume destroy'), or see TODO.md item 26"
+	fi
+
+	# Free space is the real constraint, and it is subtler than it looks: the
+	# image is sparse, so truncating it costs nothing TODAY, but every byte the
+	# build later writes into the grown filesystem has to come from this drive.
+	# Reporting the shortfall up front is the whole point -- a cap the drive
+	# can never honour just moves the failure into a build, which is where it
+	# is most expensive.
+	local grow_gb free_gb
+	grow_gb=$(( (new_bytes - cur_bytes + 1073741823) / 1073741824 ))
+	free_gb="$(free_gb_for "$dir")"
+	info "  growth   : ${grow_gb} GiB, free on that drive: ${free_gb} GiB"
+	if [ "$free_gb" -lt "$grow_gb" ]; then
+		warn "      That drive cannot currently back the full growth."
+		warn "      The image is sparse, so this succeeds now and fails LATER,"
+		warn "      mid-build, when the space is actually asked for."
+	fi
+
+	confirm "  Grow '$name' to $want?" || { info "  Left unchanged."; return 1; }
+
+	# 1. Extend the sparse image. python3 rather than truncate(1), which macOS
+	#    does not ship (only GNU coreutils' gtruncate, and shedding Homebrew
+	#    dependencies is the direction of travel -- see TODO.md item 9).
+	#    os.truncate only moves the file's end; it allocates nothing.
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ truncate %s to %s bytes%s\n' "$C_DIM" "$img" "$new_bytes" "$C_RST"
+	else
+		/usr/bin/python3 -c 'import os,sys; os.truncate(sys.argv[1], int(sys.argv[2]))' \
+			"$img" "$new_bytes" \
+			|| die "could not extend $img" "check permissions and free space on that drive"
+		did "extended volume.img to $(fmt_kb $((new_bytes / 1024)))"
+	fi
+
+	# 2. Tell the daemon. Both fields matter: sizeInBytes is what it attaches,
+	#    options.size is what 'container volume ls'/'inspect' report (and hence
+	#    what mackas status shows). Written via a temp file and mv so a crash
+	#    mid-write cannot leave an unparseable entity.json behind -- that file
+	#    is the daemon's only record that this volume exists at all.
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ set sizeInBytes=%s and options.size=%s in %s%s\n' \
+			"$C_DIM" "$new_bytes" "$want" "$ent" "$C_RST"
+	else
+		local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/mackas-entity.XXXXXX")" \
+			|| die "could not create a temp file" "check ${TMPDIR:-/tmp}"
+		sed -e "s/\"sizeInBytes\":[0-9][0-9]*/\"sizeInBytes\":$new_bytes/" \
+		    -e "s/\"size\":\"[^\"]*\"/\"size\":\"$want\"/" "$ent" > "$tmp" \
+			|| { rm -f "$tmp"; die "could not rewrite $ent" "inspect it by hand"; }
+		grep -q "\"sizeInBytes\":$new_bytes" "$tmp" \
+			|| { rm -f "$tmp"; die "the rewritten entity.json does not carry the new size" \
+				"inspect $ent by hand; nothing was changed"; }
+		run mv "$tmp" "$ent"
+		did "recorded the new size in entity.json"
+	fi
+
+	# 3. Make the daemon re-read it. Its volume index is built once, at its own
+	#    startup, so without this the attach in step 4 uses the OLD size and
+	#    resize2fs would find nothing new to grow into.
+	run container system restart
+
+	# 4. Grow the filesystem. Mounted (online) growth: ext4 supports it, and
+	#    'container run -v name:/mnt' is the only handle we have on the block
+	#    device. -u 0:0 and CAP_SYS_ADMIN for the same reasons fstrim needs
+	#    them -- the image's default user cannot do this, and root without the
+	#    cap still gets EPERM on the resize ioctl.
+	local inner='set -e
+command -v resize2fs >/dev/null 2>&1 || { echo "MACKAS-ERR: resize2fs is not in this image" >&2; exit 90; }
+dev=$(grep " /mnt " /proc/mounts | cut -d" " -f1 | head -1)
+[ -n "$dev" ] || { echo "MACKAS-ERR: could not identify the device behind /mnt" >&2; exit 91; }
+resize2fs "$dev"'
+	if run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" \
+		"$KAS_IMAGE" sh -c "$inner"; then
+		[ "$DRY_RUN" -eq 1 ] && return 0
+		did "grew the ext4 filesystem on '$name' to $want"
+		info "  '$SCRIPT_CMD status' now reports the new cap."
+		return 0
+	fi
+
+	# The daemon and the image agree on the new size at this point; only the
+	# filesystem inside is still the old one. That is a safe state -- the
+	# volume mounts and works, it just has not gained the space yet -- so say
+	# exactly that rather than implying the volume is damaged.
+	warn "      The image and the daemon now agree on $want, but the ext4"
+	warn "      filesystem inside is still $(fmt_kb $((cur_bytes / 1024)))."
+	warn "      The volume is intact and usable at its old capacity."
+	die "could not grow the filesystem on '$name'" \
+		"if the image lacks resize2fs (e2fsprogs), re-run once it is available -- steps 1-3 are already done and are idempotent"
+}
+
 # Ask Spotlight where a volume.img with the right shape lives. Prints one
 # candidate directory per line (the dir that CONTAINS volume.img). Test seam:
 # MACKAS_MDFIND overrides the mdfind binary, exactly like MACKAS_CONTAINER_BIN.
@@ -6364,6 +6561,7 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD volume duplicate <source> <duplicate>
   $SCRIPT_CMD volume destroy <name> | all | --all
   $SCRIPT_CMD volume move <name> <dir>
+  $SCRIPT_CMD volume resize <name> <size>
   $SCRIPT_CMD volume recover [<name>]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
@@ -6389,6 +6587,16 @@ ${C_BLD}SUBCOMMANDS${C_RST}
                        e.g. put a big TMPDIR on a roomier disk. Refuses an
                        in-use volume (one-VM rule). '$SCRIPT_CMD status' then
                        reports the new location.
+  resize <name> <size> GROW a volume in place, keeping its contents: extend the
+  (grow)               sparse image, record the new size, restart the daemon so
+                       it sees it, then grow the ext4 filesystem to fill it.
+                       Sizes are the usual 1T/500G/800M. Refuses an in-use
+                       volume (one-VM rule), and reports the growth against
+                       free space on the drive the image actually lives on --
+                       the image is sparse, so an over-large cap succeeds now
+                       and fails later, mid-build. SHRINKING IS REFUSED:
+                       resize2fs cannot shrink a mounted filesystem and a
+                       volume can only be attached mounted.
   recover [<name>]     When you have moved a volume.img by hand and the runtime
                        can no longer find it, locate it with Spotlight and
                        offer to re-point the symlink. With no name, checks all
@@ -6441,10 +6649,11 @@ cmd_volume() {
 		duplicate|dup|clone)   volume_duplicate ${rest+"${rest[@]}"} ;;
 		destroy|delete|rm)     volume_destroy ${rest+"${rest[@]}"} ;;
 		move|relocate)         volume_move ${rest+"${rest[@]}"} ;;
+		resize|grow)           volume_resize ${rest+"${rest[@]}"} ;;
 		recover)               volume_recover ${rest+"${rest[@]}"} ;;
 		help)                  volume_usage ;;
 		*) die "unknown 'volume' subcommand: $sub" \
-			"$SCRIPT_CMD volume --help  (list | fstrim | duplicate | destroy | move | recover)" ;;
+			"$SCRIPT_CMD volume --help  (list | fstrim | duplicate | destroy | move | resize | recover)" ;;
 	esac
 }
 

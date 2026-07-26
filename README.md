@@ -255,7 +255,7 @@ Plus two files `setup` **generates** rather than ships:
 | `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. `mackas monitor --help`. See [Watching a build live](#watching-a-build-live). |
 | `clean` | Drop the TMPDIR volume (recreated empty). Keeps the downloads/sstate volumes and the checkout. |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
-| `volume` | Manage the ext4 volumes: `list`, `fstrim` (reclaim disk from a sparse image; `all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or every volume (`--all`/`-a`), `move` one to another disk, `recover` a hand-moved one. |
+| `volume` | Manage the ext4 volumes: `list`, `fstrim` (reclaim disk from a sparse image; `all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or every volume (`--all`/`-a`), `move` one to another disk, `resize` (grow) one in place, `recover` a hand-moved one. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
 
 Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes` (or
@@ -335,6 +335,7 @@ second mount ([TODO.md](TODO.md) item 5).
 ./mackas volume duplicate oe-build-sstate sstate-backup   # sstate-backup is a new NAME you choose, an APFS copy-on-write clone of oe-build-sstate
 ./mackas volume destroy sstate-backup       # remove ONE volume
 ./mackas volume move oe-build-tmp /Volumes/Fast/oe   # relocate one image to another disk
+./mackas volume resize oe-build-tmp 1T      # GROW one in place, keeping its contents
 ```
 
 A sparse ext4 image only ever grows: deleting files inside the guest never
@@ -357,6 +358,20 @@ that is in use. If you ever move an image by hand and the symlink goes stale,
 `mackas volume recover` finds it again with Spotlight and offers to re-point.
 A later `volume destroy`/`clean` of that volume also removes the per-volume
 symlink `move` planted, so a moved-then-destroyed volume leaves nothing dangling.
+
+`volume resize <name> <size>` **grows** a volume in place, keeping everything
+in it — the answer to a TMPDIR that turns out too small, or an sstate cap
+chosen months ago, without paying for it with the cache. It extends the sparse
+image, records the new size where the daemon reads it, restarts the daemon so
+it picks that up, then grows the ext4 filesystem to fill the new space; all
+three have to happen, since a bigger block device with the same-sized
+filesystem on it gains nothing. It reports the growth against free space on
+the drive the image *actually* lives on and warns when that drive cannot back
+it — sparse images make an over-large cap succeed now and fail later, in the
+middle of a build. **Shrinking is refused**, not merely missing: `resize2fs`
+cannot shrink a mounted filesystem and a container volume can only be attached
+mounted, so a shrink has to be copy-into-a-new-volume instead
+(`volume duplicate` + `volume destroy`).
 
 ### Pruning the sstate cache
 

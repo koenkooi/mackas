@@ -1,7 +1,8 @@
 #!/usr/bin/env bats
 #
 # Tests for `mackas volume` -- list, fstrim (reclaim sparse-image space),
-# duplicate and destroy an arbitrary ext4 container volume.
+# duplicate, destroy, move, resize (grow in place) and recover an arbitrary
+# ext4 container volume.
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -969,4 +970,134 @@ break_volume() {
 	recover oe-build-tmp
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'healthy'
+}
+
+# ---------------------------------------------------------------------------
+# resize -- grow a volume in place (TODO.md item 26)
+#
+# The daemon stores a volume as entity.json (with "sizeInBytes" and
+# "options":{"size":...}) beside a SPARSE volume.img whose apparent size equals
+# sizeInBytes. Growing is therefore three separate facts that must all move
+# together -- image, daemon record, filesystem -- and the tests below pin each
+# one, because getting two of the three right is a silent no-op: a bigger block
+# device with the same-sized ext4 on it gains nothing.
+#
+# Shrinking is refused rather than half-implemented: resize2fs cannot shrink a
+# MOUNTED filesystem, and a container volume can only be attached mounted.
+# ---------------------------------------------------------------------------
+
+# Like have_volume, but also writes the entity.json the daemon really keeps --
+# minified, keys unspaced, exactly the shape observed on a live install. resize
+# reads sizeInBytes out of this and writes it back, so a realistic file is the
+# whole point.
+have_volume_with_entity() {
+	local name="$1" size="$2" bytes="$3" kb="${4:-8192}"
+	have_volume "$name" "$size" "$kb"
+	printf '{"source":"%s/%s/volume.img","labels":{},"format":"ext4","name":"%s","driver":"local","sizeInBytes":%s,"creationDate":806328848.109219,"options":{"size":"%s"}}' \
+		"$(VOLDIR)" "$name" "$name" "$bytes" "$size" > "$(VOLDIR)/$name/entity.json"
+	# The image's APPARENT size is what gets extended; keep it consistent with
+	# sizeInBytes so a grow is measurable.
+	/usr/bin/python3 -c 'import os,sys; os.truncate(sys.argv[1], int(sys.argv[2]))' \
+		"$(VOLDIR)/$name/volume.img" "$bytes"
+}
+
+apparent_size() { /usr/bin/python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_size)' "$1"; }
+
+@test "volume resize: grows the image, the daemon record and the filesystem" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol -y resize oe-build-tmp 1T
+	[ "$status" -eq 0 ]
+
+	# 1. the sparse image really is bigger (apparent size, not blocks)
+	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 1099511627776 ]
+	# 2. BOTH daemon-visible fields moved, and the JSON is still one object
+	grep -qF '"sizeInBytes":1099511627776' "$(VOLDIR)/oe-build-tmp/entity.json"
+	grep -qF '"size":"1T"' "$(VOLDIR)/oe-build-tmp/entity.json"
+	! grep -qF '"sizeInBytes":128849018880' "$(VOLDIR)/oe-build-tmp/entity.json"
+	# 3. the daemon was made to re-read it -- its index is built once, at
+	#    startup, so without this the attach below would use the OLD size
+	assert_call 'system] [restart'
+	# 4. and the filesystem was grown, with the two flags that are not optional
+	assert_call 'run] [--rm] [-u] [0:0] [--cap-add] [CAP_SYS_ADMIN] [-v] [oe-build-tmp:/mnt'
+	# ...running resize2fs against the device behind the mount, not a path
+	assert_call 'resize2fs'
+	assert_call '/proc/mounts'
+}
+
+@test "volume resize: refuses to shrink rather than half-doing it" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol -y resize oe-build-tmp 40G
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'shrink'
+	# Nothing moved: not the image, not the record.
+	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
+	grep -qF '"size":"120G"' "$(VOLDIR)/oe-build-tmp/entity.json"
+	refute_call 'system] [restart'
+}
+
+@test "volume resize: the same size is a no-op, not a pointless daemon restart" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol -y resize oe-build-tmp 120G
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'already that size'
+	refute_call 'system] [restart'
+}
+
+@test "volume resize: refuses a volume a running build holds (one-VM rule)" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	MOCK_INUSE=oe-build-tmp vol -y resize oe-build-tmp 1T
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'running container'
+	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
+}
+
+@test "volume resize: --dry-run reports the plan and mutates nothing" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol --dry-run resize oe-build-tmp 1T
+	[ "$status" -eq 0 ]
+	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
+	grep -qF '"sizeInBytes":128849018880' "$(VOLDIR)/oe-build-tmp/entity.json"
+	refute_call 'system] [restart'
+}
+
+@test "volume resize: rejects a size it cannot parse, before touching anything" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol -y resize oe-build-tmp banana
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'not a size'
+	[ "$(apparent_size "$(VOLDIR)/oe-build-tmp/volume.img")" -eq 128849018880 ]
+}
+
+@test "volume resize: a nonexistent volume errors, and both arguments are required" {
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol -y resize no-such-volume 1T
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'does not exist'
+
+	vol -y resize oe-build-tmp
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'needs <name> and <size>'
+}
+
+@test "volume resize: says so when the drive cannot back the growth, since sparse hides it" {
+	# The image is sparse, so an over-large cap succeeds now and fails later,
+	# mid-build, when the space is actually asked for. Saying it up front is
+	# the entire value of the check.
+	have_volume_with_entity oe-build-tmp 120G 128849018880
+	vol -y resize oe-build-tmp 900T
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'cannot currently back'
+	printf '%s\n' "$output" | grep -qi 'fails LATER'
+}
+
+@test "volume resize: refuses a volume whose entity.json it cannot read a size from" {
+	# `container volume create` in the fake (like the real one, mid-create)
+	# leaves an EMPTY entity.json. Guessing a size there would write a
+	# fabricated sizeInBytes into the daemon's only record of the volume.
+	have_volume oe-build-tmp 120G 4096
+	: > "$(VOLDIR)/oe-build-tmp/entity.json"
+	vol -y resize oe-build-tmp 1T
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'could not read the current size'
+	refute_call 'system] [restart'
 }
