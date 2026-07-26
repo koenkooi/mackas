@@ -1660,6 +1660,17 @@ refuse_if_stale_entity() {
 delete_volume() {
 	local name="$1"
 	volume_exists "$name" || return 0
+
+	# Where the image REALLY lives, read before anything is deleted. This has
+	# to happen first: the per-volume symlink is the only record of a relocated
+	# volume's location, and the daemon removes that symlink as part of the
+	# delete (verified against container 1.1.0 -- it disappears, while the
+	# directory it pointed at does not). Read it afterwards and there is
+	# nothing left to read.
+	local moved_to=""
+	[ -L "$CONTAINER_VOLUMES_DIR/$name" ] && \
+		moved_to="$(readlink "$CONTAINER_VOLUMES_DIR/$name" 2>/dev/null || true)"
+
 	if run container volume delete "$name" || run container volume rm "$name"; then
 		did "removed volume '$name'"
 		# A prior 'volume move' plants a per-volume symlink at
@@ -1669,9 +1680,32 @@ delete_volume() {
 		# volumes, previously moved onto separate disks, were destroyed
 		# (daemon shows them gone) yet the symlinks stayed behind, now
 		# dangling at nonexistent paths. Clean it up at the source.
+		# Belt and braces: on a runtime that leaves the symlink behind, clear
+		# it so nothing is left dangling. container 1.1.0 removes it itself,
+		# so this is normally a no-op.
 		if [ -L "$CONTAINER_VOLUMES_DIR/$name" ]; then
 			run rm -f "$CONTAINER_VOLUMES_DIR/$name"
 			did "removed the now-dangling symlink at $CONTAINER_VOLUMES_DIR/$name"
+		fi
+
+		# The delete removes what the daemon knows about -- for a relocated
+		# volume that is the symlink, NOT the image it pointed at. So
+		# destroying a moved volume silently leaves its whole image behind on
+		# the other drive: a "destroyed" 300 GB TMPDIR still costing 300 GB,
+		# with nothing left referring to it to explain where the space went.
+		# Verified live. Say so, and offer to finish the job.
+		if [ -n "$moved_to" ] && [ -d "$moved_to" ]; then
+			local left; left="$(du -sh "$moved_to" 2>/dev/null | awk '{print $1}')"
+			warn "      '$name' lived on another drive, and the delete only removed the reference."
+			warn "      Its image is still on disk${left:+ (${left})}:"
+			warn "        $moved_to"
+			if confirm "      Remove that leftover directory too?"; then
+				run rm -rf "${moved_to:?}"
+				did "removed the leftover image directory $moved_to"
+			else
+				warn "      Left in place. Remove it by hand when you are sure:"
+				warn "        rm -rf $(quote_cmd "$moved_to")"
+			fi
 		fi
 		return 0
 	fi
@@ -2390,6 +2424,21 @@ check_state() {
 	check_one_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
 	check_one_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
 	check_one_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "SSTATE_DIR -> /sstate"
+
+	# Images left behind on another drive by destroying a relocated volume.
+	# Nothing points at them any more, so nothing else would ever mention them.
+	local orphans orphan n_orph
+	orphans="$(find_orphaned_volume_images 2>/dev/null)"
+	if [ -n "$orphans" ]; then
+		n_orph="$(printf '%s\n' "$orphans" | grep -c .)"
+		ck_warn "$n_orph orphaned volume image(s): on disk, but no volume refers to them" \
+			"these are what a destroyed RELOCATED volume leaves behind; remove any you do not want"
+		printf '%s\n' "$orphans" | while IFS= read -r orphan; do
+			[ -n "$orphan" ] || continue
+			printf '         %s%s%s (%s)\n' "$C_DIM" "$orphan" "$C_RST" \
+				"$(du -sh "$orphan" 2>/dev/null | awk '{print $1}')"
+		done
+	fi
 
 	# A volume from before the split into three. It is not used any more, and a
 	# stale 200G image is exactly the thing this disk cannot spare.
@@ -6738,6 +6787,44 @@ volume_spotlight_find() {
 		dir="$(dirname "$img")"
 		[ "$(basename "$dir")" = "$name" ] || continue
 		[ -f "$dir/entity.json" ] || continue
+		printf '%s\n' "$dir"
+	done
+}
+
+# Orphaned volume images: a volume.img on some drive that no volume claims.
+#
+# These are created by destroying a RELOCATED volume. `container volume delete`
+# removes what the daemon knows about -- for a moved volume that is the
+# per-volume SYMLINK, not the image it points at -- so the image survives on
+# the other drive with nothing left referring to it. A "destroyed" 300 GB
+# TMPDIR goes on costing 300 GB, and the only clue is free space that never
+# came back. delete_volume now warns and offers to remove it at the moment it
+# happens; this finds the ones destroyed before that existed, or removed by
+# some other route.
+#
+# Spotlight is the only way to find them: without the symlink there is no
+# record of which drives were ever used, so there is nowhere else to look.
+# Same query and structural filtering as volume_spotlight_find, but matching
+# ANY directory name rather than one volume's, and then discarding every
+# directory that IS a live volume or the runtime's own location.
+#
+# Prints one "<dir>" per orphan. Silent when Spotlight is unavailable or the
+# index is off -- an empty answer here must never read as "nothing is wrong",
+# which is why the caller reports the difference.
+find_orphaned_volume_images() {
+	local mdfind="${MACKAS_MDFIND:-mdfind}" img dir base real
+	local known; known="$(container volume ls 2>/dev/null | awk 'NR>1 {print $1}')"
+	"$mdfind" "kMDItemFSName == 'volume.img'" 2>/dev/null | while IFS= read -r img; do
+		[ -f "$img" ] || continue
+		dir="$(dirname "$img")"
+		[ -f "$dir/entity.json" ] || continue
+		base="$(basename "$dir")"
+		# Still a live volume? Then it is not an orphan, wherever it lives.
+		printf '%s\n' "$known" | grep -qxF "$base" && continue
+		# The runtime's own directory for that name -- if the image is there,
+		# or a symlink still points at it, something still refers to it.
+		real="$(volume_real_dir "$base")"
+		[ "$real" = "$dir" ] && continue
 		printf '%s\n' "$dir"
 	done
 }
