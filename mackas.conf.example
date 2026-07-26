@@ -218,6 +218,20 @@
 # already ends with a differently-named fragment).
 #MACKAS_KAS_AUTO_FRAGMENT=1
 
+# Whether that same wrapper also DERIVES the two settings above from the file
+# list it was just given, and exports them into that shell: the first entry
+# names the checkout under work/, so 'kas-container shell
+# meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml' yields
+# MACKAS_PROJECT_DIR=meta-angstrom and
+# MACKAS_KAS_CONFIG=kas/angstrom.yml:kas/beaglebone.yml. Without them,
+# bitbake-getvar refuses and 'retrieve'/'buildstats analyze' either fail or
+# silently use OE-core default paths a distro has redefined. On by default.
+#
+# Exported into that shell ONLY -- never written here, and never over a value
+# already set. A chain spanning sibling layers derives nothing (there is no
+# checkout-relative form of a sibling, since mackas cd's into one checkout).
+#MACKAS_KAS_AUTO_PROJECT=1
+
 # The smoketest ladder's build rungs: space-separated bitbake targets, run in
 # order after the universal parse-only rung. Empty by default (the built-in
 # default, not what is shown commented out below): with no targets set, the

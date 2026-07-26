@@ -73,6 +73,7 @@ MACKAS_PROJECT_BRANCH
 MACKAS_PROJECT_DIR
 MACKAS_KAS_CONFIG
 MACKAS_KAS_AUTO_FRAGMENT
+MACKAS_KAS_AUTO_PROJECT
 MACKAS_SMOKETEST_TARGETS
 MACKAS_OVERHEAD
 MACKAS_OVERHEAD_INTERVAL
@@ -616,6 +617,23 @@ set_defaults() {
 	# symptom). Set to 0 to go back to composing it yourself, e.g. if your own
 	# <files> list already ends with a differently-named fragment.
 	MACKAS_KAS_AUTO_FRAGMENT=1
+
+	# Whether the env.sh 'kas-container' wrapper also DERIVES
+	# MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG from the file list it was just
+	# given, and exports them into that shell. ON by default. The workflow
+	# this exists for is real and was hit repeatedly: someone drives kas by
+	# hand ('kas-container shell meta-angstrom/kas/angstrom.yml:...') and
+	# never sets MACKAS_PROJECT_DIR, so bitbake_getvar -- and therefore
+	# 'retrieve' and 'buildstats analyze' -- refuse outright, or silently fall
+	# back to OE-core default paths a distro has redefined. The file list
+	# already names the checkout, so there is nothing to ask the user for.
+	#
+	# Exported into the CURRENT shell only, never written to a config file
+	# (same ephemeral philosophy as setup's own size flags), and never over an
+	# already-set value -- env beats the config file in mackas's own
+	# precedence, so a derived value is picked up by the next mackas command
+	# in that shell with no further plumbing.
+	MACKAS_KAS_AUTO_PROJECT=1
 
 	# The smoketest ladder's build rungs, space-separated bitbake targets, run
 	# in order after the universal parse-only rung. Empty by default: with no
@@ -2701,7 +2719,7 @@ setup_shim_and_env() {
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
-	local q_fragrepo q_autofrag
+	local q_fragrepo q_autofrag q_autoproj
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
 	q_work="$(shq "$MACKAS_WORK")"
@@ -2716,6 +2734,7 @@ setup_shim_and_env() {
 	q_parallel="$(shq "-j $MACKAS_CPUS")"
 	q_fragrepo="$(shq "$MACKAS_KAS_FRAGMENT_REPO")"
 	q_autofrag="$(shq "$MACKAS_KAS_AUTO_FRAGMENT")"
+	q_autoproj="$(shq "$MACKAS_KAS_AUTO_PROJECT")"
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_ENV_SH" "$C_RST"
@@ -2784,7 +2803,83 @@ export MACKAS_RUNTIME_ARGS=$q_runtime_args
 # append"), and whether the wrapper appends it automatically. See
 # MACKAS_KAS_AUTO_FRAGMENT in $SCRIPT_NAME for the full story.
 export MACKAS_KAS_FRAGMENT_REPO=$q_fragrepo
-export MACKAS_KAS_AUTO_FRAGMENT=$q_autofrag
+
+# ':-' so a value already exported in THIS shell wins, exactly like
+# GITCONFIG_FILE above. A bare assignment here would silently clobber
+# 'MACKAS_KAS_AUTO_PROJECT=0' set in a shell rc BEFORE env.sh is sourced,
+# which is a perfectly reasonable way to turn either of these off.
+export MACKAS_KAS_AUTO_FRAGMENT=\${MACKAS_KAS_AUTO_FRAGMENT:-$q_autofrag}
+export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}
+
+# _mackas_derive_project needs this to tell "cwd is work/" from "cwd is a
+# checkout under work/". Same value as KAS_WORK_DIR above, under the name the
+# rest of mackas uses.
+export MACKAS_WORK=$q_work
+
+# Derive MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG from the file list a hand-typed
+# 'kas-container build/shell/... <files>' just used, and export them into THIS
+# shell so a later 'mackas retrieve'/'buildstats analyze' in the same shell
+# resolves paths through bitbake instead of refusing. See
+# MACKAS_KAS_AUTO_PROJECT in $SCRIPT_NAME for the full story. Never writes a
+# config file, and never overrides a value that is already set.
+_mackas_derive_project() {
+	[ "\${MACKAS_KAS_AUTO_PROJECT:-0}" = "1" ] || return 0
+	local files="\${1:-}" proj="" rest entry stripped out=""
+	[ -n "\$files" ] || return 0
+	[ -n "\${MACKAS_WORK:-}" ] || return 0
+
+	if [ "\$PWD" = "\$MACKAS_WORK" ]; then
+		# The documented flow: cwd is work/, so every entry is
+		# <checkout>/path/to.yml and the leading component names the checkout.
+		case "\$files" in
+			*/*) proj="\${files%%/*}" ;;
+			*) return 0 ;;
+		esac
+		# Strip that component off every entry to get the checkout-relative
+		# form compose_kas_files uses. A chain spanning SIBLING layers (e.g.
+		# meta-angstrom/... plus meta-ti/...) cannot be expressed that way at
+		# all -- mackas commands cd INTO the checkout, so a sibling would sit
+		# outside the /repo mount -- so derive nothing rather than something
+		# that parses but resolves wrong.
+		rest="\$files"
+		while [ -n "\$rest" ]; do
+			entry="\${rest%%:*}"
+			case "\$rest" in
+				*:*) rest="\${rest#*:}" ;;
+				*)   rest="" ;;
+			esac
+			case "\$entry" in
+				"\$proj"/*) stripped="\${entry#"\$proj"/}" ;;
+				*) proj=""; break ;;
+			esac
+			out="\${out:+\$out:}\$stripped"
+		done
+	elif [ "\${PWD%/*}" = "\$MACKAS_WORK" ]; then
+		# cwd is the checkout itself, so the entries are already relative.
+		proj="\${PWD##*/}"
+		out="\$files"
+	fi
+	[ -n "\$proj" ] || return 0
+
+	# Only fill in what is genuinely unset: an explicit value, wherever it
+	# came from, always wins.
+	local did=""
+	if [ -z "\${MACKAS_PROJECT_DIR:-}" ]; then
+		export MACKAS_PROJECT_DIR="\$proj"
+		export MACKAS_PROJECT="\$MACKAS_WORK/\$proj"
+		did="MACKAS_PROJECT_DIR=\$proj"
+	fi
+	if [ -z "\${MACKAS_KAS_CONFIG:-}" ] && [ -n "\$out" ]; then
+		export MACKAS_KAS_CONFIG="\$out"
+		did="\${did:+\$did }MACKAS_KAS_CONFIG=\$out"
+	fi
+	# Say it once per shell -- useful the first time, noise on every call.
+	if [ -n "\$did" ] && [ -z "\${_MACKAS_PROJECT_NOTED:-}" ]; then
+		_MACKAS_PROJECT_NOTED=1
+		printf '%s: derived %s for this shell\n' "$SCRIPT_NAME" "\$did" >&2
+	fi
+	return 0
+}
 
 kas-container() {
 	# Prepend our bin dir so kas-container ALWAYS finds the GNU realpath shim
@@ -2821,31 +2916,39 @@ kas-container() {
 	# positional argument is not a kas file list the same way (dump has many
 	# more pre-config flags; menu's positional is a kconfig file, not
 	# \`config\` at all).
+	# The scan runs for its own sake, NOT only when the fragment is about to be
+	# appended: _mackas_derive_project needs the same file list, and the case
+	# it exists to fix is precisely the one where no project is configured yet
+	# (so MACKAS_KAS_FRAGMENT_REPO does not exist and the append is skipped).
 	local _mackas_sub="\${1:-}" _mackas_arg _mackas_files="" _mackas_frag
 	local _mackas_before=()
-	if [ "\${MACKAS_KAS_AUTO_FRAGMENT:-0}" = "1" ] && [ -f "\$MACKAS_KAS_FRAGMENT_REPO" ]; then
-		case "\$_mackas_sub" in
-			build|shell|checkout)
-				shift
-				while [ \$# -gt 0 ]; do
-					_mackas_arg="\$1"
-					case "\$_mackas_arg" in
-						-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
-							_mackas_before+=("\$_mackas_arg"); shift ;;
-						--skip=*|--target=*|--cmd=*|--task=*|--provenance=*)
-							_mackas_before+=("\$_mackas_arg"); shift ;;
-						--skip|--target|-c|--cmd|--task|--provenance)
-							_mackas_before+=("\$_mackas_arg"); shift
-							if [ \$# -gt 0 ]; then
-								_mackas_before+=("\$1"); shift
-							fi
-							;;
-						-*)
-							break ;;
-						*)
-							_mackas_files="\$_mackas_arg"; shift; break ;;
-					esac
-				done
+	case "\$_mackas_sub" in
+		build|shell|checkout)
+			shift
+			while [ \$# -gt 0 ]; do
+				_mackas_arg="\$1"
+				case "\$_mackas_arg" in
+					-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
+						_mackas_before+=("\$_mackas_arg"); shift ;;
+					--skip=*|--target=*|--cmd=*|--task=*|--provenance=*)
+						_mackas_before+=("\$_mackas_arg"); shift ;;
+					--skip|--target|-c|--cmd|--task|--provenance)
+						_mackas_before+=("\$_mackas_arg"); shift
+						if [ \$# -gt 0 ]; then
+							_mackas_before+=("\$1"); shift
+						fi
+						;;
+					-*)
+						break ;;
+					*)
+						_mackas_files="\$_mackas_arg"; shift; break ;;
+				esac
+			done
+			# Derive BEFORE the fragment is appended, so the fragment never
+			# lands in the derived MACKAS_KAS_CONFIG (compose_kas_files adds
+			# it back itself, and a doubled entry is a kas parse error).
+			_mackas_derive_project "\$_mackas_files"
+			if [ "\${MACKAS_KAS_AUTO_FRAGMENT:-0}" = "1" ] && [ -f "\$MACKAS_KAS_FRAGMENT_REPO" ]; then
 				case "\$_mackas_files" in
 					''|*macos-local.yml) ;;
 					*)
@@ -2853,10 +2956,10 @@ kas-container() {
 						[ -n "\$_mackas_frag" ] && _mackas_files="\$_mackas_files:\$_mackas_frag"
 						;;
 				esac
-				set -- "\$_mackas_sub" "\${_mackas_before[@]}" \${_mackas_files:+"\$_mackas_files"} "\$@"
-				;;
-		esac
-	fi
+			fi
+			set -- "\$_mackas_sub" "\${_mackas_before[@]}" \${_mackas_files:+"\$_mackas_files"} "\$@"
+			;;
+	esac
 	env PATH=$q_shim:"\$PATH" KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
 		$q_kasbin --runtime-args "\$MACKAS_RUNTIME_ARGS" "\$@"
 }

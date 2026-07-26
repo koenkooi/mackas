@@ -229,6 +229,41 @@ or an unsourced shell bypasses the wrapper and builds with no volumes, no
 limits, and no auto-appended fragment. `mackas status` prints the exact
 `--runtime-args` in effect.
 
+That same argument scan feeds a second job: unless `MACKAS_KAS_AUTO_PROJECT=0`,
+`_mackas_derive_project()` turns the file list into `MACKAS_PROJECT_DIR` and
+`MACKAS_KAS_CONFIG` and **exports them into the calling shell**. This exists
+because driving kas by hand sets neither, and `bitbake_getvar()` refuses
+without `MACKAS_PROJECT_DIR` (it is what `MACKAS_PROJECT` — the directory kas
+is run from — derives from), which in turn makes `retrieve` and `buildstats
+analyze` fail or fall back to OE-core default paths a distro has redefined.
+That failure was hit repeatedly in real use, and the file list already
+contains the answer.
+
+The rules are deliberately narrow, because a *wrong* derivation is worse than
+none — it produces a config that parses and then resolves against the wrong
+tree:
+
+- **From `work/`** (the documented cwd), the first colon-entry's leading path
+  component names the checkout; it is stripped from every entry to give the
+  checkout-relative form `compose_kas_files()` expects.
+- **From inside a checkout** (`$PWD`'s parent is `work/`), the entries are
+  already relative and the directory name is the project.
+- **A chain spanning sibling layers** (`meta-angstrom/…:meta-ti/…`) derives
+  **nothing at all**. mackas commands `cd` into one checkout, so a sibling
+  falls outside kas's `/repo` mount — there is no checkout-relative form to
+  derive, and deriving `MACKAS_PROJECT_DIR` alone would leave
+  `KAS_FILES_ARG` as the bare fragment, which parses but describes a
+  different build.
+- **Any other cwd** derives nothing.
+
+Derivation runs *before* the fragment is appended, so `macos-local.yml` never
+lands in the derived `MACKAS_KAS_CONFIG` (`compose_kas_files()` adds it back
+itself, and a doubled entry is a kas parse error). Values already set in the
+environment always win, and nothing is ever written to a config file — the
+same ephemeral philosophy as `setup`'s own size flags. Since env beats the
+config file in mackas's precedence order, the next `mackas` command in that
+shell picks the derived values up with no further plumbing.
+
 ## Live build progress: the monitor bridge
 
 A build inside the container reports nothing to macOS in real time beyond

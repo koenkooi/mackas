@@ -823,6 +823,145 @@ with_project_fragment() {
 }
 
 # ---------------------------------------------------------------------------
+# env.sh -- the wrapper deriving MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG
+#
+# Driving kas by hand sets neither, so bitbake_getvar() refuses outright and
+# everything built on it (retrieve, buildstats analyze's SVG rendering) either
+# fails or silently falls back to OE-core default paths a distro has
+# redefined. Hit repeatedly live. The file list already names the checkout, so
+# there is nothing to ask the user for -- derive it and export into THIS shell.
+# ---------------------------------------------------------------------------
+
+# derived VAR ARGS... -- run the wrapper in a clean child shell from CWD_VAR
+# and print one exported variable's value afterwards.
+derived() {
+	local var="$1" cwd="$2"; shift 2
+	(cd "$cwd" && /bin/bash -c '
+		. "$1" >/dev/null 2>&1
+		var="$2"; shift 2
+		kas-container "$@" >/dev/null 2>&1
+		eval "printf %s \"\${$var:-}\""
+	' _ "$MACKAS_ENV_SH" "$var" "$@")
+}
+
+@test "derive: from work/, a single-layer chain sets PROJECT_DIR and a checkout-relative KAS_CONFIG" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	[ "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK" shell meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml)" = "meta-angstrom" ]
+	# The leading checkout component is stripped from EVERY entry: that is the
+	# form compose_kas_files() expects, because run_kas() cd's into the checkout.
+	[ "$(derived MACKAS_KAS_CONFIG "$MACKAS_WORK" shell meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml)" = "kas/angstrom.yml:kas/beaglebone.yml" ]
+}
+
+@test "derive: the appended macos-local.yml never lands in the derived KAS_CONFIG" {
+	# compose_kas_files() appends the fragment itself; a doubled entry is a kas
+	# parse error, so derivation has to happen BEFORE the auto-append.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	got="$(derived MACKAS_KAS_CONFIG "$MACKAS_WORK" shell meta-angstrom/kas/base.yml)"
+	[ "$got" = "kas/base.yml" ]
+}
+
+@test "derive: works from inside the checkout, where entries are already relative" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	[ "$(derived MACKAS_PROJECT_DIR "$MACKAS_PROJECT" shell kas/base.yml)" = "meta-angstrom" ]
+	[ "$(derived MACKAS_KAS_CONFIG "$MACKAS_PROJECT" shell kas/base.yml)" = "kas/base.yml" ]
+}
+
+@test "derive: a chain spanning SIBLING layers derives NOTHING, rather than something that resolves wrong" {
+	# mackas commands cd INTO the checkout, so a sibling layer would sit
+	# outside the /repo mount -- there is no checkout-relative form of
+	# meta-ti/... when the checkout is meta-angstrom. Deriving half of it
+	# would produce a config that parses and then resolves to the wrong tree.
+	with_project_fragment
+	mkdir -p "$MACKAS_WORK/meta-ti/kas"
+	write_env_sh
+	fake_kas_container
+	[ -z "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK" shell meta-angstrom/kas/a.yml:meta-ti/kas/machine.yml)" ]
+	[ -z "$(derived MACKAS_KAS_CONFIG "$MACKAS_WORK" shell meta-angstrom/kas/a.yml:meta-ti/kas/machine.yml)" ]
+}
+
+@test "derive: still fires when NO project is configured (the case it exists for)" {
+	# MACKAS_PROJECT_DIR empty => no fragment installed => the auto-append is
+	# skipped. Derivation must NOT be skipped with it: this is precisely the
+	# state that made bitbake_getvar refuse.
+	derive_paths
+	mkdir -p "$MACKAS_WORK/meta-angstrom/kas"
+	write_env_sh
+	fake_kas_container
+	[ "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK" shell meta-angstrom/kas/base.yml)" = "meta-angstrom" ]
+}
+
+@test "derive: never overrides a value already set in the environment" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	got="$(cd "$MACKAS_WORK" && MACKAS_PROJECT_DIR=mine MACKAS_KAS_CONFIG=kas/mine.yml /bin/bash -c '
+		. "$1" >/dev/null 2>&1
+		kas-container shell meta-angstrom/kas/base.yml >/dev/null 2>&1
+		printf "%s|%s" "$MACKAS_PROJECT_DIR" "$MACKAS_KAS_CONFIG"' _ "$MACKAS_ENV_SH")"
+	[ "$got" = "mine|kas/mine.yml" ]
+}
+
+@test "derive: MACKAS_KAS_AUTO_PROJECT=0 set BEFORE sourcing env.sh disables it" {
+	# env.sh must not clobber a value the shell already exported -- the ':-'
+	# guard, same shape GITCONFIG_FILE already uses in that file.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	got="$(cd "$MACKAS_WORK" && MACKAS_KAS_AUTO_PROJECT=0 /bin/bash -c '
+		. "$1" >/dev/null 2>&1
+		kas-container shell meta-angstrom/kas/base.yml >/dev/null 2>&1
+		printf "%s" "${MACKAS_PROJECT_DIR:-}"' _ "$MACKAS_ENV_SH")"
+	[ -z "$got" ]
+}
+
+@test "derive: MACKAS_KAS_AUTO_FRAGMENT=0 set BEFORE sourcing env.sh disables the append too" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && MACKAS_KAS_AUTO_FRAGMENT=0 /bin/bash -c '
+		. "$1" >/dev/null 2>&1
+		kas-container shell meta-angstrom/kas/base.yml' _ "$MACKAS_ENV_SH")"
+	! printf '%s\n' "$out" | grep -q 'macos-local.yml'
+}
+
+@test "derive: says what it did, once per shell, not on every call" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	err="$(cd "$MACKAS_WORK" && /bin/bash -c '
+		. "$1" >/dev/null 2>&1
+		kas-container shell meta-angstrom/kas/base.yml >/dev/null
+		kas-container shell meta-angstrom/kas/base.yml >/dev/null
+		kas-container shell meta-angstrom/kas/base.yml >/dev/null' _ "$MACKAS_ENV_SH" 2>&1 >/dev/null)"
+	[ "$(printf '%s\n' "$err" | grep -c 'derived MACKAS_PROJECT_DIR=meta-angstrom')" -eq 1 ]
+}
+
+@test "derive: a non-kas cwd (neither work/ nor a checkout under it) derives nothing" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	mkdir -p "$TESTDIR/elsewhere"
+	[ -z "$(derived MACKAS_PROJECT_DIR "$TESTDIR/elsewhere" shell meta-angstrom/kas/base.yml)" ]
+}
+
+@test "derive: zsh sourcing env.sh derives the same values as bash" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	got="$(cd "$MACKAS_WORK" && /bin/zsh -c '
+		. "$1" >/dev/null 2>&1
+		kas-container shell meta-angstrom/kas/angstrom.yml >/dev/null 2>&1
+		printf "%s|%s" "$MACKAS_PROJECT_DIR" "$MACKAS_KAS_CONFIG"' _ "$MACKAS_ENV_SH")"
+	[ "$got" = "meta-angstrom|kas/angstrom.yml" ]
+}
+
+# ---------------------------------------------------------------------------
 # gitconfig -- the git "dubious ownership" workaround (THE blocker)
 # ---------------------------------------------------------------------------
 
