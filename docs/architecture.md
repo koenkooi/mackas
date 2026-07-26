@@ -262,9 +262,19 @@ into `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG` and **exports them into
 the calling shell**. Driving kas by hand sets neither, and
 `bitbake_getvar()` refuses without `MACKAS_PROJECT_DIR` (it is what
 `MACKAS_PROJECT` — the directory kas is run from — derives from), which in
-turn makes `retrieve` and `buildstats analyze` fail or fall back to OE-core
-default paths a distro has redefined. The file list already contains the
-answer, so the wrapper derives it.
+turn makes `retrieve`, `buildstats analyze` and `clean tmp+deploy` fail or
+fall back to OE-core default paths a distro has redefined. The file list
+already contains the answer, so the wrapper derives it.
+
+**Piping the invocation drops the export, silently.** `kas-container ... |
+tail -3` (or any pipe) runs the function on the left-hand side in a
+subshell — a property of pipelines, not something the wrapper can opt out
+of — so its `export`s die with that subshell and never reach the calling
+shell. The "derived MACKAS_PROJECT_DIR=..." info line still prints, because
+it runs before the pipe closes, so the invocation *looks* like it worked
+right up until the next command falls back to a wrong default. Run it
+unpiped when the derived vars need to survive into later commands in the
+same shell.
 
 The rules are deliberately narrow, because a *wrong* derivation is worse
 than none — it produces a config that parses and then resolves against the
@@ -309,22 +319,32 @@ rewrite re-runs `repos_checkout` and `repos_apply_patches`, which reset every
 declared repo to its pinned revision and re-apply patches. On a checkout with
 local commits that is destructive, not merely slow.
 
-Skip the four repo-touching steps individually and leave `write_bbconfig`
-alone:
+**`mackas exec CMD` is the tool form of this** — `mackas exec du -sh
+openembedded-core` runs exactly the invocation below, with the four flags
+baked in and no way to omit them, so there is no hand-typed command left to
+get wrong:
 
 ```sh
 kas-container shell --skip setup_dir --skip finish_setup_repos \
   --skip repos_checkout --skip repos_apply_patches meta-angstrom/kas/base.yml
 ```
 
-That regenerates `local.conf`/`bblayers.conf` with the fragment composed in
-without touching any repo. `-k` is safe afterwards, since the fragment's
-settings are then baked into the file it keeps unchanged.
+Reach for the recipe above by hand only when `exec` cannot help: driving a
+sibling-layer chain (`exec` uses the single configured `KAS_FILES_ARG`, the
+same scope `retrieve`/`buildstats analyze` have), or a shell that hasn't
+sourced `env.sh`. That regenerates `local.conf`/`bblayers.conf` with the
+fragment composed in without touching any repo. `-k` is safe afterwards,
+since the fragment's settings are then baked into the file it keeps
+unchanged.
 
-This is the same rule mackas follows internally: `bitbake_getvar()` is a
-read-only query and passes exactly those four `--skip` flags unconditionally,
-so no variable lookup — and therefore no `mackas retrieve` or `buildstats
-analyze` — can ever reset a checkout.
+This is the same rule mackas follows internally, and now in one place
+structurally rather than by convention: `bitbake_getvar()` and `mackas exec`
+both call a shared `kas_shell_ro()` helper that passes exactly those four
+`--skip` flags unconditionally, so no variable lookup or manual `exec` — and
+therefore no `mackas retrieve`, `buildstats analyze`, `clean tmp+deploy`, or
+ad-hoc check — can ever reset a checkout. Before `kas_shell_ro()` existed,
+this string lived in `bitbake_getvar()` alone; a second, independent copy is
+exactly the kind of drift the old conditional-`-k` data-loss bug came from.
 
 ## Live build progress: the monitor bridge
 

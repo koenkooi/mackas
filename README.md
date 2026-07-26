@@ -288,10 +288,17 @@ so a later `mackas retrieve` or `buildstats analyze` resolves
 `DEPLOY_DIR`/`LOG_DIR`/`BUILDHISTORY_DIR` through bitbake instead of refusing
 (or silently falling back to defaults your distro has redefined).
 `MACKAS_KAS_AUTO_FRAGMENT=0` / `MACKAS_KAS_AUTO_PROJECT=0` disable the two
-conveniences. The wrapper finds the file list even behind known flags, but
-**backs off untouched at any flag it does not recognize** rather than guess
-— double-check the fragment got appended (`mackas status`'s "kas files"
-line, or the command kas echoes back). Flag list and mechanics:
+conveniences. **Piping the invocation loses the export**: `kas-container ... |
+tail -3` runs the function in a subshell (any pipeline's left-hand side
+does), so its `export MACKAS_PROJECT_DIR=...`/`MACKAS_KAS_CONFIG=...` dies
+with that subshell and never reaches your interactive one — while the "info"
+line announcing the derivation still prints, since that happens before the
+pipe closes, so it silently looks like it worked. Run it unpiped if you need
+the derived vars afterward. The wrapper finds the file list even behind
+known flags, but **backs off untouched at any flag it does not recognize**
+rather than guess — double-check the fragment got appended (`mackas
+status`'s "kas files" line, or the command kas echoes back). Flag list and
+mechanics:
 [architecture.md](docs/architecture.md#running-kas-container-by-hand). A
 chain spanning *sibling* layers (`meta-angstrom/…:meta-ti/…`) derives
 nothing — mackas commands `cd` into a single checkout and a sibling would
@@ -302,13 +309,22 @@ fragment — and, with a pipx/pip kas on `PATH`, possibly a different kas
 release than the 5.4 mackas pins. `mackas check` reports which
 `kas-container` wins ([architecture.md](docs/architecture.md#the-ext4-volumes)).
 
+> **For a one-off read-only command, use `mackas exec CMD` instead of typing
+> `kas-container` by hand** (e.g. `mackas exec du -sh openembedded-core`) —
+> it bakes in the repo-preserving `--skip` flags below and cannot be talked
+> out of them, closing this off entirely rather than relying on remembering
+> it. `mackas exec --help` for the full explanation.
+>
 > **`-k` does more than its name suggests, and dropping it is worse.** It
 > skips writing `conf/local.conf`/`conf/bblayers.conf` as well as the repo
 > checkout and patch steps, so adding the fragment to a file list has no
 > effect on an already-configured checkout — but simply dropping `-k` re-runs
 > `repos_checkout`/`repos_apply_patches` and can reset repos to their pinned
-> commit. The safe recipe is in
-> [architecture.md](docs/architecture.md#running-kas-container-by-hand).
+> commit. `mackas exec` covers this for anything it can reach; the hand-typed
+> `--skip` recipe in
+> [architecture.md](docs/architecture.md#running-kas-container-by-hand)
+> is what's left for the case `exec` cannot help with — a sibling-layer
+> chain, driven from `work/` directly (see above).
 
 ## Adopting a root from another Mac
 

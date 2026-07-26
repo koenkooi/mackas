@@ -8,16 +8,17 @@ break by accident.
 
 ## What this repo is
 
-- `mackas` — the whole tool, one ~4600-line **bash 3.2** script. Subcommands:
-  `check`, `setup`, `smoketest`, `shell`, `status`, `retrieve`, `buildstats`,
-  `volume`, `clean`, `destroy`, `set`, `get`, `unset`.
+- `mackas` — the whole tool, one ~8000-line **bash 3.2** script. Subcommands:
+  `check`, `setup`, `adopt`, `smoketest`, `status`, `shell`, `exec`,
+  `retrieve`, `buildstats`, `sstate`, `monitor`, `clean`, `destroy`, `volume`,
+  `set`, `get`, `unset`.
 - `bin/docker` — a shim that translates the `docker` CLI calls kas-container v5.4
   makes into Apple `container` calls. Nothing more.
 - `mirror-server/mackas-mirrord` — optional HTTP mirror server. **Python 3.7+,
   stdlib only.**
 - `tools/mackas-buildstats-analyze`, `tools/mackas-overhead` — Python, stdlib
   only, build profiling.
-- `tests/` — 22 `*.bats` files + 3 `test_*.py` files.
+- `tests/` — 31 `*.bats` files + 4 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security.
 - `TODO.md` — the roadmap. Numbered items are referenced across the codebase,
