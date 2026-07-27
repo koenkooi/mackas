@@ -181,7 +181,92 @@ What follows for a long-running app:
 - **Do not copy `tools/mackas-monitor` here.** The CLI poller deliberately
   exits with a connection error on the first failed fetch, because a
   foreground command that hangs forever on a dead port is worse than one that
-  says so. An app has the opposite obligation.
+  says so. An app has the opposite obligation. (The CLI is likely to grow an
+  opt-in watch mode — see below — but exiting stays its default, so the rules
+  above, not the CLI's control flow, are what an app should follow.)
+
+### The same gap, from the CLI side: multi-build batches
+
+**It is not only smoketest.** The same shape turns up with no smoketest in
+sight: a hand-typed batch of N machines, one `kas-container build <machine
+files>` per machine, run in sequence with `MACKAS_MONITOR=1` exported. Per
+"Enabling the bridge" above, the `kas-container` wrapper recomputes
+`--runtime-args` live per call, so *every one* of those invocations publishes
+its own bridge on the same port — N separate containers, N separate bridges,
+gaps in between. Structurally identical to the rungs; only the thing driving
+the sequence differs (a human's shell history instead of `cmd_smoketest`).
+
+What that user wants is one `mackas monitor --notify` running all evening,
+announcing start and outcome per machine. What they get is one machine's
+worth: `tools/mackas-monitor`'s loop `return 1`s the first time `fetch()`
+raises, and it also returns as soon as it sees a terminal `status`, so the
+process is gone before machine 2's container is up. The workaround that gets
+reached for instead is polling each machine's build *log* for a completion
+marker — i.e. abandoning the bridge entirely. Two independent users driven
+off the bridge by the same one-line behaviour is enough to fix it in the CLI,
+not only in a future app.
+
+**Recommended direction: reconnect-and-wait, ended by the human.** As an
+opt-in flag (`--watch`, working name), not a change of default. Exiting on a
+dead port is right for the common `mackas monitor` typed when a build should
+already be running, and the current exit status mirrors the build (0 success,
+1 failed), which a script may lean on.
+
+Deliberately *not* a "watch N builds" count. A hand-typed batch changes shape
+mid-evening; a count one too high hangs, one too low exits early, and nothing
+in the bridge lets the tool check which happened. There is no end-of-batch
+signal at this layer, and inventing one means coordinating a shell loop that
+mackas does not own. Ctrl-C *is* the end-of-batch signal, and for a
+human-driven CLI that is the honest answer rather than a missing feature. An
+`--idle-timeout` for the unattended case is a fine optional extra; it should
+default to off.
+
+Three things it needs, all in `tools/mackas-monitor`:
+
+1. **A failed fetch is a state, not an exit.** Print "waiting for a build" at
+   most once per outage, back off about a second, keep polling.
+2. **Reset `prev_status` to `None` on every disconnect.** Without this the
+   next build is silently un-announced. `transition_message()` only fires on
+   a *change*, and its started clause is `status == "building" and
+   prev_status in (None, "idle")`. A bridge only begins serving once
+   bitbake's UI is up, so the first successful poll of build N+1 is very
+   often already `building`; against a stale `prev_status` of `building` that
+   is not a change, and nothing notifies. `None` is already the "attached
+   mid-build, announce what you found" sentinel, so re-arming reuses existing
+   semantics rather than adding any.
+3. **Do not exit on `success`/`failed` in watch mode** — notify, then go back
+   to waiting.
+
+**The end-of-build race, which watch mode makes impossible to ignore.**
+`mackasjson.main()` calls `_finish()` and then, in its `finally`,
+`httpd.shutdown()` and `httpd.server_close()` immediately; bitbake exits right
+behind it. The terminal `status` is therefore served only for the residual
+`serve_forever()` poll window — half a second at the outside — not for the
+rest of the container's life. With the default 2 s
+`MACKAS_MONITOR_POLL_INTERVAL`, a poller usually never observes `success` at
+all: it sees `building`, then the port is gone. (Derived from the code path,
+not from a live run — `tests/monitor.bats` uses a fake bridge that stays up,
+so it cannot catch this; worth confirming live.) Today that costs at most one
+"build succeeded" notification. Across a batch it costs one per machine,
+which is the entire point of the feature. The cheap fix belongs on the bridge
+side: after `_finish()`, keep serving until the terminal state has been
+fetched once, or a few seconds, whichever comes first, and only then shut
+down. Until that exists — and for any watcher that still misses the window —
+"disconnected while `building`" means **outcome unknown**: say nothing,
+never report it as a failure.
+
+**Per-build identity is already good enough here; do not grow a `--label` for
+it.** The payload carries no build id (above), but the notification bodies do
+not need one: `machine`, `distro` and `targets` come from each new
+invocation's own bridge, so consecutive machines already read as "… for
+beaglebone/Angstrom" then "… for qemuriscv64/Angstrom", and consecutive
+smoketest rungs differ by `targets`. A `--label` echoed into the title is a
+three-line change if a batch ever wants its own name, but it is a
+*per-process* constant: it can name the batch, never the build within it, so
+it does not belong in the reconnect work. Correlating builds across
+reconnects into a *history* — the app's problem, not the CLI's — still wants
+a real identity field, and that is a bridge change to propose rather than a
+heuristic to infer.
 
 ## Consider SwiftBar first
 
