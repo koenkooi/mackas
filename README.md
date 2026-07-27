@@ -277,8 +277,11 @@ kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml
 ```
 
 `kas-container` here is a **shell function**, not the program on your
-`PATH`. `env.sh` defines it to supply `--runtime-args` (the ext4 volumes and
-CPU/memory limits), point `GITCONFIG_FILE` at the generated `safe.directory`
+`PATH`. `env.sh` defines it to supply `--runtime-args` (the ext4 volumes,
+CPU/memory limits, and the live-progress-bridge args when `MACKAS_MONITOR=1`
+— recomputed live per call via `mackas runtime-args`, not frozen at `setup`
+time, so exporting a setting takes effect on the very next hand-typed build),
+point `GITCONFIG_FILE` at the generated `safe.directory`
 config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, append the generated
 tuning fragment `:kas/macos-local.yml` (parallelism, `BB_DISKMON_DIRS`,
 `BB_HASHSERVE_DB_DIR`, mirrors) onto the file list, and derive

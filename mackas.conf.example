@@ -314,6 +314,11 @@
 # bind-mounts an overlay, shadows the container's bitbake and runs a background
 # HTTP thread on every build, so unlike MACKAS_OVERHEAD/MACKAS_FSTRIM_AUTO (which
 # cost near nothing) it stays opt-in. See docs/architecture.md and README.
+#
+# Applies live to a hand-typed `kas-container build/shell <files>` too, not
+# just `mackas smoketest`/`shell` -- the env.sh wrapper recomputes
+# --runtime-args per call (`mackas runtime-args`), so exporting this before
+# the build is enough; no need to re-run `mackas setup` first.
 #MACKAS_MONITOR=0
 # Host port the bridge publishes and `mackas monitor` polls.
 #MACKAS_MONITOR_PORT=8801

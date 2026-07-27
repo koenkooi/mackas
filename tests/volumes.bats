@@ -43,6 +43,11 @@ lib_setup() {
 	# shellcheck disable=SC1090
 	. "$MACKAS"
 	SCRIPT_DIR="$REPO_ROOT"
+	# Sourcing (not executing) leaves SCRIPT_NAME as this TEST RUNNER's own
+	# basename ($0 is inherited across `.`), not "mackas" -- harmless until
+	# something depends on it matching real usage, which the env.sh wrapper's
+	# live runtime-args shell-out now does (it calls "$SCRIPT_DIR/$SCRIPT_NAME").
+	SCRIPT_NAME="mackas"
 	TESTDIR="$(make_tmpdir)"
 	setup_colors
 	set_defaults
@@ -488,7 +493,10 @@ write_env_sh() {
 	write_env_sh
 	grep -qF "export MACKAS_RUNTIME_ARGS='-c 6 -m 12g" "$MACKAS_ENV_SH"
 	grep -qF 'kas-container() {' "$MACKAS_ENV_SH"
-	grep -qF -- '--runtime-args "$MACKAS_RUNTIME_ARGS"' "$MACKAS_ENV_SH"
+	# --runtime-args is recomputed LIVE per call (issue #25: a frozen copy
+	# meant MACKAS_MONITOR=1 silently never reached a hand-typed build) --
+	# MACKAS_RUNTIME_ARGS above is only _mackas_runtime_args()'s fallback.
+	grep -qF -- '--runtime-args "$(_mackas_runtime_args)"' "$MACKAS_ENV_SH"
 	# ...and the wrapper must blank the dir vars for the same reason env.sh
 	# does not export them.
 	grep -qF 'KAS_BUILD_DIR= DL_DIR= SSTATE_DIR=' "$MACKAS_ENV_SH"
@@ -619,11 +627,12 @@ write_env_sh() {
 	esac
 }
 
-@test "env.sh: the kas-container wrapper's \$@ and \$MACKAS_RUNTIME_ARGS survive generation" {
+@test "env.sh: the kas-container wrapper's \$@ and \$(_mackas_runtime_args) survive generation" {
 	# Same distinction inside the function body: the binary path is ours and
-	# is quoted, while $@ and $MACKAS_RUNTIME_ARGS must expand at call time.
+	# is quoted, while $@ and the _mackas_runtime_args() call must expand/run
+	# at call time, not at generation time.
 	write_env_sh
-	grep -qF -- '--runtime-args "$MACKAS_RUNTIME_ARGS" "$@"' "$MACKAS_ENV_SH"
+	grep -qF -- '--runtime-args "$(_mackas_runtime_args)" "$@"' "$MACKAS_ENV_SH"
 	grep -qF "'$KAS_CONTAINER_BIN'" "$MACKAS_ENV_SH"
 }
 
@@ -820,6 +829,139 @@ with_project_fragment() {
 	write_env_sh
 	/bin/bash -n "$MACKAS_ENV_SH"
 	/bin/zsh -n "$MACKAS_ENV_SH"
+}
+
+# ---------------------------------------------------------------------------
+# env.sh -- the kas-container wrapper recomputes --runtime-args LIVE
+#
+# Issue #25: MACKAS_RUNTIME_ARGS used to be a string frozen once, at 'mackas
+# setup' generation time. Exporting MACKAS_MONITOR=1 (or anything else
+# kas_runtime_args() reads) in a live shell before a hand-typed
+# 'kas-container build ...' did NOTHING -- the wrapper never re-read it, with
+# no error or warning that it had not taken effect. _mackas_runtime_args()
+# now shells out to the real mackas binary per call instead of using a frozen
+# copy, so this cannot drift out of sync with run_kas()'s own live value
+# again -- one implementation, not two.
+#
+# These tests spawn the wrapper WITHOUT MACKAS_LIB_ONLY leaking into the
+# subshell: lib_setup exports it for THIS bats process's own sourcing, but
+# the live shell-out is a REAL invocation of the mackas binary that must
+# reach main() -- MACKAS_LIB_ONLY=1 inherited into that subshell would skip
+# main() entirely and always silently hit the fallback. MACKAS_CONF=/dev/null
+# keeps the shell-out from ever touching the developer's own ~/.mackas.conf.
+# ---------------------------------------------------------------------------
+
+fake_bitbake_checkout() {
+	# monitor_runtime_args() finds the checkout via a live `find` under
+	# MACKAS_WORK for */bin/bitbake -- without one, it silently skips (that
+	# contract is tested elsewhere); these tests need it present.
+	mkdir -p "$MACKAS_WORK/bitbake/bin"
+	touch "$MACKAS_WORK/bitbake/bin/bitbake"
+}
+
+@test "runtime-args: the plumbing command prints exactly kas_runtime_args()'s value" {
+	[ "$(cmd_runtime_args)" = "$(kas_runtime_args)" ]
+}
+
+@test "kas-container wrapper: MACKAS_MONITOR=1 exported live reaches a hand-typed build" {
+	with_project_fragment
+	fake_bitbake_checkout
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '
+		unset MACKAS_LIB_ONLY
+		export MACKAS_CONF=/dev/null MACKAS_MONITOR=1
+		. "$1" >/dev/null 2>&1
+		kas-container build meta-angstrom/kas/base.yml
+	' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qF -- '-p 8801:8801'
+	printf '%s\n' "$out" | grep -qF 'MACKAS_MONITOR_PORT=8801'
+}
+
+@test "kas-container wrapper: the monitor bridge is absent when MACKAS_MONITOR is unset" {
+	with_project_fragment
+	fake_bitbake_checkout
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '
+		unset MACKAS_LIB_ONLY MACKAS_MONITOR
+		export MACKAS_CONF=/dev/null
+		. "$1" >/dev/null 2>&1
+		kas-container build meta-angstrom/kas/base.yml
+	' _ "$MACKAS_ENV_SH")"
+	! printf '%s\n' "$out" | grep -q '8801'
+}
+
+@test "kas-container wrapper: live recompute still carries the volumes and cpu/mem limits (regression)" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '
+		unset MACKAS_LIB_ONLY
+		export MACKAS_CONF=/dev/null
+		. "$1" >/dev/null 2>&1
+		kas-container build meta-angstrom/kas/base.yml
+	' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qF -- '-v oe-build-tmp:/build -e KAS_BUILD_DIR=/build'
+	printf '%s\n' "$out" | grep -qF -- '-v oe-build-dl:/downloads -e DL_DIR=/downloads'
+	printf '%s\n' "$out" | grep -qF -- '-v oe-build-sstate:/sstate -e SSTATE_DIR=/sstate'
+}
+
+@test "kas-container wrapper: falls back to the frozen MACKAS_RUNTIME_ARGS when the live recompute fails" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '
+		unset MACKAS_LIB_ONLY
+		export MACKAS_CONF=/dev/null MACKAS_CPUS=bogus
+		. "$1" >/dev/null 2>&1
+		kas-container build meta-angstrom/kas/base.yml
+	' _ "$MACKAS_ENV_SH" 2>"$TESTDIR/stderr")"
+	printf '%s\n' "$out" | grep -qF -- '-c 6 -m 12g'
+	grep -qi "could not recompute --runtime-args live" "$TESTDIR/stderr"
+}
+
+@test "kas-container wrapper: the live-recompute fallback warning fires on EVERY call while broken" {
+	# Not deduped to once-per-shell like _mackas_derive_project's note:
+	# _mackas_runtime_args is always invoked through a command substitution
+	# ("$(_mackas_runtime_args)"), which bash always runs in a subshell, so a
+	# "warned already" flag set inside it can never survive back to later
+	# calls in the same shell. Repeating the warning while genuinely broken
+	# is the honest tradeoff, not a bug -- this pins that it is deliberate.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	err="$(cd "$MACKAS_WORK" && /bin/bash -c '
+		unset MACKAS_LIB_ONLY
+		export MACKAS_CONF=/dev/null MACKAS_CPUS=bogus
+		. "$1" >/dev/null 2>&1
+		kas-container build meta-angstrom/kas/base.yml >/dev/null
+		kas-container build meta-angstrom/kas/base.yml >/dev/null
+	' _ "$MACKAS_ENV_SH" 2>&1 >/dev/null)"
+	[ "$(printf '%s\n' "$err" | grep -c "could not recompute")" -eq 2 ]
+}
+
+@test "kas-container wrapper: the fallback still fires under 'set -e' in zsh (regression: errexit killed it)" {
+	# The '|| true' on _mackas_runtime_args's assignment is load-bearing:
+	# under 'set -e', zsh (macOS's default shell, which env.sh explicitly
+	# supports -- see the zsh -n tests above) kills the command-substitution
+	# subshell at the failing rt="$(...)" assignment itself, BEFORE the
+	# fallback lines run -- so a broken live path handed kas-container an
+	# EMPTY --runtime-args: no volumes, no limits, and no warning. bash
+	# happens to survive the same assignment, which is why the bash tests
+	# above could never catch this.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/zsh -c '
+		set -e
+		unset MACKAS_LIB_ONLY
+		export MACKAS_CONF=/dev/null MACKAS_CPUS=bogus
+		. "$1" >/dev/null 2>&1
+		kas-container build meta-angstrom/kas/base.yml
+	' _ "$MACKAS_ENV_SH" 2>"$TESTDIR/stderr")"
+	printf '%s\n' "$out" | grep -qF -- '-c 6 -m 12g'
+	grep -qi "could not recompute --runtime-args live" "$TESTDIR/stderr"
 }
 
 # ---------------------------------------------------------------------------

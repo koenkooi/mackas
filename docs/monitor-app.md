@@ -125,6 +125,18 @@ mackas --set MACKAS_MONITOR=1 smoketest &
 mackas monitor            # or your app, polling 127.0.0.1:8801
 ```
 
+This works identically for a hand-typed build in a sourced shell — the
+`kas-container` wrapper recomputes `--runtime-args` live per call (see
+architecture.md's "Running `kas-container` by hand"), so exporting
+`MACKAS_MONITOR=1` before a `kas-container build <files>` publishes the
+same bridge, not just through `smoketest`/`shell`:
+
+```sh
+export MACKAS_MONITOR=1
+kas-container build meta-ai/kas/base.yml &
+mackas monitor
+```
+
 Off by default (`MACKAS_MONITOR=0`), and it should stay that way. It mounts two
 files over the checkout's own `bin/bitbake`, makes bitbake load a mackas module
 as its UI, runs a background HTTP thread inside the build, and publishes an

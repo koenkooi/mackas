@@ -3215,10 +3215,11 @@ setup_shim_and_env() {
 	# the whole point -- our values must not expand, the user's shell variables
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
-	local q_root q_base q_project q_cpus q_parallel q_scriptdir
+	local q_root q_base q_project q_cpus q_parallel q_scriptdir q_scriptbin
 	local q_fragrepo q_autofrag q_autoproj
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
+	q_scriptbin="$(shq "$SCRIPT_DIR/$SCRIPT_NAME")"
 	q_work="$(shq "$MACKAS_WORK")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
@@ -3293,6 +3294,12 @@ fi
 # supported way to build. The wrapper below exists so that a bare
 # 'kas-container ...' typed by hand in this shell gets the same treatment
 # instead of silently building at cpus=4/memory=1gb with no volumes.
+#
+# This is the value at the moment 'setup' generated this file -- the FALLBACK
+# the wrapper's _mackas_runtime_args() below falls back to only if it cannot
+# ask $SCRIPT_NAME for the live value (a stale/incompatible binary, or
+# settings this shell has since broken). Normal calls never use this frozen
+# copy; see _mackas_runtime_args for why a frozen copy alone was the bug.
 export MACKAS_RUNTIME_ARGS=$q_runtime_args
 
 # Absolute path to the generated fragment (empty project -> a path that
@@ -3378,6 +3385,41 @@ _mackas_derive_project() {
 	return 0
 }
 
+# _mackas_runtime_args -- print the CURRENT --runtime-args string by asking
+# $SCRIPT_NAME itself, live, on every call -- so a setting kas_runtime_args()
+# reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a MACKAS_VOLUME_NAME
+# override, ...) takes effect on a hand-typed kas-container call the same
+# way it already does for '$SCRIPT_NAME smoketest'/'shell', not just after
+# the next '$SCRIPT_NAME setup'. See '$SCRIPT_NAME runtime-args --help'.
+#
+# Falls back to the frozen MACKAS_RUNTIME_ARGS (exported above, the value at
+# generation time) if the live call ever fails -- a stale/incompatible
+# $SCRIPT_NAME binary, or a setting this shell has since broken -- so a
+# broken live path degrades to today's behavior rather than breaking the
+# build. Warns on EVERY call while broken, not just once: this function is
+# always invoked through a command substitution ("\$(_mackas_runtime_args)"
+# below), which bash always runs in a subshell, so a "warned already" flag
+# set in here can never survive back to the caller to make later calls
+# quiet -- unlike _mackas_derive_project above, which is called directly
+# (never through "\$(...)") and so can dedupe its own one-time note for real.
+# Repeating the warning while genuinely broken is the honest tradeoff.
+_mackas_runtime_args() {
+	local rt
+	# '|| true' is load-bearing: under 'set -e' zsh (macOS's default shell)
+	# kills this command-substitution subshell at the failing assignment
+	# itself, so without it a broken live path would skip the fallback below
+	# entirely and hand kas-container an EMPTY --runtime-args -- no volumes,
+	# no limits, no warning. bash happens to survive; zsh does not.
+	rt="\$($q_scriptbin runtime-args 2>/dev/null)" || true
+	if [ -n "\$rt" ]; then
+		printf '%s' "\$rt"
+		return 0
+	fi
+	printf '%s: could not recompute --runtime-args live; using the value baked in at setup time (re-run: %s setup)\n' \\
+		"$SCRIPT_NAME" "$SCRIPT_NAME" >&2
+	printf '%s' "\$MACKAS_RUNTIME_ARGS"
+}
+
 kas-container() {
 	# Prepend our bin dir so kas-container ALWAYS finds the GNU realpath shim
 	# installed there, no matter what \$PATH looks like when this is called.
@@ -3458,7 +3500,7 @@ kas-container() {
 			;;
 	esac
 	env PATH=$q_shim:"\$PATH" KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
-		$q_kasbin --runtime-args "\$MACKAS_RUNTIME_ARGS" "\$@"
+		$q_kasbin --runtime-args "\$(_mackas_runtime_args)" "\$@"
 }
 
 export BB_NUMBER_THREADS=$q_cpus
@@ -6302,6 +6344,30 @@ ${C_BLD}ONE-VM RULE${C_RST}
 EOF
 }
 
+runtime_args_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD runtime-args${C_RST} -- plumbing. Prints the \`--runtime-args\` string
+a build right now would use (CPU/memory limits, the three ext4 volume
+mounts, mirror mounts if enabled, the live-progress-bridge args if
+MACKAS_MONITOR=1) and nothing else.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD runtime-args
+
+Not something you normally run directly: the \`kas-container\` wrapper
+env.sh generates calls this itself, once per invocation, so a setting that
+affects the build (MACKAS_MONITOR, a volume-name override, ...) takes
+effect on a hand-typed \`kas-container build/shell <files>\` the same way it
+already does for '$SCRIPT_CMD smoketest'/'shell' -- not just after the next
+'$SCRIPT_CMD setup'. Exists so that fact has one implementation instead of
+being copied into the generated env.sh.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted
+but change nothing here -- there is nothing to confirm and nothing dry-run
+would print differently.
+EOF
+}
+
 destroy_usage() {
 	cat <<EOF
 ${C_BLD}$SCRIPT_CMD destroy${C_RST} -- remove all four volumes (the three active ones
@@ -6324,6 +6390,18 @@ Requires typing the word DESTROY to confirm, unless -y/--yes/-f/--force is
 given (required for non-interactive use). --dry-run and -v/--verbose also
 work here.
 EOF
+}
+
+# cmd_runtime_args -- print kas_runtime_args()'s current value, stdout only,
+# nothing else. The env.sh wrapper shells out to this per call (see
+# setup_shim_and_env) instead of freezing the string at 'setup' time, so a
+# setting kas_runtime_args() reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a
+# volume-name override) reaches a hand-typed kas-container call the same way
+# it already reaches run_kas() -- one implementation, not two copies that can
+# drift (see issue #25: the frozen copy is exactly how MACKAS_MONITOR=1
+# silently never took effect for a hand-typed build).
+cmd_runtime_args() {
+	printf '%s\n' "$(kas_runtime_args)"
 }
 
 cmd_destroy() {
@@ -7739,6 +7817,8 @@ ${C_BLD}COMMANDS${C_RST}
   set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
   get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.
   unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
+  runtime-args  Plumbing: prints the effective --runtime-args string. The
+             env.sh wrapper calls this itself; you don't normally need to.
   help       This message, or '$SCRIPT_CMD help COMMAND' for one command's own.
 
 ${C_BLD}OPTIONS${C_RST}
@@ -7946,10 +8026,10 @@ main() {
 				cmd="adopt"; shift
 				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|destroy)
+			check|smoketest|status|shell|destroy|runtime-args)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args help)" ;;
 		esac
 	done
 
@@ -7995,6 +8075,7 @@ main() {
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
 		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
+		runtime-args) if [ "$want_help" -eq 1 ]; then runtime_args_usage; else cmd_runtime_args; fi ;;
 		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;
 		exec)       cmd_exec ${EXEC_ARGS+"${EXEC_ARGS[@]}"} ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
