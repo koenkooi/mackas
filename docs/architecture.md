@@ -225,8 +225,15 @@ supported mechanism. See
 kas command in a sourced shell builds against the same volumes, limits and
 config fragment as mackas's own commands. The wrapper:
 
-- supplies `--runtime-args "$MACKAS_RUNTIME_ARGS"` (the volume mounts and
-  the `-c`/`-m` limits);
+- supplies `--runtime-args` from `_mackas_runtime_args()`, which asks
+  `mackas runtime-args` for the CURRENT value on every call rather than a
+  string frozen when `setup` last ran — so a setting `kas_runtime_args()`
+  reads (`MACKAS_MONITOR`, `MACKAS_USE_NFS_MIRRORS`, a volume-name override)
+  takes effect on a hand-typed build the same way it already does for
+  `mackas smoketest`/`shell`, not just after the next `mackas setup`. Falls
+  back to `MACKAS_RUNTIME_ARGS` (the frozen, generation-time value, still
+  exported for exactly this) if the live call ever fails, with a warning —
+  volume mounts and `-c`/`-m` limits either way;
 - blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`;
 - unless `MACKAS_KAS_AUTO_FRAGMENT=0`, appends the generated
   `macos-local.yml` fragment onto the file-list argument of
