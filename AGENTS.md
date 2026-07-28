@@ -21,6 +21,12 @@ break by accident.
 - `tests/` — 31 `*.bats` files + 4 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security.
+- `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to
+  build an OpenEmbedded project (not for developing mackas itself — that's
+  what the rest of this file is for). Copy or symlink it into a project's own
+  `.claude/skills/mackas/` to make Claude Code load it there; see the file
+  itself for what it covers (`mackas exec`, the `--skip` footguns, retrieve/
+  clean/monitor, one-VM troubleshooting).
 - `TODO.md` — the roadmap. Numbered items are referenced across the codebase,
   so existing items keep their numbers (a finished item is annotated in place,
   never renumbered away). New items go at the end.
@@ -117,3 +123,5 @@ a partial run.
 - Storage, network shares, volume caps, fstrim — [docs/storage.md](docs/storage.md).
 - What a build costs (measured) — [docs/performance.md](docs/performance.md).
 - The roadmap and known gaps/non-goals — [TODO.md](TODO.md).
+- **Actually driving a build with mackas** (as opposed to developing mackas
+  itself) — [skills/mackas/SKILL.md](skills/mackas/SKILL.md).
