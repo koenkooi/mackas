@@ -269,9 +269,13 @@ into `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG` and **exports them into
 the calling shell**. Driving kas by hand sets neither, and
 `bitbake_getvar()` refuses without `MACKAS_PROJECT_DIR` (it is what
 `MACKAS_PROJECT` — the directory kas is run from — derives from), which in
-turn makes `retrieve`, `buildstats analyze` and `clean tmp+deploy` fail or
-fall back to OE-core default paths a distro has redefined. The file list
-already contains the answer, so the wrapper derives it.
+turn affects `retrieve`, `buildstats analyze` and `clean tmp+deploy` when
+`bitbake-getvar` cannot resolve. `retrieve` and `buildstats analyze` are
+non-destructive reads, so they still warn and fall back to OE-core default
+paths a distro has redefined, and report per-object when nothing is found
+there. `clean tmp+deploy` is about to run an in-place `rm -rf`, so it has no
+safe fallback to guess: it refuses outright instead. The file list already
+contains the answer, so the wrapper derives it.
 
 **Piping the invocation drops the export, silently.** `kas-container ... |
 tail -3` (or any pipe) runs the function on the left-hand side in a
@@ -392,6 +396,19 @@ under `mackas-uibridge/`:
   last, so a `PATH`-shadow would always lose. This is the same per-container
   mount-substitution technique kas-container itself uses for its `.git` overlay
   — the real checkout on disk is never modified.
+
+Two behaviors of `mackasjson.py` matter enough to call out here; see
+[monitor-app.md](monitor-app.md) for the full mechanism and reasoning behind
+each. First, it never issues a `getVariable` round-trip to the cooker (for
+`MACHINE`/`DISTRO`) before `bb.ui.knotty.main()` has run — an earlier call
+site did, and that forced the cooker to parse its base configuration against
+an empty environment, crashing OE-core's `base.bbclass` and turning a
+100%-successful build into one bitbake reported as failed. Second, once a
+build ends, the bridge lingers — serving the terminal `success`/`failed`
+status for up to `TERMINAL_LINGER_SECONDS` (5.0), or until it has actually
+been fetched once, whichever comes first, skipped on Ctrl-C — before shutting
+the server down, so a poller has a real chance to observe the outcome rather
+than only ever seeing `building` followed by the port disappearing.
 
 `monitor_runtime_args()` (in `mackas`) assembles the mounts and the `-p`
 publish when `MACKAS_MONITOR=1`, appending them to `--runtime-args`. It is

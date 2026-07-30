@@ -84,10 +84,10 @@ this document.
 
 | Field | Type | Meaning, and what it is allowed to do |
 |---|---|---|
-| `status` | string | One of **`idle`**, **`building`**, **`success`**, **`failed`**. Starts `idle`; becomes `building` on the first `ParseStarted`/`*TaskStarted`; becomes `success`/`failed` from bitbake's own exit code once `knotty.main()` returns, or `failed` if it raised. Within one container's life it only ever moves forward, and never leaves `success`/`failed`. |
+| `status` | string | One of **`idle`**, **`building`**, **`success`**, **`failed`**. Starts `idle`; becomes `building` on the first `ParseStarted`/`*TaskStarted`; becomes `success`/`failed` from bitbake's own exit code once `knotty.main()` returns, or `failed` if it raised. Within one container's life it only ever moves forward, and never leaves `success`/`failed`. Once it reaches a terminal value the bridge keeps serving it for a little while rather than shutting down immediately — see ["the end-of-build race"](#the-end-of-build-race-which-watch-mode-makes-impossible-to-ignore) below. |
 | `targets` | array of string | What the build was asked to produce, from bitbake's own parsed command line (`params.options.pkgs_to_build`). Populated **before the build starts**, so it is the one useful thing to show at the `building` edge, when no task is running yet. Empty when bitbake was given no explicit target (it then builds whatever the kas config names) — treat empty as "unknown", not as "nothing". |
-| `machine` | string \| null | `MACHINE`, read from the cooker at UI startup via `server.runCommand(["getVariable", …])` — the same mechanism knotty uses for its own config. `null` if unset or unreadable. On a **multiconfig** build this is only the default `MACHINE`; per-multiconfig builds legitimately have several, so treat it as a label rather than a complete description of what was built. |
-| `distro` | string \| null | `DISTRO`, same source and same caveats. |
+| `machine` | string \| null | `MACHINE`, read from the cooker via `server.runCommand(["getVariable", …])` on the **first event-loop call after `bb.ui.knotty.main()` has started** — deliberately not at UI startup, since a pre-knotty round-trip was traced to a real build-killing crash (see [architecture.md](architecture.md#live-build-progress-the-monitor-bridge)). `null` until that first call; it lands at essentially the same instant `status` first becomes `"building"`, so a `"building"` payload with `machine: null` is possible only for a sub-millisecond window, never for a whole poll interval. On a **multiconfig** build this is only the default `MACHINE`; per-multiconfig builds legitimately have several, so treat it as a label rather than a complete description of what was built. |
+| `distro` | string \| null | `DISTRO`, same source, same timing, same caveats. |
 | `current.recipe` | string \| null | The **basename of the task's recipe file**, e.g. `busybox_1.36.0.bb` — not a `PN`. `null` until a task has started, and left at the last known value afterwards (task-completion events carry no recipe, so this is the last *started* recipe, not necessarily the one that just finished). |
 | `current.task` | string \| null | bitbake's task name, e.g. `do_compile`. Same staleness rule. |
 | `progress.done` | int | **Phase-dependent.** During parsing it is parsed-recipe count; during the run queue it is `stats.completed`. |
@@ -238,22 +238,35 @@ Three things it needs, all in `tools/mackas-monitor`:
    to waiting.
 
 **The end-of-build race, which watch mode makes impossible to ignore.**
-`mackasjson.main()` calls `_finish()` and then, in its `finally`,
-`httpd.shutdown()` and `httpd.server_close()` immediately; bitbake exits right
-behind it. The terminal `status` is therefore served only for the residual
-`serve_forever()` poll window — half a second at the outside — not for the
-rest of the container's life. With the default 2 s
-`MACKAS_MONITOR_POLL_INTERVAL`, a poller usually never observes `success` at
-all: it sees `building`, then the port is gone. (Derived from the code path,
-not from a live run — `tests/monitor.bats` uses a fake bridge that stays up,
-so it cannot catch this; worth confirming live.) Today that costs at most one
-"build succeeded" notification. Across a batch it costs one per machine,
-which is the entire point of the feature. The cheap fix belongs on the bridge
-side: after `_finish()`, keep serving until the terminal state has been
-fetched once, or a few seconds, whichever comes first, and only then shut
-down. Until that exists — and for any watcher that still misses the window —
-"disconnected while `building`" means **outcome unknown**: say nothing,
-never report it as a failure.
+Without a linger, `mackasjson.main()` would call `_finish()` and then, in its
+`finally`, shut the server down immediately, with bitbake exiting right
+behind it — serving the terminal `status` only for the residual
+`serve_forever()` poll window, half a second at the outside. Against the
+default 2 s `MACKAS_MONITOR_POLL_INTERVAL` a poller would usually never
+observe `success`/`failed` at all: it would see `building`, then the port
+would be gone. Today that would cost at most one "build succeeded"
+notification; across a batch, one per machine — the entire point of the
+feature.
+
+The bridge mitigates this: after `_finish()` sets the terminal status,
+`main()`'s `finally` waits for that status to actually reach a client
+(`do_GET` signals an event once it has written a terminal-status body), or
+for `TERMINAL_LINGER_SECONDS` (5.0) to elapse, whichever comes first, before
+shutting the server down. 5 seconds covers two full default 2 s poll windows
+(`MACKAS_MONITOR_POLL_INTERVAL` in `tools/mackas-monitor`) plus slack for one
+timed-out fetch retry at that tool's own 2.0 s `REQUEST_TIMEOUT`. It is
+deliberately not configurable via an env var: nobody has asked for one, and a
+wrong value would silently re-break notifications. `KeyboardInterrupt`/
+`SystemExit` — a human hitting Ctrl-C, or an explicit exit — skip the linger
+entirely and shut down immediately, so Ctrl-C still gets an instant prompt
+back.
+
+This is a mitigation, not a full close of the gap: a poll interval raised
+well above the default, a poller that first attaches after the linger
+window, or the process dying without ever reaching that `finally` (SIGKILL,
+`mackas destroy`, OOM) all still miss the terminal status. So "disconnected
+while `building`" still means **outcome unknown**: say nothing, never report
+it as a failure — that rule stays mandatory regardless of the linger.
 
 **Per-build identity is already good enough here; do not grow a `--label` for
 it.** The payload carries no build id (above), but the notification bodies do
