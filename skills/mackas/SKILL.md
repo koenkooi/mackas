@@ -172,7 +172,10 @@ needs the exact subdirectory.
 > of `tmp/`, not inside it. That is one distro's own choice, not a mackas fact
 > and not an OE default. It is exactly why `mackas retrieve` and
 > `mackas clean tmp+deploy` resolve every path through bitbake instead of the
-> textbook layout.
+> textbook layout — a project shaped exactly like this one is precisely what
+> used to let `clean tmp+deploy` silently assume the textbook path and skip
+> the real `DEPLOY_DIR` entirely, which is why it now refuses instead of
+> guessing when that resolution fails.
 
 `buildhistory` sits at `${TOPDIR}/buildhistory` by class default — inside the
 same volume bare `mackas clean` discards, and it records nothing at all unless
@@ -301,11 +304,15 @@ the setting takes effect on the very next build (confirm with `mackas
 runtime-args` before/after: the `mackasjson.py` mount and `-p 8801:8801` should
 appear). But **each machine in the batch is a separate container and therefore a
 separate bridge**, with a gap in between, and `mackas monitor` exits on the
-first dead port. That gap, the `prev_status` re-arming it needs, and the
-end-of-build race are documented in full in
+first dead port — both still real reasons to prefer the log for a
+multi-machine batch. That gap and the `prev_status` re-arming it needs are
+documented in full in
 [monitor-app.md](../../docs/monitor-app.md#the-same-gap-from-the-cli-side-multi-build-batches)
 — do not re-derive them, and until the CLI grows a watch mode, use the
-log-polling loop for batches. The bridge (with `--notify`, or
+log-polling loop for batches. (The single-build end-of-build race is a
+separate, narrower problem and is now mitigated bridge-side — the bridge
+lingers after a terminal status before shutting down — but that does not
+touch the batch gap above.) The bridge (with `--notify`, or
 `mackas set MACKAS_MONITOR_NOTIFY 1`) is a nice-to-have for a human watching
 *one* build interactively. Note also: "disconnected while `building`" means
 **outcome unknown** — say nothing, never report it as a failure.
@@ -432,8 +439,10 @@ build in the same shell, `retrieve` just works. If you rely on derivation:
 - **A chain spanning sibling layers derives nothing** by design
   ([architecture.md](../../docs/architecture.md#deriving-mackas_project_dir-and-mackas_kas_config)).
 - **Requires a fresh `env.sh`** (see Preflight).
-- `mackas clean tmp+deploy` and `buildstats analyze` resolve the same way and
-  hit the identical wrong-default fallback without it.
+- `mackas clean tmp+deploy` resolves the same way, but without it now refuses
+  outright (an in-place `rm -rf` has no safe default to guess); `buildstats
+  analyze` resolves the same way too but still falls back to a possibly-wrong
+  default without it.
 
 **Never run Apple's `container` CLI directly to work around any of this.**
 mackas's volume-attachment guard only runs when the operation goes through

@@ -113,6 +113,10 @@ fstrim automatically afterward for exactly that reason
 (`MACKAS_FSTRIM_AUTO=1`, the default the build path already uses around a
 `smoketest`/`shell` run; set `0` to skip it and reclaim by hand later).
 
+It resolves both `TMPDIR` and `DEPLOY_DIR` through bitbake, and now refuses
+outright when either cannot be resolved, because a guessed `DEPLOY_DIR`
+previously let the command report a success it had not actually performed.
+
 Two details matter here — get either one wrong and the reclaim silently does
 nothing:
 
