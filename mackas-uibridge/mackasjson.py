@@ -51,6 +51,16 @@
 # 'kas-container shell'/'mackas smoketest' is therefore unchanged; this
 # module is a pure side-channel tap, not a UI replacement.
 #
+# The same crash resurfaced once more, via a second path: _set_machine()
+# used to be called from main() directly, before bb.ui.knotty.main() ever
+# ran -- i.e. before knotty's own params.updateToServer() call had handed
+# the cooker its real environment. That getVariable round-trip forced the
+# same premature, empty-environment config parse the observer design hit,
+# reaching a real build as a base.bbclass AttributeError. The standing
+# invariant this module now maintains is: no server round-trip before
+# bb.ui.knotty.main() has run. _set_machine() is therefore only ever called
+# from inside _TeeEventHandler.waitEvent(), on its first invocation.
+#
 # ---------------------------------------------------------------------------
 # WHY NOT SimpleHTTPRequestHandler
 #
@@ -88,12 +98,29 @@ MAX_RECENT_EVENTS = 50
 MAX_FAILED_TASKS = 20
 
 _lock = threading.Lock()
+
+# See item 31's fix in main()/do_GET() below: after _finish() sets a terminal
+# status, the server lingers for a bit rather than shutting down immediately,
+# so a poller actually has a chance to observe "success"/"failed" instead of
+# only ever seeing "building" followed by the port disappearing.
+TERMINAL_STATUSES = ("success", "failed")
+# Covers two full default 2-second poll windows (MACKAS_MONITOR_POLL_INTERVAL
+# in tools/mackas-monitor) plus slack for one timed-out fetch retry (that
+# tool's own REQUEST_TIMEOUT is 2.0). Deliberately NOT configurable via an
+# env var: nobody has asked for one, and a wrong value would silently
+# re-break notifications -- don't add one even if it looks like a natural
+# knob.
+TERMINAL_LINGER_SECONDS = 5.0
+_terminal_fetched = threading.Event()
+
 _state = {
     "status": "idle",
-    # What this build was asked to produce, and what for. Both known before
-    # any event arrives (see _set_targets/_set_machine), so they are the one
-    # useful thing a "build started" notification can say -- at that moment
-    # no task is running yet.
+    # What this build was asked to produce, and what for. "targets" is known
+    # before any event arrives (see _set_targets, pure client-side, no server
+    # round-trip); "machine"/"distro" arrive later, with the first waitEvent
+    # call (see _set_machine/_TeeEventHandler.waitEvent) -- they need a
+    # getVariable round-trip to the cooker, which is only safe to issue once
+    # bb.ui.knotty.main() has handed the real environment to the server.
     "targets": [],
     "machine": None,
     "distro": None,
@@ -129,11 +156,19 @@ def _set_targets(params):
 def _set_machine(server):
     """Ask the cooker what MACHINE and DISTRO this build is for.
 
-    server.runCommand(["getVariable", ...]) is knotty's OWN way of reading
-    configuration (bb/ui/knotty.py reads BBINCLUDELOGS, BB_CONSOLELOG and
-    friends exactly like this), and this runs from the same place -- once, at
-    UI startup, before the event loop -- so it is not a new mechanism and it
-    does not race a busy cooker the way registering a second observer does.
+    MUST be called only from inside knotty's event loop -- i.e. from
+    _TeeEventHandler.waitEvent(), never before bb.ui.knotty.main() has run.
+    A pre-knotty call was traced to a real crash: knotty.main() calls
+    params.updateToServer(server, os.environ.copy()) near its own top,
+    before its event loop starts, and that is what hands the real
+    environment to the cooker. A getVariable round-trip issued before that
+    forces the cooker to parse its base configuration prematurely, against
+    an empty environment (self.configuration.env == {}), which leaves
+    BB_ORIGENV with no PATH entry; OE-core's base.bbclass
+    setup_hosttools_dir() then does origbbenv.getVar("PATH") -> None ->
+    path.split(":") and raises AttributeError. That crash reaches the
+    client as a logged ERROR event, turning an otherwise-successful build
+    into one bitbake reports as failed via a non-zero exit code.
 
     Both are plain strings here. On a MULTICONFIG build MACHINE is only the
     default one, and per-multiconfig builds legitimately have several; a
@@ -236,12 +271,23 @@ class _TeeEventHandler:
     """Wraps the real eventHandler bb.ui.knotty.main() drives. Every method
     it doesn't override is delegated via __getattr__, so knotty sees the
     exact same interface it always does -- only waitEvent() is intercepted,
-    to observe each event on its way through, unchanged, to knotty."""
+    to observe each event on its way through, unchanged, to knotty.
 
-    def __init__(self, real):
+    Also the sole place _set_machine() is called from: the first waitEvent()
+    call is only ever reached after knotty.main() has already run
+    params.updateToServer(), so firing it here (rather than at UI startup)
+    is what keeps that getVariable round-trip from racing the cooker's own
+    config parse. See _set_machine()'s docstring for the crash this avoids."""
+
+    def __init__(self, real, server):
         self._real = real
+        self._server = server
+        self._machine_fetched = False
 
     def waitEvent(self, delay):
+        if not self._machine_fetched:
+            self._machine_fetched = True
+            _set_machine(self._server)
         event = self._real.waitEvent(delay)
         if event is not None:
             _observe(event)
@@ -264,12 +310,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         with _lock:
+            status = _state["status"]
             body = json.dumps(_state).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        # Only signal once the terminal state has actually reached a client
+        # -- i.e. after the write above returns -- and only for the real
+        # JSON body path, never for "building" or an error response.
+        if status in TERMINAL_STATUSES:
+            _terminal_fetched.set()
 
     def do_HEAD(self):
         self.send_response(405)
@@ -279,18 +331,33 @@ class _Handler(BaseHTTPRequestHandler):
 
 def main(server, eventHandler, params):
     _set_targets(params)
-    _set_machine(server)
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
+    linger = True
     try:
-        rc = bb.ui.knotty.main(server, _TeeEventHandler(eventHandler), params)
+        rc = bb.ui.knotty.main(server, _TeeEventHandler(eventHandler, server), params)
         _finish("failed" if rc else "success")
         return rc
+    except (KeyboardInterrupt, SystemExit):
+        # A human hitting Ctrl-C (or an explicit exit) wants their prompt
+        # back immediately -- don't make them wait out the linger window.
+        linger = False
+        _finish("failed")
+        raise
     except BaseException:
         _finish("failed")
         raise
     finally:
+        if linger:
+            # Mitigation, not a guarantee: a poll interval raised well above
+            # the default, a poller that first attaches after this window,
+            # or the process dying without reaching this finally at all
+            # (SIGKILL, `mackas destroy`) will still miss the terminal
+            # status. The poller-side rule -- "disconnected while building"
+            # means outcome unknown, never report it as a failure -- must
+            # stay documented regardless (a separate docs task covers that).
+            _terminal_fetched.wait(TERMINAL_LINGER_SECONDS)
         # shutdown() alone stops serve_forever()'s loop but leaves the
         # listening socket open -- confirmed live: without server_close()
         # too, bitbake's own exit logged a ResourceWarning for it.

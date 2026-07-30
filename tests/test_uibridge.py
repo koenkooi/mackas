@@ -19,12 +19,17 @@
 # named setscene failures would accuse innocent recipes on a perfectly healthy
 # build, which is worse than saying nothing.
 
+import http.client
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
+import threading
+import time
 import types
 import unittest
+from http.server import ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -240,6 +245,375 @@ class FinishTest(BridgeTestCase):
         self.assertEqual(bridge._state["status"], "success")
         bridge._finish("failed")
         self.assertEqual(bridge._state["status"], "failed")
+
+
+class TeeEventHandlerMachineFetchTest(BridgeTestCase):
+    """_TeeEventHandler is the ONLY place _set_machine() may run (see its own
+    docstring, and TODO.md item 32's full root-cause writeup): a getVariable
+    round-trip issued before bb.ui.knotty.main() has run
+    params.updateToServer() forces a premature, empty-environment cooker
+    config parse, which crashes a real build via base.bbclass's
+    setup_hosttools_dir() -- an otherwise 100%-successful build reported as
+    FAILED. These tests pin the fix: the fetch happens on the first
+    waitEvent() call, exactly once, regardless of what that call returns,
+    and never before."""
+
+    class _RealHandler:
+        """Stand-in for the real eventHandler bb.ui.knotty.main() drives.
+        waitEvent() returns items from a queue in order; an exhausted queue
+        (or an explicit None entry) mirrors a poll that timed out without an
+        event -- a normal, non-exceptional return from the real thing."""
+        def __init__(self, events=()):
+            self._events = list(events)
+            self.calls = 0
+
+        def waitEvent(self, delay):
+            self.calls += 1
+            return self._events.pop(0) if self._events else None
+
+    def setUp(self):
+        super().setUp()
+        # An unrelated fix (TODO.md item 31) added this one-shot Event for
+        # the terminal-status HTTP linger; reset it here purely for
+        # isolation between tests -- nothing else in this class touches it.
+        bridge._terminal_fetched.clear()
+
+    def test_no_fetch_at_construction(self):
+        srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
+        real = self._RealHandler([_task_event(
+            "runQueueTaskStarted", "/l/busybox_1.36.bb", "do_compile")])
+        bridge._TeeEventHandler(real, srv)
+        self.assertEqual(srv.calls, [])
+
+    def test_first_waitEvent_fetches_machine_and_distro_exactly_once(self):
+        srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
+        real = self._RealHandler([_task_event(
+            "runQueueTaskStarted", "/l/busybox_1.36.bb", "do_compile")])
+        tee = bridge._TeeEventHandler(real, srv)
+        tee.waitEvent(0)
+        self.assertEqual(srv.calls,
+                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"]])
+        self.assertEqual(bridge._state["machine"], "beaglebone")
+        self.assertEqual(bridge._state["distro"], "angstrom")
+
+    def test_fetch_happens_once_not_per_event(self):
+        srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
+        events = [_task_event("runQueueTaskStarted", f"/l/p{i}.bb", "do_compile")
+                  for i in range(5)]
+        real = self._RealHandler(events)
+        tee = bridge._TeeEventHandler(real, srv)
+        for _ in range(5):
+            tee.waitEvent(0)
+        self.assertEqual(len(srv.calls), 2)
+
+    def test_a_None_event_still_consumes_the_one_shot_fetch(self):
+        # The fix is deliberately unconditional: it fires on the first call
+        # regardless of whether that call actually returns an event.
+        # TODO.md item 32's "Fix" section notes gating it on a real event
+        # first (as originally suggested) would be more cautious than
+        # necessary, not wrong -- but the precisely-necessary invariant is
+        # just "on or after the first waitEvent() call".
+        srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
+        real = self._RealHandler([None, None])
+        tee = bridge._TeeEventHandler(real, srv)
+        self.assertIsNone(tee.waitEvent(0))
+        self.assertEqual(len(srv.calls), 2)
+        self.assertIsNone(tee.waitEvent(0))
+        self.assertEqual(len(srv.calls), 2)
+
+    def test_event_passes_through_unchanged_and_is_still_observed(self):
+        srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
+        event = _task_event(
+            "runQueueTaskStarted", "/l/busybox_1.36.bb", "do_compile", 3, 10)
+        real = self._RealHandler([event])
+        tee = bridge._TeeEventHandler(real, srv)
+        result = tee.waitEvent(0)
+        self.assertIs(result, event)  # not a copy/wrapper -- knotty sees the real thing.
+        self.assertEqual(bridge._state["status"], "building")
+        self.assertEqual(bridge._state["current"],
+                         {"recipe": "busybox_1.36.bb", "task": "do_compile"})
+
+    def test_main_performs_no_server_round_trip_before_knotty_main_is_entered(self):
+        """The regression guard that matters most: this is the test that
+        would fail if _set_machine() were ever moved back to the top of
+        main(), which is exactly the bug TODO.md item 32 describes (a real
+        build reported FAILED despite 100% of tasks succeeding)."""
+        srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
+        snapshot = []
+
+        def fake_knotty_main(server, eventHandler, params):
+            # This mirrors what the real bb.ui.knotty.main() does before its
+            # event loop starts: nothing server-side has happened yet at
+            # this point in the real code either (params.updateToServer()
+            # talks to the server over its own command, never getVariable).
+            snapshot.append(list(server.calls))
+            eventHandler.waitEvent(0)
+            # Skip the real item-31 terminal-status linger -- unrelated to
+            # what this test checks, and would otherwise block for
+            # TERMINAL_LINGER_SECONDS.
+            bridge._terminal_fetched.set()
+            return 0
+
+        knotty = bridge.bb.ui.knotty
+        had_main = hasattr(knotty, "main")
+        old_main = getattr(knotty, "main", None)
+
+        def _restore_main():
+            if had_main:
+                knotty.main = old_main
+            else:
+                del knotty.main
+        self.addCleanup(_restore_main)
+        knotty.main = fake_knotty_main
+
+        old_port = bridge.PORT
+        # Ephemeral port -- main() reads the module global PORT at call
+        # time (there's no local rebinding in its body), so this override
+        # takes effect without needing to touch the real default of 8801.
+        bridge.PORT = 0
+        self.addCleanup(setattr, bridge, "PORT", old_port)
+
+        real = self._RealHandler([_task_event(
+            "runQueueTaskStarted", "/l/busybox_1.36.bb", "do_compile")])
+        params = types.SimpleNamespace(options=types.SimpleNamespace(pkgs_to_build=[]))
+
+        rc = bridge.main(srv, real, params)
+
+        self.assertEqual(rc, 0)
+        # Nothing was asked of the cooker before knotty's own main() ran.
+        self.assertEqual(snapshot, [[]])
+        # ...and the ONE waitEvent() call inside it is what triggered the
+        # fetch -- exactly those two calls, nothing more.
+        self.assertEqual(srv.calls,
+                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"]])
+
+
+class _HandlerFixture:
+    """A live bridge._Handler server on 127.0.0.1:0 -- the same real,
+    in-process HTTP server idiom tests/test_mirrord.py's ServerFixture uses
+    (bind ("127.0.0.1", 0), serve on a daemon thread, drive it with
+    http.client). Loopback only, ephemeral port: never 0.0.0.0, so this
+    fixture never triggers a macOS incoming-connections permission prompt."""
+
+    def __init__(self):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), bridge._Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever,
+                                        kwargs={"poll_interval": 0.05},
+                                        daemon=True)
+        self.thread.start()
+
+    def get(self, path="/"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, body
+        finally:
+            conn.close()
+
+    def head(self, path="/"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("HEAD", path)
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status
+        finally:
+            conn.close()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+
+class TerminalStatusLingerTest(BridgeTestCase):
+    """Pins TODO.md item 31's fix at the HTTP-handler level: do_GET() only
+    flips _terminal_fetched after a client has actually received a
+    terminal-status body -- never for "building", never for a 404 (or any
+    other request this handler doesn't serve with a 200 JSON body)."""
+
+    def setUp(self):
+        super().setUp()
+        # Same reason TeeEventHandlerMachineFetchTest resets this: a
+        # module-global one-shot Event must never leak between tests.
+        bridge._terminal_fetched.clear()
+        self.fixture = _HandlerFixture()
+        self.addCleanup(self.fixture.close)
+
+    def test_building_status_is_served_without_setting_the_flag(self):
+        bridge._state["status"] = "building"
+        status, body = self.fixture.get("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "building")
+        self.assertFalse(bridge._terminal_fetched.is_set())
+
+    def test_a_fetch_after_success_sets_the_flag(self):
+        bridge._finish("success")
+        status, body = self.fixture.get("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "success")
+        self.assertTrue(bridge._terminal_fetched.is_set())
+
+    def test_a_fetch_after_failed_sets_the_flag(self):
+        bridge._finish("failed")
+        status, body = self.fixture.get("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "failed")
+        self.assertTrue(bridge._terminal_fetched.is_set())
+
+    def test_a_404_never_sets_the_flag_even_when_status_is_terminal(self):
+        bridge._finish("success")
+        status, body = self.fixture.get("/nonexistent")
+        self.assertEqual(status, 404)
+        self.assertFalse(bridge._terminal_fetched.is_set())
+
+    def test_an_unserved_method_never_sets_the_flag_even_when_terminal(self):
+        # _Handler.do_HEAD() is a fixed 405 -- it never reaches the
+        # body-write that do_GET() gates the flag on.
+        bridge._finish("success")
+        status = self.fixture.head("/")
+        self.assertEqual(status, 405)
+        self.assertFalse(bridge._terminal_fetched.is_set())
+
+
+class MainTerminalLingerTest(BridgeTestCase):
+    """Pins TODO.md item 31's fix at the main()-level: the finally block's
+    _terminal_fetched.wait(TERMINAL_LINGER_SECONDS) call, and the
+    KeyboardInterrupt/SystemExit fast-path that skips it entirely. Follows
+    TeeEventHandlerMachineFetchTest.
+    test_main_performs_no_server_round_trip_before_knotty_main_is_entered's
+    own pattern for stubbing bb.ui.knotty.main and overriding bridge.PORT to
+    an ephemeral port via addCleanup-restored monkeypatches."""
+
+    def setUp(self):
+        super().setUp()
+        bridge._terminal_fetched.clear()
+
+    def _patch_knotty_main(self, fn):
+        knotty = bridge.bb.ui.knotty
+        had_main = hasattr(knotty, "main")
+        old_main = getattr(knotty, "main", None)
+
+        def _restore():
+            if had_main:
+                knotty.main = old_main
+            else:
+                del knotty.main
+        self.addCleanup(_restore)
+        knotty.main = fn
+
+    def _patch_port(self, port=0):
+        # main() reads the module global PORT at call time (no local
+        # rebinding in its body), so this override takes effect without
+        # needing to touch the real default of 8801.
+        old_port = bridge.PORT
+        bridge.PORT = port
+        self.addCleanup(setattr, bridge, "PORT", old_port)
+
+    def _patch_linger(self, seconds):
+        old = bridge.TERMINAL_LINGER_SECONDS
+        bridge.TERMINAL_LINGER_SECONDS = seconds
+        self.addCleanup(setattr, bridge, "TERMINAL_LINGER_SECONDS", old)
+
+    @staticmethod
+    def _params():
+        return types.SimpleNamespace(options=types.SimpleNamespace(pkgs_to_build=[]))
+
+    # main() binds a real ThreadingHTTPServer and its finally block always
+    # runs httpd.shutdown() before returning/re-raising. shutdown() blocks
+    # until serve_forever()'s loop notices the shutdown request, which (at
+    # the default poll_interval of 0.5s that main() uses) measured ~0.5-0.52s
+    # on this machine -- on top of whatever the linger itself contributes.
+    # That fixed cost is present on EVERY call below, lingered or not, so the
+    # linger durations and margins here are sized to stay clearly separated
+    # from it in both directions rather than cutting it close.
+    _SHORT_LINGER = 1.5  # a "linger happens" duration comfortably above ~0.5s
+    _LONG_LINGER = 2.0   # Ctrl-C: prove the skip holds even with room to spare
+    _FAST_PATH_CEILING = 1.0  # skip/cut-short paths must land under this
+
+    def test_linger_happens_when_nobody_ever_fetches(self):
+        # Knotty stub returns immediately; nothing ever calls back to set
+        # _terminal_fetched -- main() must still wait out the full window.
+        self._patch_port(0)
+        self._patch_linger(self._SHORT_LINGER)
+        self._patch_knotty_main(lambda server, eventHandler, params: 0)
+
+        start = time.monotonic()
+        rc = bridge.main(object(), object(), self._params())
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(bridge._state["status"], "success")
+        self.assertGreaterEqual(elapsed, self._SHORT_LINGER - 0.2)
+
+    def test_linger_is_cut_short_by_an_early_fetch(self):
+        # Stands in for a poller that already fetched the terminal state via
+        # do_GET() -- see TerminalStatusLingerTest for that half of the
+        # mechanism -- so main() must not wait out the rest of the window.
+        self._patch_port(0)
+        self._patch_linger(self._SHORT_LINGER)
+
+        def fake_knotty_main(server, eventHandler, params):
+            bridge._terminal_fetched.set()
+            return 0
+        self._patch_knotty_main(fake_knotty_main)
+
+        start = time.monotonic()
+        rc = bridge.main(object(), object(), self._params())
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(bridge._state["status"], "success")
+        self.assertLess(elapsed, self._FAST_PATH_CEILING)
+
+    def test_ctrl_c_skips_the_linger_entirely(self):
+        # A human hitting Ctrl-C wants their prompt back immediately -- a
+        # more generous linger here (2.0s) than the other tests keeps this
+        # assertion honest without inviting flakiness on a loaded machine.
+        self._patch_port(0)
+        self._patch_linger(self._LONG_LINGER)
+
+        def fake_knotty_main(server, eventHandler, params):
+            raise KeyboardInterrupt()
+        self._patch_knotty_main(fake_knotty_main)
+
+        start = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            bridge.main(object(), object(), self._params())
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(bridge._state["status"], "failed")
+        self.assertLess(elapsed, self._FAST_PATH_CEILING)
+
+    def test_a_non_ctrl_c_crash_still_lingers(self):
+        # A plain crash (not Ctrl-C/SystemExit) must still give a poller the
+        # linger window to observe the "failed" status.
+        self._patch_port(0)
+        self._patch_linger(self._SHORT_LINGER)
+
+        def fake_knotty_main(server, eventHandler, params):
+            raise RuntimeError("boom")
+        self._patch_knotty_main(fake_knotty_main)
+
+        start = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            bridge.main(object(), object(), self._params())
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(bridge._state["status"], "failed")
+        self.assertGreaterEqual(elapsed, self._SHORT_LINGER - 0.2)
+
+
+class TerminalLingerDefaultsTest(BridgeTestCase):
+    def test_shipped_defaults(self):
+        # A silent retune of either constant would quietly re-break the
+        # notification this fix exists for (see TODO.md item 31) or widen
+        # what counts as terminal -- catch it here, fast and unconditional.
+        self.assertEqual(bridge.TERMINAL_LINGER_SECONDS, 5.0)
+        self.assertEqual(bridge.TERMINAL_STATUSES, ("success", "failed"))
 
 
 if __name__ == "__main__":
