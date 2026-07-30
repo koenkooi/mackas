@@ -86,19 +86,23 @@ esac
 last="${@: -1}"
 case "$last" in
 	*"[ -d "*)
-		# The probe: '[ -d P1 ] || [ -d P2 ]'. Succeed if ANY named path is
-		# listed in MOCK_TMP_HAS (space-separated guest paths, not basenames --
-		# the probe tests the exact resolved path).
+		# The probe now reports existence as STDOUT TOKENS, not an OR'd exit
+		# status: '[ -d P1 ] && echo TMPDIR; [ -d P2 ] && echo DEPLOY_DIR;
+		# exit 0'. For each path in MOCK_TMP_HAS (space-separated guest
+		# paths, not basenames -- exact resolved path), echo the token whose
+		# own "[ -d PATH ] && echo TOKEN" clause is present in $last -- both
+		# quoted (printf %q on a path needing it) and bare (the common case)
+		# forms. Always exit 0: emptiness of stdout, not exit status, is what
+		# "neither exists" means under the new contract.
 		for p in $MOCK_TMP_HAS; do
-			case " $last " in
-				*" $p "*|*"'$p'"*) exit 0 ;;
-			esac
-			# also match without quoting, since printf %q leaves plain paths bare
-			case "$last" in
-				*" $p "*|*"$p ]"*) exit 0 ;;
-			esac
+			for token in TMPDIR DEPLOY_DIR; do
+				case "$last" in
+					*"-d $p ] && echo $token"*|*"-d '$p' ] && echo $token"*)
+						echo "$token" ;;
+				esac
+			done
 		done
-		exit 1 ;;
+		exit 0 ;;
 	*"rm -rf"*) exit 0 ;;
 	chown) exit 0 ;;
 esac
@@ -160,6 +164,12 @@ fake_kas_container() {
 	chmod +x "$ROOT/bin/kas-container"
 }
 
+# tmp_deploy_ok -- convenience baseline for tests that are not specifically
+# about resolution failure: both TMPDIR and DEPLOY_DIR resolve successfully,
+# to the plain OE-core layout (DEPLOY_DIR under TMPDIR). Callers still need
+# MACKAS_PROJECT_DIR set (see fake_kas_container's checkout requirement).
+tmp_deploy_ok() { fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/tmp/deploy"; }
+
 # ---------------------------------------------------------------------------
 # Parser / dispatcher
 # ---------------------------------------------------------------------------
@@ -180,6 +190,11 @@ fake_kas_container() {
 		printf '%s\n' "$output" | grep -qF 'tmp+deploy'
 		printf '%s\n' "$output" | grep -qF 'downloads'
 		printf '%s\n' "$output" | grep -qF 'sstate'
+		# tmp+deploy's path resolution requirement is documented, not just
+		# implemented -- a reader hitting the refusal should be able to find
+		# the fix in --help without digging through the source.
+		printf '%s\n' "$output" | grep -qF 'MACKAS_PROJECT_DIR'
+		printf '%s\n' "$output" | grep -qF 'MACKAS_KAS_CONFIG'
 	done
 }
 
@@ -213,19 +228,37 @@ fake_kas_container() {
 		grep -F 'rm -rf' "$CLOG" | grep -qF '/build/deploy'
 }
 
-@test "clean tmp+deploy: falls back to the defaults with a warning when bitbake-getvar fails" {
+@test "clean tmp+deploy: refuses rather than guessing a default when bitbake-getvar can't resolve TMPDIR (issue #30)" {
 	have_volumes oe-build-tmp
-	# The base setup()'s kas-container is an empty stub -- bitbake_getvar must
-	# fail closed and clean must still work against the assumed defaults.
+	# No fake_kas_container, no MACKAS_PROJECT_DIR: the base setup()'s
+	# kas-container is an empty stub, so bitbake_getvar must fail closed --
+	# and clean must now REFUSE, not silently fall back to a guessed default
+	# and report success against a DEPLOY_DIR it never touched (the live bug
+	# github.com/koenkooi/mackas/issues/30 tracks).
 	MOCK_TMP_HAS="/build/tmp" mk -y clean tmp+deploy
-	[ "$status" -eq 0 ]
-	printf '%s\n' "$output" | grep -qi 'could not resolve TMPDIR'
-	printf '%s\n' "$output" | grep -qi 'could not resolve DEPLOY_DIR'
+	[ "$status" -ne 0 ]
+	refute_call "rm -rf"
+	printf '%s\n' "$output" | grep -qF 'MACKAS_PROJECT_DIR'
+	printf '%s\n' "$output" | grep -qF 'MACKAS_KAS_CONFIG'
+	# The assertion that actually pins the bug: no claimed success.
+	! printf '%s\n' "$output" | grep -qi 'cleared'
+}
+
+@test "clean tmp+deploy: DEPLOY_DIR alone failing to resolve still refuses" {
+	have_volumes oe-build-tmp
+	# TMPDIR resolves; DEPLOY_DIR's case arm is never added, so its
+	# bitbake-getvar query comes back empty and bitbake_getvar() fails it.
+	fake_kas_container "TMPDIR=/build/tmp"
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'DEPLOY_DIR'
+	refute_call "rm -rf"
 }
 
 @test "clean tmp+deploy: never deletes or recreates the TMPDIR volume itself" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" mk -y clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	refute_call "volume delete"
 	refute_call "volume rm"
@@ -244,14 +277,17 @@ fake_kas_container() {
 
 @test "clean tmp+deploy: a container holding a DIFFERENT volume does not block it" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" MOCK_BUSY_VOLUME=oe-build-sstate mk -y clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MOCK_BUSY_VOLUME=oe-build-sstate MACKAS_PROJECT_DIR=meta-angstrom \
+		mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	assert_call "rm -rf"
 }
 
 @test "clean tmp+deploy: --dry-run probes for real but deletes nothing" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" mk --dry-run clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk --dry-run clean tmp+deploy
 	[ "$status" -eq 0 ]
 	# The read-only probe always runs, dry-run or not (same reasoning as
 	# sstate prune's scan): its 'test -d' shows up in the real container log.
@@ -267,17 +303,21 @@ fake_kas_container() {
 
 @test "clean tmp+deploy: declining leaves everything untouched" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" mk clean tmp+deploy < /dev/null
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk clean tmp+deploy < /dev/null
 	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'declined'
 	refute_call "rm -rf"
 }
 
 @test "clean tmp+deploy: nothing to clean when neither path exists yet" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="" mk -y clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'nothing to clean'
 	refute_call "rm -rf"
+	refute_call "fstrim"
 }
 
 @test "clean tmp+deploy: nothing to clean when the TMPDIR volume does not exist at all" {
@@ -289,7 +329,8 @@ fake_kas_container() {
 
 @test "clean tmp+deploy: explains the refill is sstate restores, not fresh rebuilds" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" mk -y clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'stamps went with TMPDIR'
 	printf '%s\n' "$output" | grep -qi 'sstate restores'
@@ -297,30 +338,76 @@ fake_kas_container() {
 
 @test "clean tmp+deploy: auto-fstrims TMPDIR afterward (the in-place rm does not reclaim host disk on its own)" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" mk -y clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	assert_call "[fstrim] [-v] [/mnt]"
 }
 
 @test "clean tmp+deploy: MACKAS_FSTRIM_AUTO=0 skips the auto-fstrim" {
 	have_volumes oe-build-tmp
-	MOCK_TMP_HAS="/build/tmp" mk -y --set MACKAS_FSTRIM_AUTO=0 clean tmp+deploy
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom \
+		mk -y --set MACKAS_FSTRIM_AUTO=0 clean tmp+deploy
 	[ "$status" -eq 0 ]
 	refute_call "fstrim"
 }
 
 @test "clean tmp+deploy: skips the auto-fstrim (declined/nothing-to-clean paths never reach it)" {
 	have_volumes oe-build-tmp
+	tmp_deploy_ok
 	# Nothing to clean: neither TMPDIR nor DEPLOY_DIR exists yet.
-	MOCK_TMP_HAS="" mk -y clean tmp+deploy
+	MOCK_TMP_HAS="" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	refute_call "fstrim"
 	# Declined: no -y and not a tty, so confirm() auto-declines before the rm.
-	MOCK_TMP_HAS="/build/tmp" mk clean tmp+deploy
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk clean tmp+deploy
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'declined'
 	refute_call "rm -rf"
 	refute_call "fstrim"
+}
+
+@test "clean tmp+deploy: reports BOTH paths cleared when both exist" {
+	have_volumes oe-build-tmp
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp /build/tmp/deploy" MACKAS_PROJECT_DIR=meta-angstrom \
+		mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | \
+		grep -qF "cleared TMPDIR (/build/tmp) and DEPLOY_DIR (/build/tmp/deploy) in 'oe-build-tmp'"
+}
+
+@test "clean tmp+deploy: only TMPDIR present -- clears it, reports DEPLOY_DIR did not exist" {
+	have_volumes oe-build-tmp
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "rm -rf"
+	printf '%s\n' "$output" | \
+		grep -qF "cleared TMPDIR (/build/tmp) in 'oe-build-tmp'; DEPLOY_DIR (/build/tmp/deploy) did not exist"
+	# Not the "both cleared" wording (lowercase "cleared", the did() message --
+	# the confirm PROMPT also says "TMPDIR (...) and DEPLOY_DIR (...)" since
+	# both are always offered together, so anchor on "cleared" to tell the
+	# success message apart from that prompt text) -- DEPLOY_DIR never
+	# existed here.
+	! printf '%s\n' "$output" | grep -qF "cleared TMPDIR (/build/tmp) and DEPLOY_DIR ("
+}
+
+@test "clean tmp+deploy: only DEPLOY_DIR present (a distro moving it to a sibling of tmp/) -- reports TMPDIR did not exist" {
+	have_volumes oe-build-tmp
+	# Angstrom's own conf/distro/angstrom.conf redefines DEPLOY_DIR to a
+	# sibling of tmp/, the exact shape of the real incident this target
+	# guards against (github.com/koenkooi/mackas/issues/30).
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy"
+	MOCK_TMP_HAS="/build/deploy" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "rm -rf"
+	printf '%s\n' "$output" | \
+		grep -qF "cleared DEPLOY_DIR (/build/deploy) in 'oe-build-tmp'; TMPDIR (/build/tmp) did not exist"
+	# Not the "both cleared" wording either (see the TMPDIR-only test above
+	# for why this anchors on lowercase "cleared").
+	! printf '%s\n' "$output" | grep -qF "cleared TMPDIR (/build/tmp) and DEPLOY_DIR ("
 }
 
 @test "clean tmp+deploy: refuses an unsafe resolved path instead of rm-ing it" {
@@ -425,4 +512,16 @@ fake_kas_container() {
 	assert_call "[volume] [delete] [oe-build-dl]"
 	assert_call "[volume] [delete] [oe-build-sstate]"
 	refute_call "[volume] [delete] [oe-build-tmp]"
+}
+
+@test "clean tmp+deploy downloads: an unresolved var aborts the WHOLE invocation, not just tmp+deploy" {
+	have_volumes oe-build-tmp oe-build-dl
+	# No fake_kas_container, no MACKAS_PROJECT_DIR: tmp+deploy's resolution
+	# dies via die_unresolved_guest_var, a hard exit -- not a per-target
+	# rc=1 that lets cmd_clean's loop carry on to the next target. There is
+	# no partial-completion story for a refusal like this one, deliberately:
+	# a future reader must not "fix" this by making downloads run anyway.
+	MOCK_TMP_HAS="/build/tmp" mk -y clean tmp+deploy downloads
+	[ "$status" -ne 0 ]
+	refute_call "[volume] [delete] [oe-build-dl]"
 }

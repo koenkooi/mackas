@@ -6337,6 +6337,23 @@ ${C_BLD}TARGETS${C_RST} (optional, repeatable, order does not matter)
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after 'clean', e.g. '$SCRIPT_CMD --dry-run clean downloads'.
 
+${C_BLD}PATH RESOLUTION (tmp+deploy)${C_RST}
+  tmp+deploy resolves the real TMPDIR/DEPLOY_DIR from bitbake instead of
+  assuming the OE-core default layout -- a distro conf may set DEPLOY_DIR to
+  any path, e.g. a sibling of tmp/ rather than inside it. That resolution
+  needs \$MACKAS_PROJECT_DIR and \$MACKAS_KAS_CONFIG set -- in the config
+  file, or exported in this shell:
+    export MACKAS_PROJECT_DIR=<checkout under work/>
+    export MACKAS_KAS_CONFIG=<its kas files>
+  If bitbake-getvar still fails with those set, tmp+deploy REFUSES rather
+  than guessing a path it is about to rm -rf (see '$SCRIPT_CMD status'/
+  'check') -- deliberate: a guessed path can only be right by luck or a
+  silent no-op reported as success. downloads/sstate are unaffected --
+  whole-volume operations, no bitbake variable resolution involved. A
+  sourced env.sh can derive both automatically from a hand-typed
+  'kas-container build/shell <files>', but only for that one shell
+  session, never across a piped invocation.
+
 ${C_BLD}ONE-VM RULE${C_RST}
   Only one VM may access an ext4 image at a time. Each target refuses while a
   running build (smoketest/shell) still holds the volume it needs -- stop it
@@ -6519,6 +6536,25 @@ clean_tmpdir_volume() {
 	did "cleaned TMPDIR; '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' kept"
 }
 
+# die_unresolved_guest_var VAR -- clean_tmp_deploy() is about to rm -rf a path
+# resolved by bitbake-getvar, so a failed resolution is hard-failed here
+# rather than handled with this codebase's usual confirm()-gated automated
+# fix: there is nothing safe to offer instead. 'clean' has no file list of its
+# own to derive MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG from the way the
+# kas-container wrapper's _mackas_derive_project does, and a guessed path
+# feeding an in-place rm -rf can only be right by luck or a silent no-op
+# reported as success -- exactly the incident this replaces (see
+# clean_tmp_deploy's own comment above the two bitbake_getvar calls).
+die_unresolved_guest_var() {
+	local var="$1" hint
+	if [ -z "$MACKAS_PROJECT_DIR" ]; then
+		hint="no project is configured -- export MACKAS_PROJECT_DIR=<checkout under work/> and export MACKAS_KAS_CONFIG=<its kas files>"
+	else
+		hint="the bitbake-getvar query itself failed; see the warning above -- $SCRIPT_CMD status"
+	fi
+	die "$var could not be resolved via bitbake-getvar; clean tmp+deploy will not guess a path it is about to rm -rf" "$hint"
+}
+
 # refuse_unsafe_guest_path PATH LABEL -- die unless PATH is strictly under
 # /build with no '..' component. Guards clean_tmp_deploy()'s in-place `rm -rf`
 # against a bitbake-getvar answer this throwaway container cannot safely act
@@ -6571,23 +6607,26 @@ clean_tmp_deploy() {
 	fi
 
 	local tmpdir deploydir
-	tmpdir="$(bitbake_getvar TMPDIR)" || {
-		tmpdir="/build/tmp"
-		warn "  could not resolve TMPDIR via bitbake-getvar; assuming the default ($tmpdir)"
-	}
-	deploydir="$(bitbake_getvar DEPLOY_DIR)" || {
-		deploydir="/build/tmp/deploy"
-		warn "  could not resolve DEPLOY_DIR via bitbake-getvar; assuming the default ($deploydir)"
-	}
+	tmpdir="$(bitbake_getvar TMPDIR)" || die_unresolved_guest_var TMPDIR
+	deploydir="$(bitbake_getvar DEPLOY_DIR)" || die_unresolved_guest_var DEPLOY_DIR
 	refuse_unsafe_guest_path "$tmpdir" TMPDIR
 	refuse_unsafe_guest_path "$deploydir" DEPLOY_DIR
 
 	# Always runs for real, dry-run or not -- a read-only probe, same
 	# reasoning as sstate_prune's scan: "nothing to clean" needs the REAL
-	# state, not --dry-run's assumed yes.
-	if ! container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
-		sh -c "[ -d $(printf '%q' "$tmpdir") ] || [ -d $(printf '%q' "$deploydir") ]" 2>/dev/null
-	then
+	# state, not --dry-run's assumed yes. One container run reports BOTH
+	# paths' existence as stdout tokens (sstate_prune's scan idiom) rather
+	# than an OR'd exit status, so a lone survivor can be reported honestly
+	# below instead of folded into a blanket "cleared both". The trailing
+	# `exit 0` keeps a genuinely-absent path (a false `[ -d ] && echo`) from
+	# making the whole probe look like it failed.
+	local present have_tmpdir have_deploydir
+	present="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+		sh -c "[ -d $(printf '%q' "$tmpdir") ] && echo TMPDIR; [ -d $(printf '%q' "$deploydir") ] && echo DEPLOY_DIR; exit 0" 2>/dev/null)" || present=""
+	if printf '%s\n' "$present" | grep -qxF TMPDIR; then have_tmpdir="yes"; else have_tmpdir="no"; fi
+	if printf '%s\n' "$present" | grep -qxF DEPLOY_DIR; then have_deploydir="yes"; else have_deploydir="no"; fi
+
+	if [ "$have_tmpdir" = "no" ] && [ "$have_deploydir" = "no" ]; then
 		info "Nothing to clean -- neither $tmpdir nor $deploydir exists yet (has a build run? $SCRIPT_CMD smoketest)"
 		return 0
 	fi
@@ -6597,7 +6636,18 @@ clean_tmp_deploy() {
 
 	run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
 		sh -c "rm -rf $(printf '%q' "$tmpdir") $(printf '%q' "$deploydir")"
-	did "cleared TMPDIR and DEPLOY_DIR in '$MACKAS_VOL_TMP' -- buildhistory and conf/ untouched"
+
+	# Report per-path, not a blanket "cleared both": an rm -rf against a path
+	# that never existed is a silent no-op, and an earlier version of this
+	# message claimed success for a DEPLOY_DIR it never touched (the incident
+	# github.com/koenkooi/mackas/issues/30 tracks).
+	if [ "$have_tmpdir" = "yes" ] && [ "$have_deploydir" = "yes" ]; then
+		did "cleared TMPDIR ($tmpdir) and DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP' -- buildhistory and conf/ untouched"
+	elif [ "$have_tmpdir" = "yes" ]; then
+		did "cleared TMPDIR ($tmpdir) in '$MACKAS_VOL_TMP'; DEPLOY_DIR ($deploydir) did not exist -- buildhistory and conf/ untouched"
+	else
+		did "cleared DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP'; TMPDIR ($tmpdir) did not exist -- buildhistory and conf/ untouched"
+	fi
 	info "  the stamps went with TMPDIR, so the next build re-runs the whole task"
 	info "  graph -- SSTATE_DIR survives, so that is mostly cheap sstate restores"
 	info "  of the same cached artifacts. For a genuinely fresh rebuild of"
