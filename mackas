@@ -2229,7 +2229,7 @@ check_target_volume() {
 						"a reboot unmounts it; '$SCRIPT_CMD setup' (or any build command) reattaches it, or by hand: hdiutil attach $(printf '%q' "$MACKAS_WORKSPACE_IMAGE") -nobrowse"
 				else
 					ck_fail "workspace image is recorded as $MACKAS_WORKSPACE_IMAGE, but no such file exists" \
-						"mount the drive it lives on, or find it with 'mdfind -name $(printf '%q' "$(basename "$MACKAS_WORKSPACE_IMAGE")")' and move it back; '$SCRIPT_CMD unset MACKAS_WORKSPACE_IMAGE' if you no longer use an image"
+						"'$SCRIPT_CMD volume recover' finds it with Spotlight and offers to move it back; '$SCRIPT_CMD unset MACKAS_WORKSPACE_IMAGE' if you no longer use an image"
 				fi
 				;;
 		esac
@@ -3003,6 +3003,40 @@ reattach_workspace_image() {
 	write_workspace_sentinel "$mp"
 	record_workspace_image "$img"
 	did "reattached workspace image at $MACKAS_ROOT/work -> $mp"
+}
+
+# workspace_unpushed_work_line -- item 19 phase 4. A reboot only unmounts the
+# workspace image (attach_workspace_image/ensure_workspace_attached handle
+# that); it never destroys it. The one thing genuinely at risk if the image
+# itself were ever lost is uncommitted or unpushed work inside it -- a clean,
+# pushed layer costs nothing to lose (git clone restores it). Pure reporting,
+# no new state: iterate the git repos one level under work/, count dirty
+# (git status --porcelain) and ahead-of-upstream (git log @{u}.., tolerating
+# no upstream configured), and print one line only when N > 0. Silent when no
+# image is configured or the image is not currently attached (nothing safe to
+# inspect -- a plain, unmounted work/ is not the checkouts).
+workspace_unpushed_work_line() {
+	[ -n "${MACKAS_WORKSPACE_IMAGE:-}" ] || return 0
+	local wst
+	set +e; workspace_is_attached; wst=$?; set -e
+	[ "$wst" -eq 0 ] || return 0
+
+	local d n=0 dirty ahead
+	for d in "$MACKAS_ROOT"/work/*/; do
+		[ -d "${d}.git" ] || continue
+		dirty="$(git -C "$d" status --porcelain 2>/dev/null | head -1)" || dirty=""
+		# '|| ahead=""': git log fails outright with no upstream configured
+		# (the common case for a layer nobody has pushed a branch for yet) --
+		# tolerated, per this function's own contract, not a real error. A
+		# bare assignment here would trip this script's own set -e/pipefail
+		# on that failure before the tolerant fallback below ever ran.
+		ahead="$(git -C "$d" log '@{u}..' --oneline 2>/dev/null | head -1)" || ahead=""
+		{ [ -n "$dirty" ] || [ -n "$ahead" ]; } && n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] || return 0
+	info ""
+	warn "  $n layer(s) have uncommitted or unpushed work inside the workspace image."
+	warn "  'git push' is the real backup -- this line is a nudge, not a snapshot."
 }
 
 # ensure_workspace_attached -- the fail-closed guard, called on the way into
@@ -6762,6 +6796,12 @@ cmd_status() {
 		if [ ! -f "$MACKAS_WORKSPACE_IMAGE" ]; then
 			show "attached" "NO -- the image file itself is missing ($SCRIPT_CMD check explains)"
 		else
+			# du -h reports actual disk blocks allocated (sparse-aware on APFS),
+			# the same idiom status_volume() uses for the ext4 volumes -- real
+			# usage, not the image's logical/configured size.
+			local wsize
+			wsize="$(du -h "$MACKAS_WORKSPACE_IMAGE" 2>/dev/null | awk '{print $1}')"
+			[ -n "$wsize" ] && show "on disk" "$wsize"
 			local wst
 			set +e; workspace_is_attached; wst=$?; set -e
 			case "$wst" in
@@ -6773,6 +6813,7 @@ cmd_status() {
 		info ""
 		info "  work/ holds the layer checkouts. They are git repos with real remotes,"
 		info "  so 'git push' is the backup story -- the image is one file with none."
+		workspace_unpushed_work_line
 	fi
 
 	hdr "ext4 volumes"
@@ -8247,7 +8288,80 @@ volume_recover() {
 	else
 		info "Recovered $fixed volume(s)."
 	fi
+
+	# The workspace image (item 19 phase 3) is not an ext4 volume -- no
+	# runtime symlink, so it has no place in the loop above -- but a scan
+	# with no explicit <name> is the same "something's broken, help me fix
+	# it" moment, so it belongs in the same command. Skipped when <name> was
+	# given: that scopes this run to one NAMED ext4 volume specifically.
+	[ -n "$only" ] || workspace_image_recover
 	return 0
+}
+
+# workspace_image_recover -- item 19 phase 3. When the workspace image FILE
+# itself goes missing (moved by hand, drive gone, deleted), MACKAS_WORKSPACE_IMAGE
+# is the record -- unlike an ext4 volume there is no runtime symlink to
+# re-point. Mirrors volume_recover()'s UX (Spotlight-located, confirm-gated,
+# refuse-to-guess-on-multiple-hits, the mdutil -s indexing-off diagnosis) but
+# the fix is different: move the FOUND image back to the recorded path
+# (volume_transfer()'s holes-preserving copy, same care 'volume move' takes),
+# rather than update a symlink. Printing the found path for the user to
+# adopt by hand (mackas set MACKAS_WORKSPACE_IMAGE <found>) is the fallback
+# when moving is declined -- never silently touched without confirmation.
+workspace_image_recover() {
+	[ -n "${MACKAS_WORKSPACE_IMAGE:-}" ] || return 0
+	[ -f "$MACKAS_WORKSPACE_IMAGE" ] && return 0
+
+	err "workspace image is recorded as $MACKAS_WORKSPACE_IMAGE, but no such file exists"
+
+	local mdfind="${MACKAS_MDFIND:-mdfind}" base f matches="" count=0 chosen
+	base="$(basename "$MACKAS_WORKSPACE_IMAGE")"
+	while IFS= read -r f; do
+		[ -f "$f" ] || continue
+		matches="${matches:+$matches
+}$f"
+	done < <("$mdfind" "kMDItemFSName == '$base'" 2>/dev/null)
+	[ -n "$matches" ] && count="$(printf '%s\n' "$matches" | grep -c .)"
+
+	if [ "$count" -eq 0 ]; then
+		local disk; disk="$(dirname "$MACKAS_WORKSPACE_IMAGE")"
+		if command -v mdutil >/dev/null 2>&1 && mdutil -s "$disk" 2>/dev/null | grep -qi "disabled"; then
+			warn "  Spotlight indexing is off for $disk, so it cannot search there."
+		else
+			warn "  Spotlight found no file named '$base' anywhere it indexes."
+		fi
+		info "  Move it back by hand once you know the path, or:"
+		info "    $SCRIPT_CMD unset MACKAS_WORKSPACE_IMAGE   # if you no longer use one"
+		return 0
+	fi
+
+	if [ "$count" -gt 1 ]; then
+		warn "  Spotlight found $count candidates named '$base'; refusing to guess:"
+		printf '%s\n' "$matches" | while IFS= read -r f; do info "    $f"; done
+		info "  Move the right one back by hand, or adopt one with '$SCRIPT_CMD set MACKAS_WORKSPACE_IMAGE <path>'."
+		return 0
+	fi
+
+	chosen="$matches"
+	info "  found it at: $chosen"
+	if confirm "  move it back to $MACKAS_WORKSPACE_IMAGE?"; then
+		local src_mp dest_mp cross_fs=0
+		src_mp="$(volume_mount_point "$(dirname "$chosen")")"
+		dest_mp="$(volume_mount_point "$(dirname "$MACKAS_WORKSPACE_IMAGE")")"
+		[ "$src_mp" != "$dest_mp" ] && cross_fs=1
+		run mkdir -p "$(dirname "$MACKAS_WORKSPACE_IMAGE")"
+		volume_transfer "$chosen" "$MACKAS_WORKSPACE_IMAGE" "$cross_fs"
+		if [ "$DRY_RUN" -eq 1 ]; then
+			info "  (dry-run: would move $chosen -> $MACKAS_WORKSPACE_IMAGE; nothing changed)"
+		elif [ -f "$MACKAS_WORKSPACE_IMAGE" ]; then
+			did "recovered workspace image -> $MACKAS_WORKSPACE_IMAGE"
+		else
+			err "  moved, but $MACKAS_WORKSPACE_IMAGE still does not exist -- check $chosen"
+		fi
+	else
+		info "  left it at $chosen -- adopt it instead with:"
+		info "    $SCRIPT_CMD set MACKAS_WORKSPACE_IMAGE $chosen"
+	fi
 }
 
 volume_usage() {
@@ -8303,7 +8417,11 @@ ${C_BLD}SUBCOMMANDS${C_RST}
   recover [<name>]     When you have moved a volume.img by hand and the runtime
                        can no longer find it, locate it with Spotlight and
                        offer to re-point the symlink. With no name, checks all
-                       the mackas volumes. Never changes anything unprompted.
+                       the mackas volumes, AND the workspace image (if one is
+                       configured but its file has gone missing) -- offering
+                       to move it back to its recorded path instead, since it
+                       has no symlink to re-point. Never changes anything
+                       unprompted.
 
   Parenthesized names are accepted aliases -- 'ls'/'rm' etc. match Apple
   container's own vocabulary (this is a volume manager sitting right next to

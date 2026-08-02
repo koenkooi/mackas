@@ -307,6 +307,54 @@ fake_work_is_a_mount() {
 	[ ! -e "$HDIUTIL_LOG" ]
 }
 
+@test "status: shows the image's size on disk (item 19 phase 2)" {
+	dd if=/dev/zero of="$IMG" bs=1024 count=256 2>/dev/null
+	mkdir -p "$MACKAS_ROOT/work"
+	MACKAS_WORKSPACE_IMAGE="$IMG"
+	local out; out="$(cmd_status 2>&1)"
+	printf '%s\n' "$out" | grep -A5 'Workspace image' | grep -qi 'on disk'
+}
+
+@test "status: no unpushed-work line when nothing is dirty or ahead (item 19 phase 4)" {
+	make_image
+	mkdir -p "$MACKAS_ROOT/work/layer-clean/.git"
+	: > "$MACKAS_ROOT/work/.mackas-workspace"
+	MACKAS_WORKSPACE_IMAGE="$IMG"
+	fake_work_is_a_mount
+	local out; out="$(cmd_status 2>&1)"
+	! printf '%s\n' "$out" | grep -qi 'uncommitted or unpushed'
+}
+
+@test "status: reports layers with uncommitted work inside the workspace image (item 19 phase 4)" {
+	make_image
+	mkdir -p "$MACKAS_ROOT/work/dirty-layer"
+	git -C "$MACKAS_ROOT/work/dirty-layer" init -q
+	git -C "$MACKAS_ROOT/work/dirty-layer" config user.email t@example.com
+	git -C "$MACKAS_ROOT/work/dirty-layer" config user.name t
+	: > "$MACKAS_ROOT/work/dirty-layer/committed.txt"
+	git -C "$MACKAS_ROOT/work/dirty-layer" add committed.txt
+	git -C "$MACKAS_ROOT/work/dirty-layer" commit -q -m initial
+	echo dirty > "$MACKAS_ROOT/work/dirty-layer/uncommitted.txt"
+	: > "$MACKAS_ROOT/work/.mackas-workspace"
+	MACKAS_WORKSPACE_IMAGE="$IMG"
+	fake_work_is_a_mount
+	local out; out="$(cmd_status 2>&1)"
+	printf '%s\n' "$out" | grep -qi '1 layer(s) have uncommitted or unpushed work'
+}
+
+@test "status: the unpushed-work check never runs when the image is not attached" {
+	make_image
+	mkdir -p "$MACKAS_ROOT/work/some-layer"
+	git -C "$MACKAS_ROOT/work/some-layer" init -q
+	git -C "$MACKAS_ROOT/work/some-layer" config user.email t@example.com
+	git -C "$MACKAS_ROOT/work/some-layer" config user.name t
+	echo dirty > "$MACKAS_ROOT/work/some-layer/uncommitted.txt"
+	MACKAS_WORKSPACE_IMAGE="$IMG"
+	# NOT fake_work_is_a_mount: work/ reads as a plain, unattached directory.
+	local out; out="$(cmd_status 2>&1)"
+	! printf '%s\n' "$out" | grep -qi 'uncommitted or unpushed'
+}
+
 # ---------------------------------------------------------------------------
 # Wired into the real commands (whole-binary, still hermetic: the guard dies
 # before anything reaches hdiutil or the container runtime)

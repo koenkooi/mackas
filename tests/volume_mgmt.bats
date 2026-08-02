@@ -1003,6 +1003,105 @@ break_volume() {
 }
 
 # ---------------------------------------------------------------------------
+# volume recover ALSO checks the workspace image (item 19 phase 3) on a
+# no-arg scan -- it has no runtime symlink (its record is
+# MACKAS_WORKSPACE_IMAGE itself), so the fix is moving the found file back to
+# the recorded path, not re-pointing a symlink.
+# ---------------------------------------------------------------------------
+
+@test "volume recover: an attached workspace image is untouched, no Spotlight query" {
+	have_volume oe-build-tmp 120G 4096
+	local img="$TESTDIR/workspace.sparseimage"
+	: > "$img"
+	mk_mdfind "should-never-be-queried"
+	MACKAS_MDFIND="$MDFIND" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_WORKSPACE_IMAGE=$img" volume recover
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi 'workspace image is recorded'
+}
+
+@test "volume recover: no image configured is a pure no-op for the workspace check" {
+	have_volume oe-build-tmp 120G 4096
+	mk_mdfind
+	recover
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi 'workspace image'
+}
+
+@test "volume recover: a missing workspace image Spotlight finds gets moved back" {
+	have_volume oe-build-tmp 120G 4096
+	local recorded="$TESTDIR/root-drive/workspace.sparseimage"
+	local found="$TESTDIR/other-drive/workspace.sparseimage"
+	mkdir -p "$(dirname "$found")"
+	echo "sparse-image-payload" > "$found"
+	mk_mdfind "$found"
+	MACKAS_MDFIND="$MDFIND" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_WORKSPACE_IMAGE=$recorded" -y volume recover
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'recovered workspace image'
+	[ -f "$recorded" ]
+	grep -qF "sparse-image-payload" "$recorded"
+	[ ! -f "$found" ]
+}
+
+@test "volume recover: declining the workspace move leaves it in place, with an adopt hint" {
+	have_volume oe-build-tmp 120G 4096
+	local recorded="$TESTDIR/root-drive/workspace.sparseimage"
+	local found="$TESTDIR/other-drive/workspace.sparseimage"
+	mkdir -p "$(dirname "$found")"
+	echo "sparse-image-payload" > "$found"
+	mk_mdfind "$found"
+	MACKAS_MDFIND="$MDFIND" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_WORKSPACE_IMAGE=$recorded" volume recover <<< "n"
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'adopt it instead'
+	printf '%s\n' "$output" | grep -qF "set MACKAS_WORKSPACE_IMAGE $found"
+	[ -f "$found" ]
+	[ ! -f "$recorded" ]
+}
+
+@test "volume recover: multiple workspace-image candidates refuses to guess" {
+	have_volume oe-build-tmp 120G 4096
+	local recorded="$TESTDIR/root-drive/workspace.sparseimage"
+	local a="$TESTDIR/a/workspace.sparseimage" b="$TESTDIR/b/workspace.sparseimage"
+	mkdir -p "$(dirname "$a")" "$(dirname "$b")"
+	: > "$a"; : > "$b"
+	mk_mdfind "$a" "$b"
+	MACKAS_MDFIND="$MDFIND" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_WORKSPACE_IMAGE=$recorded" -y volume recover
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'refusing to guess'
+	[ ! -f "$recorded" ]
+}
+
+@test "volume recover: no Spotlight hits for the workspace image gives a clear message" {
+	have_volume oe-build-tmp 120G 4096
+	local recorded="$TESTDIR/root-drive/workspace.sparseimage"
+	mk_mdfind
+	MACKAS_MDFIND="$MDFIND" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_WORKSPACE_IMAGE=$recorded" -y volume recover
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'found no file named'
+	printf '%s\n' "$output" | grep -qF 'unset MACKAS_WORKSPACE_IMAGE'
+}
+
+@test "volume recover <name>: an explicit volume name skips the workspace-image check" {
+	have_volume oe-build-tmp 120G 4096
+	local recorded="$TESTDIR/root-drive/workspace.sparseimage"
+	mk_mdfind
+	MACKAS_MDFIND="$MDFIND" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set "MACKAS_WORKSPACE_IMAGE=$recorded" -y volume recover oe-build-tmp
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi 'workspace image'
+}
+
+# ---------------------------------------------------------------------------
 # resize -- grow a volume in place (TODO.md item 26)
 #
 # `volume resize` grows a volume by COPYING it into a new one of the target
