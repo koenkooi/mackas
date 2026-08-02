@@ -147,6 +147,20 @@ if [ "$is_fstrim" -eq 1 ]; then
 		dd if=/dev/zero of="$voldir/$name/volume.img" bs=1024 \
 			count="${MOCK_FSTRIM_AFTER_KB:-2048}" 2>/dev/null
 	fi
+	if [ -n "${MOCK_FSTRIM_BOOT_NOISE:-}" ]; then
+		# Apple container's own boot-progress reporting, verbatim shape: since
+		# mackas captures this command's output through $(...) rather than a
+		# real TTY, container falls back to one newline-terminated line per
+		# step instead of updating a single line in place via \r.
+		printf '[0/6] [0s]\n'
+		printf '[1/6] Fetching image [0s]\n'
+		printf '[2/6] Unpacking image [0s]\n'
+		printf '[3/6] Fetching kernel [0s]\n'
+		printf '[4/6] Fetching init image [0s]\n'
+		printf '[5/6] Unpacking init image [0s]\n'
+		printf '[6/6] Starting container [0s]\n'
+		printf '[6/6] Starting container [0s]\n'
+	fi
 	# Deliberately a wild number, unrelated to the du delta: this is guest free
 	# space, which is exactly what mackas must NOT report.
 	echo "/mnt: 953.7 MiB (999999999 bytes) trimmed"
@@ -351,6 +365,20 @@ refute_call() {
 	# fstrim's own figure must not leak into what we report as reclaimed.
 	! printf '%s\n' "$output" | grep -q '999999999'
 	! printf '%s\n' "$output" | grep -qi 'reclaimed 953'
+}
+
+@test "volume fstrim: container's own boot-progress noise is collapsed, not printed verbatim" {
+	have_volume oe-build-tmp 120G 8192
+	MOCK_FSTRIM_AFTER_KB=2048 MOCK_FSTRIM_BOOT_NOISE=1 vol fstrim oe-build-tmp
+	[ "$status" -eq 0 ]
+	# None of the eight raw "[N/6] ... [Ts]" boot-progress lines survive.
+	! printf '%s\n' "$output" | grep -qE '^\s*fstrim: \[[0-9]+/[0-9]+\]'
+	# The real fstrim result line still gets through.
+	printf '%s\n' "$output" | grep -qF 'trimmed'
+}
+
+@test "volume fstrim: the reclaimed figure is wrapped in \$C_BLD/\$C_RST in the source" {
+	grep -qF '${C_BLD}(reclaimed $(fmt_kb "$reclaimed_kb"))${C_RST}"' "$MACKAS"
 }
 
 @test "volume fstrim: a device that does not support discard is reported, not claimed" {
