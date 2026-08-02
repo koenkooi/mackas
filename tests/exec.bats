@@ -40,7 +40,7 @@ setup() {
 	echo 0 > "$EXIT_CODE_FILE"
 	export EXIT_CODE_FILE
 
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 {
 	printf 'CALL:'
@@ -53,6 +53,12 @@ rc=0
 [ -f "$EXIT_CODE_FILE" ] && rc="$(cat "$EXIT_CODE_FILE")"
 exit "$rc"
 EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	# ensure_kas_container_installed requires BOTH files present (a wrapper
+	# with no .real, or a .real with no wrapper on PATH, both count as "not
+	# installed") -- cmd_exec calls it, so the wrapper itself must exist
+	# too, even though only kas-container.real above is ever exec'd.
+	touch "$ROOT/bin/kas-container"
 	chmod +x "$ROOT/bin/kas-container"
 
 	CLOG="$TESTDIR/container.log"

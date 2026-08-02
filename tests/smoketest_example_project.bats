@@ -76,11 +76,16 @@ EOF
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	KLOG="$TESTDIR/kas.log"
 	export KLOG
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 printf 'PWD=%s ARGV=%s\n' "$PWD" "$*" >> "$KLOG"
 exit 0
 EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	# ensure_kas_container_installed (cmd_smoketest calls it) requires BOTH
+	# files present -- the wrapper itself must exist too, even though only
+	# kas-container.real above is ever exec'd.
+	touch "$ROOT/bin/kas-container"
 	chmod +x "$ROOT/bin/kas-container"
 
 	PATH="$TESTDIR/fakebin:$ROOT/bin:$PATH"

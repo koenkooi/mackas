@@ -69,8 +69,8 @@ setup() {
 
 	ROOT="$TESTDIR/oe"
 	mkdir -p "$ROOT/bin"
-	touch "$ROOT/bin/kas-container"
-	chmod +x "$ROOT/bin/kas-container"
+	touch "$ROOT/bin/kas-container.real"
+	chmod +x "$ROOT/bin/kas-container.real"
 }
 
 teardown() {

@@ -18,7 +18,7 @@ break by accident.
   stdlib only.**
 - `tools/mackas-buildstats-analyze`, `tools/mackas-overhead` — Python, stdlib
   only, build profiling.
-- `tests/` — 31 `*.bats` files + 4 `test_*.py` files.
+- `tests/` — 33 `*.bats` files + 4 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security.
 - `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to
