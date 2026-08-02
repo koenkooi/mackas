@@ -41,6 +41,13 @@ setup() {
 	MOCK_SSTATE_SCAN_FAIL=""
 	export MOCK_SSTATE_SCAN_FAIL
 
+	# MOCK_FSTRIM_FAIL: set to make item 28's post-prune fstrim call (a
+	# `container run ... fstrim -v /mnt`) exit non-zero, same convention as
+	# volume_mgmt.bats -- proves a failing fstrim never turns a successful
+	# prune into a reported failure.
+	MOCK_FSTRIM_FAIL=""
+	export MOCK_FSTRIM_FAIL
+
 	mkdir -p "$TESTDIR/fakebin"
 	cat > "$TESTDIR/fakebin/container" <<'EOF'
 #!/usr/bin/env bash
@@ -52,7 +59,14 @@ setup() {
 
 case "$1 $2" in
 	"system status") echo "status running"; exit 0 ;;
-	"volume ls") echo "NAME"; exit 0 ;;
+	"volume ls")
+		# volume_fstrim_one() (item 28's post-prune fstrim) refuses to run
+		# against a volume it cannot see via 'volume ls' -- report the sstate
+		# volume as existing so that path is actually exercised here.
+		echo "NAME TYPE DRIVER OPTIONS"
+		echo "oe-build-sstate named local size=40G"
+		exit 0
+		;;
 	"container ls"|"ls ")
 		echo "ID  IMAGE  STATE"
 		[ -n "${MOCK_BUSY_VOLUME:-}" ] && echo "buildbox  kas  running"
@@ -65,8 +79,18 @@ case "$1 $2" in
 		;;
 esac
 
-# Fall through: a `container run ...`. The last arg(s) are the find command.
-last="${@: -1}"
+# Fall through: a `container run ...`. The last arg(s) are the find command,
+# or (item 28) an `fstrim -v /mnt` run right after a successful prune.
+is_fstrim=0
+for a in "$@"; do [ "$a" = "fstrim" ] && is_fstrim=1; done
+if [ "$is_fstrim" -eq 1 ]; then
+	if [ -n "${MOCK_FSTRIM_FAIL:-}" ]; then
+		echo "fstrim: /mnt: FITRIM ioctl failed: Operation not permitted" >&2
+		exit 1
+	fi
+	echo "/mnt: 0 bytes trimmed"
+	exit 0
+fi
 case "$*" in
 	*"-printf"*)
 		if [ -n "${MOCK_SSTATE_SCAN_FAIL:-}" ]; then
@@ -193,6 +217,38 @@ refute_call() {
 	MOCK_SSTATE_SIZES="1048576" mk -y sstate prune --older-than 90d
 	assert_call "run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/sstate] [ghcr.io/siemens/kas/kas:5.4] [find] [/sstate] [-type] [f] [-mtime] [+90] [-printf]"
 	assert_call "run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/sstate] [ghcr.io/siemens/kas/kas:5.4] [find] [/sstate] [-type] [f] [-mtime] [+90] [-delete]"
+}
+
+# ---------------------------------------------------------------------------
+# Item 28: fstrim automatically follows a successful prune
+# ---------------------------------------------------------------------------
+
+@test "sstate prune: fstrims the volume afterward by default" {
+	MOCK_SSTATE_SIZES="1048576" mk -y sstate prune --older-than 90d
+	[ "$status" -eq 0 ]
+	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim] [-v] [/mnt]"
+	printf '%s\n' "$output" | grep -qF "pruned 1 sstate object(s)"
+}
+
+@test "sstate prune: MACKAS_FSTRIM_AUTO=0 skips the post-prune fstrim" {
+	MOCK_SSTATE_SIZES="1048576" run "$MACKAS" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" --set MACKAS_RELOCATE_VOLUMES=0 \
+		--set MACKAS_FSTRIM_AUTO=0 -y sstate prune --older-than 90d
+	[ "$status" -eq 0 ]
+	refute_call "[fstrim]"
+}
+
+@test "sstate prune: nothing to prune never fstrims (no delete happened, nothing to reclaim)" {
+	mk -y sstate prune --older-than 90d
+	[ "$status" -eq 0 ]
+	refute_call "[fstrim]"
+}
+
+@test "sstate prune: a failing fstrim does not turn a successful prune into a failure" {
+	MOCK_SSTATE_SIZES="1048576" MOCK_FSTRIM_FAIL=1 mk -y sstate prune --older-than 90d
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "pruned 1 sstate object(s)"
+	assert_call "[fstrim]"
 }
 
 # ---------------------------------------------------------------------------

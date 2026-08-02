@@ -225,8 +225,11 @@ N days" genuinely means "nothing built in N days has needed this", not
 pruned object still needed just gets rebuilt, one task, never a correctness
 risk. The scan is real even under `--dry-run` (so the reported count/size
 are real); deletion happens only after confirmation or `-y`, and the one-VM
-rule applies. For surgical pruning — keep only what one checkout's stamps
-still reference — use openembedded-core's own
+rule applies. A successful prune fstrims the sstate volume automatically
+afterward, so freed space is reclaimed on the host without a separate
+`mackas volume fstrim sstate` step (`MACKAS_FSTRIM_AUTO=1`, same knob `clean
+tmp+deploy` uses). For surgical pruning — keep only what one checkout's
+stamps still reference — use openembedded-core's own
 `scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
 "nothing has touched this in months" case. For a full wipe instead of
 age-based pruning, `mackas clean sstate` deletes and recreates the whole
