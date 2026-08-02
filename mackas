@@ -5719,6 +5719,168 @@ cmd_exec() {
 }
 
 # ---------------------------------------------------------------------------
+# lock / dump -- reproducibility artifacts (item 13). Both are kas-container's
+# own TOP-LEVEL subcommands (like build/shell), never run through
+# kas_shell_ro() -- that helper wraps a shell COMMAND inside a configured
+# bitbake environment ('shell -c "..."'), which is not what dump/lock are;
+# they resolve/pin the kas config itself and need no bitbake environment at
+# all. Both still go through the full runtime-args/gitconfig/one-VM
+# machinery every other real kas-container invocation in this file uses --
+# neither touches TMPDIR/DL_DIR/SSTATE_DIR, but attaching the volumes
+# unconditionally, like retrieve/exec/clean do, keeps this file's one
+# invariant ("every real invocation always gets real ext4 volumes") intact
+# rather than carving out a volume-less exception for two commands.
+# ---------------------------------------------------------------------------
+
+# kas_project_subcommand_preflight -- shared by cmd_lock/cmd_dump: the
+# project-checkout/gitconfig/one-VM checks every direct kas-container
+# subcommand invocation in this file needs, before running it. Sets
+# $rt_args/$gitconfig for the caller (not local to this function -- callers
+# declare them and read them straight after calling this).
+kas_project_subcommand_preflight() {
+	local cmd_name="$1" v
+	require_mackas_root
+	ensure_workspace_attached
+	ensure_kas_container_installed
+	ensure_project_checked_out
+
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		if volume_in_use "$v"; then
+			die "volume '$v' is attached to a running container" \
+				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD $cmd_name'"
+		fi
+	done
+
+	rt_args="$(kas_runtime_args)"
+	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
+	if [ ! -r "$gitconfig" ] || ! has_safe_directory_star "$gitconfig"; then
+		die "gitconfig for the container's dubious-ownership workaround is missing or incomplete: $gitconfig" \
+			"$SCRIPT_CMD setup"
+	fi
+}
+
+lock_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD lock${C_RST} -- pin every declared repo to its exact current commit.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD lock
+
+Runs \`kas-container lock\` against the project's kas config -- kas's own
+reproducibility mechanism, writing a resolved lockfile INTO the checkout
+next to the kas config it locked (see kas's own output above for the exact
+path; the name and location are kas's choice, not mackas's). /repo is a
+host bind mount, not an ext4 volume, so the lockfile is immediately visible
+on the Mac, no retrieve needed.
+
+Read-only from mackas's own perspective -- nothing here touches TMPDIR/
+DL_DIR/SSTATE_DIR -- but kas lock itself writes into the checkout, so this
+is NOT wrapped in the repo-preserving --skip flags '$SCRIPT_CMD exec' uses;
+run it when you actually want a fresh lock, not as a casual query.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. lock refuses while a
+  running build (smoketest/shell) still holds any of the three volumes.
+EOF
+}
+
+cmd_lock() {
+	# No argument parsing here: 'lock' is dispatched bare, like check/status/
+	# shell/destroy -- the outer parser already consumed --dry-run/-y/-v/
+	# --help (and --config/--set, which must come before the command word
+	# anyway) as GLOBAL flags before this ever runs. See lock_usage.
+	local rt_args gitconfig
+	kas_project_subcommand_preflight lock
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "${C_BLD}mackas lock${C_RST} -- would run:"
+		info "  $(quote_cmd kas-container lock "$KAS_FILES_ARG")"
+		return 0
+	fi
+
+	local rc=0
+	(
+		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE=docker \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" lock "$KAS_FILES_ARG"
+	) || rc=$?
+	[ "$rc" -eq 0 ] || die "kas lock failed (rc=$rc)" "$SCRIPT_CMD shell to investigate"
+	did "kas lock finished -- see its own output above for the lockfile's path"
+}
+
+dump_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD dump${C_RST} -- write the fully-resolved kas config next to the logs.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD dump
+
+Runs \`kas-container dump --resolve-env --resolve-local --resolve-refs\`
+against the project's kas config and saves the resolved YAML it prints to
+\$MACKAS_LOGS/dump-<timestamp>.yml -- every env var, every local override
+and every repo ref resolved to its exact value, a reproducibility record
+next to a build's own logs (see item 13 in TODO.md). Purely read-only:
+kas dump writes nothing into the checkout itself.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. dump refuses while a
+  running build (smoketest/shell) still holds any of the three volumes.
+EOF
+}
+
+cmd_dump() {
+	# No argument parsing here: 'dump' is dispatched bare, like check/status/
+	# shell/destroy -- the outer parser already consumed --dry-run/-y/-v/
+	# --help as GLOBAL flags before this ever runs. See dump_usage.
+	local rt_args gitconfig
+	kas_project_subcommand_preflight dump
+
+	# MACKAS_DUMP_TS: an undocumented test seam for a deterministic filename
+	# in tests, same convention as MACKAS_RETRIEVE_TS/MACKAS_OVERHEAD_BIN.
+	local ts out
+	ts="${MACKAS_DUMP_TS:-$(date +%Y%m%d%H%M%S)}"
+	out="$MACKAS_LOGS/dump-${ts}.yml"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "${C_BLD}mackas dump${C_RST} -- would run:"
+		info "  $(quote_cmd kas-container dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")"
+		info "  writing resolved config to: $out"
+		return 0
+	fi
+
+	mkdir -p "$MACKAS_LOGS"
+	local rc=0
+	(
+		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE=docker \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
+	) > "$out" || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		rm -f "$out"
+		die "kas dump failed (rc=$rc)" "$SCRIPT_CMD shell to investigate"
+	fi
+	did "wrote resolved config to $out"
+}
+
+# ---------------------------------------------------------------------------
 # retrieve -- copy build outputs out of the ext4 TMPDIR volume
 # buildstats -- work with buildstats already retrieved
 # ---------------------------------------------------------------------------
@@ -8527,6 +8689,10 @@ ${C_BLD}COMMANDS${C_RST}
   unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
   runtime-args  Plumbing: prints the effective --runtime-args string. The
              env.sh wrapper calls this itself; you don't normally need to.
+  lock       Pin every declared repo to its exact current commit
+             (\`kas lock\`, writes into the checkout). '$SCRIPT_CMD lock --help'.
+  dump       Save the fully-resolved kas config next to the logs
+             (\`kas dump --resolve-*\`). '$SCRIPT_CMD dump --help'.
   help       This message, or '$SCRIPT_CMD help COMMAND' for one command's own.
 
 ${C_BLD}OPTIONS${C_RST}
@@ -8734,10 +8900,10 @@ main() {
 				cmd="adopt"; shift
 				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|destroy|runtime-args)
+			check|smoketest|status|shell|destroy|runtime-args|lock|dump)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args lock dump help)" ;;
 		esac
 	done
 
@@ -8784,6 +8950,8 @@ main() {
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
 		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
 		runtime-args) if [ "$want_help" -eq 1 ]; then runtime_args_usage; else cmd_runtime_args; fi ;;
+		lock)      if [ "$want_help" -eq 1 ]; then lock_usage;      else cmd_lock;      fi ;;
+		dump)      if [ "$want_help" -eq 1 ]; then dump_usage;      else cmd_dump;      fi ;;
 		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;
 		exec)       cmd_exec ${EXEC_ARGS+"${EXEC_ARGS[@]}"} ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
