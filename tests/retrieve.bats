@@ -136,15 +136,26 @@ esac
 
 # The copy: `... sh -c "mkdir -p '/out/<sub>' && cp -r '<guest>/.' '/out/<sub>/'"`.
 # destsub (the mackas-facing object key, e.g. "deploy") and guestsub (the
-# resolved guest path's own basename) are extracted independently -- they can
-# differ when bitbake-getvar resolves a distro-redefined path, and the
-# destination must be named after destsub regardless.
+# resolved guest path's own basename, or -- for item 24's nested deploy/images
+# object specifically -- its path relative to the fixture root) are extracted
+# independently -- they can differ when bitbake-getvar resolves a
+# distro-redefined path, and the destination must be named after destsub
+# regardless.
 last="${@: -1}"
 case "$last" in
 	*"cp -r"*)
 		destsub="$(printf '%s\n' "$last" | sed -E "s#.*mkdir -p '/out/([^']*)'.*#\1#")"
 		guestdir="$(printf '%s\n' "$last" | sed -E "s#.*cp -r '([^']*)/\.'.*#\1#")"
-		guestsub="${guestdir##*/}"
+		case "$guestdir" in
+			*/deploy/images|*/deploy/images/*)
+				# Nested object: keep it relative to the fixture root
+				# ($FIXTURE/deploy/images[/machine]) rather than a bare
+				# basename, which would look for a same-named top-level dir
+				# that does not exist.
+				guestsub="deploy/images${guestdir#*/deploy/images}"
+				;;
+			*) guestsub="${guestdir##*/}" ;;
+		esac
 		if [ -n "$outdir" ] && [ -d "$FIXTURE/$guestsub" ]; then
 			mkdir -p "$outdir/$destsub"
 			cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
@@ -368,6 +379,98 @@ EOF
 	[ "$status" -eq 0 ]
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	[ -d "$ROOT/artifacts/log" ]
+	[ -d "$ROOT/artifacts/deploy" ]
+}
+
+# ---------------------------------------------------------------------------
+# Item 24: 'retrieve deploy images [MACHINE]' narrows to DEPLOY_DIR_IMAGE
+# ---------------------------------------------------------------------------
+
+@test "retrieve: deploy images narrows to DEPLOY_DIR_IMAGE, not the whole deploy tree" {
+	MOCK_TMP_HAS="images" mk retrieve deploy images
+	[ "$status" -eq 0 ]
+	# bitbake-getvar is unwired in this test (no real checkout) -- falls back
+	# to the DEPLOY_DIR_IMAGE default, /build/tmp/deploy/images, NOT bare
+	# /build/tmp/deploy (the whole-tree object's own default).
+	assert_call "-d /build/tmp/deploy/images ]"
+	[ -d "$ROOT/artifacts/deploy/images" ]
+	# The whole-tree object was never asked for.
+	refute_call "-d /build/tmp/deploy ]"
+}
+
+@test "retrieve: deploy images asks bitbake-getvar for DEPLOY_DIR_IMAGE, not a hand-built path" {
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR_IMAGE "*) echo "/build/some/dist/images/qemuarm" ;;
+esac
+exit 0
+STUB
+	chmod +x "$ROOT/bin/kas-container.real"
+	MACKAS_PROJECT_DIR=meta-angstrom MOCK_TMP_HAS="qemuarm" mk retrieve deploy images
+	[ "$status" -eq 0 ]
+	assert_call "-d /build/some/dist/images/qemuarm ]"
+}
+
+@test "retrieve: deploy images MACHINE substitutes only the trailing path component" {
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR_IMAGE "*) echo "/build/some/dist/images/qemuarm" ;;
+esac
+exit 0
+STUB
+	chmod +x "$ROOT/bin/kas-container.real"
+	MACKAS_PROJECT_DIR=meta-angstrom MOCK_TMP_HAS="qemuarm-armv5te" \
+		mk retrieve deploy images qemuarm-armv5te
+	[ "$status" -eq 0 ]
+	# The real answer's DEPLOY_DIR-ish prefix ("/build/some/dist/images")
+	# survives untouched -- only the trailing "qemuarm" is swapped for the
+	# requested MACHINE, never a blind DEPLOY_DIR/images/<machine> guess.
+	assert_call "-d /build/some/dist/images/qemuarm-armv5te ]"
+	refute_call "-d /build/some/dist/images/qemuarm ]"
+}
+
+@test "retrieve: deploy images MACHINE falls back with the machine already appended" {
+	# bitbake-getvar unwired (no real checkout): the fallback default must be
+	# built WITH the requested machine in place, not substituted afterward --
+	# there is no real trailing component to swap in the fallback path.
+	MOCK_TMP_HAS="qemuarm-armv5te" mk retrieve deploy images qemuarm-armv5te
+	[ "$status" -eq 0 ]
+	assert_call "-d /build/tmp/deploy/images/qemuarm-armv5te ]"
+}
+
+@test "retrieve: deploy images composes with another object in one call" {
+	MOCK_TMP_HAS="buildstats images" mk retrieve deploy images buildstats
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/images" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+}
+
+@test "retrieve: deploy images does not swallow --dest as a MACHINE" {
+	MOCK_TMP_HAS="images" mk retrieve deploy images --dest "$TESTDIR/elsewhere"
+	[ "$status" -eq 0 ]
+	[ -d "$TESTDIR/elsewhere/deploy/images" ]
+	assert_call "-d /build/tmp/deploy/images ]"
+}
+
+@test "retrieve: deploy images does not swallow the next object as a MACHINE" {
+	MOCK_TMP_HAS="images log" mk retrieve deploy images logs
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/images" ]
+	[ -d "$ROOT/artifacts/log" ]
+	assert_call "-d /build/tmp/deploy/images ]"
+	assert_call "-d /build/tmp/log ]"
+}
+
+@test "retrieve: bare 'deploy' still fetches the whole tree, unaffected by item 24" {
+	MOCK_TMP_HAS="buildstats log deploy" mk retrieve deploy
+	[ "$status" -eq 0 ]
+	assert_call "-d /build/tmp/deploy ]"
 	[ -d "$ROOT/artifacts/deploy" ]
 }
 
