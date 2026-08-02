@@ -143,11 +143,9 @@ kas-container's `forward_dir()` **bind-mounts the host directory** that
 forward_dir KAS_BUILD_DIR "/build" "rw"     # -v $KAS_BUILD_DIR:/build:rw -e KAS_BUILD_DIR=/build
 ```
 
-Setting any of them to a Mac path therefore puts TMPDIR straight back on
-APFS over virtiofs — the exact thing the volumes exist to avoid. So all
-three **must stay unset**. `forward_dir()` returns early on an **empty**
-value, and that is the hook mackas uses: it leaves all three blank and
-mounts the volumes itself:
+This runs on the **host** side of the invocation — the process that goes on to call Apple `container run`. Setting any of the three to a Mac path there would bind-mount that path onto the guest, putting TMPDIR straight back on APFS over virtiofs — the exact thing the volumes exist to avoid. So on the host side, all three **must stay blank — set to an empty string, not merely left unset**: an old `env.sh` sourced into the same shell may still export one of them at a stale APFS path, and only an explicit empty value beats that export. `forward_dir()` returns early only on an **empty** value, never on a merely-unset one, and that empty-vs-unset distinction is the hook mackas relies on.
+
+Blanking the host-side vars is not the whole story, and conflating the two halves is exactly what made an earlier theory of this bug plausible but wrong. `--runtime-args` separately carries `-e KAS_BUILD_DIR=/build` (and the `DL_DIR`/`SSTATE_DIR` equivalents):
 
 ```sh
 kas-container --runtime-args "-c 18 -m 42g \
@@ -156,9 +154,9 @@ kas-container --runtime-args "-c 18 -m 42g \
   -v oe-build-sstate:/sstate -e SSTATE_DIR=/sstate" build ...
 ```
 
-The `-v` supplies a real ext4 at the guest path; the `-e` tells kas to use
-it without kas ever seeing a host path to bind-mount. `--runtime-args`
-(alias `--docker-args`) is a supported kas-container flag, so no kas patch.
+That `-e` reaches the **guest** as an ordinary environment variable, re-establishing `KAS_BUILD_DIR` *inside* the container, where it was never blank at all. kas's own `Context.__init__` reads it from there and sets `TOPDIR` accordingly, so a correctly-invoked build ends up with `TOPDIR=/build` — the ext4 volume — without the guest ever consulting the host-side blanking above. The `-v` supplies the real ext4 filesystem at that guest path; the `-e` is what tells kas to use it instead of falling back. `--runtime-args` (alias `--docker-args`) is a supported kas-container flag, so no kas patch.
+
+The corollary: a build that reaches kas-container with **no `-e` at all** — one that bypassed the protection wrapper entirely, so no `--runtime-args` ever reached it — has `KAS_BUILD_DIR` genuinely unset inside the guest, not merely blank. kas then falls back to `KAS_WORK_DIR/build`, which lives on the virtiofs-backed host bind mount, not on any ext4 volume. That is the exact ambiguity that made the original root-cause theory for this whole issue plausible-but-wrong: it assumed every mackas build structurally put `TOPDIR` on virtiofs, when the real story is narrower — a **bypassed** build does, a **correctly-invoked** one never did. See [issue #27](https://github.com/koenkooi/mackas/issues/27).
 
 > **`KAS_EXTRA_RUNTIME_ARGS` is not an environment variable.** kas-container
 > sets it to `""` unconditionally *before* parsing arguments (v5.4, line
@@ -221,45 +219,25 @@ supported mechanism. See
 
 ## Running `kas-container` by hand
 
-`env.sh` defines `kas-container` as a **shell function**, so a hand-typed
-kas command in a sourced shell builds against the same volumes, limits and
-config fragment as mackas's own commands. The wrapper:
+Two layers now protect a hand-typed `kas-container` invocation, and they no longer do the same job.
 
-- supplies `--runtime-args` from `_mackas_runtime_args()`, which asks
-  `mackas runtime-args` for the CURRENT value on every call rather than a
-  string frozen when `setup` last ran — so a setting `kas_runtime_args()`
-  reads (`MACKAS_MONITOR`, `MACKAS_USE_NFS_MIRRORS`, a volume-name override)
-  takes effect on a hand-typed build the same way it already does for
-  `mackas smoketest`/`shell`, not just after the next `mackas setup`. Falls
-  back to `MACKAS_RUNTIME_ARGS` (the frozen, generation-time value, still
-  exported for exactly this) if the live call ever fails, with a warning —
-  volume mounts and `-c`/`-m` limits either way;
-- blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`;
-- unless `MACKAS_KAS_AUTO_FRAGMENT=0`, appends the generated
-  `macos-local.yml` fragment onto the file-list argument of
-  `build`/`shell`/`checkout`, resolved fresh from `$PWD` on every call
-  rather than baked in at generation time (the supported flow `cd`s to
-  `work/`, the parent of every layer checkout, not into the project itself —
-  see the main README).
+**`$MACKAS_BIN/kas-container` is a generated wrapper *script*** (`write_kas_wrapper()` in `mackas`), and it is what `$PATH` actually resolves `kas-container` to — so it protects **every invocation shape that reaches it via `$PATH` resolution**: `nohup kas-container ...`, `env kas-container ...`, a Makefile recipe, an unsourced shell, and the shell function below's own hand-off, all alike. It:
 
-The file-list argument is not always immediately after the subcommand —
-kas's own config argument accepts options first (e.g. `shell -k <files>`,
-exactly what `bitbake_getvar()` itself passes, or `--skip STEP` repeated,
-the repo-state-preserving alternative to `-k` this project's own docs
-recommend). So the wrapper scans past known boolean flags
-(`-k`/`--keep-config-unchanged`, `--force-checkout`, `--update`,
-`-E`/`--preserve-env`) and known value flags (`--skip`/`--target`/`-c`/
-`--cmd`/`--task`/`--provenance`, consuming their separate argument too, the
-single-token `--x=y` form included) to find it, and backs off untouched if
-it meets any other option it does not recognize, rather than guess wrong.
-`dump`/`menu` are deliberately not covered: their positional argument is not
-a plain kas file list the same way.
+- computes `--runtime-args` **live**, asking `mackas runtime-args` for the current value on every call rather than a string frozen when `setup` last ran — so a setting `kas_runtime_args()` reads (`MACKAS_MONITOR`, `MACKAS_USE_NFS_MIRRORS`, a volume-name override) takes effect on a hand-typed build the same way it already does for `mackas smoketest`/`shell`, not just after the next `mackas setup`. Falls back to a frozen copy baked in at generation time (`MACKAS_FROZEN_RUNTIME_ARGS`) if the live call ever fails, with a warning;
+- **refuses to launch, rather than guess,** if the value about to be used (live or fallback) is empty or missing any of the three ext4 volume mounts — a multi-hour build with no protected storage attached is strictly worse than failing fast before it ever starts;
+- blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side of the call (see above);
+- prepends the shim dir to `PATH` and sets up the container engine, image and `GITCONFIG_FILE`;
+- guards against re-entry (`MACKAS_KAS_WRAPPED=1`) and against double-injecting `--runtime-args` if the caller already passed one;
+- then `exec`s `$MACKAS_BIN/kas-container.real`, the pinned, sha256-verified upstream script, which never sits on `$PATH` itself.
 
-Typing `kas-container build ...` in a sourced shell therefore does the right
-thing. `command kas-container`, an absolute path, or an unsourced shell
-bypasses the wrapper and builds with no volumes, no limits, and no
-auto-appended fragment. `mackas status` prints the exact `--runtime-args` in
-effect.
+`env.sh`'s `kas-container` **shell function** now does only what a subprocess fundamentally cannot do in the *same* shell, before handing off to the wrapper script above:
+
+- unless `MACKAS_KAS_AUTO_FRAGMENT=0`, appends the generated `macos-local.yml` fragment onto the file-list argument of `build`/`shell`/`checkout`, resolved fresh from `$PWD` on every call rather than baked in at generation time (the supported flow `cd`s to `work/`, the parent of every layer checkout, not into the project itself — see the main README);
+- derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that same file list and exports them into the calling shell (see the next section).
+
+The file-list argument is not always immediately after the subcommand — kas's own config argument accepts options first (e.g. `shell -k <files>`, exactly what `bitbake_getvar()` itself passes, or `--skip STEP` repeated, the repo-state-preserving alternative to `-k` this project's own docs recommend). So the function scans past known boolean flags (`-k`/`--keep-config-unchanged`, `--force-checkout`, `--update`, `-E`/`--preserve-env`) and known value flags (`--skip`/`--target`/`-c`/`--cmd`/`--task`/`--provenance`, consuming their separate argument too, the single-token `--x=y` form included) to find it, and backs off untouched if it meets any other option it does not recognize, rather than guess wrong. `dump`/`menu` are deliberately not covered: their positional argument is not a plain kas file list the same way.
+
+Typing `kas-container build ...` in a sourced shell gets both layers: the fragment append and project derivation from the shell function, then the volumes, limits and refusal-not-guess policy from the wrapper script it hands off to. `command kas-container`, an absolute path, `nohup`, `env`, or any other `$PATH`-resolved call **still reaches the same wrapper script** — that is the whole point of moving the protection from shell-function resolution to `$PATH` resolution (issue [#27](https://github.com/koenkooi/mackas/issues/27)) — so it still gets the ext4 volumes, the `-c`/`-m` limits and the refuse-rather-than-guess behaviour. The one thing such a bypass does **not** get is the auto-appended tuning fragment and the `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation, since those remain shell-function-only conveniences that need the calling shell — not safety-critical protection. `mackas status` prints the exact `--runtime-args` in effect.
 
 ### Deriving `MACKAS_PROJECT_DIR` and `MACKAS_KAS_CONFIG`
 

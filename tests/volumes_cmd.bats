@@ -623,7 +623,7 @@ install_fake_kas() {
 	# run leaves behind at $ROOT/gitconfig.
 	mkdir -p "$ROOT"
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 {
 	printf 'ARGV:'
@@ -638,6 +638,11 @@ install_fake_kas() {
 } >> "$KLOG"
 exit 0
 EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	# ensure_kas_container_installed (cmd_shell calls it) requires BOTH files
+	# present -- the wrapper itself must exist too, even though only
+	# kas-container.real above is ever exec'd.
+	touch "$ROOT/bin/kas-container"
 	chmod +x "$ROOT/bin/kas-container"
 	KLOG="$TESTDIR/kas.log"
 	export KLOG

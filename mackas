@@ -116,6 +116,7 @@ MACKAS_MONITOR
 MACKAS_MONITOR_PORT
 MACKAS_MONITOR_NOTIFY
 MACKAS_BUILDSTATS_ACCUMULATE
+MACKAS_SOCKET_SWEEP
 "
 
 # ---------------------------------------------------------------------------
@@ -767,6 +768,14 @@ set_defaults() {
 	# this is set to 1. Set to 1 only if you want raw accumulation and will
 	# manage it yourself.
 	MACKAS_BUILDSTATS_ACCUMULATE=0
+
+	# Sweep any bitbake.sock/hashserve.sock stranded on the host-visible
+	# checkout/work tree before a build starts (see clear_stale_sockets for
+	# the virtiofs-stuck-socket mechanism this defends against). ON by
+	# default: it only ever touches two exact filenames at two narrow paths,
+	# only when nothing is using the volumes, so there is nothing for a
+	# default-on sweep to break. Set to 0 to disable.
+	MACKAS_SOCKET_SWEEP=1
 }
 
 CONFIG_FILE_USED=""
@@ -1187,7 +1196,7 @@ derive_paths() {
 		MACKAS_BASE=""
 		MACKAS_BIN=""; MACKAS_WORK=""; MACKAS_KAS=""; MACKAS_LOGS=""
 		MACKAS_PROJECT=""; MACKAS_ENV_SH=""; MACKAS_GITCONFIG=""
-		KAS_CONTAINER_BIN=""; SHIM_DIR=""
+		KAS_CONTAINER_BIN=""; KAS_CONTAINER_REAL=""; SHIM_DIR=""
 		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
 		KAS_FILES_ARG="$(compose_kas_files)"
 		MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
@@ -1250,6 +1259,12 @@ derive_paths() {
 	# See setup_gitconfig() for why this file exists at all.
 	MACKAS_GITCONFIG="$MACKAS_BASE/gitconfig"
 	KAS_CONTAINER_BIN="$MACKAS_BIN/kas-container"
+	# KAS_CONTAINER_BIN is the generated protection wrapper that $PATH
+	# resolves; KAS_CONTAINER_REAL is the pinned upstream script the wrapper
+	# exec's. mackas's own code always calls .real directly so the runtime
+	# args are never computed twice (once by the wrapper, once by mackas
+	# itself).
+	KAS_CONTAINER_REAL="$MACKAS_BIN/kas-container.real"
 	SHIM_DIR="$MACKAS_BIN"
 	# kas fragment, as seen from the project checkout (kas rewrites paths
 	# under the repo dir to /repo/... inside the container, so the fragment
@@ -2535,10 +2550,52 @@ check_state() {
 		fi
 	fi
 
-	if [ -x "$KAS_CONTAINER_BIN" ]; then
-		ck_pass "kas-container present: $("$KAS_CONTAINER_BIN" --version 2>&1 | head -1)"
+	# Report the .real / wrapper split correctly, not just "is something
+	# executable at KAS_CONTAINER_BIN" -- that alone can't tell a real
+	# protection wrapper apart from the raw upstream script sitting at the
+	# same path (see write_kas_wrapper()/setup_kas_container()). Query
+	# --version against KAS_CONTAINER_REAL, never the wrapper: the wrapper
+	# shells out to `$SCRIPT_CMD runtime-args` before handing off, which is
+	# pointless overhead for a version check and the wrong semantics besides.
+	if [ -x "$KAS_CONTAINER_REAL" ] && [ -x "$KAS_CONTAINER_BIN" ]; then
+		local wrapper_sum
+		wrapper_sum="$(shasum -a 256 "$KAS_CONTAINER_BIN" | awk '{print $1}')"
+		if [ "$wrapper_sum" = "$KAS_CONTAINER_SHA256" ]; then
+			# The single most important check in this whole rung: the wrapper
+			# file at KAS_CONTAINER_BIN matches the PINNED UPSTREAM sha256,
+			# meaning it is not a wrapper at all any more -- something
+			# overwrote the protection wrapper with the raw upstream script.
+			# Everything else can be installed correctly and this still
+			# silently reopens the bypass write_kas_wrapper() exists to close.
+			ck_fail "the protection wrapper at $KAS_CONTAINER_BIN has been overwritten with the raw upstream kas-container script (its sha256 matches the pinned upstream sha256, not a generated wrapper) -- \$PATH-resolved kas-container calls now bypass mackas entirely, with no volumes, no limits, no auto-appended fragment" \
+				"$SCRIPT_CMD setup   # regenerates the wrapper from the verified .real copy"
+		else
+			ck_pass "kas-container present: $("$KAS_CONTAINER_REAL" --version 2>&1 | head -1)"
+		fi
+	elif [ -x "$KAS_CONTAINER_REAL" ]; then
+		# .real is verified and installed, but the wrapper $PATH actually
+		# resolves 'kas-container' to is missing or not executable -- this is
+		# the exact condition under which a nohup'd or $PATH-resolved build
+		# runs unprotected again (the whole point of this split).
+		ck_fail "kas-container.real is installed and verified, but the protection wrapper at $KAS_CONTAINER_BIN is missing (or not executable) -- nohup/\$PATH-resolved kas-container invocations run unprotected again: no volumes, no limits, no auto-appended fragment" \
+			"$SCRIPT_CMD setup   # regenerates the wrapper"
 	else
 		ck_info "kas-container not installed yet -> $KAS_CONTAINER_BIN"
+	fi
+
+	# A correctly-invoked mackas build never creates a bare "build" directory
+	# directly under the work dir -- volumes are attached via --runtime-args
+	# and KAS_BUILD_DIR/DL_DIR/SSTATE_DIR stay unset (see AGENTS.md invariant
+	# 2). If kas ever ran here with none of that wired up -- exactly what
+	# happens when $PATH resolves 'kas-container' straight to KAS_CONTAINER_REAL
+	# instead of the protection wrapper -- kas falls back to its own default
+	# and creates $MACKAS_WORK/build. Its mere existence is proof-positive
+	# that an unprotected build ran at some point (the kas-container bypass,
+	# issue #27), even if the wrapper is correctly in place right now. This
+	# rung only reports it -- 'check' changes nothing on disk, ever.
+	if [ -d "$MACKAS_WORK/build" ]; then
+		ck_warn "$MACKAS_WORK/build exists -- a correctly-invoked mackas build never creates this directory, so its mere presence is proof an unprotected \$PATH-resolved kas-container build ran at some point (the kas-container bypass, issue #27)" \
+			"rm -rf $(printf '%q' "$MACKAS_WORK/build")"
 	fi
 
 	if [ -z "$MACKAS_PROJECT_URL" ]; then
@@ -3228,14 +3285,20 @@ setup_shim_and_env() {
 	# the whole point -- our values must not expand, the user's shell variables
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
-	local q_root q_base q_project q_cpus q_parallel q_scriptdir q_scriptbin
+	local q_root q_base q_project q_cpus q_parallel q_scriptdir
 	local q_fragrepo q_autofrag q_autoproj
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
-	q_scriptbin="$(shq "$SCRIPT_DIR/$SCRIPT_NAME")"
 	q_work="$(shq "$MACKAS_WORK")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
+	# Deliberately KAS_CONTAINER_BIN (the write_kas_wrapper() protection
+	# wrapper), NOT KAS_CONTAINER_REAL -- this is the one place in this whole
+	# file that is SUPPOSED to call the wrapper rather than the pinned
+	# upstream binary. The generated kas-container() function's entire job at
+	# the point it uses this is to hand off to that wrapper, which is what
+	# supplies the live --runtime-args/volume-blanking/PATH safety net; do not
+	# "fix" this to point at .real.
 	q_kasbin="$(shq "$KAS_CONTAINER_BIN")"
 	q_runtime_args="$(shq "$(kas_runtime_args)")"
 	q_root="$(shq "$MACKAS_ROOT")"
@@ -3304,15 +3367,25 @@ fi
 # limits and volumes only arrive via the --runtime-args flag.
 #
 # 'mackas smoketest' and 'mackas shell' pass all of this for you and are the
-# supported way to build. The wrapper below exists so that a bare
-# 'kas-container ...' typed by hand in this shell gets the same treatment
-# instead of silently building at cpus=4/memory=1gb with no volumes.
+# supported way to build. Two layers now protect a bare, hand-typed
+# 'kas-container ...' from silently building at Apple's cpus=4/memory=1gb
+# defaults with no volumes: $KAS_CONTAINER_BIN (a real script generated by
+# write_kas_wrapper() in $SCRIPT_NAME) protects EVERY invocation shape --
+# nohup, env, an unsourced shell, and this function's own hand-off to it
+# below -- while the kas-container() function defined further down in this
+# file does only what a subprocess fundamentally cannot do in the SAME shell:
+# derive MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG and append the macos-local.yml
+# fragment, both before handing off to that wrapper.
 #
-# This is the value at the moment 'setup' generated this file -- the FALLBACK
-# the wrapper's _mackas_runtime_args() below falls back to only if it cannot
-# ask $SCRIPT_NAME for the live value (a stale/incompatible binary, or
-# settings this shell has since broken). Normal calls never use this frozen
-# copy; see _mackas_runtime_args for why a frozen copy alone was the bug.
+# This is the value at the moment 'setup' generated this file -- conceptually
+# the same FROZEN FALLBACK the $KAS_CONTAINER_BIN wrapper script bakes into
+# its own MACKAS_FROZEN_RUNTIME_ARGS (see write_kas_wrapper()), computed
+# independently there rather than read from this export. The kas-container()
+# function below no longer consults this variable at all -- it delegates
+# --runtime-args (live value AND fallback) entirely to the wrapper now.
+# Kept exported anyway, unchanged, so a shell that already sourced an older
+# env.sh keeps seeing the name it had -- removing it out from under an
+# already-sourced shell is the breaking change, not keeping an unread export.
 export MACKAS_RUNTIME_ARGS=$q_runtime_args
 
 # Absolute path to the generated fragment (empty project -> a path that
@@ -3398,41 +3471,6 @@ _mackas_derive_project() {
 	return 0
 }
 
-# _mackas_runtime_args -- print the CURRENT --runtime-args string by asking
-# $SCRIPT_NAME itself, live, on every call -- so a setting kas_runtime_args()
-# reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a MACKAS_VOLUME_NAME
-# override, ...) takes effect on a hand-typed kas-container call the same
-# way it already does for '$SCRIPT_NAME smoketest'/'shell', not just after
-# the next '$SCRIPT_NAME setup'. See '$SCRIPT_NAME runtime-args --help'.
-#
-# Falls back to the frozen MACKAS_RUNTIME_ARGS (exported above, the value at
-# generation time) if the live call ever fails -- a stale/incompatible
-# $SCRIPT_NAME binary, or a setting this shell has since broken -- so a
-# broken live path degrades to today's behavior rather than breaking the
-# build. Warns on EVERY call while broken, not just once: this function is
-# always invoked through a command substitution ("\$(_mackas_runtime_args)"
-# below), which bash always runs in a subshell, so a "warned already" flag
-# set in here can never survive back to the caller to make later calls
-# quiet -- unlike _mackas_derive_project above, which is called directly
-# (never through "\$(...)") and so can dedupe its own one-time note for real.
-# Repeating the warning while genuinely broken is the honest tradeoff.
-_mackas_runtime_args() {
-	local rt
-	# '|| true' is load-bearing: under 'set -e' zsh (macOS's default shell)
-	# kills this command-substitution subshell at the failing assignment
-	# itself, so without it a broken live path would skip the fallback below
-	# entirely and hand kas-container an EMPTY --runtime-args -- no volumes,
-	# no limits, no warning. bash happens to survive; zsh does not.
-	rt="\$($q_scriptbin runtime-args 2>/dev/null)" || true
-	if [ -n "\$rt" ]; then
-		printf '%s' "\$rt"
-		return 0
-	fi
-	printf '%s: could not recompute --runtime-args live; using the value baked in at setup time (re-run: %s setup)\n' \\
-		"$SCRIPT_NAME" "$SCRIPT_NAME" >&2
-	printf '%s' "\$MACKAS_RUNTIME_ARGS"
-}
-
 kas-container() {
 	# Prepend our bin dir so kas-container ALWAYS finds the GNU realpath shim
 	# installed there, no matter what \$PATH looks like when this is called.
@@ -3512,8 +3550,17 @@ kas-container() {
 			set -- "\$_mackas_sub" "\${_mackas_before[@]}" \${_mackas_files:+"\$_mackas_files"} "\$@"
 			;;
 	esac
-	env PATH=$q_shim:"\$PATH" KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
-		$q_kasbin --runtime-args "\$(_mackas_runtime_args)" "\$@"
+	# Hand off to $KAS_CONTAINER_BIN, the protection wrapper SCRIPT
+	# write_kas_wrapper() generates in $SCRIPT_NAME (see q_kasbin's own
+	# assignment above for why this must stay the wrapper, never .real). IT
+	# now computes --runtime-args live (falling back to a frozen copy the same
+	# way this function used to), blanks KAS_BUILD_DIR/DL_DIR/SSTATE_DIR,
+	# prepends the shim dir to PATH, and sets up the container
+	# engine/image/gitconfig -- none of that belongs here anymore.
+	# MACKAS_KAS_FRAGMENT_DONE=1 tells it the fragment-append above already
+	# ran in this shell, so its own "did this bypass the function?" stderr
+	# note stays quiet for this call.
+	MACKAS_KAS_FRAGMENT_DONE=1 $q_kasbin "\$@"
 }
 
 export BB_NUMBER_THREADS=$q_cpus
@@ -3825,32 +3872,229 @@ setup_volumes() {
 setup_kas_container() {
 	step "kas-container v$KAS_CONTAINER_VERSION"
 	local want_sum have_sum
-	if [ -x "$KAS_CONTAINER_BIN" ]; then
+
+	# Migration, before anything else: every Mac that ran an older mackas has
+	# the raw upstream script sitting directly at KAS_CONTAINER_BIN (the path
+	# $PATH resolves for 'kas-container'). Move it aside to .real -- a pure
+	# `mv`, no re-download -- so write_kas_wrapper() below can put a
+	# protection wrapper where $PATH actually finds it. Only when it already
+	# verifies against the pin: an unverified file is exactly what the
+	# re-fetch path below exists to replace, so let it fall through to that
+	# instead of migrating something we cannot trust.
+	if [ ! -e "$KAS_CONTAINER_REAL" ] && [ -x "$KAS_CONTAINER_BIN" ]; then
 		have_sum="$(shasum -a 256 "$KAS_CONTAINER_BIN" | awk '{print $1}')"
 		if [ "$have_sum" = "$KAS_CONTAINER_SHA256" ]; then
+			run mv "$KAS_CONTAINER_BIN" "$KAS_CONTAINER_REAL"
+			did "moved raw kas-container aside -> $KAS_CONTAINER_REAL so a protection wrapper can take its place"
+		fi
+	fi
+
+	if [ -x "$KAS_CONTAINER_REAL" ]; then
+		have_sum="$(shasum -a 256 "$KAS_CONTAINER_REAL" | awk '{print $1}')"
+		if [ "$have_sum" = "$KAS_CONTAINER_SHA256" ]; then
 			skip "kas-container $KAS_CONTAINER_VERSION verified (sha256 ok)"
+			# Regenerate unconditionally -- see write_kas_wrapper()'s own
+			# comment for why returning here without it would be the bug.
+			write_kas_wrapper
 			return
 		fi
 		warn "      existing kas-container has unexpected sha256; re-fetching"
 	fi
 
 	run mkdir -p "$MACKAS_BIN"
-	run curl -fsSL -o "$KAS_CONTAINER_BIN" "$KAS_CONTAINER_URL"
-	run chmod +x "$KAS_CONTAINER_BIN"
+	run curl -fsSL -o "$KAS_CONTAINER_REAL" "$KAS_CONTAINER_URL"
+	run chmod +x "$KAS_CONTAINER_REAL"
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ verify sha256 == %s%s\n' "$C_DIM" "$KAS_CONTAINER_SHA256" "$C_RST"
+		write_kas_wrapper
 		return
 	fi
 
-	have_sum="$(shasum -a 256 "$KAS_CONTAINER_BIN" | awk '{print $1}')"
+	have_sum="$(shasum -a 256 "$KAS_CONTAINER_REAL" | awk '{print $1}')"
 	if [ "$have_sum" != "$KAS_CONTAINER_SHA256" ]; then
-		rm -f "$KAS_CONTAINER_BIN"
+		rm -f "$KAS_CONTAINER_REAL"
 		die "kas-container sha256 mismatch (got $have_sum, want $KAS_CONTAINER_SHA256)" \
 			"the upstream tag may have moved; verify $KAS_CONTAINER_URL by hand"
 	fi
-	want_sum="$("$KAS_CONTAINER_BIN" --version 2>&1 | head -1 || true)"
-	did "installed $KAS_CONTAINER_BIN ($want_sum, sha256 ok)"
+	want_sum="$("$KAS_CONTAINER_REAL" --version 2>&1 | head -1 || true)"
+	did "installed $KAS_CONTAINER_REAL ($want_sum, sha256 ok)"
+	write_kas_wrapper
+}
+
+# write_kas_wrapper -- (re)generate the protection wrapper that lands at
+# KAS_CONTAINER_BIN, the path $PATH actually resolves 'kas-container' to.
+# KAS_CONTAINER_REAL (the pinned upstream script) never sits on $PATH itself.
+#
+# Called unconditionally at the end of setup_kas_container(), on every path
+# including the skip path where .real was already verified and nothing else
+# changed -- exactly like env.sh/gitconfig regeneration elsewhere in this
+# file: deterministic, idempotent, cheap to redo. Returning early on that
+# skip path without writing this file would leave a verified .real with no
+# wrapper in front of it, which is the exact bug this mechanism exists to
+# close: a bare, hand-typed 'kas-container build ...' on $PATH would run the
+# raw upstream script directly, at Apple's cpus=4/memory=1gb defaults, with
+# no ext4 volumes attached at all.
+#
+# Quoting discipline copies setup_shim_and_env()'s own generated env.sh:
+# every interpolated value goes through shq() before it lands in the
+# heredoc, never raw inside a "..." -- a MACKAS_ROOT or gitconfig path with a
+# double quote or $ in it is a legal APFS path, not an edge case, and pasting
+# it straight into the heredoc would make it code the wrapper's own shell
+# executes rather than an inert value.
+write_kas_wrapper() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '%s+ write %s%s\n' "$C_DIM" "$KAS_CONTAINER_BIN" "$C_RST"
+		return
+	fi
+
+	local q_real q_shim q_self q_work q_image q_gitconfig q_rtargs q_scriptname
+	q_real="$(shq "$KAS_CONTAINER_REAL")"
+	q_shim="$(shq "$SHIM_DIR")"
+	q_self="$(shq "$SCRIPT_DIR/$SCRIPT_NAME")"
+	q_work="$(shq "$MACKAS_WORK")"
+	q_image="$(shq "$KAS_IMAGE")"
+	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
+	q_rtargs="$(shq "$(kas_runtime_args)")"
+	q_scriptname="$(shq "$SCRIPT_NAME")"
+
+	run mkdir -p "$MACKAS_BIN"
+	cat > "$KAS_CONTAINER_BIN" <<EOF
+#!/bin/sh
+# Generated by $SCRIPT_NAME v$SCRIPT_VERSION -- a protection wrapper, not the
+# real kas-container. Do not edit by hand; re-run '$SCRIPT_NAME setup' to
+# regenerate it (cheap, deterministic, safe to redo any time).
+#
+# \$PATH resolves 'kas-container' to THIS file, never KAS_CONTAINER_REAL (the
+# real upstream script, baked in below) directly -- so a bare, hand-typed
+# 'kas-container build ...' gets the same volumes/limits/gitconfig treatment
+# as '$SCRIPT_NAME smoketest'/'$SCRIPT_NAME shell', instead of silently
+# launching at Apple's cpus=4/memory=1gb defaults with NO ext4 volumes
+# attached (see kas_runtime_args() in $SCRIPT_NAME for why bind-mounting
+# APFS in their place would be actively wrong, not merely slower).
+#
+# POSIX /bin/sh only, no bash-only syntax (no arrays, no 'local') -- this may
+# be invoked by any shell that happens to be on \$PATH, not just the one
+# $SCRIPT_NAME itself runs under.
+
+KAS_CONTAINER_REAL=$q_real
+SHIM_DIR=$q_shim
+MACKAS_SELF=$q_self
+MACKAS_WORK=$q_work
+KAS_IMAGE=$q_image
+MACKAS_GITCONFIG=$q_gitconfig
+SCRIPT_NAME=$q_scriptname
+# The --runtime-args string in effect when '$SCRIPT_NAME setup' generated
+# this file -- the FALLBACK used only if live recomputation below fails (a
+# stale/incompatible $SCRIPT_NAME binary, or a setting this shell has since
+# broken). Normal calls never use this frozen copy.
+MACKAS_FROZEN_RUNTIME_ARGS=$q_rtargs
+
+# Re-entry guard. KAS_CONTAINER_REAL must never lead back to this wrapper --
+# a symlink loop, or .real somehow replaced by a copy of this file -- would
+# otherwise re-inject --runtime-args and call itself again forever, a fork
+# bomb instead of a clean failure.
+if [ "\$MACKAS_KAS_WRAPPED" = "1" ]; then
+	echo "\$SCRIPT_NAME: kas-container wrapper re-entry detected; execing the real binary directly" >&2
+	exec "\$KAS_CONTAINER_REAL" "\$@"
+fi
+
+# If the caller already passed --runtime-args/--docker-args itself, do not
+# inject a second one: kas-container ACCUMULATES repeated --runtime-args
+# values instead of the last one winning, so adding ours alongside the
+# caller's own would double every -v mount rather than replace it. Only the
+# LEADING options are scanned -- up to the first token that is not itself an
+# option, kas's own subcommand/file-list argument -- so a later, unrelated
+# positional value can never be mistaken for this flag.
+for _mackas_kas_arg in "\$@"; do
+	case "\$_mackas_kas_arg" in
+		--runtime-args|--docker-args|--runtime-args=*|--docker-args=*)
+			MACKAS_KAS_WRAPPED=1 exec "\$KAS_CONTAINER_REAL" "\$@"
+			;;
+		-*)
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+# Live recompute: ask $SCRIPT_NAME itself for today's --runtime-args string,
+# so a setting change (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a
+# MACKAS_VOLUME_NAME override, ...) reaches a hand-typed 'kas-container ...'
+# the same way it already reaches '$SCRIPT_NAME smoketest'/'shell', not just
+# after the next '$SCRIPT_NAME setup'.
+#
+# '|| true' matters here for the same reason it matters in env.sh's own
+# _mackas_runtime_args(): under 'set -e', a failing command substitution
+# would abort before the fallback below ever runs, handing kas-container an
+# EMPTY --runtime-args -- no volumes, no limits, no warning -- instead of
+# degrading to the frozen copy above.
+rt="\$("\$MACKAS_SELF" runtime-args 2>/dev/null)" || true
+
+if [ -z "\$rt" ]; then
+	echo "\$SCRIPT_NAME: could not recompute --runtime-args live; using the value baked in at setup time (re-run: \$SCRIPT_NAME setup)" >&2
+	rt="\$MACKAS_FROZEN_RUNTIME_ARGS"
+fi
+
+# Validate whichever string is about to be used, live or fallback: it must
+# be non-empty and name all three ext4 volumes kas_runtime_args() always
+# emits. Refusing here, rather than exec'ing anyway, is deliberate -- a
+# multi-hour build with no protected storage attached is strictly worse
+# than failing fast before it ever starts.
+_mackas_kas_ok=1
+case "\$rt" in
+	*":/build"*) ;;
+	*) _mackas_kas_ok=0 ;;
+esac
+case "\$rt" in
+	*":/downloads"*) ;;
+	*) _mackas_kas_ok=0 ;;
+esac
+case "\$rt" in
+	*":/sstate"*) ;;
+	*) _mackas_kas_ok=0 ;;
+esac
+if [ -z "\$rt" ] || [ "\$_mackas_kas_ok" != "1" ]; then
+	echo "\$SCRIPT_NAME: refusing to launch kas-container -- --runtime-args is empty or missing an ext4 volume (/build, /downloads, /sstate); this would build with NO protected storage attached" >&2
+	exit 1
+fi
+
+# The fragment-append (macos-local.yml: parallelism, BB_DISKMON_DIRS,
+# BB_HASHSERVE_DB_DIR, mirrors) only happens in the env.sh shell function,
+# which this direct invocation bypassed entirely. MACKAS_KAS_FRAGMENT_DONE is
+# not set yet by anything as of this mackas version, so this note always
+# prints for now -- expected, and it will stop once a later change makes the
+# env.sh function set it before calling into this wrapper.
+if [ "\$MACKAS_KAS_FRAGMENT_DONE" != "1" ]; then
+	echo "\$SCRIPT_NAME: macos-local.yml was not appended to this invocation (it did not go through the env.sh shell function) -- '$SCRIPT_NAME smoketest'/'$SCRIPT_NAME shell' are the fully-featured path" >&2
+fi
+
+# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are set EMPTY, not unset: an old env.sh
+# sourced in this shell may still export them at an APFS path, and a
+# non-empty value would make kas-container's forward_dir() bind-mount that
+# path over the ext4 volume \$rt just asked for. forward_dir() returns early
+# only on an empty value, not on an unset one -- see run_kas()'s own comment
+# in $SCRIPT_NAME for the fuller story.
+#
+# --runtime-args must be given BEFORE \$@: kas-container's own argument
+# parser stops recognizing its own flags at the first non-option token (the
+# subcommand), so appending it after \$@ would leave it unparsed.
+#
+# GITCONFIG_FILE honours one already in the environment (":-", exactly like
+# env.sh's own GITCONFIG_FILE handling) -- a value the user exported
+# themselves always wins over the one baked in here at generation time.
+exec env PATH="\$SHIM_DIR:/opt/homebrew/bin:\$PATH" \\
+	MACKAS_KAS_WRAPPED=1 \\
+	KAS_CONTAINER_ENGINE=docker \\
+	KAS_WORK_DIR="\$MACKAS_WORK" \\
+	KAS_CONTAINER_IMAGE="\$KAS_IMAGE" \\
+	GITCONFIG_FILE="\${GITCONFIG_FILE:-\$MACKAS_GITCONFIG}" \\
+	KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
+	"\$KAS_CONTAINER_REAL" --runtime-args "\$rt" "\$@"
+EOF
+	run chmod +x "$KAS_CONTAINER_BIN"
+	did "wrote $KAS_CONTAINER_BIN"
 }
 
 setup_project() {
@@ -4578,6 +4822,51 @@ auto_fstrim() {
 	return 0
 }
 
+# clear_stale_sockets [LOG] -- remove any bitbake.sock/hashserve.sock that
+# ended up on the host-visible checkout/work tree (a virtiofs bind mount)
+# instead of inside an ext4 volume. This only happens when a build bypasses
+# mackas's normal invocation (a stale kas-container binary still on $PATH, a
+# config error, etc. -- see issue #27), but once it happens the socket is
+# stuck FOREVER from the guest's point of view: bind() succeeds once, but
+# every later stat/unlink on that same path fails with ENOTSUP. It is,
+# however, an ordinary special file from macOS's own side, so a host-side rm
+# clears it -- this is that sweep, run before a build starts so a leftover
+# from a past bypassed/failed build cannot make the NEXT one fail to bind.
+# Gated by MACKAS_SOCKET_SWEEP (default on) and by all three volumes
+# reporting NOT in use -- the same nothing-holds-the-volumes window
+# auto_fstrim/clear_buildstats_before_build use -- so it can never run while a
+# real build might plausibly be listening on one of these paths. STRICTLY
+# non-fatal, like its neighbors: a sweep failure must never change a build's
+# exit status.
+clear_stale_sockets() {
+	[ "${MACKAS_SOCKET_SWEEP:-1}" = "1" ] || return 0
+	local log="${1:-}" v
+
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		volume_in_use "$v" && return 0
+	done
+
+	_sweep_stale_sockets_in() {
+		local dir="$1" maxdepth="$2" f
+		[ -d "$dir" ] || return 0
+		find "$dir" -maxdepth "$maxdepth" -type s \
+			\( -name bitbake.sock -o -name hashserve.sock \) 2>/dev/null |
+		while IFS= read -r f; do
+			if [ -n "$log" ]; then
+				warn "removing stale socket $f (left behind by a build whose control connection ended up on the host-visible checkout/work tree instead of the ext4 volume; virtiofs makes it permanently stuck from the guest's side, but it is an ordinary file from macOS's own side)" >>"$log" 2>&1 || true
+			else
+				warn "removing stale socket $f (left behind by a build whose control connection ended up on the host-visible checkout/work tree instead of the ext4 volume; virtiofs makes it permanently stuck from the guest's side, but it is an ordinary file from macOS's own side)"
+			fi
+			rm -f "$f" || true
+		done
+		return 0
+	}
+
+	_sweep_stale_sockets_in "$MACKAS_WORK/build" 2
+	_sweep_stale_sockets_in "$MACKAS_PROJECT" 1
+	return 0
+}
+
 # clear_buildstats_before_build [LOG] -- delete tmp/buildstats in the TMPDIR
 # volume right before a build starts, unless MACKAS_BUILDSTATS_ACCUMULATE=1.
 # ON by default: buildstats.bbclass opens build_stats in APPEND mode and never
@@ -4647,7 +4936,7 @@ run_kas() {
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ (cd %s && %s --runtime-args %s %s)%s\n' \
 			"$C_DIM" "$(printf '%q' "$MACKAS_PROJECT")" \
-			"$(printf '%q' "$KAS_CONTAINER_BIN")" "$(printf '%q' "$rt_args")" \
+			"$(printf '%q' "$KAS_CONTAINER_REAL")" "$(printf '%q' "$rt_args")" \
 			"$(quote_cmd "$@")" "$C_RST"
 		return 0
 	fi
@@ -4668,13 +4957,18 @@ run_kas() {
 		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
 		BB_NUMBER_THREADS="$MACKAS_CPUS" \
 		PARALLEL_MAKE="-j $MACKAS_CPUS" \
-		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" "$@"
+		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" "$@"
 	}
 
 	# Reclaim the images before the run (they may have ratcheted up last time)
 	# and after (this run's peak is now dead space). Both happen while nothing
 	# holds the volumes -- the kas container has not started / has exited.
 	auto_fstrim before "$log"
+
+	# Same window: nothing holds the volumes yet, so sweeping any stranded
+	# bitbake.sock/hashserve.sock is safe here too (see clear_stale_sockets
+	# for the virtiofs-stuck-socket mechanism this defends against).
+	clear_stale_sockets "$log"
 
 	# Same window: nothing holds the volume yet, so clearing tmp/buildstats is
 	# safe here too (see clear_buildstats_before_build for why this defaults on).
@@ -4826,7 +5120,7 @@ kas_shell_ro() {
 		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
 		BB_NUMBER_THREADS="$MACKAS_CPUS" \
 		PARALLEL_MAKE="-j $MACKAS_CPUS" \
-		"$KAS_CONTAINER_BIN" --runtime-args "$rt_args" shell $kflag "$KAS_FILES_ARG" -c "$cmdstring"
+		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" shell $kflag "$KAS_FILES_ARG" -c "$cmdstring"
 	)
 }
 
@@ -5056,7 +5350,12 @@ cleanup_example_project() {
 # full 'setup' lands here -- and nothing external needs installing (unlike a
 # missing 'container' or Homebrew), so mackas can just do it.
 ensure_kas_container_installed() {
-	[ -x "$KAS_CONTAINER_BIN" ] && return 0
+	# Both files must be present: KAS_CONTAINER_BIN alone could be a wrapper
+	# with no .real behind it to exec (fails at build time, not here), and
+	# KAS_CONTAINER_REAL alone means $PATH still resolves 'kas-container' to
+	# nothing -- the exact unprotected-invocation bug this wrapper exists to
+	# close. Either half-state must be treated as "not installed".
+	[ -x "$KAS_CONTAINER_REAL" ] && [ -x "$KAS_CONTAINER_BIN" ] && return 0
 	warn "      kas-container is not installed yet."
 	if ! confirm "      Install it now (setup's own step)?"; then
 		die "kas-container not installed" "$SCRIPT_CMD setup"
@@ -6231,7 +6530,8 @@ cmd_status() {
 	hdr "Present?"
 	local p
 	for p in "$MACKAS_ROOT" "$MACKAS_SHORT_LINK" "$MACKAS_ENV_SH" "$KAS_CONTAINER_BIN" \
-	         "$SHIM_DIR/docker" "$MACKAS_PROJECT" "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_KAS_FRAGMENT_REPO"; do
+	         "$KAS_CONTAINER_REAL" "$SHIM_DIR/docker" "$MACKAS_PROJECT" \
+	         "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_KAS_FRAGMENT_REPO"; do
 		if [ -e "$p" ]; then
 			printf '  %s[yes]%s %s\n' "$C_GRN" "$C_RST" "$p"
 		else
