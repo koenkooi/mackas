@@ -371,6 +371,7 @@ it to the user):
 
 ```sh
 mackas retrieve deploy                    # -> $MACKAS_BASE/artifacts/, can be tens of GB
+mackas retrieve deploy images [MACHINE]   # just the boot images for one board, not the whole feed
 mackas retrieve buildstats logs           # -> artifacts/{buildstats,logs}
 mackas retrieve buildhistory
 mackas retrieve buildstats --dest ~/out

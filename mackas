@@ -5771,11 +5771,16 @@ fetch_tmp_subdir() {
 	# failure (permissions, an exotic guest fs) never masks a directory that
 	# DOES exist -- size reporting is a nicety, not a precondition; only a
 	# missing directory (the `[ -d ] || exit 1`) is treated as absent.
-	# printf %q quotes $guest safely for the sh -c string.
-	local probe rc size_kb=""
+	# printf %q quotes $guest safely for the sh -c string. `|| rc=$?` (never a
+	# bare `rc=$?` on the next line) -- under this script's set -euo
+	# pipefail, a failing substitution trips set -e before a later bare
+	# `rc=$?` line ever runs, same idiom sstate_prune/attach_workspace_image
+	# already use. NOT `2>/dev/null` on the outer command: a genuine runtime
+	# failure (the VM never started, the image is missing) must still reach
+	# the user, not be silently folded into "no such directory".
+	local probe rc=0 size_kb=""
 	probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
-		sh -c "[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0" 2>/dev/null)"
-	rc=$?
+		sh -c "[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0")" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		case "$sub" in
 			buildstats)
@@ -5804,7 +5809,13 @@ fetch_tmp_subdir() {
 		return 1
 	fi
 
-	size_kb="$(printf '%s\n' "$probe" | awk '{print $1; exit}')"
+	# NOT the first line: $probe is captured through $(...), not a real TTY,
+	# so Apple container's own boot-progress reporting ("[3/6] Fetching
+	# kernel [0s]", see volume_fstrim_one's identical noise) can precede the
+	# real `du -sk` line here too. Only a line actually shaped like `du`'s
+	# own "SIZE<TAB-or-space>PATH" output -- starting with digits -- is a
+	# candidate; the LAST such line wins, in case more than one appears.
+	size_kb="$(printf '%s\n' "$probe" | awk '/^[0-9]+[ \t]/ { v = $1 } END { print v }')"
 	case "$size_kb" in ''|*[!0-9]*) size_kb="" ;; esac
 	if [ -n "$size_kb" ]; then
 		info "  $sub: $(fmt_kb "$size_kb") to transfer to $dest"
@@ -5968,6 +5979,16 @@ cmd_retrieve() {
 						''|-*|buildstats|logs|deploy|buildhistory|help)
 							objects[$idx]="deploy:images" ;;
 						*)
+							# A MACHINE substitutes straight into the trailing
+							# path component of a resolved guest path (see
+							# fetch_tmp_subdir) -- refuse anything shaped like
+							# a path escape ('/', '..') rather than let a typo
+							# silently retrieve some other directory entirely.
+							case "$1" in
+								*/*|*..*)
+									die "MACHINE '$1' looks unsafe (contains '/' or '..')" \
+										"a MACHINE is a plain name, e.g. 'qemuarm64', not a path" ;;
+							esac
 							objects[$idx]="deploy:images:$1"; shift ;;
 					esac
 				fi
@@ -6012,6 +6033,16 @@ cmd_retrieve() {
 		die "volume '$MACKAS_VOL_TMP' is attached to a running container" \
 			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD retrieve'"
 	fi
+	# fetch_tmp_subdir's existence+size probe now always attaches the volume
+	# for real, dry-run or not (item 33) -- refuse before that if it does not
+	# exist yet at all, the same guard clean_tmp_deploy/sstate_prune already
+	# have, rather than let a bind-mount of a not-yet-created named volume
+	# have whatever side effect Apple's runtime gives one during a mere
+	# preview.
+	if ! volume_exists "$MACKAS_VOL_TMP"; then
+		warn "Nothing to retrieve -- '$MACKAS_VOL_TMP' does not exist yet ($SCRIPT_CMD setup)"
+		return 1
+	fi
 
 	info "${C_BLD}mackas retrieve${C_RST}"
 	info "  volume  : $MACKAS_VOL_TMP"
@@ -6047,7 +6078,6 @@ cmd_retrieve() {
 			buildstats)   var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
 			buildhistory) var="BUILDHISTORY_DIR"; default="/build/buildhistory" ;;
 			deploy:images|deploy:images:*)
-				sub="deploy/images"
 				var="DEPLOY_DIR_IMAGE"
 				# Everything after the second ':' is the optional MACHINE
 				# override (empty when the user just wrote 'deploy images'
@@ -6059,6 +6089,11 @@ cmd_retrieve() {
 				machine="${it#deploy:images}"
 				machine="${machine#:}"
 				default="/build/tmp/deploy/images${machine:+/$machine}"
+				# destsub (below) is named after sub, so it must ALSO carry
+				# the machine -- otherwise 'deploy images boardA' followed by
+				# 'deploy images boardB' would both land in the same
+				# $dest/deploy/images, silently merging two boards' outputs.
+				sub="deploy/images${machine:+/$machine}"
 				;;
 		esac
 		# fetch_tmp_subdir itself now measures and prints the real size to
