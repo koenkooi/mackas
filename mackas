@@ -5711,10 +5711,20 @@ fetch_tmp_subdir() {
 		warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
 	fi
 
-	# Existence probe first, so "no build has run yet" is a clear message and
-	# not an obscure cp failure. Under --dry-run run() prints and returns 0, so
-	# the copy command below is still shown.
-	if ! run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" test -d "$guest"; then
+	# Existence probe AND a real size measurement in the SAME container hop --
+	# a VM boot is the expensive part, not the extra `du`. Always runs for
+	# real, dry-run or not (same reasoning as clean_tmp_deploy/sstate_prune's
+	# own probes): a --dry-run preview is more useful showing the REAL
+	# transfer size than an assumed yes. The trailing `exit 0` means a `du`
+	# failure (permissions, an exotic guest fs) never masks a directory that
+	# DOES exist -- size reporting is a nicety, not a precondition; only a
+	# missing directory (the `[ -d ] || exit 1`) is treated as absent.
+	# printf %q quotes $guest safely for the sh -c string.
+	local probe rc size_kb=""
+	probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
+		sh -c "[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0" 2>/dev/null)"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
 		case "$sub" in
 			buildstats)
 				warn "  no $guest in '$MACKAS_VOL_TMP' -- has a build run yet? ($SCRIPT_CMD smoketest)"
@@ -5740,6 +5750,30 @@ fetch_tmp_subdir() {
 				;;
 		esac
 		return 1
+	fi
+
+	size_kb="$(printf '%s\n' "$probe" | awk '{print $1; exit}')"
+	case "$size_kb" in ''|*[!0-9]*) size_kb="" ;; esac
+	if [ -n "$size_kb" ]; then
+		info "  $sub: $(fmt_kb "$size_kb") to transfer to $dest"
+
+		# Warn, never refuse: retrieve is a copy, not a destructive operation,
+		# and a df estimate can be wrong (sparse files, other things writing
+		# to the same filesystem concurrently) -- a real ENOSPC failing the
+		# cp -r partway is an acceptable fallback for what is fundamentally
+		# just a heads-up. Walk up to the nearest existing ancestor: $dest
+		# itself may not be created yet (the mkdir -p below, or --dry-run,
+		# which never creates it at all).
+		local df_target="$dest" free_kb
+		while [ -n "$df_target" ] && [ ! -d "$df_target" ]; do
+			df_target="$(dirname "$df_target")"
+		done
+		free_kb="$(df -k "$df_target" 2>/dev/null | awk 'NR==2{print $4}')"
+		case "$free_kb" in
+			''|*[!0-9]*) ;;
+			*) [ "$free_kb" -ge "$size_kb" ] || \
+				warn "  $dest may not have enough free space for $sub ($(fmt_kb "$free_kb") free, $(fmt_kb "$size_kb") needed)" ;;
+		esac
 	fi
 
 	destsub="$sub${extra:+/$extra}"
@@ -5826,6 +5860,13 @@ ${C_BLD}A CONSTANT BUILDNAME${C_RST}
 ${C_BLD}ONE-VM RULE${C_RST}
   Only one VM may access an ext4 image at a time. retrieve refuses while a
   running build (smoketest/shell) still holds the TMPDIR volume -- stop it first.
+
+${C_BLD}TRANSFER SIZE${C_RST}
+  Each object's real size is measured (not guessed) before it is copied, and
+  printed as e.g. 'deploy: 4.2G to transfer to \$dest' -- this also runs under
+  --dry-run. If \$dest's filesystem looks too small for it, retrieve warns
+  (never refuses); a du/df failure never blocks the retrieval either, size
+  reporting is a nicety, not a precondition.
 EOF
 }
 
@@ -5921,7 +5962,11 @@ cmd_retrieve() {
 			buildstats)   var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
 			buildhistory) var="BUILDHISTORY_DIR"; default="/build/buildhistory" ;;
 		esac
-		[ "$it" = "deploy" ] && warn "  deploy can be large (tens of GB); this may take a while and fill $dest"
+		# fetch_tmp_subdir itself now measures and prints the real size to
+		# transfer (and warns if $dest looks too small) -- replacing what used
+		# to be one hardcoded "deploy can be large" guess that said nothing
+		# about the other three objects and nothing real about this
+		# project's actual deploy/ contents.
 		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
