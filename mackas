@@ -5289,6 +5289,13 @@ smoketest_rung() {
 print_build_summary() {
 	local label="$1" log="$2" start_s="$3" end_s="$4" target elapsed_s elapsed_min tasks suffix
 	target="${label#build }"
+	# The no-explicit-target rung's label is the parenthesised
+	# "(kas config's own default target)" -- strip the parens so the summary
+	# reads as a sentence ("kas config's own default target built ...")
+	# instead of carrying them into the middle of one.
+	case "$target" in
+		\(*\)) target="${target#(}"; target="${target%)}" ;;
+	esac
 	elapsed_s=$(( end_s - start_s ))
 	elapsed_min="$(LC_ALL=C awk -v s="$elapsed_s" 'BEGIN { printf "%.1f", s / 60 }')"
 	tasks="$(grep -oE 'Attempted [0-9]+ tasks' "$log" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)"

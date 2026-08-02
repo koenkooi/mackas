@@ -201,6 +201,24 @@ EOF
 	printf '%s\n' "$output" | grep -qF '6253 tasks'
 }
 
+@test "smoketest ladder: the default-target rung's summary reads naturally, without the label's parens" {
+	# No MACKAS_SMOKETEST_TARGETS at all -- the ladder's own "no explicit
+	# target" rung, labelled "build (kas config's own default target)".
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+echo "kas-fake-stdout-marker"
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 --set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai --set MACKAS_KAS_CONFIG=kas/base.yml smoketest
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "✓ kas config's own default target built"
+	! printf '%s\n' "$output" | grep -qF '✓ ('
+}
+
 @test "smoketest ladder: the summary omits the task count rather than guess when it cannot be read" {
 	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
