@@ -308,6 +308,17 @@
 #MACKAS_BUILDSTATS_ACCUMULATE=0
 
 
+# Sweep away any bitbake.sock/hashserve.sock stranded on the host-visible
+# checkout/work tree before every kas run (see `clear_stale_sockets` in
+# mackas). This can only happen when a build bypasses mackas's normal
+# invocation, but once it does the socket is stuck forever from the guest's
+# side (virtiofs), even though it is an ordinary file macOS can remove. ON by
+# default is safe: it only ever touches bitbake.sock/hashserve.sock, only at
+# $MACKAS_WORK/build and the project checkout, and only when none of the
+# three build volumes report in use. Set to 0 to disable.
+#MACKAS_SOCKET_SWEEP=1
+
+
 # Live bitbake progress bridge (OPTIONAL, opt-in). With MACKAS_MONITOR=1 a build
 # publishes its progress as JSON over HTTP from inside its own container, and
 # `mackas monitor` polls it and prints one line per update. OFF by default: it
