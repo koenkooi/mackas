@@ -146,6 +146,7 @@ from macOS. `mackas retrieve` copies them out with a throwaway container:
 ```sh
 ./mackas retrieve buildstats                # -> $MACKAS_BASE/artifacts/
 ./mackas retrieve buildstats logs deploy    # also tmp/log and tmp/deploy; deploy can be tens of GB
+./mackas retrieve deploy images [MACHINE]   # just the boot images for one board, not the whole feed
 ./mackas retrieve buildhistory              # what each build produced, if the project inherits it
 ./mackas retrieve buildstats --dest ~/out   # elsewhere
 ./mackas buildstats analyze [PATH]          # summarise what was fetched

@@ -83,7 +83,16 @@ EOF
 
 case "$1 $2" in
 	"system status") echo "status running"; exit 0 ;;
-	"volume ls") echo "NAME"; exit 0 ;;
+	"volume ls")
+		# volume_exists() gates cmd_retrieve's whole run (item 33 follow-up:
+		# fetch_tmp_subdir's probe always attaches the volume for real, so
+		# retrieve refuses up front rather than bind-mount a name that was
+		# never created) -- report the TMPDIR volume present, matching a
+		# project that has actually run a build.
+		echo "NAME TYPE DRIVER OPTIONS"
+		echo "oe-build-tmp named local size=120G"
+		exit 0
+		;;
 	"image ls") echo "NAME TAG"; echo "ghcr.io/siemens/kas/kas 5.4"; exit 0 ;;
 	"container ls"|"ls ")
 		echo "ID  IMAGE  STATE"
@@ -122,6 +131,14 @@ done
 # success), just nothing printed.
 case "${@: -1}" in
 	*"du -sk"*)
+		# MOCK_PROBE_RUNTIME_FAIL models the container RUNTIME itself failing
+		# (a VM that never booted, a missing image) -- distinct from the
+		# script's own controlled `exit 1` for "no such directory": this one
+		# writes to stderr, which must reach the user, not be swallowed.
+		if [ -n "${MOCK_PROBE_RUNTIME_FAIL:-}" ]; then
+			echo "container: fake runtime error: could not start the VM" >&2
+			exit 125
+		fi
 		guest="$(printf '%s\n' "${@: -1}" | sed -E 's#.*du -sk ([^ ]+).*#\1#')"
 		sub="${guest##*/}"
 		case " $MOCK_TMP_HAS " in
@@ -156,9 +173,14 @@ case "$last" in
 				;;
 			*) guestsub="${guestdir##*/}" ;;
 		esac
-		if [ -n "$outdir" ] && [ -d "$FIXTURE/$guestsub" ]; then
+		# mkdir -p is unconditional in the REAL sh -c string (it runs before
+		# `&&`), so it is unconditional here too; only the cp -r half depends
+		# on a matching fixture existing (a test that just wants to see the
+		# destination land in the right place, without needing real fixture
+		# content there, still gets a real "$outdir/$destsub" directory).
+		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
-			cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
 		fi
 		exit 0
 		;;
@@ -365,6 +387,16 @@ EOF
 	! printf '%s\n' "$output" | grep -qF 'to transfer'
 }
 
+@test "retrieve: a genuine runtime failure's stderr reaches the user, not swallowed" {
+	# Distinct from "no such directory" (a controlled exit 1 with no stderr,
+	# reported as the friendly 'has a build run yet?' message): a real
+	# runtime failure must surface its own text, the way it did before the
+	# combined probe existed.
+	MOCK_PROBE_RUNTIME_FAIL=1 mk retrieve buildstats
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'fake runtime error'
+}
+
 @test "retrieve: warns when the destination looks too small for the measured size" {
 	# An absurdly large MOCK_DU_KB (~9.5 PiB) guarantees no real disk has that
 	# much free space, so this needs no df fake -- the real df on this host is
@@ -472,6 +504,48 @@ STUB
 	[ "$status" -eq 0 ]
 	assert_call "-d /build/tmp/deploy ]"
 	[ -d "$ROOT/artifacts/deploy" ]
+}
+
+@test "retrieve: a MACHINE shaped like a path escape is refused before ever touching the runtime" {
+	mk retrieve deploy images ../../etc
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'looks unsafe'
+	refute_call "-d "
+}
+
+@test "retrieve: a MACHINE containing a bare slash is also refused" {
+	mk retrieve deploy images some/where
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'looks unsafe'
+}
+
+@test "retrieve: two different MACHINE overrides land in two different destinations" {
+	MOCK_TMP_HAS="boardA" mk retrieve deploy images boardA
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/images/boardA" ]
+	rm -rf "$CLOG"; : > "$CLOG"
+	MOCK_TMP_HAS="boardB" mk retrieve deploy images boardB
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/images/boardB" ]
+	# boardA's destination is untouched by boardB's retrieval.
+	[ -d "$ROOT/artifacts/deploy/images/boardA" ]
+}
+
+@test "retrieve: refuses cleanly when the TMPDIR volume does not exist at all" {
+	cat > "$TESTDIR/fakebin/container" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+	"system status") echo "status running"; exit 0 ;;
+	"volume ls") echo "NAME TYPE DRIVER OPTIONS"; exit 0 ;;
+	"container ls"|"ls "*|"ls") echo "ID"; exit 0 ;;
+esac
+exit 0
+EOF
+	chmod +x "$TESTDIR/fakebin/container"
+	mk retrieve buildstats
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'does not exist yet'
+	refute_call "-d "
 }
 
 # ---------------------------------------------------------------------------
