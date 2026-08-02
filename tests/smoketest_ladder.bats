@@ -1,6 +1,8 @@
 #!/usr/bin/env bats
 #
-# Tests for the smoketest ladder's FAILURE path -- cmd_smoketest / smoketest_rung.
+# Tests for the smoketest ladder's FAILURE path, and (item 16) its
+# build-completion summary line -- cmd_smoketest / smoketest_rung /
+# print_build_summary.
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -171,4 +173,82 @@ FILES="kas/base.yml:kas/macos-local.yml"
 	local bad
 	bad="$(grep -c -v "^PWD=$PROJ|" "$KLOG" || true)"
 	[ "$bad" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Item 16: the build-completion summary line
+# ---------------------------------------------------------------------------
+#
+# A single successful target ("a") so the ladder never reaches the
+# deliberately-failing "b"/"c" from the shared fake -- these tests replace
+# kas-container.real with their own success-only stub.
+
+@test "smoketest ladder: a successful build rung prints the completion summary" {
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+echo "kas-fake-stdout-marker"
+echo "NOTE: Tasks Summary: Attempted 6253 tasks of which 6100 didn't need to be rerun and all succeeded."
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 --set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai --set MACKAS_KAS_CONFIG=kas/base.yml \
+		--set "MACKAS_SMOKETEST_TARGETS=a" smoketest
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF '✓ a built'
+	printf '%s\n' "$output" | grep -qF '6253 tasks'
+}
+
+@test "smoketest ladder: the summary omits the task count rather than guess when it cannot be read" {
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+echo "kas-fake-stdout-marker (no Tasks Summary line this time)"
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 --set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai --set MACKAS_KAS_CONFIG=kas/base.yml \
+		--set "MACKAS_SMOKETEST_TARGETS=a" smoketest
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF '✓ a built'
+	! printf '%s\n' "$output" | grep -qF 'tasks)'
+}
+
+@test "smoketest ladder: no completion summary for the parse-only rung, only the build rung" {
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 --set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai --set MACKAS_KAS_CONFIG=kas/base.yml \
+		--set "MACKAS_SMOKETEST_TARGETS=a" smoketest
+	[ "$status" -eq 0 ]
+	[ "$(printf '%s\n' "$output" | grep -cF '✓ ')" -eq 1 ]
+}
+
+@test "smoketest ladder: --dry-run never prints a fabricated completion summary" {
+	run "$MACKAS" -y --dry-run --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 --set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai --set MACKAS_KAS_CONFIG=kas/base.yml \
+		--set "MACKAS_SMOKETEST_TARGETS=a" smoketest
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qF '✓ '
+}
+
+@test "smoketest ladder: a failing build rung never prints a completion summary" {
+	# The shared 'smoketest' helper's targets are "a b c", "b" deliberately
+	# failing -- "a" builds successfully first and DOES get a summary; only
+	# the failing "b" (where the ladder stops) must never get one.
+	smoketest
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF '✓ a built'
+	! printf '%s\n' "$output" | grep -qF '✓ b built'
 }
