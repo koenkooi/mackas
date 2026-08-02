@@ -175,6 +175,24 @@ mk() {
 	grep -qxF "MACKAS_PROJECT_DIR='meta-ai'" "$TESTDIR/newconfig.conf"
 }
 
+@test "adopt: a detached-HEAD checkout reports no branch, not the literal HEAD" {
+	# kas checks layers out to a pinned revision, which is normally a detached
+	# HEAD -- this is the everyday case adopt_introspect_project must get
+	# right, not an edge case. `git rev-parse --abbrev-ref HEAD` used to
+	# print the literal string "HEAD" here (exit 0, not empty), so the
+	# "<none: detached HEAD>" fallback below never fired and
+	# MACKAS_PROJECT_BRANCH got the bogus value 'HEAD' written to disk.
+	mkdir -p "$FOREIGN/work" "$FOREIGN/bin"
+	git clone -q -b testbranch "$FIXTURE" "$FOREIGN/work/meta-ai"
+	git -C "$FOREIGN/work/meta-ai" checkout -q --detach HEAD
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "branch   : <none: detached HEAD>"
+	! printf '%s\n' "$output" | grep -qF "branch   : HEAD"
+	grep -qxF "MACKAS_PROJECT_BRANCH=''" "$TESTDIR/newconfig.conf"
+	! grep -qF "MACKAS_PROJECT_BRANCH='HEAD'" "$TESTDIR/newconfig.conf"
+}
+
 @test "adopt: zero checkouts under work/ adopts infra only, no project" {
 	mkdir -p "$FOREIGN/work" "$FOREIGN/bin"
 	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"

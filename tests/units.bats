@@ -97,6 +97,40 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# adopt_check_ownership -- the noowners fast path must survive a mount point
+# with a space in it (a Finder-named external drive, e.g. "1TB WD Blue").
+# `df`/`mount`/`find` are overridden as one-line seams for the duration of a
+# single test, the same pattern workspace_attach.bats uses for path_device --
+# real df/mount output is reproduced verbatim, never reparsed loosely.
+# ---------------------------------------------------------------------------
+
+@test "adopt_check_ownership: a mount point containing a space is matched, not truncated" {
+	mkdir -p "$TESTDIR/root/work"
+	FIND_LOG="$TESTDIR/find.log"
+	df() {
+		printf 'Filesystem 512-blocks Used Available Capacity Mounted on\n'
+		printf '/dev/disk15s1 1953115488 7104 1952703784 1%% /Volumes/1TB WD Blue\n'
+	}
+	mount() {
+		printf '/dev/disk15s1 on /Volumes/1TB WD Blue (apfs, local, noowners)\n'
+	}
+	find() { printf 'called\n' >>"$FIND_LOG"; command find "$@"; }
+
+	local out rc
+	set +e; out="$(adopt_check_ownership "$TESTDIR/root" 2>&1)"; rc=$?; set -e
+
+	[ "$rc" -eq 0 ]
+	# The fast path must return before ever walking work/ -- that walk over a
+	# real multi-GB OE checkout is the multi-minute stall this function
+	# exists to avoid. If $NF truncated the mount point to "Blue", the
+	# `mount` grep below would never match and this test would still see
+	# 'find' invoked (harmlessly, since work/ is empty here) instead of
+	# short-circuiting.
+	[ ! -e "$FIND_LOG" ]
+	[ -z "$out" ]
+}
+
+# ---------------------------------------------------------------------------
 # is_setting_name -- guards --set
 # ---------------------------------------------------------------------------
 

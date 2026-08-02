@@ -35,6 +35,12 @@ setup() {
 	MOCK_SSTATE_SIZES=""
 	export MOCK_SSTATE_SIZES
 
+	# MOCK_SSTATE_SCAN_FAIL: set to make the scan's `container run ... find`
+	# exit non-zero with a stderr message, same convention as
+	# MOCK_FSTRIM_FAIL in volume_mgmt.bats.
+	MOCK_SSTATE_SCAN_FAIL=""
+	export MOCK_SSTATE_SCAN_FAIL
+
 	mkdir -p "$TESTDIR/fakebin"
 	cat > "$TESTDIR/fakebin/container" <<'EOF'
 #!/usr/bin/env bash
@@ -63,6 +69,10 @@ esac
 last="${@: -1}"
 case "$*" in
 	*"-printf"*)
+		if [ -n "${MOCK_SSTATE_SCAN_FAIL:-}" ]; then
+			echo "find: '/sstate': Permission denied" >&2
+			exit 1
+		fi
 		for sz in ${MOCK_SSTATE_SIZES:-}; do printf '%s\n' "$sz"; done
 		exit 0
 		;;
@@ -129,6 +139,18 @@ refute_call() {
 @test "sstate prune: the scan uses the right -mtime threshold" {
 	mk -y sstate prune --older-than 90d
 	assert_call "find] [/sstate] [-type] [f] [-mtime] [+90] [-printf]"
+}
+
+# ---------------------------------------------------------------------------
+# A failing scan
+# ---------------------------------------------------------------------------
+
+@test "sstate prune: a scan failure is reported, not silently aborted" {
+	MOCK_SSTATE_SCAN_FAIL=1 mk -y sstate prune --older-than 90d
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'could not scan'
+	printf '%s\n' "$output" | grep -qi 'permission denied'
+	refute_call "-delete"
 }
 
 # ---------------------------------------------------------------------------

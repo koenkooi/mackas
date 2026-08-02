@@ -2546,9 +2546,13 @@ check_state() {
 		ck_info "  set MACKAS_PROJECT_URL/_BRANCH/_DIR in $(config_hint) (see mackas.conf.example), then re-run setup"
 	elif [ -d "$MACKAS_PROJECT/.git" ]; then
 		local br
-		br="$(git -C "$MACKAS_PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+		# symbolic-ref, not rev-parse --abbrev-ref: see setup_project's own
+		# comment -- the latter prints the literal "HEAD" on a detached
+		# checkout instead of empty, which would falsely ck_warn about an
+		# adopted, intentionally-detached (no recorded branch) project.
+		br="$(git -C "$MACKAS_PROJECT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
 		if [ "$br" = "$MACKAS_PROJECT_BRANCH" ]; then
-			ck_pass "project checked out at $MACKAS_PROJECT (branch $br)"
+			ck_pass "project checked out at $MACKAS_PROJECT (branch ${br:-<none: detached HEAD>})"
 		else
 			ck_warn "project at $MACKAS_PROJECT is on branch '$br', wanted '$MACKAS_PROJECT_BRANCH'" \
 				"git -C $(printf '%q' "$MACKAS_PROJECT") checkout $MACKAS_PROJECT_BRANCH"
@@ -2873,11 +2877,20 @@ workspace_is_attached() {
 # and saying so now beats a baffling refusal tomorrow.
 write_workspace_sentinel() {
 	local mp="$1" f="$1/$WORKSPACE_SENTINEL"
-	[ -f "$f" ] && return 0
+	# The DRY_RUN branch must come BEFORE the "already there" check, not
+	# after: under --dry-run, attach_workspace_image() always returns the
+	# same fixed placeholder mount point ('/Volumes/mackas-workspace',
+	# regardless of what this invocation would really mount), so checking
+	# that path for a real file means checking whatever ELSE happens to be
+	# mounted there on THIS Mac right now -- unrelated host state, not
+	# anything about the operation being simulated. Found live: a real
+	# workspace image already mounted under that same volume name made a
+	# --dry-run silently skip printing this line entirely.
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ (write %s)%s\n' "$C_DIM" "$(printf '%q' "$f")" "$C_RST"
 		return 0
 	fi
+	[ -f "$f" ] && return 0
 	vrb "+ (write $(printf '%q' "$f"))"
 	printf '%s\n' "mackas workspace image -- do not delete: this file is how mackas tells its own case-sensitive workspace mount apart from any other volume mounted at work/. See docs/storage.md." >"$f" \
 		|| die "cannot write $f -- the workspace image mounted at $mp is not writable" \
@@ -3844,7 +3857,13 @@ setup_project() {
 	step "project $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH)"
 	if [ -d "$MACKAS_PROJECT/.git" ]; then
 		local br
-		br="$(git -C "$MACKAS_PROJECT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+		# symbolic-ref, not rev-parse --abbrev-ref: the latter prints the
+		# literal string "HEAD" (not empty) on a detached checkout -- the
+		# normal state for an adopted, kas-pinned layer. MACKAS_PROJECT_BRANCH
+		# is empty for exactly that case (see adopt_introspect_project), so
+		# both sides read empty and this correctly takes the "leave it alone"
+		# branch below instead of trying to fetch/checkout an empty ref.
+		br="$(git -C "$MACKAS_PROJECT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
 		if [ "$br" = "$MACKAS_PROJECT_BRANCH" ]; then
 			# Already on the wanted branch: leave it alone. A live checkout may
 			# have uncommitted work or fetched layers -- never re-clone over it.
@@ -4313,7 +4332,13 @@ adopt_introspect_project() {
 
 	printf '%s\n' "$(basename "$chosen")"
 	git -C "$chosen" remote get-url origin 2>/dev/null || printf '\n'
-	git -C "$chosen" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '\n'
+	# symbolic-ref, not rev-parse --abbrev-ref: the latter prints the literal
+	# string "HEAD" (exit 0, not empty) on a detached checkout -- which is the
+	# NORMAL state for a kas-managed layer (checked out to a pinned revision)
+	# -- so the caller's "no branch" fallback below would never fire and a
+	# later setup_project() would `git checkout HEAD`, re-detaching to
+	# whatever HEAD resolves to instead of leaving it alone.
+	git -C "$chosen" symbolic-ref --short -q HEAD 2>/dev/null || printf '\n'
 }
 
 # adopt_unique_volume_name BASE -- BASE disambiguated against every volume
@@ -4357,7 +4382,12 @@ adopt_unique_short_link() {
 # not need to.
 adopt_check_ownership() {
 	local root="$1" mountpoint
-	mountpoint="$(df -P "$root" 2>/dev/null | awk 'NR==2 {print $NF}')"
+	# volume_mount_point, not a bare `df -P | awk '{print $NF}'`: the
+	# "Mounted on" column is field 6..NF, not just $NF -- a Finder-named
+	# external drive routinely has a space in it (e.g. "1TB WD Blue"), and
+	# $NF alone silently truncates to the last WORD, never matching the
+	# `mount` line below and defeating this whole fast path.
+	mountpoint="$(volume_mount_point "$root")"
 	if [ -n "$mountpoint" ] && mount 2>/dev/null | grep -qF " on $mountpoint (" \
 		&& mount 2>/dev/null | grep -F " on $mountpoint (" | grep -q 'noowners'; then
 		return 0
@@ -5877,7 +5907,7 @@ EOF
 # context is needed (unlike bitbake_getvar): this only ever runs `find`
 # against the mounted volume, never bitbake itself.
 sstate_prune() {
-	local older_than="" days report rc count=0 total_kb=0
+	local older_than="" days report rc=0 count=0 total_kb=0
 
 	while [ $# -gt 0 ]; do
 		case "$1" in
@@ -5918,10 +5948,16 @@ sstate_prune() {
 	# Always runs for real, dry-run or not -- a read-only scan, and --dry-run
 	# needs the REAL count/size to be worth anything (same reasoning as
 	# bitbake_getvar()).
+	# `|| rc=$?` (never a bare `rc=$?` on the next line) so a failing scan
+	# doesn't trip `set -e` before the die() below can run -- same idiom as
+	# attach_workspace_image()/volume_fstrim_one(). 2>&1 (not 2>/dev/null)
+	# merges stderr into $report so a real failure's text reaches die();
+	# harmless for the success-path parsing below, since a clean `find` run
+	# that exits 0 writes nothing to stderr.
 	report="$(container run --rm -u 0:0 -v "$MACKAS_VOL_SSTATE:/sstate" "$KAS_IMAGE" \
-		find /sstate -type f -mtime "+$days" -printf '%s\n' 2>/dev/null)"
-	rc=$?
-	[ "$rc" -eq 0 ] || die "could not scan '$MACKAS_VOL_SSTATE' (rc=$rc)" "check the container runtime: $SCRIPT_CMD status"
+		find /sstate -type f -mtime "+$days" -printf '%s\n' 2>&1)" || rc=$?
+	[ "$rc" -eq 0 ] || die "could not scan '$MACKAS_VOL_SSTATE' (rc=$rc)${report:+: $report}" \
+		"check the container runtime: $SCRIPT_CMD status"
 
 	if [ -n "$report" ]; then
 		count="$(printf '%s\n' "$report" | grep -c .)"
