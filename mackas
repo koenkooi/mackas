@@ -5232,9 +5232,12 @@ overhead_stop() {
 smoketest_rung() {
 	# smoketest_rung <n> <total> <label> <expect> <kas args...>
 	local n="$1" total="$2" label="$3" expect="$4"; shift 4
-	local log slug rc=0
+	local log slug rc=0 is_build=0 start_s end_s
 	slug="$(printf '%s' "$label" | tr ' /:' '---')"
 	log="$MACKAS_LOGS/smoketest-${n}-${slug}.log"
+	# 'build' vs 'shell' (parse-only) -- only a real build rung gets item 16's
+	# completion summary; parse-only builds nothing to summarise.
+	[ "${1:-}" = "build" ] && is_build=1
 
 	printf '\n%s[rung %s/%s] %s%s\n' "$C_BLD" "$n" "$total" "$label" "$C_RST"
 	printf '      %sexpect: %s%s\n' "$C_DIM" "$expect" "$C_RST"
@@ -5251,15 +5254,21 @@ smoketest_rung() {
 	# Wrap the build in the host-side sampler. Everything overhead-related sits
 	# inside `set +e` so a sampler hiccup can never abort the rung, and
 	# overhead_stop() runs AFTER rc is captured so it cannot change the result.
+	# start_s/end_s are real wall-clock around run_kas, independent of
+	# MACKAS_OVERHEAD (which may be off, or its sampler unavailable) -- item
+	# 16's completion summary needs elapsed time regardless of that setting.
 	set +e
 	overhead_start
+	start_s=$(date +%s)
 	run_kas "$log" "$@"
 	rc=$?
+	end_s=$(date +%s)
 	overhead_stop "$log"
 	set -e
 
 	if [ "$rc" -eq 0 ]; then
 		printf '      %s[OK]%s %s\n' "$C_GRN" "$C_RST" "$label"
+		[ "$is_build" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] && print_build_summary "$label" "$log" "$start_s" "$end_s"
 	else
 		printf '      %s[FAILED]%s %s (exit %s)\n' "$C_RED" "$C_RST" "$label" "$rc"
 		printf '      %ssee: %s%s\n' "$C_BLU" "$log" "$C_RST"
@@ -5267,6 +5276,25 @@ smoketest_rung() {
 		[ -f "$log" ] && tail -20 "$log" | sed 's/^/        /'
 	fi
 	return "$rc"
+}
+
+# print_build_summary LABEL LOG START END -- item 16: a one-line completion
+# summary after a genuinely successful build rung (never on parse-only or a
+# failure -- smoketest_rung only calls this on rc=0 for a 'build' rung), in
+# the shape the README demo shows: '✓ TARGET built  (X.Y min, N tasks)'.
+# Elapsed time is real, measured around run_kas regardless of MACKAS_OVERHEAD.
+# The task count comes from bitbake's own "NOTE: Tasks Summary: Attempted N
+# tasks" line in LOG -- omitted, never guessed, when that line is not found
+# (an unusual kas output shape, or bitbake wording this differently).
+print_build_summary() {
+	local label="$1" log="$2" start_s="$3" end_s="$4" target elapsed_s elapsed_min tasks suffix
+	target="${label#build }"
+	elapsed_s=$(( end_s - start_s ))
+	elapsed_min="$(LC_ALL=C awk -v s="$elapsed_s" 'BEGIN { printf "%.1f", s / 60 }')"
+	tasks="$(grep -oE 'Attempted [0-9]+ tasks' "$log" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || true)"
+	suffix="$elapsed_min min"
+	[ -n "$tasks" ] && suffix="$suffix, $tasks tasks"
+	printf '      %s✓ %s built  (%s)%s\n' "$C_GRN" "$target" "$suffix" "$C_RST"
 }
 
 smoketest_usage() {
@@ -5283,7 +5311,10 @@ rung per target in MACKAS_SMOKETEST_TARGETS -- or, if that is empty (the
 default), whatever \`bitbake\` builds with no --target, i.e. the project's
 own kas config default. \`auto-fstrim\` reclaims the sparse ext4 volumes
 before and after. Logs land in \$MACKAS_LOGS/smoketest-*.log; host CPU/RSS
-overhead is sampled around each rung.
+overhead is sampled around each rung. Each build rung that genuinely
+succeeds prints a one-line summary, e.g. '✓ core-image-base built (35.5 min,
+6253 tasks)' -- the task count is omitted, never guessed, if bitbake's own
+Tasks Summary line cannot be found in that rung's log.
 
 If no project is configured at all, smoketest OFFERS the qualcomm-linux/
 meta-ai example for that one run only -- never persisted, never the default,
