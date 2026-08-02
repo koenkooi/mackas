@@ -7257,7 +7257,15 @@ volume_fstrim_one() {
 	# the failure ourselves below (a device with discard_max_bytes=0 errors here).
 	local out st=0
 	out="$(container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$name:/mnt" "$KAS_IMAGE" fstrim -v /mnt 2>&1)" || st=$?
-	[ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  fstrim: /'
+	# $out is captured through $(...), not streamed to a real TTY, so
+	# container's own boot-progress reporting ("[3/6] Fetching kernel [0s]")
+	# lands as 7-8 separate newline-terminated lines instead of one
+	# in-place-updating line -- and by the time we get here the run has
+	# already finished, so none of them carry information any more. Drop
+	# them; only fstrim's own output (if any) is worth the "  fstrim: " noise.
+	local filtered
+	filtered="$(printf '%s\n' "$out" | grep -vE '^\[[0-9]+/[0-9]+\]' || true)"
+	[ -n "$filtered" ] && printf '%s\n' "$filtered" | sed 's/^/  fstrim: /'
 
 	if [ "$st" -ne 0 ]; then
 		# Some backing filesystems report discard_max_bytes=0 and fstrim
@@ -7284,7 +7292,7 @@ volume_fstrim_one() {
 	reclaimed_kb=$(( ${before_kb:-0} - ${after_kb:-0} ))
 	[ "$reclaimed_kb" -lt 0 ] && reclaimed_kb=0
 
-	did "fstrim '$name': $(fmt_kb "${before_kb:-0}") -> $(fmt_kb "${after_kb:-0}") (reclaimed $(fmt_kb "$reclaimed_kb"))"
+	did "fstrim '$name': $(fmt_kb "${before_kb:-0}") -> $(fmt_kb "${after_kb:-0}") ${C_BLD}(reclaimed $(fmt_kb "$reclaimed_kb"))${C_RST}"
 	if [ "$reclaimed_kb" -eq 0 ]; then
 		info "  Nothing to reclaim -- the image was already compact."
 	fi
