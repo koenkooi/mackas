@@ -980,7 +980,7 @@ and looks for a `.mackas-workspace` sentinel file at the mount's root, then:
 | Different device, sentinel present | Already attached. Nothing to do. |
 | Same device, or `work/` missing or a dangling symlink | Reattach the image and re-point the symlink. |
 | Different device, **no** sentinel | Refuse: something is mounted at `work/`, but not the recorded image. |
-| Image file missing | Refuse, with an `mdfind` line to locate it. |
+| Image file missing | Refuse. `mackas volume recover` (no name needed) locates it with Spotlight and offers to move it back. |
 | `hdiutil attach` fails | Refuse. |
 | `work/` is a **non-empty plain directory** | Refuse, and leave it alone: its contents were written to a case-insensitive filesystem and may already be corrupt, but they are yours to salvage. |
 
@@ -994,14 +994,31 @@ Refusing is deliberate and has no override flag: an unattached workspace is
 not an empty workspace, it is the wrong filesystem. `check` and `status`
 report the state without ever mounting anything, so a build that "worked
 yesterday" and now refuses has its answer in one line of `mackas check`.
+`status` also reports the image's real size on disk (`du -h`, sparse-aware,
+the same idiom the ext4 volumes' own status line uses).
+
+**Recovering a missing image.** Unlike an ext4 volume, the workspace image has
+no runtime symlink to re-point — `MACKAS_WORKSPACE_IMAGE` itself is the
+record. `mackas volume recover` (no `<name>` needed; naming one ext4 volume
+explicitly skips the workspace check) locates a missing image by filename with
+Spotlight, refuses to guess if more than one candidate turns up, and — after
+confirmation — moves the found file back to the recorded path with the same
+holes-preserving copy `volume move` uses, rather than chase it wherever it
+ended up. Declining prints the found path so it can be adopted instead
+(`mackas set MACKAS_WORKSPACE_IMAGE <path>`).
 
 Losing the image costs nothing for any layer that is clean and pushed —
 `git clone` restores it byte for byte. What is genuinely at risk is
 uncommitted or unpushed work, and `git push` is the backup story: the image is
-a single file with none of its own. Time Machine cuts the opposite way here
-from the build volumes: the image is small (source checkouts, single-digit
-GiB) and holds the only copy of exactly what git cannot restore, so a
-TM-backed source volume is a feature rather than the hazard [below](#time-machine).
+a single file with none of its own. `status` says so directly when it
+matters: while the image is attached, it counts the git repos one level under
+`work/` that are dirty or ahead of their upstream and prints one line naming
+how many — silent when the count is zero, or the image is not attached (there
+is nothing safe to inspect through the wrong filesystem). Time Machine cuts
+the opposite way here from the build volumes: the image is small (source
+checkouts, single-digit GiB) and holds the only copy of exactly what git
+cannot restore, so a TM-backed source volume is a feature rather than the
+hazard [below](#time-machine).
 
 ## Time Machine
 
