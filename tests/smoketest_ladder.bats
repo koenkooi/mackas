@@ -12,7 +12,7 @@
 # the operator sees [FAILED]/exit-code/log/last-20-lines, and the exact rung
 # argv (and cwd) reach kas in order.
 #
-# Fully hermetic: a fake kas-container ($ROOT/bin/kas-container) records $PWD +
+# Fully hermetic: a fake kas-container ($ROOT/bin/kas-container.real) records $PWD +
 # argv per call and keys its exit on the target; a fake `container` on PATH
 # makes the auto-fstrim probe and the one-VM check inert so only kas runs.
 # Nothing touches the real Apple container runtime, a volume, or the network.
@@ -47,7 +47,7 @@ setup() {
 	KLOG="$TESTDIR/kas.log"
 	export KLOG
 	: > "$KLOG"
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 # Drop the leading `--runtime-args <value>` pair mackas always prepends, so the
 # record is the kas SUBCOMMAND argv (the runtime-args string is pinned exactly
@@ -65,6 +65,11 @@ case " ${args[*]} " in
 esac
 exit 0
 EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	# ensure_kas_container_installed (cmd_smoketest calls it) requires BOTH
+	# files present -- the wrapper itself must exist too, even though only
+	# kas-container.real above is ever exec'd.
+	touch "$ROOT/bin/kas-container"
 	chmod +x "$ROOT/bin/kas-container"
 
 	# Fake container: system up, but no volumes and no running containers, so

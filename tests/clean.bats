@@ -25,8 +25,8 @@ setup() {
 
 	ROOT="$TESTDIR/oe"
 	mkdir -p "$ROOT/bin"
-	touch "$ROOT/bin/kas-container"
-	chmod +x "$ROOT/bin/kas-container"
+	touch "$ROOT/bin/kas-container.real"
+	chmod +x "$ROOT/bin/kas-container.real"
 
 	CLOG="$TESTDIR/container.log"
 	export CLOG
@@ -160,8 +160,8 @@ fake_kas_container() {
 		done
 		printf 'esac\n'
 		printf 'exit 0\n'
-	} > "$ROOT/bin/kas-container"
-	chmod +x "$ROOT/bin/kas-container"
+	} > "$ROOT/bin/kas-container.real"
+	chmod +x "$ROOT/bin/kas-container.real"
 }
 
 # tmp_deploy_ok -- convenience baseline for tests that are not specifically

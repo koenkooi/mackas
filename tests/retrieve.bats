@@ -29,8 +29,8 @@ setup() {
 	ROOT="$TESTDIR/oe"
 	mkdir -p "$ROOT/bin"
 	# cmd_retrieve requires kas-container to be installed.
-	touch "$ROOT/bin/kas-container"
-	chmod +x "$ROOT/bin/kas-container"
+	touch "$ROOT/bin/kas-container.real"
+	chmod +x "$ROOT/bin/kas-container.real"
 
 	CLOG="$TESTDIR/container.log"
 	export CLOG
@@ -236,14 +236,14 @@ refute_call() {
 	# bitbake_getvar refuses up front unless MACKAS_PROJECT is a real checkout
 	# (MACKAS_PROJECT_DIR must be set, not just MACKAS_KAS_CONFIG) -- give it one.
 	mkdir -p "$ROOT/work/meta-angstrom/.git"
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
 	*"bitbake-getvar --value -q DEPLOY_DIR "*) echo "/build/some/renamed-output" ;;
 esac
 exit 0
 EOF
-	chmod +x "$ROOT/bin/kas-container"
+	chmod +x "$ROOT/bin/kas-container.real"
 	mkdir -p "$FIXTURE/renamed-output/images"
 	echo bin > "$FIXTURE/renamed-output/images/fake2.img"
 
@@ -273,7 +273,7 @@ EOF
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	KREC="$TESTDIR/kas-argv.log"
 	export KREC
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 {
 	for a in "$@"; do printf '[%s] ' "$a"; done
@@ -284,7 +284,7 @@ case " $* " in
 esac
 exit 0
 EOF
-	chmod +x "$ROOT/bin/kas-container"
+	chmod +x "$ROOT/bin/kas-container.real"
 
 	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
 	[ "$status" -eq 0 ]
@@ -302,7 +302,7 @@ EOF
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	KREC="$TESTDIR/kas-argv.log"
 	export KREC
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 {
 	for a in "$@"; do printf '[%s] ' "$a"; done
@@ -313,7 +313,7 @@ case " $* " in
 esac
 exit 0
 EOF
-	chmod +x "$ROOT/bin/kas-container"
+	chmod +x "$ROOT/bin/kas-container.real"
 
 	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
 	[ "$status" -eq 0 ]
@@ -540,14 +540,14 @@ EOF
 	# destination must still be named after the object key.
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	mkdir -p "$ROOT/work/meta-angstrom/.git"
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
 	*"bitbake-getvar --value -q BUILDHISTORY_DIR "*) echo "/build/elsewhere/bh-store" ;;
 esac
 exit 0
 EOF
-	chmod +x "$ROOT/bin/kas-container"
+	chmod +x "$ROOT/bin/kas-container.real"
 	mkdir -p "$FIXTURE/bh-store/images"
 	echo img > "$FIXTURE/bh-store/images/files-in-image.txt"
 
@@ -587,7 +587,7 @@ EOF
 	# of one expected thing.
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	mkdir -p "$ROOT/work/meta-angstrom/.git"
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
 	*"bitbake-getvar --value -q BUILDHISTORY_DIR "*)
@@ -597,7 +597,7 @@ case " $* " in
 esac
 exit 0
 EOF
-	chmod +x "$ROOT/bin/kas-container"
+	chmod +x "$ROOT/bin/kas-container.real"
 
 	MOCK_TMP_HAS="" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve buildhistory
 	[ "$status" -ne 0 ]
@@ -673,7 +673,7 @@ EOF
 	# full setup and reset the repos.
 	assert_fails test -f "$ROOT/work/meta-angstrom/conf/local.conf"
 
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$KASARGV_LOG"
 case " $* " in
@@ -681,7 +681,7 @@ case " $* " in
 esac
 exit 0
 EOF
-	chmod +x "$ROOT/bin/kas-container"
+	chmod +x "$ROOT/bin/kas-container.real"
 	KASARGV_LOG="$ROOT/kasargv.log"; export KASARGV_LOG
 	: > "$KASARGV_LOG"
 

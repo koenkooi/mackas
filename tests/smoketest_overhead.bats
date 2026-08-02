@@ -37,12 +37,17 @@ setup() {
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 	KLOG="$TESTDIR/kas.log"
 	export KLOG
-	cat > "$ROOT/bin/kas-container" <<'EOF'
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
 #!/usr/bin/env bash
 printf 'KAS:%s\n' "$*" >> "$KLOG"
 sleep 0.4
 exit 0
 EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	# ensure_kas_container_installed (cmd_smoketest calls it) requires BOTH
+	# files present -- the wrapper itself must exist too, even though only
+	# kas-container.real above is ever exec'd.
+	touch "$ROOT/bin/kas-container"
 	chmod +x "$ROOT/bin/kas-container"
 
 	# A fake sampler: production always invokes it as `/usr/bin/python3 <bin>`,
