@@ -8,12 +8,12 @@
 #
 # These drive `mackas retrieve` as a subprocess with a fake `container` on
 # PATH that records every call and MODELS the two things that matter here: the
-# existence probe (`... test -d /build/tmp/<sub>`), and the copy itself
-# (`... sh -c 'cp -r ...'`) which actually populates the host --dest so
-# `buildstats analyze` (tested separately in buildstats_analyze.bats) would
-# have real files to chew on. It also models `container ls` / `container
-# inspect` so the one-VM refusal can be exercised. Nothing touches the real
-# Apple container runtime, a volume, or the build SSD.
+# combined existence+size probe (`... sh -c "[ -d ... ] || exit 1; du -sk
+# ..."`), and the copy itself (`... sh -c 'cp -r ...'`) which actually
+# populates the host --dest so `buildstats analyze` (tested separately in
+# buildstats_analyze.bats) would have real files to chew on. It also models
+# `container ls` / `container inspect` so the one-VM refusal can be exercised.
+# Nothing touches the real Apple container runtime, a volume, or the build SSD.
 
 bats_require_minimum_version 1.5.0
 
@@ -115,17 +115,24 @@ for a in "$@"; do
 	prev="$a"
 done
 
-# The probe: `... test -d /build/tmp/<sub>`. Succeed only for a listed sub.
-for a in "$@"; do
-	if [ "$a" = "test" ]; then
-		guest="${@: -1}"
+# The combined existence+size probe: `... sh -c "[ -d <guest> ] || exit 1;
+# du -sk <guest> 2>/dev/null; exit 0"`. Succeed (and print a MOCK_DU_KB-sized
+# `du -sk` line) only for a listed sub; MOCK_DU_FAIL models a `du` that errors
+# on an existing directory -- still exit 0 (existence, not size, gates
+# success), just nothing printed.
+case "${@: -1}" in
+	*"du -sk"*)
+		guest="$(printf '%s\n' "${@: -1}" | sed -E 's#.*du -sk ([^ ]+).*#\1#')"
 		sub="${guest##*/}"
 		case " $MOCK_TMP_HAS " in
-			*" $sub "*) exit 0 ;;
+			*" $sub "*)
+				[ -n "${MOCK_DU_FAIL:-}" ] || printf '%s\t%s\n' "${MOCK_DU_KB:-4096}" "$guest"
+				exit 0
+				;;
 			*) exit 1 ;;
 		esac
-	fi
-done
+		;;
+esac
 
 # The copy: `... sh -c "mkdir -p '/out/<sub>' && cp -r '<guest>/.' '/out/<sub>/'"`.
 # destsub (the mackas-facing object key, e.g. "deploy") and guestsub (the
@@ -201,7 +208,8 @@ refute_call() {
 	# This machine's uid is not 0, so an argv match alone could pass against a
 	# hardcoded literal on the wrong command. Pin the source form: both the probe
 	# and the copy run as -u 0:0.
-	grep -qF -- 'run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" test -d "$guest"' "$MACKAS"
+	grep -qF -- 'probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \' "$MACKAS"
+	grep -qF -- 'du -sk $(printf '"'"'%q'"'"' "$guest")' "$MACKAS"
 	grep -qF -- '-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE"' "$MACKAS"
 }
 
@@ -214,7 +222,7 @@ refute_call() {
 @test "retrieve: logs also fetches tmp/log" {
 	MOCK_TMP_HAS="buildstats log" mk retrieve buildstats logs
 	[ "$status" -eq 0 ]
-	assert_call "test] [-d] [/build/tmp/log]"
+	assert_call "-d /build/tmp/log ]"
 	[ -d "$ROOT/artifacts/log" ]
 }
 
@@ -249,7 +257,7 @@ EOF
 
 	MOCK_TMP_HAS="renamed-output" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
 	[ "$status" -eq 0 ]
-	assert_call "test] [-d] [/build/some/renamed-output]"
+	assert_call "-d /build/some/renamed-output ]"
 	# Named after the object key, not the resolved path's own basename.
 	[ -d "$ROOT/artifacts/deploy/images" ]
 	[ ! -d "$ROOT/artifacts/renamed-output" ]
@@ -330,9 +338,29 @@ EOF
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
-@test "retrieve: deploy warns it can be large" {
-	MOCK_TMP_HAS="buildstats deploy" mk retrieve deploy
-	printf '%s\n' "$output" | grep -qi 'deploy can be large'
+@test "retrieve: reports the real measured size to transfer, not a fixed guess" {
+	# Item 33: replaces the old hardcoded "deploy can be large" line -- every
+	# object gets a REAL, measured figure now, not just deploy.
+	MOCK_TMP_HAS="buildstats deploy" MOCK_DU_KB=4194304 mk retrieve deploy
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "deploy: 4.0G to transfer"
+	! printf '%s\n' "$output" | grep -qi 'deploy can be large'
+}
+
+@test "retrieve: a du failure does not block the retrieval (size reporting is a nicety)" {
+	MOCK_TMP_HAS="buildstats" MOCK_DU_FAIL=1 mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+	! printf '%s\n' "$output" | grep -qF 'to transfer'
+}
+
+@test "retrieve: warns when the destination looks too small for the measured size" {
+	# An absurdly large MOCK_DU_KB (~9.5 PiB) guarantees no real disk has that
+	# much free space, so this needs no df fake -- the real df on this host is
+	# always the failing side of the comparison.
+	MOCK_TMP_HAS="buildstats" MOCK_DU_KB=10000000000000 mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'may not have enough free space'
 }
 
 @test "retrieve: order of objects does not matter" {
@@ -405,13 +433,16 @@ EOF
 	[ "$status" -eq 0 ]
 	# The copy command is shown (the guest path survives printf %q verbatim)...
 	printf '%s\n' "$output" | grep -qF '/build/tmp/buildstats'
-	# ...but nothing was copied out, no dest was made, and no mutating container
-	# run was executed. (volume_in_use's read-only ls/status queries may run --
-	# they change nothing -- so CLOG is not required to be empty.)
+	# ...but nothing was copied out and no dest was made. The existence+size
+	# probe (item 33) DOES run for real even under --dry-run -- same reasoning
+	# as clean_tmp_deploy/sstate_prune's own read-only probes: a preview is
+	# more useful showing the real transfer size than an assumed yes -- so
+	# CLOG is not expected to be empty and a real size IS reported here.
 	[ ! -d "$ROOT/artifacts/buildstats" ]
 	[ ! -d "$ROOT/artifacts" ]
+	printf '%s\n' "$output" | grep -qF 'buildstats: 4.0M to transfer'
 	refute_call "cp -r"
-	refute_call "[run] [--rm] [-u] [0:0]"
+	refute_call ":/out]"
 }
 
 # ---------------------------------------------------------------------------
@@ -529,7 +560,7 @@ EOF
 	# every project that has it.
 	MOCK_TMP_HAS="buildhistory" mk retrieve buildhistory
 	[ "$status" -eq 0 ]
-	assert_call "test] [-d] [/build/buildhistory]"
+	assert_call "-d /build/buildhistory ]"
 	refute_call "test] [-d] [/build/tmp/buildhistory]"
 }
 
@@ -553,7 +584,7 @@ EOF
 
 	MOCK_TMP_HAS="bh-store" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve buildhistory
 	[ "$status" -eq 0 ]
-	assert_call "test] [-d] [/build/elsewhere/bh-store]"
+	assert_call "-d /build/elsewhere/bh-store ]"
 	refute_call "test] [-d] [/build/buildhistory]"
 	# Named after the object key, not the resolved path's own basename.
 	[ -d "$ROOT/artifacts/buildhistory/images" ]
@@ -604,7 +635,7 @@ EOF
 	printf '%s\n' "$output" | grep -qi 'does not INHERIT buildhistory'
 	! printf '%s\n' "$output" | grep -qF 'bitbake-getvar failed for BUILDHISTORY_DIR'
 	! printf '%s\n' "$output" | grep -qF 'could not resolve BUILDHISTORY_DIR'
-	assert_call "test] [-d] [/build/buildhistory]"
+	assert_call "-d /build/buildhistory ]"
 }
 
 @test "retrieve: --dry-run buildhistory prints the copy but creates nothing" {
@@ -614,7 +645,7 @@ EOF
 	[ ! -d "$ROOT/artifacts/buildhistory" ]
 	[ ! -d "$ROOT/artifacts" ]
 	refute_call "cp -r"
-	refute_call "[run] [--rm] [-u] [0:0]"
+	refute_call ":/out]"
 }
 
 @test "retrieve: buildhistory composes with the other objects in one call" {
@@ -623,8 +654,8 @@ EOF
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	[ -d "$ROOT/artifacts/buildhistory/packages" ]
 	# Each object resolved its own path: buildstats keeps its tmp-shaped one.
-	assert_call "test] [-d] [/build/tmp/buildstats]"
-	assert_call "test] [-d] [/build/buildhistory]"
+	assert_call "-d /build/tmp/buildstats ]"
+	assert_call "-d /build/buildhistory ]"
 	# Both hints, and buildstats still nests under the retrieve timestamp.
 	printf '%s\n' "$output" | grep -qF 'buildstats analyze'
 	printf '%s\n' "$output" | grep -qF "git -C $ROOT/artifacts/buildhistory log"
