@@ -565,7 +565,9 @@ their normal paths under `work/<layer>`.
 Note that `-k`/`--keep-config-unchanged` is **not** a synonym: it skips five
 steps including `write_bbconfig`, so it also stops kas regenerating
 `local.conf`/`bblayers.conf` — meaning adding a fragment to the file list has no
-effect under `-k`. Use the explicit `--skip` pair, which is surgical.
+effect under `-k`. Use the explicit `--skip` pair, which is surgical. A
+hand-typed `kas-container ... -k ...` through `env.sh` now prints a one-line
+stderr heads-up about this rather than staying silent about it.
 
 ### When it backfires: blocking fresh patches
 
