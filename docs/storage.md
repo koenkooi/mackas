@@ -113,6 +113,16 @@ fstrim automatically afterward for exactly that reason
 (`MACKAS_FSTRIM_AUTO=1`, the default the build path already uses around a
 `smoketest`/`shell` run; set `0` to skip it and reclaim by hand later).
 
+`mackas sstate prune` is the same story: its `find -delete` also runs **in
+place** inside the already-attached sstate volume, so a prune that reclaims
+tens of GB of stale objects leaves the freed blocks allocated on the host
+image until something discards them. It fstrims the sstate volume
+automatically right after a successful prune, gated by the same
+`MACKAS_FSTRIM_AUTO`, non-fatally (a prune that succeeded is still reported
+as a success even if the fstrim itself fails or the volume's filesystem
+doesn't support discard). Prune and reclaim are not two separate manual
+steps to remember — only the age threshold is.
+
 It resolves both `TMPDIR` and `DEPLOY_DIR` through bitbake, and now refuses
 outright when either cannot be resolved, because a guessed `DEPLOY_DIR`
 previously let the command report a success it had not actually performed.

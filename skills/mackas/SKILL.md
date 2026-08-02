@@ -520,10 +520,14 @@ build stays fresh indefinitely.
 Safe to prune aggressively — sstate is hash-addressed, so a pruned object that
 turns out to be needed just gets rebuilt once. Never a correctness risk. The
 scan is real even under `--dry-run` (the reported count/size have to be real to
-be worth anything); deletion happens only after confirmation or `-y`. For
-surgical pruning — keep only what one checkout's stamps still reference — use
-openembedded-core's own `scripts/sstate-cache-management.py`; `sstate prune`
-solves the coarser "nothing has touched this in months" case.
+be worth anything); deletion happens only after confirmation or `-y`. A
+successful prune deletes in place inside the already-attached volume, so it
+fstrims the sstate volume automatically afterward (`MACKAS_FSTRIM_AUTO=1`,
+non-fatal, same knob `clean tmp+deploy` uses) rather than leaving reclaim as a
+separate manual step. For surgical pruning — keep only what one checkout's
+stamps still reference — use openembedded-core's own
+`scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
+"nothing has touched this in months" case.
 
 ## The `--skip` flag family
 

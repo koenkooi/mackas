@@ -290,7 +290,8 @@
 # fstrim`). ON by default; fstrim is ~0.01s and runs when nothing holds the
 # volumes, so it neither slows nor endangers the build. The same knob gates the
 # fstrim `mackas clean tmp+deploy` runs after its in-place clear (see `mackas
-# clean --help`). Set to 0 to turn it off.
+# clean --help`) and the fstrim `mackas sstate prune` runs after its in-place
+# delete (see `mackas sstate --help`). Set to 0 to turn it off.
 # It must be exactly 0 or 1: any other value disables it (matching
 # MACKAS_OVERHEAD -- only the literal "1" turns it on).
 #MACKAS_FSTRIM_AUTO=1

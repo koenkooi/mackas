@@ -6283,6 +6283,19 @@ sstate_prune() {
 	run container run --rm -u 0:0 -v "$MACKAS_VOL_SSTATE:/sstate" "$KAS_IMAGE" \
 		find /sstate -type f -mtime "+$days" -delete
 	did "pruned $count sstate object(s), freed $(fmt_kb "$total_kb")"
+
+	# The delete above ran IN PLACE inside the volume that was already
+	# attached for the scan/delete -- like clean_tmp_deploy's in-place rm, the
+	# freed ext4 blocks stay allocated on the host image until something
+	# discards them (docs/storage.md's "Reclaiming disk"), so unlike a fresh
+	# 'volume create' this needs an explicit fstrim or the space just sits
+	# there until someone remembers 'volume fstrim sstate' by hand. Same
+	# MACKAS_FSTRIM_AUTO knob and non-fatal `|| true` clean_tmp_deploy/run_kas
+	# already use: fstrim failing (a non-hole-punching host filesystem) must
+	# never turn a successful prune into a reported failure.
+	if [ "${MACKAS_FSTRIM_AUTO:-1}" = "1" ]; then
+		volume_fstrim_one "$MACKAS_VOL_SSTATE" 1 || true
+	fi
 }
 
 cmd_sstate() {
