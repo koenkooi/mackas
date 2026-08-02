@@ -238,6 +238,43 @@ teardown() {
 		grep -qx 'canary-do-not-lose-me' /mnt/payload/canary.txt
 }
 
+@test "real resize: the copy path preserves the volume's ownership (item 26's real open question)" {
+	# volume_resize_by_copy() (the ONLY mechanism 'volume resize' runs today --
+	# the in-place entity.json/resize2fs path this file's own header describes
+	# was tried, found structurally impossible against sparse_super2, and
+	# removed) copies via 'tar -cf - . | tar -xf -' inside a -u 0:0 container,
+	# never chowning the destination itself afterward. The real open question:
+	# does the volume ROOT survive with the same ownership ensure_volume() gave
+	# it originally (the non-root uid:gid a real build's uid 30000 process
+	# needs to write into), or does a fresh 'container volume create' plus a
+	# root-run tar silently hand back a root-owned mount the next build can't
+	# write to?
+	local v=zztest-resize-owner
+	make_vol "$v" "$START_SIZE"
+
+	local owner_before
+	owner_before="$(container run --rm -u 0:0 -v "$v:/mnt" "$(rt_image)" stat -c '%u:%g' /mnt)"
+	[ "$owner_before" = "$(id -u):$(id -g)" ]
+
+	mk -y volume resize "$v" "$GROWN_SIZE"
+	[ "$status" -eq 0 ]
+
+	local owner_after
+	owner_after="$(container run --rm -u 0:0 -v "$v:/mnt" "$(rt_image)" stat -c '%u:%g' /mnt)"
+	[ "$owner_after" = "$owner_before" ]
+
+	# The real-world failure mode this guards: kas drops to USER_ID/GROUP_ID
+	# (the INVOKING HOST user's uid:gid -- ensure_volume()'s own chown target,
+	# not a fixed in-image uid) before touching the volume, so the resized
+	# volume must still be writable AS THAT USER, exactly as it was before --
+	# not just as root via -u 0:0, which would pass even on a volume nothing
+	# but root can use.
+	container run --rm -u "$(id -u):$(id -g)" -v "$v:/mnt" "$(rt_image)" \
+		sh -c 'echo post-resize-write-check > /mnt/write-check.txt'
+	container run --rm -u 0:0 -v "$v:/mnt" "$(rt_image)" \
+		grep -qx 'post-resize-write-check' /mnt/write-check.txt
+}
+
 @test "real resize: the grown space is actually usable, not just reported" {
 	# A filesystem can report a bigger size and still fail to allocate into it.
 	# Write past the ORIGINAL cap to prove the space is real.
