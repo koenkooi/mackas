@@ -306,10 +306,16 @@ mechanics:
 chain spanning *sibling* layers (`meta-angstrom/…:meta-ti/…`) derives
 nothing — mackas commands `cd` into a single checkout and a sibling would
 fall outside the `/repo` mount — so keep driving those by hand from `work/`.
-Bypassing the function (`command kas-container`, an absolute path, an
-unsourced shell) builds wrong: no volumes, Apple's default 4 CPUs / 1 GB, no
-fragment — and, with a pipx/pip kas on `PATH`, possibly a different kas
-release than the 5.4 mackas pins. `mackas check` reports which
+Bypassing the function (`command kas-container`, an absolute path, `nohup`,
+`env`, an unsourced shell) still reaches `$MACKAS_BIN/kas-container` — a
+generated protection wrapper script, not the raw upstream binary — so it
+still gets the ext4 volumes and CPU/memory limits; only the auto-appended
+fragment and the project-variable derivation are lost, since those remain
+shell-function-only conveniences (see
+[architecture.md](docs/architecture.md#running-kas-container-by-hand)).
+The separate, still-real concern is a pipx/pip kas earlier on `PATH` than
+`$MACKAS_BIN`: it resolves to a *different* kas-container release entirely,
+not the 5.4 mackas pins. `mackas check` reports which
 `kas-container` wins ([architecture.md](docs/architecture.md#the-ext4-volumes)).
 
 > **For a one-off read-only command, use `mackas exec CMD` instead of typing
@@ -505,12 +511,18 @@ The design decisions, the negative results, and the reasons behind both:
   via `mackas shell`, or serve them with `mackas-mirrord`.
 - The kernel may need `container system kernel set --recommended --force`
   once after install. `check` probes this by booting a throwaway container.
-- **In an unsourced shell, a kas-container installed by other means wins.**
-  `env.sh`'s shell function shadows `PATH` only when sourced; a bare
-  `kas-container` in a fresh shell runs whatever pipx or pip put on `PATH`
-  (typically `~/.local/bin/kas-container`) — silently, with no volumes,
-  Apple's 4 CPUs / 1 GB, and whatever kas version that install happens to
-  be. `check` reports which one wins.
+- **A kas-container installed by other means can still win on `PATH`.**
+  `env.sh`'s shell function is only one of the ways `kas-container` gets
+  found; `$MACKAS_BIN/kas-container` (the generated protection wrapper
+  script `$PATH` itself resolves to) is what a bare, unsourced, `nohup`- or
+  `env`-launched `kas-container` reaches instead, and that wrapper still
+  computes `--runtime-args` and blanks the dir vars — it is not the
+  unprotected case this used to be. The concern that remains is PATH
+  *ordering*: if pipx or pip installed their own `kas-container` earlier on
+  `PATH` than `$MACKAS_BIN` (typically `~/.local/bin/kas-container`), a bare
+  `kas-container` resolves to *that* script instead — a different kas
+  version entirely, with none of mackas's protection. `check` reports which
+  one wins.
 
 ## Verification status
 

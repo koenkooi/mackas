@@ -55,6 +55,12 @@ fetches. mackas orchestrates these; it does not vouch for them.
   and **sha256-verified** on download; the container image is pinned by tag. A
   reference clone of kas lives in `kas-upstream/` for reading — the project keeps
   **zero patches to kas**, so there is no vendored, modified upstream to drift.
+  That pin applies specifically to `$MACKAS_BIN/kas-container.real`, the
+  downloaded file; the small protection wrapper script mackas generates
+  alongside it at `$MACKAS_BIN/kas-container` is **locally generated, not
+  downloaded or hash-pinned the same way**, and is held to the same
+  interpolation-safety rules (`shq()`/safe quoting) as the other generated
+  files this repo already writes, such as `env.sh`.
 - **Minimal dependency surface.** The Python components are **stdlib-only**
   (3.7+): no `pip install`, no third-party packages, nothing to compromise via a
   transitive dependency. The rest is POSIX shell plus tools already on a Mac

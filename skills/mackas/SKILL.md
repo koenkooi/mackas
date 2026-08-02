@@ -49,43 +49,15 @@ three volumes exist, and `docker resolves to` the shim under
 `$MACKAS_ROOT/bin/docker` — **not** `/usr/local/bin/docker`. If anything is
 off, `mackas check` names the fix for each item.
 
-**`kas-container` must be the sourced shell function, not a bare binary.**
-`env.sh` defines it to inject `--runtime-args` (the three volumes, the `-c`/`-m`
-limits), to blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` so kas's own bind-mount
-logic stays out of the way, and to append the generated tuning fragment.
-`command kas-container`, an absolute path, or an unsourced shell silently builds
-with Apple's default 4 CPUs / 1 GB, no volumes and no fragment — and with a
-pipx/pip kas on `PATH`, possibly a different kas release entirely. `mackas
-check` reports which one wins.
+**Prefer the sourced shell function, but a bypass is no longer dangerous.** `env.sh` defines a `kas-container` shell function that appends the generated tuning fragment and derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG`, then hands off to `$MACKAS_BIN/kas-container` — a generated protection wrapper *script*, not the raw upstream binary, that computes `--runtime-args` (the three volumes, the `-c`/`-m` limits) live and blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side so kas's own bind-mount logic stays out of the way. Because that wrapper script is what `$PATH` itself resolves `kas-container` to, `command kas-container`, an absolute path, `nohup`, `env`, or an unsourced shell all still reach it — the only things such a bypass loses are the auto-appended fragment and the project-variable derivation, not the volumes or limits. The one separate, still-real concern: a pipx/pip-installed kas sitting earlier on `PATH` than `$MACKAS_BIN` makes a bare `kas-container` resolve to a *different* kas-container script entirely, at whatever version that install happens to be. `mackas check` reports which one wins.
 
-**Never launch a build under `nohup`, `env`, `xargs`, or anything else that
-resolves `kas-container` via `$PATH` instead of the shell function** —
-`command kas-container` is only the obvious case; these are the silent one.
-`$PATH` lookup finds the *raw upstream* `kas-container` script that sits
-alongside the wrapper, completely skipping `env.sh`'s function — with no
-error, no warning, nothing to distinguish it in the output from a real
-mackas-driven build until much later. The build still runs, but unprotected:
-no ext4 volumes, Apple's bare 4 CPU / 1 GB defaults, and — because
-`KAS_BUILD_DIR` is genuinely unset rather than pointed at `/build` — kas falls
-back to `KAS_WORK_DIR/build` on the virtiofs bind mount, where
-`bitbake-server`'s control sockets get permanently stuck (a fresh `bind()`
-still works, but every later `stat`/`unlink` on that socket file fails with
-`OSError: [Errno 95] Operation not supported`, so a later restart just fails
-the identical way). This is exactly how a real multi-machine batch build
-failed repeatedly in practice: backgrounded with `nohup kas-container build
-... &`, each run silently unprotected. If a build needs to be backgrounded,
-redirect instead — `kas-container build ... > log 2>&1 &` runs the function
-in the current shell and backgrounds the job, without the `nohup`/`env`
-detour through `$PATH`. Full writeup: [issue #27](https://github.com/koenkooi/mackas/issues/27).
+**This used to be true, and it was silently dangerous: `nohup`, `env`, `xargs`, or anything else that resolves `kas-container` via `$PATH` instead of the shell function used to reach the *raw upstream* `kas-container` script directly, completely skipping `env.sh`'s function** — with no error, no warning, nothing to distinguish it in the output from a real mackas-driven build until much later. The build still ran, but unprotected: no ext4 volumes, Apple's bare 4 CPU / 1 GB defaults, and — because `KAS_BUILD_DIR` was genuinely unset rather than pointed at `/build` — kas fell back to `KAS_WORK_DIR/build` on the virtiofs bind mount, where `bitbake-server`'s control sockets got permanently stuck (a fresh `bind()` still works, but every later `stat`/`unlink` on that socket file fails with `OSError: [Errno 95] Operation not supported`, so a later restart just fails the identical way). This is exactly how a real multi-machine batch build failed repeatedly in practice: backgrounded with `nohup kas-container build ... &`, each run silently unprotected.
+
+**The wrapper fix (issue #27) closes this.** `$MACKAS_BIN/kas-container` is now itself a protection wrapper script, not the raw upstream binary — so `nohup`, `env`, `xargs`, an unsourced shell, or any other `$PATH`-resolved call all reach a build with the correct ext4 volumes, `-c`/`-m` limits and blanked dir vars, the same as `mackas smoketest`/`shell`. What still differs on a bypassed path, compared to the fully-featured sourced-shell-function path, is the auto-appended tuning fragment and the `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation — both remain shell-function-only conveniences, not safety-critical. So `mackas smoketest`/`mackas shell`, or a properly sourced shell, is still the recommended, fully-featured way to work — but the wrapper now makes a bypass survivable rather than dangerous. If a build needs to be backgrounded, prefer redirecting in a sourced shell anyway — `kas-container build ... > log 2>&1 &` runs the function in the current shell and backgrounds the job, so the fragment and project derivation still happen. Full writeup: [issue #27](https://github.com/koenkooi/mackas/issues/27).
 
 ### env.sh staleness — check this first when something "documented as fixed" isn't happening
 
-**`env.sh` is generated by `mackas setup` and does NOT auto-update when the
-mackas script changes.** It can sit stale through days of real fixes with no
-error and no warning; sourcing it silently keeps the old wrapper behaviour.
-`mackas` itself never goes stale this way — `env.sh` puts the mackas checkout on
-`PATH`, so `mackas <subcommand>` is always the live script. Only the sourced
-wrapper (runtime-args, fragment append, project derivation) can be old.
+**`env.sh` is generated by `mackas setup` and does NOT auto-update when the mackas script changes** — but a stale, previously-sourced `env.sh` is much less dangerous than it used to be. The protection wrapper it delegates to, `$MACKAS_BIN/kas-container`, is regenerated by `mackas setup` independent of any particular shell's sourced state, and it live-recomputes `--runtime-args` on every call rather than freezing it — so the wrapper a stale shell hands off to is not stale itself. What a stale `env.sh` *can* still have wrong is the sourced **function's own behaviour** — fragment auto-append, project derivation — since those are shell-function-only conveniences and are subject to staleness the way they always were. `mackas` itself never goes stale this way either — `env.sh` puts the mackas checkout on `PATH`, so `mackas <subcommand>` is always the live script.
 
 Whenever you are told "mackas was updated", or a behaviour described in this
 file demonstrably isn't happening, regenerate:
