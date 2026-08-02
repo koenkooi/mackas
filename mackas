@@ -5692,7 +5692,7 @@ cmd_exec() {
 # retrieval already put there -- on top of the accumulation buildstats.bbclass
 # itself already does guest-side (see check_buildstats_accumulation).
 fetch_tmp_subdir() {
-	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" guest destsub quiet_undefined=0 rc
+	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" guest destsub quiet_undefined=0 rc
 
 	# buildhistory is the one object whose variable is only ever defined by
 	# an optional bbclass (see bitbake_getvar): opt into its quiet-undefined
@@ -5709,6 +5709,20 @@ fetch_tmp_subdir() {
 	elif [ "$rc" -ne 0 ]; then
 		guest="$default"
 		warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
+	elif [ -n "$machine" ]; then
+		# 'retrieve deploy images MACHINE' (item 24): DEPLOY_DIR_IMAGE was just
+		# resolved for real, for the PROJECT's currently configured MACHINE --
+		# bitbake has no CLI knob to re-resolve it under a different one
+		# without reconfiguring the checkout. OE-core's bitbake.conf always
+		# names this directory's final path component literally ${MACHINE}
+		# regardless of how a distro redefines DEPLOY_DIR itself (the
+		# multiconfig/SDK machinery across the ecosystem depends on that), so
+		# swapping only the trailing component of the REAL resolved path is a
+		# distro-safe substitution -- never a blind 'DEPLOY_DIR/images/
+		# $machine' guess built without asking bitbake first. Only done on
+		# the rc=0 (real answer) path -- $default above is already built with
+		# $machine appended where it belongs, by the caller.
+		guest="${guest%/*}/$machine"
 	fi
 
 	# Existence probe AND a real size measurement in the SAME container hop --
@@ -5835,6 +5849,15 @@ ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matte
                        so successive retrievals never merge together.
   logs                 tmp/log -- cooker.log and friends.
   deploy               tmp/deploy -- the images and ipks. Can be tens of GB.
+  deploy images [MACHINE]
+                       Just DEPLOY_DIR_IMAGE (\${DEPLOY_DIR}/images/\${MACHINE})
+                       -- the boot images for one board, without every
+                       ipk/rpm feed and every MACHINE a multiconfig build has
+                       ever produced. MACHINE defaults to the project's
+                       currently configured one; an explicit override
+                       substitutes only the resolved path's trailing
+                       component, never a blind DEPLOY_DIR/images/MACHINE
+                       guess. Lands at \$dest/deploy/images.
   buildhistory         buildhistory/ -- what each build produced: package and
                        image contents, sizes, dependencies, sysroot listings.
                        Only exists if the project INHERITs buildhistory; most
@@ -5876,7 +5899,7 @@ EOF
 # name it lands under on the host: 'logs' is the CLI-facing plural of tmp/log,
 # and 'buildhistory' resolves to ${TOPDIR}/buildhistory, outside tmp/ entirely.
 cmd_retrieve() {
-	local dest="" objects=() want_help=0
+	local dest="" objects=() want_help=0 idx
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--dry-run)     DRY_RUN=1; shift ;;
@@ -5888,7 +5911,30 @@ cmd_retrieve() {
 			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
 			--dest)        dest="${2:-}"; [ -n "$dest" ] || die "--dest needs a DIR"; shift 2 ;;
 			--dest=*)      dest="${1#*=}"; shift ;;
-			buildstats|logs|deploy|buildhistory) objects+=("$1"); shift ;;
+			deploy)
+				# 'deploy' optionally takes its own sub-scope: 'images
+				# [MACHINE]' narrows the whole-DEPLOY_DIR copy down to just
+				# DEPLOY_DIR_IMAGE (boot images for one board), instead of
+				# every ipk/rpm feed and every MACHINE a multiconfig build
+				# has ever produced. Encoded into the object token itself
+				# ('deploy:images' / 'deploy:images:MACHINE') rather than a
+				# separate array, so the rest of this function's per-object
+				# loop stays a flat list of strings.
+				objects+=("deploy"); shift
+				if [ "${1:-}" = "images" ]; then
+					shift
+					idx=$((${#objects[@]} - 1))
+					case "${1:-}" in
+						# Not a MACHINE: either nothing follows, another flag,
+						# or the next object keyword entirely.
+						''|-*|buildstats|logs|deploy|buildhistory|help)
+							objects[$idx]="deploy:images" ;;
+						*)
+							objects[$idx]="deploy:images:$1"; shift ;;
+					esac
+				fi
+				;;
+			buildstats|logs|buildhistory) objects+=("$1"); shift ;;
 			-*) die "unknown option for 'retrieve': $1" "$SCRIPT_CMD retrieve --help" ;;
 			*) die "unknown object for 'retrieve': $1" \
 				"$SCRIPT_CMD retrieve --help  (objects: buildstats logs deploy buildhistory)" ;;
@@ -5951,23 +5997,38 @@ cmd_retrieve() {
 	# BUILDHISTORY_DIR at ${TOPDIR}/buildhistory, and TOPDIR inside the
 	# container is /build itself -- so its default is a SIBLING of tmp/, not a
 	# subdirectory of it.
-	local it sub var extra default fetched=0 got_buildstats=0 got_buildhistory=0
+	local it sub var extra default machine fetched=0 got_buildstats=0 got_buildhistory=0
 	for it in "${objects[@]}"; do
 		sub="$it"
 		var="DEPLOY_DIR"
 		extra=""
 		default="/build/tmp/$it"
+		machine=""
 		case "$it" in
 			logs)         sub="log"; var="LOG_DIR"; default="/build/tmp/log" ;;
 			buildstats)   var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
 			buildhistory) var="BUILDHISTORY_DIR"; default="/build/buildhistory" ;;
+			deploy:images|deploy:images:*)
+				sub="deploy/images"
+				var="DEPLOY_DIR_IMAGE"
+				# Everything after the second ':' is the optional MACHINE
+				# override (empty when the user just wrote 'deploy images'
+				# with none), see fetch_tmp_subdir's own comment for how it
+				# is applied to a REAL bitbake-getvar answer. Appended here
+				# too, to the FALLBACK default -- unlike the real answer, the
+				# fallback has no existing trailing MACHINE component to
+				# substitute, so it must be built with one already in place.
+				machine="${it#deploy:images}"
+				machine="${machine#:}"
+				default="/build/tmp/deploy/images${machine:+/$machine}"
+				;;
 		esac
 		# fetch_tmp_subdir itself now measures and prints the real size to
 		# transfer (and warns if $dest looks too small) -- replacing what used
 		# to be one hardcoded "deploy can be large" guess that said nothing
 		# about the other three objects and nothing real about this
 		# project's actual deploy/ contents.
-		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra"; then
+		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra" "$machine"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
 			[ "$it" = "buildhistory" ] && got_buildhistory=1
