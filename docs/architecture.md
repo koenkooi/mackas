@@ -326,6 +326,15 @@ fragment composed in without touching any repo. `-k` is safe afterwards,
 since the fragment's settings are then baked into the file it keeps
 unchanged.
 
+A hand-typed invocation through the `env.sh` `kas-container()` function is not
+left silent about this any more, either: the same argv scan that finds the
+file list for fragment auto-append also recognizes `-k`/
+`--keep-config-unchanged` and prints a one-line heads-up to stderr that
+`write_bbconfig` — and so any fragment change in the file list this call
+names — will not take effect this run. Not a refusal: `-k` on an
+already-configured checkout is a legitimate choice, just previously silent
+about what it skips.
+
 This is the same rule mackas follows internally, and now in one place
 structurally rather than by convention: `bitbake_getvar()` and `mackas exec`
 both call a shared `kas_shell_ro()` helper that passes exactly those four

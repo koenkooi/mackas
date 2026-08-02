@@ -3518,7 +3518,11 @@ kas-container() {
 			while [ \$# -gt 0 ]; do
 				_mackas_arg="\$1"
 				case "\$_mackas_arg" in
-					-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
+					-k|--keep-config-unchanged)
+						_mackas_before+=("\$_mackas_arg"); shift
+						echo "\$SCRIPT_NAME: -k/--keep-config-unchanged skips write_bbconfig this run -- any local.conf/bblayers.conf change in the file list (including an auto-appended macos-local.yml) will not take effect until a build without -k" >&2
+						;;
+					--force-checkout|--update|-E|--preserve-env)
 						_mackas_before+=("\$_mackas_arg"); shift ;;
 					--skip=*|--target=*|--cmd=*|--task=*|--provenance=*)
 						_mackas_before+=("\$_mackas_arg"); shift ;;

@@ -814,6 +814,35 @@ with_project_fragment() {
 	printf '%s\n' "$out" | grep -qxF 'meta-angstrom/kas/angstrom.yml:meta-angstrom/kas/beaglebone.yml:meta-angstrom/kas/macos-local.yml'
 }
 
+@test "kas-container wrapper: -k prints a one-line heads-up that write_bbconfig is skipped" {
+	# Issue #28: a hand-typed '-k' silently skips write_bbconfig, so a fragment
+	# right there in the file list (including macos-local.yml) has no effect --
+	# nothing errors, the only symptom is a downstream bitbake warning that
+	# reads like an unrelated config problem. Not a refusal: -k on an
+	# already-configured checkout is legitimate, just previously silent.
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell -k meta-angstrom/kas/angstrom.yml 2>&1' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qi 'keep-config-unchanged skips write_bbconfig'
+}
+
+@test "kas-container wrapper: --keep-config-unchanged (long form) also warns" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container build --keep-config-unchanged meta-angstrom/kas/angstrom.yml 2>&1' _ "$MACKAS_ENV_SH")"
+	printf '%s\n' "$out" | grep -qi 'keep-config-unchanged skips write_bbconfig'
+}
+
+@test "kas-container wrapper: no -k, no warning" {
+	with_project_fragment
+	write_env_sh
+	fake_kas_container
+	out="$(cd "$MACKAS_WORK" && /bin/bash -c '. "$1" >/dev/null 2>&1; kas-container shell meta-angstrom/kas/angstrom.yml 2>&1' _ "$MACKAS_ENV_SH")"
+	! printf '%s\n' "$out" | grep -qi 'write_bbconfig'
+}
+
 @test "kas-container wrapper: multiple recognized boolean flags before <files> all survive, in order" {
 	with_project_fragment
 	write_env_sh
