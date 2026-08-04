@@ -251,6 +251,17 @@
 #MACKAS_KAS_AUTO_PROJECT=1
 
 
+# The image `mackas volume fsck` runs e2fsck from, inside a throwaway
+# container. Empty (the default) means the kas image.
+#
+# The kas image does NOT ship e2fsprogs (verified: no e2fsck, fsck.ext4,
+# dumpe2fs or debugfs anywhere on its PATH), so mackas apt-gets it into the
+# throwaway container on demand -- it is Debian 13 trixie with a working
+# apt, and a build already needs network. Set this to an image that already
+# has e2fsprogs to skip that install and let `volume fsck` work offline.
+#MACKAS_FSCK_IMAGE=""
+
+
 # The smoketest ladder's build rungs: space-separated bitbake targets, run in
 # order after the universal parse-only rung. Empty by default (the built-in
 # default, not what is shown commented out below): with no targets set, the

@@ -483,6 +483,19 @@ resize/destroy doesn't reclaim the space you expected, look for that prompt in
 the output, and for the leftover directory on the relocated drive if it was
 declined.
 
+### Repairing ext4 corruption after a crash
+
+A host crash mid-write can leave a volume's ext4 metadata inconsistent — the
+symptom is bitbake dying with `OSError: [Errno 117] Structure needs
+cleaning` on some path under `/build`. `mackas volume fsck <name> | all |
+--all [--check-only]` repairs it with `e2fsck`, on a `cp -c` clone of
+`volume.img` inside a throwaway container — the real volume is never
+reachable from inside the guest, and nothing is promoted back over it until
+an independent second check pass confirms the repair is clean. The
+pre-repair image is kept alongside it afterwards, forever; mackas never
+deletes it, not even with `-y`
+([storage.md](../../docs/storage.md#repairing-ext4-corruption-mackas-volume-fsck)).
+
 ### Cleaning
 
 `mackas clean` with **no target** deletes and recreates the *whole* TMPDIR
