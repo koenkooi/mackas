@@ -92,6 +92,7 @@ lib_setup() {
 
 	write_self_stub "$(kas_runtime_args)" 0
 	write_recorder
+	write_container_mock
 	write_kas_wrapper
 }
 
@@ -134,6 +135,41 @@ force_frozen_fallback() {
 	FROZEN_FAKE="$1"
 	# shellcheck disable=SC2317  # invoked indirectly by write_kas_wrapper()
 	kas_runtime_args() { printf '%s' "$FROZEN_FAKE"; }
+}
+
+# write_container_mock -- a fake `container` on $PATH answering "system
+# status"/"system start", the same daemon-check the wrapper now runs before
+# ever handing off to .real (issue #33). Without this, the wrapper's
+# unconditional `container system status` call would reach the REAL Apple
+# container CLI, since nothing else in this file puts a fake one on $PATH.
+# Default: always "running", matching every pre-existing test's assumption
+# that the daemon is up and 'system start' is never called. A test that
+# wants the down-then-recovers or down-forever cases sets MOCK_CONTAINER_DOWN
+# =1 (and, for the recovers case, CONTAINER_STARTED_MARKER) before invoking
+# the wrapper.
+write_container_mock() {
+	mkdir -p "$TESTDIR/fakebin"
+	CONTAINER_LOG="$TESTDIR/container.rec"
+	export CONTAINER_LOG
+	cat > "$TESTDIR/fakebin/container" <<'EOF'
+#!/usr/bin/env bash
+printf 'CALL: %s\n' "$*" >> "$CONTAINER_LOG"
+if [ "$1 $2" = "system status" ]; then
+	if [ "${MOCK_CONTAINER_DOWN:-0}" = "1" ] && [ ! -f "${CONTAINER_STARTED_MARKER:-/nonexistent-marker-xyzzy}" ]; then
+		exit 1
+	fi
+	echo "status running"
+	exit 0
+fi
+if [ "$1 $2" = "system start" ]; then
+	[ -n "${CONTAINER_STARTED_MARKER:-}" ] && touch "$CONTAINER_STARTED_MARKER"
+	exit 0
+fi
+exit 0
+EOF
+	chmod +x "$TESTDIR/fakebin/container"
+	PATH="$TESTDIR/fakebin:$PATH"
+	export PATH
 }
 
 # write_recorder -- the fake .real kas-container the wrapper execs at the
@@ -319,4 +355,50 @@ rec_runtime_args_value() {
 	loop_rc=0
 	timeout 5 "$KAS_CONTAINER_BIN" build foo.yml >/dev/null 2>&1 || loop_rc=$?
 	[ "$loop_rc" -eq 124 ]
+}
+
+# ---------------------------------------------------------------------------
+# 9: auto-start the container runtime (issue #33). A hand-typed kas-container
+# invocation gets the same container_running-then-start treatment mackas's
+# own shell/exec/smoketest do, instead of whatever raw error the daemon-down
+# state produces.
+# ---------------------------------------------------------------------------
+
+@test "auto-start: runtime already up, no 'system start' is ever called" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	! grep -q 'system start' "$CONTAINER_LOG"
+}
+
+@test "auto-start: runtime down at invocation, comes up after 'system start', reaches the recorder" {
+	MOCK_CONTAINER_DOWN=1
+	CONTAINER_STARTED_MARKER="$TESTDIR/container-started"
+	export MOCK_CONTAINER_DOWN CONTAINER_STARTED_MARKER
+	[ ! -e "$CONTAINER_STARTED_MARKER" ]
+
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF 'CALL: system start' "$CONTAINER_LOG"
+	[ -e "$CONTAINER_STARTED_MARKER" ]
+	[ -e "$KREC" ]
+	rt="$(rec_runtime_args_value)"
+	printf '%s\n' "$rt" | grep -qF ':/build'
+}
+
+@test "auto-start: runtime stays down after 'system start', wrapper refuses with a clear message, recorder never created" {
+	MOCK_CONTAINER_DOWN=1
+	export MOCK_CONTAINER_DOWN
+	# No CONTAINER_STARTED_MARKER set: the mock's "system status" always
+	# fails, so 'system start' can never bring it up.
+
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'container system did not start'
+	printf '%s\n' "$out" | grep -qF 'container system status'
+	grep -qF 'CALL: system start' "$CONTAINER_LOG"
+	[ ! -e "$KREC" ]
 }

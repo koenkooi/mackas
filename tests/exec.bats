@@ -72,7 +72,14 @@ EOF
 	printf '\n'
 } >> "$CLOG"
 case "$1 $2" in
-	"system status") echo "status running"; exit 0 ;;
+	"system status")
+		if [ "${MOCK_CONTAINER_DOWN:-0}" = "1" ] && [ ! -f "${CONTAINER_STARTED_MARKER:-/nonexistent-marker-xyzzy}" ]; then
+			exit 1
+		fi
+		echo "status running"; exit 0 ;;
+	"system start")
+		[ -n "${CONTAINER_STARTED_MARKER:-}" ] && touch "$CONTAINER_STARTED_MARKER"
+		exit 0 ;;
 	"ls "*|"ls")
 		echo "ID"
 		[ -n "${MOCK_BUSY_VOLUME:-}" ] && echo "runner1"
@@ -112,6 +119,22 @@ refute_klog() {
 	if grep -qF -- "$1" "$KLOG" 2>/dev/null; then
 		printf 'expected NO kas-container call containing:\n  %s\n--- calls ---\n%s\n' \
 			"$1" "$(cat "$KLOG" 2>/dev/null)" >&2
+		return 1
+	fi
+}
+
+assert_clog() {
+	if ! grep -qF -- "$1" "$CLOG" 2>/dev/null; then
+		printf 'expected a container call containing:\n  %s\n--- calls ---\n%s\n' \
+			"$1" "$(cat "$CLOG" 2>/dev/null)" >&2
+		return 1
+	fi
+}
+
+refute_clog() {
+	if grep -qF -- "$1" "$CLOG" 2>/dev/null; then
+		printf 'expected NO container call containing:\n  %s\n--- calls ---\n%s\n' \
+			"$1" "$(cat "$CLOG" 2>/dev/null)" >&2
 		return 1
 	fi
 }
@@ -284,4 +307,36 @@ refute_klog() {
 	echo 0 > "$EXIT_CODE_FILE"
 	MACKAS_PROJECT_DIR=meta-angstrom mk exec true
 	[ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Auto-start the container runtime (issue #33): kas_shell_ro() -- the helper
+# 'exec' shares with retrieve/buildstats analyze/clean/sstate prune/lock/dump
+# -- must not surface a raw daemon-down error; it auto-starts the runtime
+# first, the same check_running-then-start logic setup_runtime() has always
+# had for 'mackas setup'.
+# ---------------------------------------------------------------------------
+
+@test "exec: runtime already up, no 'system start' is ever called" {
+	MACKAS_PROJECT_DIR=meta-angstrom mk exec true
+	[ "$status" -eq 0 ]
+	refute_clog "[system] [start]"
+}
+
+@test "exec: runtime down at invocation, comes up after 'system start', the command still runs" {
+	marker="$TESTDIR/container-started"
+	MOCK_CONTAINER_DOWN=1 CONTAINER_STARTED_MARKER="$marker" \
+		MACKAS_PROJECT_DIR=meta-angstrom mk exec true
+	[ "$status" -eq 0 ]
+	assert_clog "[system] [start]"
+	[ -f "$marker" ]
+	assert_klog "[shell]"
+}
+
+@test "exec: runtime stays down after 'system start', refuses with a clear message, kas-container never runs" {
+	MOCK_CONTAINER_DOWN=1 MACKAS_PROJECT_DIR=meta-angstrom mk exec true
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'container system did not start'
+	assert_clog "[system] [start]"
+	[ ! -f "$KLOG" ]
 }

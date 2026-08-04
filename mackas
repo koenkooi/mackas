@@ -1582,6 +1582,21 @@ image_present() {
 	container image ls 2>/dev/null | awk 'NR>1 {print $1":"$2}' | grep -qxF "$1"
 }
 
+# ensure_container_running -- the same container_running-then-start logic
+# setup_runtime() (below) already has, reused by any command about to
+# actually touch the runtime outside of 'setup' itself. The daemon does not
+# survive a reboot; without this, the first real command after a fresh boot
+# surfaces whatever raw error 'container'/'kas-container' produces trying to
+# reach it, not a mackas-owned message (issue #33). Never called from
+# status/check -- those stay read-only and short-circuit instead (see
+# check_state()).
+ensure_container_running() {
+	container_running && return 0
+	run container system start
+	container_running || die "container system did not start" \
+		"check by hand: container system status"
+}
+
 volume_exists() {
 	container volume ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qxF "$1"
 }
@@ -2519,36 +2534,51 @@ check_one_volume() {
 check_state() {
 	hdr "8. Existing state (idempotency)"
 
-	if image_present "$KAS_IMAGE"; then
-		ck_pass "image $KAS_IMAGE already pulled"
+	# Every probe below (image_present, check_one_volume's volume_exists,
+	# find_orphaned_volume_images, the legacy-volume volume_exists) asks the
+	# daemon, not the filesystem -- 'container volume ls'/'image ls' return
+	# nothing when it's not running, which used to read as "not present" /
+	# "orphaned" for state that is actually fine, just unreachable (issue
+	# #33). check_host() (rung 2) already ck_fail's the daemon-down state
+	# itself, so this is ck_info, not a second WARN/FAIL for the same root
+	# cause -- just the explanation for why this rung has nothing further to
+	# say. One clear line instead of a cascade of misleading per-item
+	# findings; the disk-only checks below (relocate symlink, wrapper
+	# sha256, stray build dir) are unaffected and still run.
+	if ! container_running; then
+		ck_info "container system is not running -- image/volume existence cannot be checked this way; everything below this point is UNKNOWN, not necessarily absent"
 	else
-		ck_info "image $KAS_IMAGE not pulled yet ('$SCRIPT_CMD setup' will pull it)"
-	fi
+		if image_present "$KAS_IMAGE"; then
+			ck_pass "image $KAS_IMAGE already pulled"
+		else
+			ck_info "image $KAS_IMAGE not pulled yet ('$SCRIPT_CMD setup' will pull it)"
+		fi
 
-	check_one_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
-	check_one_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
-	check_one_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "SSTATE_DIR -> /sstate"
+		check_one_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
+		check_one_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
+		check_one_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "SSTATE_DIR -> /sstate"
 
-	# Images left behind on another drive by destroying a relocated volume.
-	# Nothing points at them any more, so nothing else would ever mention them.
-	local orphans orphan n_orph
-	orphans="$(find_orphaned_volume_images 2>/dev/null)"
-	if [ -n "$orphans" ]; then
-		n_orph="$(printf '%s\n' "$orphans" | grep -c .)"
-		ck_warn "$n_orph orphaned volume image(s): on disk, but no volume refers to them" \
-			"these are what a destroyed RELOCATED volume leaves behind; remove any you do not want"
-		printf '%s\n' "$orphans" | while IFS= read -r orphan; do
-			[ -n "$orphan" ] || continue
-			printf '         %s%s%s (%s)\n' "$C_DIM" "$orphan" "$C_RST" \
-				"$(du -sh "$orphan" 2>/dev/null | awk '{print $1}')"
-		done
-	fi
+		# Images left behind on another drive by destroying a relocated volume.
+		# Nothing points at them any more, so nothing else would ever mention them.
+		local orphans orphan n_orph
+		orphans="$(find_orphaned_volume_images 2>/dev/null)"
+		if [ -n "$orphans" ]; then
+			n_orph="$(printf '%s\n' "$orphans" | grep -c .)"
+			ck_warn "$n_orph orphaned volume image(s): on disk, but no volume refers to them" \
+				"these are what a destroyed RELOCATED volume leaves behind; remove any you do not want"
+			printf '%s\n' "$orphans" | while IFS= read -r orphan; do
+				[ -n "$orphan" ] || continue
+				printf '         %s%s%s (%s)\n' "$C_DIM" "$orphan" "$C_RST" \
+					"$(du -sh "$orphan" 2>/dev/null | awk '{print $1}')"
+			done
+		fi
 
-	# A volume from before the split into three. It is not used any more, and a
-	# stale 200G image is exactly the thing this disk cannot spare.
-	if volume_exists "$MACKAS_VOL_LEGACY"; then
-		ck_warn "volume '$MACKAS_VOL_LEGACY' is left over from the old single-volume scheme and is NOT used" \
-			"container volume delete $(printf '%q' "$MACKAS_VOL_LEGACY")   # after checking you want nothing in it"
+		# A volume from before the split into three. It is not used any more, and a
+		# stale 200G image is exactly the thing this disk cannot spare.
+		if volume_exists "$MACKAS_VOL_LEGACY"; then
+			ck_warn "volume '$MACKAS_VOL_LEGACY' is left over from the old single-volume scheme and is NOT used" \
+				"container volume delete $(printf '%q' "$MACKAS_VOL_LEGACY")   # after checking you want nothing in it"
+		fi
 	fi
 
 	if [ "$MACKAS_RELOCATE_VOLUMES" = "1" ]; then
@@ -4047,6 +4077,22 @@ if [ "\$MACKAS_KAS_WRAPPED" = "1" ]; then
 	exec "\$KAS_CONTAINER_REAL" "\$@"
 fi
 
+# Auto-start the container runtime if it is not up yet -- the same
+# container_running()/ensure_container_running() check $SCRIPT_NAME itself
+# runs before 'shell'/'exec'/'smoketest' (issue #33). The daemon does not
+# survive a reboot; without this, a hand-typed kas-container invocation would
+# hit whatever raw error the daemon-down state produces instead of a clear
+# message.
+if ! container system status >/dev/null 2>&1 || \\
+   ! container system status 2>/dev/null | awk '\$1=="status" {print \$2}' | grep -q '^running\$'; then
+	container system start
+	if ! container system status >/dev/null 2>&1 || \\
+	   ! container system status 2>/dev/null | awk '\$1=="status" {print \$2}' | grep -q '^running\$'; then
+		echo "\$SCRIPT_NAME: container system did not start; check by hand: container system status" >&2
+		exit 1
+	fi
+fi
+
 # If the caller already passed --runtime-args/--docker-args itself, do not
 # inject a second one: kas-container ACCUMULATES repeated --runtime-args
 # values instead of the last one winning, so adding ours alongside the
@@ -4961,6 +5007,7 @@ run_kas() {
 	# is configured but not attached that path is a case-INSENSITIVE directory
 	# on the host drive. A no-op when no image is configured.
 	ensure_workspace_attached
+	ensure_container_running
 
 	rt_args="$(kas_runtime_args)"
 	# A GITCONFIG_FILE already in this shell's environment always wins; see
@@ -5075,6 +5122,7 @@ run_kas() {
 # through, live, to whoever ran 'mackas exec'.
 kas_shell_ro() {
 	local cmdstring="$1" rt_args gitconfig
+	ensure_container_running
 	rt_args="$(kas_runtime_args)"
 	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
 	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
@@ -6989,14 +7037,24 @@ cmd_status() {
 	fi
 
 	hdr "ext4 volumes"
-	status_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "/build      TMPDIR"
-	status_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "/downloads  DL_DIR"
-	status_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "/sstate     SSTATE_DIR"
-	if volume_exists "$MACKAS_VOL_LEGACY"; then
-		printf '  %s[old]%s %-22s unused leftover of the single-volume scheme\n' \
-			"$C_YEL" "$C_RST" "$MACKAS_VOL_LEGACY"
-		printf '        %sremove with: container volume delete %s%s\n' \
-			"$C_BLU" "$(printf '%q' "$MACKAS_VOL_LEGACY")" "$C_RST"
+	# status_volume()'s [yes]/[ no] and the legacy-volume line both ask the
+	# daemon (volume_exists -> 'container volume ls'), which returns nothing
+	# when it's not running -- every volume used to print [ no] for state
+	# that is actually fine, just unreachable (issue #33; see "Runtime"
+	# above for the one line that already says so).
+	if ! container_running; then
+		info "  container system is not running -- volume existence cannot be checked"
+		info "  this way; everything below is UNKNOWN, not necessarily absent"
+	else
+		status_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "/build      TMPDIR"
+		status_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "/downloads  DL_DIR"
+		status_volume "$MACKAS_VOL_SSTATE" "$MACKAS_VOLUME_SIZE_SSTATE" "/sstate     SSTATE_DIR"
+		if volume_exists "$MACKAS_VOL_LEGACY"; then
+			printf '  %s[old]%s %-22s unused leftover of the single-volume scheme\n' \
+				"$C_YEL" "$C_RST" "$MACKAS_VOL_LEGACY"
+			printf '        %sremove with: container volume delete %s%s\n' \
+				"$C_BLU" "$(printf '%q' "$MACKAS_VOL_LEGACY")" "$C_RST"
+		fi
 	fi
 	show "total cap" "$(status_total_cap_gb) GiB (sparse: costs only what is used)"
 	info ""
