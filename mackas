@@ -117,6 +117,7 @@ MACKAS_MONITOR_PORT
 MACKAS_MONITOR_NOTIFY
 MACKAS_BUILDSTATS_ACCUMULATE
 MACKAS_SOCKET_SWEEP
+MACKAS_FSCK_IMAGE
 "
 
 # ---------------------------------------------------------------------------
@@ -776,6 +777,15 @@ set_defaults() {
 	# only when nothing is using the volumes, so there is nothing for a
 	# default-on sweep to break. Set to 0 to disable.
 	MACKAS_SOCKET_SWEEP=1
+
+	# Image `mackas volume fsck` runs e2fsck from. Empty (the default) means
+	# the kas image, which mackas apt-gets e2fsprogs into on demand (see
+	# fsck_guest_script). Set to an image that already has e2fsprogs to skip
+	# that install and work offline -- same shape as the removed
+	# MACKAS_RESIZE_IMAGE (f50c9ee), resolved lazily here rather than eagerly
+	# defaulted to $KAS_IMAGE because KAS_IMAGE is itself a setting that may
+	# be overridden after set_defaults() runs.
+	MACKAS_FSCK_IMAGE=""
 }
 
 CONFIG_FILE_USED=""
@@ -7571,7 +7581,7 @@ volume_list() {
 		return 0
 	fi
 
-	local name cap img used_kb used inuse moved
+	local name cap img used_kb used inuse moved realdir leftover lk
 	while IFS="$(printf '\t')" read -r name cap; do
 		[ -n "$name" ] || continue
 		img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
@@ -7587,6 +7597,17 @@ volume_list() {
 			moved="$(readlink "$CONTAINER_VOLUMES_DIR/$name")"
 			printf '  %s-> moved to: %s%s\n' "$C_DIM" "$moved" "$C_RST"
 		fi
+		# 'volume fsck' keeps the pre-repair image as the user's only undo and
+		# never removes it itself. It is APFS block-shared with the live image,
+		# so it costs little at first and grows as the two diverge -- and it is
+		# invisible in the ON DISK column above, which is du of volume.img alone.
+		realdir="$(volume_real_dir "$name")"
+		for leftover in "$realdir"/volume.img.mackas-corrupt-*; do
+			[ -f "$leftover" ] || continue
+			lk="$(volume_img_kb "$leftover")"
+			printf '  %s-> pre-fsck image kept: %s (%s) -- rm -f it when satisfied%s\n' \
+				"$C_DIM" "$leftover" "$(fmt_kb "${lk:-0}")" "$C_RST"
+		done
 	done <<EOF
 $rows
 EOF
@@ -8295,6 +8316,355 @@ volume_resize() {
 	return "$?"
 }
 
+# Which image 'volume fsck' runs e2fsck from. Empty MACKAS_FSCK_IMAGE (the
+# default) falls back to $KAS_IMAGE -- same shape the removed
+# MACKAS_RESIZE_IMAGE used (f50c9ee), and resolved lazily for the same
+# reason: KAS_IMAGE is itself a setting that may be overridden after
+# set_defaults() ran.
+fsck_image() { printf '%s' "${MACKAS_FSCK_IMAGE:-$KAS_IMAGE}"; }
+
+# Print the POSIX-sh script that runs INSIDE the throwaway fsck container.
+# MODE is "check" (--check-only) or "repair". One definition, used by both
+# the real 'container run' and the --dry-run print, so the two can never
+# drift -- and so a test can grep the whole thing for the invariants it
+# encodes.
+#
+# MODE is baked into the emitted TEXT (an early 'exit 10' right after the
+# assess pass, in check mode) rather than passed as a guest env var: 'container
+# run -e' is not used anywhere else in this file and is unverified against
+# Apple container 1.1.0.
+fsck_guest_script() {
+	local mode="$1"
+	cat <<'EOS'
+set -e
+img=/vol/volume.img
+# e2fsprogs only if this image does not already have it. The pinned kas
+# image (ghcr.io/siemens/kas/kas:5.4) has NO e2fsprogs at all -- no e2fsck,
+# fsck.ext4, dumpe2fs or debugfs, only a generic /usr/sbin/fsck dispatcher
+# with nothing to dispatch to (verified live). It IS Debian 13 trixie with a
+# working apt, and a build already needs network, so installing into the
+# throwaway container is the cheapest route. MACKAS_FSCK_IMAGE is the escape
+# hatch for anyone who wants it prebuilt or is offline.
+if ! command -v e2fsck >/dev/null 2>&1; then
+  echo "MACKAS-FSCK: installing e2fsprogs"
+  apt-get update -qq  >/dev/null 2>&1 || { echo "MACKAS-FSCK: error apt-get update failed"; exit 12; }
+  apt-get install -y -qq e2fsprogs >/dev/null 2>&1 || { echo "MACKAS-FSCK: error could not install e2fsprogs"; exit 12; }
+fi
+command -v e2fsck >/dev/null 2>&1 || { echo "MACKAS-FSCK: error no e2fsck in this image"; exit 12; }
+# Loop-attach the CLONE. This is the whole point of the command: a loop
+# device carries a genuinely UNMOUNTED ext4 filesystem, which is what
+# e2fsck needs for a real repair. A named-volume mount (-v NAME:/path) can
+# never give us that -- Apple's runtime auto-mounts it as ext4 first.
+# Only the explicit /dev/loop0 form was verified live; --find is tried
+# first but must never be the only path.
+dev="$(losetup --find --show "$img" 2>/dev/null || true)"
+if [ -z "$dev" ]; then
+  losetup /dev/loop0 "$img" 2>/dev/null || { echo "MACKAS-FSCK: error could not attach a loop device"; exit 12; }
+  dev=/dev/loop0
+fi
+# Detach on EVERY exit path, and sync first so e2fsck's metadata writes are
+# on the virtiofs-backed file before the VM goes away.
+trap 'sync; losetup -d "$dev" >/dev/null 2>&1 || true' EXIT
+echo "MACKAS-FSCK: device $dev"
+# Assess. -f forces a check even when the superblock claims clean; -n
+# answers no to everything, so nothing is written. NOTE: -n cannot replay a
+# dirty journal, so after a crash this pass OVER-reports. That is why a
+# non-zero here is only ever read as "needs the repair pass", never as a
+# verdict, and why exit 0 is the only trusted answer.
+st=0; e2fsck -f -n "$dev" || st=$?
+if [ "$st" -eq 0 ]; then echo "MACKAS-FSCK: clean"; exit 0; fi
+echo "MACKAS-FSCK: dirty $st"
+EOS
+	[ "$mode" = check ] && printf 'exit 10\n'
+	cat <<'EOS'
+# Repair the CLONE. -y answers yes to everything; the journal is replayed
+# first, which is exactly what -n could not do.
+st=0; e2fsck -f -y "$dev" || st=$?
+echo "MACKAS-FSCK: repair-exit $st"
+# e2fsck exit bits: 1 errors corrected, 2 corrected+reboot, 4 uncorrected,
+# 8 operational error, 16 usage, 32 aborted. >=8 means it could not even do
+# the job, which is categorically different from "found and fixed things".
+if [ "$st" -ge 8 ]; then echo "MACKAS-FSCK: unrepairable"; exit 11; fi
+# Verify: an INDEPENDENT second forced pass must come back completely clean.
+# This is the rehearsal the promotion decision rests on.
+st=0; e2fsck -f -n "$dev" || st=$?
+if [ "$st" -ne 0 ]; then echo "MACKAS-FSCK: unrepairable"; exit 11; fi
+echo "MACKAS-FSCK: repaired"
+exit 0
+EOS
+}
+
+# fsck ONE volume: check, and on confirmation repair, ext4 corruption in its
+# backing image. Returns non-zero on a real failure; when called from 'all'
+# a missing/busy/leftover-blocked volume is warned and skipped rather than
+# fatal -- same shape as volume_fstrim_one().
+#
+# SAFETY: e2fsck NEVER runs against the real volume.img, in ANY mode,
+# including --check-only. The only bind mount the fsck container ever gets
+# is $work (a scratch APFS clone, created and verified BEFORE the container
+# exists) -- the original image is not reachable from inside the guest at
+# all, so no command it runs, correct or buggy, can touch it. This is
+# structural (the container invocation never names $dir or $img), not just
+# an ordering guarantee -- but the ordering holds too: nothing under
+# "STEP H" runs until the clone at $work/volume.img has been created AND
+# had its size verified equal to the original's.
+volume_fsck_one() {
+	local name="$1" from_all="${2:-0}" check_only="${3:-0}"
+
+	# STEP A -- guards, before anything at all is created on disk.
+	if ! volume_exists "$name"; then
+		if [ "$from_all" -eq 1 ]; then
+			warn "  volume '$name' does not exist; skipping"
+			return 0
+		fi
+		die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
+	fi
+
+	# One-VM rule, checked BEFORE the clone: cloning an image a live VM is
+	# mid-writing yields an inconsistent copy (same reasoning
+	# volume_duplicate() states for its own guard on the SOURCE), and
+	# promoting a repair made from an inconsistent copy would be
+	# catastrophic. This must never run after STEP G.
+	if volume_in_use "$name"; then
+		if [ "$from_all" -eq 1 ]; then
+			warn "  volume '$name' is attached to a running container; skipping (one-VM rule)"
+			return 0
+		fi
+		die "volume '$name' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD volume fsck $name'"
+	fi
+
+	# STEP B -- locate the REAL image. volume_real_dir(), never
+	# $CONTAINER_VOLUMES_DIR/$name directly, so a volume relocated by
+	# 'volume move' is handled and the clone lands on the drive the image
+	# actually lives on (same reasoning volume_resize() states for its own
+	# dir/img/ent block).
+	local dir img
+	dir="$(volume_real_dir "$name")"
+	img="$dir/volume.img"
+	if [ ! -f "$img" ]; then
+		if [ "$from_all" -eq 1 ]; then
+			warn "  '$name' has no volume.img at $dir; skipping"
+			return 0
+		fi
+		die "no volume.img at $img" "$SCRIPT_CMD volume recover $name"
+	fi
+	[ -f "$dir/entity.json" ] || die "no entity.json at $dir -- this does not look like a container volume" \
+		"$SCRIPT_CMD volume list"
+
+	# STEP C -- refuse a leftover scratch dir from an interrupted run,
+	# matching volume_resize_by_copy()'s leftover-tmpvol refusal.
+	local w
+	for w in "$dir"/.mackas-fsck-*; do
+		[ -d "$w" ] || continue
+		if [ "$from_all" -eq 1 ]; then
+			warn "  '$name' has a leftover scratch copy at $w; skipping"
+			return 0
+		fi
+		die "leftover scratch copy from an interrupted '$SCRIPT_CMD volume fsck': $w" \
+			"it holds a full copy of '$name' -- inspect it, then remove it (rm -rf $(quote_cmd "$w")) before retrying"
+	done
+
+	local mode
+	if [ "$check_only" -eq 1 ]; then mode=check; else mode=repair; fi
+
+	# STEP D -- report the plan, and budget. Free space matters because the
+	# clone is CoW-shared at first but every metadata block e2fsck rewrites
+	# diverges it from the source.
+	local stamp work keep img_kb
+	stamp="$(date +%Y%m%d-%H%M%S)"
+	work="$dir/.mackas-fsck-$stamp"
+	keep="$dir/volume.img.mackas-corrupt-$stamp"
+	img_kb="$(volume_img_kb "$img")"
+	info "${C_BLD}mackas volume fsck $name${C_RST}"
+	info "  image  : $img"
+	info "  on disk: $(fmt_kb "${img_kb:-0}")"
+	info "  scratch: $work/volume.img (APFS clone -- near-free until e2fsck writes)"
+	local free_gb; free_gb="$(free_gb_for "$dir")"
+	[ "$free_gb" -ge 2 ] || warn "      only ${free_gb} GiB free on that drive; e2fsck's rewritten metadata diverges the clone from its source and needs room."
+	# For the throwaway TMPDIR volume, say the cheaper answer out loud.
+	[ "$name" = "$MACKAS_VOL_TMP" ] && info "  ('$name' is the throwaway TMPDIR volume -- '$SCRIPT_CMD clean' recreates it fresh, which is usually cheaper than repairing it.)"
+
+	# STEP E -- --dry-run, its own early branch, exactly the shape
+	# volume_fstrim_one() uses. It must not even create the scratch dir.
+	if [ "$DRY_RUN" -eq 1 ]; then
+		run mkdir -p "$work"
+		run cp -c "$img" "$work/volume.img"
+		run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")"
+		run ln "$img" "$keep"
+		run mv -f "$work/volume.img" "$img"
+		info "  (dry-run: nothing was cloned, checked or repaired)"
+		return 0
+	fi
+
+	# STEP F -- GATE 1. The clone and the container both cost real time and
+	# (unless MACKAS_FSCK_IMAGE names an image with e2fsprogs) a network
+	# fetch, so say so plainly.
+	confirm "  Clone '$name' and run e2fsck against the COPY? ('$name' itself is not touched; installs e2fsprogs into a throwaway container)" \
+		|| { info "  Left unchanged."; return 1; }
+
+	# STEP G -- THE BACKUP. Unconditional, host-side, before any container
+	# exists. Same dir means same filesystem, so 'cp -c' is a genuine APFS
+	# clonefile and not the silent full-copy fallback volume_duplicate()'s
+	# comment warns about; it also makes the later promotion an atomic
+	# same-fs rename.
+	run mkdir -p "$work"
+	run cp -c "$img" "$work/volume.img" || { run rm -rf "${work:?}"; die "could not clone $img" "check free space on $(volume_mount_point "$dir")"; }
+
+	# stat, not a bare existence test: it doubles as the "did the clone
+	# really appear" check and gives us the byte count STEP J compares
+	# against. `|| statrc=$?` attached to the SAME statement (not a separate
+	# `rc=$?` line) so a failing stat cannot trip `set -e` before the die()
+	# below runs -- same idiom sstate_prune's report="$(...)" || rc=$? uses,
+	# and the file's own stat -f '%u' ... || return 1 (line 807-808).
+	local orig_sz="" clone_sz="" statrc=0
+	orig_sz="$(stat -f '%z' "$img" 2>/dev/null)" || statrc=$?
+	if [ "$statrc" -ne 0 ] || [ -z "$orig_sz" ]; then
+		run rm -rf "${work:?}"
+		die "could not stat $img" "nothing was changed; check permissions on $dir"
+	fi
+	statrc=0
+	clone_sz="$(stat -f '%z' "$work/volume.img" 2>/dev/null)" || statrc=$?
+	if [ "$statrc" -ne 0 ] || [ -z "$clone_sz" ]; then
+		run rm -rf "${work:?}"
+		die "the clone of $img did not appear at $work/volume.img" "check free space and permissions on $dir"
+	fi
+	if [ "$orig_sz" != "$clone_sz" ]; then
+		run rm -rf "${work:?}"
+		die "the clone is $clone_sz bytes but $img is $orig_sz -- refusing to check a copy that is not the image" \
+			"report this; nothing was changed"
+	fi
+
+	# STEP H -- THE CONTAINER. -v "$work:/vol" is a plain HOST DIRECTORY
+	# bind mount (an ordinary virtiofs share, exactly like retrieve's
+	# -v "$dest:/out"), NOT a named-volume mount, so Apple's
+	# auto-mount-as-ext4 special case never fires and e2fsck really does get
+	# an unmounted filesystem. $img is not inside $work, so nothing the
+	# guest can run can reach it -- that is the invariant, structurally.
+	# -u 0:0 and --cap-add CAP_SYS_ADMIN are both required and neither alone
+	# suffices, the same pair volume_fstrim_one() documents.
+	vrb "+ $(quote_cmd container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")")"
+	local out st=0
+	out="$(container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")" 2>&1)" || st=$?
+
+	# Same boot-progress filter volume_fstrim_one() uses: captured through
+	# $(...) rather than a TTY, container emits 7-8 "[3/6] Fetching kernel
+	# [0s]" lines that carry no information by the time we read them.
+	local filtered
+	filtered="$(printf '%s\n' "$out" | grep -vE '^\[[0-9]+/[0-9]+\]' || true)"
+	[ -n "$filtered" ] && printf '%s\n' "$filtered" | sed 's/^/  e2fsck: /'
+
+	# STEP I -- classify off the MARKER LINES (primary; $st is corroboration
+	# only, since whether Apple container faithfully propagates a guest
+	# exit status is unverified). Same output-parsing shape sstate_prune()
+	# already uses.
+	if printf '%s\n' "$out" | grep -qF 'MACKAS-FSCK: clean'; then
+		run rm -rf "${work:?}"
+		did "'$name' is clean -- no repair needed"
+		return 0
+	fi
+	if printf '%s\n' "$out" | grep -qF 'MACKAS-FSCK: error'; then
+		run rm -rf "${work:?}"
+		err "could not check '$name' -- e2fsck never ran (see above)."
+		info "  '$name' was not touched. Try MACKAS_FSCK_IMAGE=<image with e2fsprogs> if this is a network problem."
+		return 1
+	fi
+	if [ "$check_only" -eq 1 ]; then
+		run rm -rf "${work:?}"
+		warn "  '$name' is NOT clean. Note that a read-only pass cannot replay a dirty"
+		warn "  journal, so after a crash it over-reports -- re-run without --check-only"
+		warn "  to have the repair pass replay it first and say what is really wrong."
+		return 1
+	fi
+	if printf '%s\n' "$out" | grep -qF 'MACKAS-FSCK: unrepairable'; then
+		err "e2fsck could not bring a copy of '$name' to a clean state."
+		info "  '$name' itself was NOT modified. The attempted repair is at:"
+		info "    $work/volume.img"
+		info "  Remove it when you are done with it: rm -rf $(quote_cmd "$work")"
+		return 1
+	fi
+	if ! printf '%s\n' "$out" | grep -qF 'MACKAS-FSCK: repaired'; then
+		run rm -rf "${work:?}"
+		err "e2fsck produced no result mackas understands (rc=$st) -- '$name' was not touched"
+		return 1
+	fi
+
+	# STEP J -- size re-check, then GATE 2. e2fsck never changes an image's
+	# size; a difference means something other than a repair happened, so
+	# refuse rather than promote. Same statrc idiom as STEP G.
+	statrc=0
+	clone_sz="$(stat -f '%z' "$work/volume.img" 2>/dev/null)" || statrc=$?
+	if [ "$statrc" -ne 0 ] || [ -z "$clone_sz" ]; then
+		die "could not stat the repaired copy at $work/volume.img" "'$name' was not touched; inspect $work by hand"
+	fi
+	if [ "$orig_sz" != "$clone_sz" ]; then
+		die "the repaired copy is $clone_sz bytes but '$name' is $orig_sz -- refusing to promote it" \
+			"'$name' was not touched; the copy is at $work/volume.img"
+	fi
+	confirm "  Promote the repaired copy to be '$name's volume.img? (the current image is kept alongside it)" \
+		|| { info "  Left unchanged. The repaired copy is at $work/volume.img (rm -rf it when done)."; return 1; }
+
+	# STEP K -- PROMOTION. The ONLY step that touches the real image, and it
+	# is reached only after the rehearsal above verified clean. 'ln' first
+	# (instant, shares every block), so volume.img is never absent for even
+	# an instant; then an atomic same-fs rename replaces it. INT/TERM
+	# blocked across the window, the identical guard volume_move() puts
+	# around its own transfer.
+	trap '' INT TERM
+	run ln "$img" "$keep"
+	run mv -f "$work/volume.img" "$img"
+	trap on_interrupt INT TERM
+	run rmdir "$work"
+
+	did "repaired '$name'"
+	info "  The pre-repair image is kept (APFS-shared, so it costs little today):"
+	info "    $keep"
+	info "  mackas never removes it. Once you are satisfied the volume is good:"
+	info "    rm -f $(quote_cmd "$keep")"
+	info "  '$SCRIPT_CMD volume list' reports it until you do."
+	info "  ext4 repair may have moved unrecoverable directory entries into"
+	info "  lost+found rather than restoring them in place -- normal after a crash."
+	info "  For tmp: '$SCRIPT_CMD clean' rebuilds it. For sstate: bitbake re-fetches."
+	return 0
+}
+
+# volume fsck <name> | all -- check, and offer to repair, ext4 corruption in
+# a volume's backing image. 'all' is the primary, documented form of this
+# command's object; --all/-a are accepted synonyms, exactly as for
+# 'volume fstrim'/'volume destroy'.
+volume_fsck() {
+	# Mutating and it runs a container against volume images, so it needs a
+	# root for the same reason volume_fstrim() states: without one, 'all'
+	# would expand to the default volume names and operate on whatever
+	# install happens to share them.
+	require_mackas_root
+	local do_all=0 check_only=0 names=() a
+	for a in "$@"; do
+		case "$a" in
+			all|-a|--all)     do_all=1 ;;
+			-n|--check-only)  check_only=1 ;;
+			-*) die "unknown option for 'volume fsck': $a" \
+				"$SCRIPT_CMD volume fsck <name> | all | --all [--check-only]" ;;
+			*)  names+=("$a") ;;
+		esac
+	done
+
+	if [ "$do_all" -eq 1 ]; then
+		[ "${#names[@]}" -eq 0 ] || die "'volume fsck all' takes no volume name" \
+			"$SCRIPT_CMD volume fsck all"
+		names=("$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE")
+	fi
+
+	[ "${#names[@]}" -ge 1 ] || die "'volume fsck' needs a volume name (or 'all'/--all)" \
+		"$SCRIPT_CMD volume fsck <name> | all | --all"
+
+	local n rc=0
+	for n in "${names[@]}"; do
+		volume_fsck_one "$n" "$do_all" "$check_only" || rc=1
+	done
+	return "$rc"
+}
+
 # Ask Spotlight where a volume.img with the right shape lives. Prints one
 # candidate directory per line (the dir that CONTAINS volume.img). Test seam:
 # MACKAS_MDFIND overrides the mdfind binary, exactly like MACKAS_CONTAINER_BIN.
@@ -8537,6 +8907,7 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD volume destroy <name> | all | --all
   $SCRIPT_CMD volume move <name> <dir>
   $SCRIPT_CMD volume resize <name> <size>
+  $SCRIPT_CMD volume fsck <name> | all | --all [--check-only]
   $SCRIPT_CMD volume recover [<name>]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
@@ -8576,6 +8947,27 @@ ${C_BLD}SUBCOMMANDS${C_RST}
                        on. SHRINKING IS REFUSED: the same copy would work, but
                        silently discarding data that no longer fits is not
                        something mackas will do for you.
+  fsck <name>          Check, and offer to REPAIR, ext4 corruption in a
+                       volume's backing image -- the '[Errno 117] Structure
+                       needs cleaning' a host crash mid-write leaves behind.
+                       Works on a CLONE: mackas copies volume.img first
+                       (APFS copy-on-write, near-free), runs e2fsck against
+                       the copy inside a throwaway container, and only
+                       offers to promote the result once a second, clean
+                       verification pass has confirmed the repair. '<name>'
+                       itself is never written until you say yes to that,
+                       and the pre-repair image is kept alongside it
+                       afterwards -- mackas never deletes it, not even with
+                       -y. --check-only (-n) stops after the check. 'all'
+                       (or --all/-a) does the three mackas volumes,
+                       skipping any that are in use. A repair can move
+                       unrecoverable directory entries into lost+found
+                       rather than restoring them in place; that is normal
+                       fsck behaviour after a crash, not a mackas bug.
+                       Needs e2fsprogs, which the kas image does not ship
+                       -- it is installed into the throwaway container
+                       (needs network); set MACKAS_FSCK_IMAGE to an image
+                       that already has it to skip that.
   recover [<name>]     When you have moved a volume.img by hand and the runtime
                        can no longer find it, locate it with Spotlight and
                        offer to re-point the symlink. With no name, checks all
@@ -8594,11 +8986,12 @@ before or after the subcommand, e.g. '$SCRIPT_CMD --dry-run volume fstrim oe-bui
 or '$SCRIPT_CMD volume fstrim oe-build-tmp --dry-run' both work.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. fstrim, duplicate and destroy
-  all refuse a volume a running container holds -- for duplicate, that guard is
-  on the SOURCE, since a clone of a live (mid-write) image is inconsistent. In
-  --all/-a mode (fstrim or destroy), a busy volume is skipped with a warning
-  instead of aborting the whole run; naming a volume explicitly still refuses.
+  Only one VM may access an ext4 image at a time. fstrim, duplicate, destroy
+  and fsck all refuse a volume a running container holds -- for duplicate,
+  that guard is on the SOURCE, since a clone of a live (mid-write) image is
+  inconsistent. In --all/-a mode (fstrim, destroy or fsck), a busy volume is
+  skipped with a warning instead of aborting the whole run; naming a volume
+  explicitly still refuses.
 EOF
 }
 
@@ -8633,10 +9026,11 @@ cmd_volume() {
 		destroy|delete|rm)     volume_destroy ${rest+"${rest[@]}"} ;;
 		move|relocate)         volume_move ${rest+"${rest[@]}"} ;;
 		resize|grow)           volume_resize ${rest+"${rest[@]}"} ;;
+		fsck)                  volume_fsck ${rest+"${rest[@]}"} ;;
 		recover)               volume_recover ${rest+"${rest[@]}"} ;;
 		help)                  volume_usage ;;
 		*) die "unknown 'volume' subcommand: $sub" \
-			"$SCRIPT_CMD volume --help  (list | fstrim | duplicate | destroy | move | resize | recover)" ;;
+			"$SCRIPT_CMD volume --help  (list | fstrim | duplicate | destroy | move | resize | fsck | recover)" ;;
 	esac
 }
 
@@ -8682,7 +9076,8 @@ ${C_BLD}COMMANDS${C_RST}
   destroy    Remove all three volumes, $MACKAS_ROOT and the short symlink.
              Makes you type DESTROY.
   volume     Manage the ext4 volumes: list, fstrim (reclaim disk), duplicate,
-             destroy one, move one to another disk, recover a hand-moved one.
+             destroy one, move one to another disk, resize one, fsck a
+             corrupted one, recover a hand-moved one.
              '$SCRIPT_CMD volume --help'.
   set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
   get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.

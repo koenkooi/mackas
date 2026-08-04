@@ -235,12 +235,18 @@ resize2fs: kernel does not support online resize with sparse_super2
 feature — `dumpe2fs -h` on a fresh volume lists it — and the guest kernel has
 no online-resize support for a filesystem carrying it. An *offline* resize
 would not care, but that requires the filesystem unmounted, and a container
-volume can only ever be attached mounted; the loop-device route needs
-`--privileged`, which Apple `container` does not have. All three of image,
-daemon record and filesystem therefore cannot be made to move together, and a
-half-grown volume — bigger block device, same-sized filesystem — is a silent
-no-op worth avoiding. This would change only if Apple stopped setting
-`sparse_super2` or the guest kernel gained support for it.
+volume attached the normal way (`-v NAME:/path`) can only ever be mounted —
+Apple's runtime bind-mounts it as ext4 before any command in the container
+even runs. **Correction (found while building `volume fsck`, below): a loop
+device does NOT need `--privileged`** — `losetup` against a raw image file
+works with just `--cap-add CAP_SYS_ADMIN`, verified live. That is a real,
+unmounted block device, and it is genuinely open whether `resize2fs` would
+work against one the same way `e2fsck` now does for repair — untried, and a
+bigger change than this item's own copy-based mechanism, so not pursued
+here. Filed as a follow-on to this item's own TODO entry. All three of
+image, daemon record and filesystem still cannot be made to move together
+via the mounted-volume path, so the copy mechanism below remains what
+`resize` actually does today.
 
 The copy needs no `resize2fs`, no hand-edited `entity.json` and no daemon
 restart, so it rests on none of those assumptions. Because Apple `container`
@@ -268,6 +274,66 @@ finally asks for the space.
 deciding what to do with data that no longer fits, and silently discarding it
 is not something mackas will do on your behalf. To get a smaller volume,
 create one and copy in what you want.
+
+### Repairing ext4 corruption (`mackas volume fsck`)
+
+A host crash (power loss, a kernel panic, macOS itself dying) that kills the
+Virtualization.framework VM mid-write can leave a volume's ext4 filesystem
+metadata inconsistent — the real-world symptom is bitbake dying with
+`OSError: [Errno 117] Structure needs cleaning` (`EUCLEAN`) on some path
+under `/build`. `mackas volume fsck <name> | all | --all [--check-only]`
+repairs this with `e2fsck`, the same tool a real Linux box would use — but
+getting a genuinely unmounted filesystem to run it against is the same
+mounted-volume problem `resize` runs into above, solved differently here.
+
+**The volume is never touched directly, and the container never sees it.**
+`-v NAME:/path` bind-mounts a NAMED volume, which Apple's runtime auto-mounts
+as ext4 before any command runs — the same fact that rules out an in-place
+resize also rules out ever getting `e2fsck` unmounted access this way, and a
+dirty journal (near-certain after a crash mid-write) would auto-replay — a
+write — the moment anything, even a read-only check, tried to mount it.
+Instead:
+
+1. `cp -c` (an APFS clonefile, same directory so it is a genuine
+   copy-on-write clone, not a slow full copy) `volume.img` into a scratch
+   subdirectory next to it, `.mackas-fsck-<timestamp>/`.
+2. Bind-mount **that scratch subdirectory** — a plain host directory, not a
+   named volume, so Apple's auto-mount-as-ext4 special case never fires —
+   into a throwaway container. The real `volume.img` is not reachable from
+   inside the guest at all; nothing the container runs, correct or buggy,
+   can touch it. This is structural, not just careful ordering.
+3. Inside, `losetup` the cloned `.img` file onto a loop device — a real,
+   genuinely *unmounted* ext4 filesystem, which is what `e2fsck` needs for
+   an actual repair, not merely a read-only check. This needs only
+   `--cap-add CAP_SYS_ADMIN` (the same capability `fstrim` already uses),
+   not `--privileged` (which Apple `container` does not have) — verified
+   live; see the correction above resize's own similar-sounding claim.
+4. `e2fsck -f -y` repairs the clone; an independent second `e2fsck -f -n`
+   pass must then come back completely clean before mackas will even offer
+   to promote it — the rehearsal the whole design rests on.
+5. Only after that rehearsal succeeds does a **second**, separate
+   confirmation offer to promote the repaired clone over the real
+   `volume.img` (`ln` then an atomic same-filesystem `mv -f`, interrupts
+   blocked across the window — the same care `volume move` takes over its
+   own transfer). The pre-repair image is kept alongside it afterwards,
+   forever — mackas never deletes it, not even with `-y` — as the one undo
+   a mistaken repair would need; `volume list` reports it until removed by
+   hand.
+
+The kas image does not ship `e2fsprogs` at all (no `e2fsck`, `fsck.ext4`,
+`dumpe2fs` or `debugfs` — verified live; only a generic `/usr/sbin/fsck`
+dispatcher with nothing to dispatch to), so mackas `apt-get`s it into the
+throwaway container on demand — it is Debian 13 "trixie" with a working
+`apt`, and a build already needs network. `MACKAS_FSCK_IMAGE` names an
+image that already has `e2fsprogs`, to skip that install and work offline.
+
+**A repair can relocate directory entries into `lost+found`** rather than
+restoring them exactly in place — normal `e2fsck` behavior for a corrupted
+directory entry after a crash, not a mackas bug. The file's *content*
+usually survives even when its *name/location* doesn't. For the throwaway
+TMPDIR volume specifically, `mackas clean` rebuilding it fresh is usually
+cheaper than repairing it; sstate simply gets re-fetched/re-built for
+whatever a lost object covered.
 
 ### Three drives, one build: TMPDIR, sstate and downloads apart
 

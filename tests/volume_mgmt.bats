@@ -128,6 +128,70 @@ case "$1 $2" in
 		;;
 esac
 
+# Fall through: a `container run ... -v HOSTDIR:/vol IMAGE sh -c '...'` --
+# 'volume fsck's throwaway container. It NEVER sees the real volume; the
+# only `-v` bind it ever gets is the scratch clone directory fsck_guest_script
+# creates, so this branch keys off the ':/vol' target specifically (never
+# ':/mnt', which is fstrim's own target) and reports the mock's canned
+# MACKAS-FSCK: marker lines instead of running a real e2fsck.
+is_fsck=0
+fsck_hostdir=""
+prev=""
+for a in "$@"; do
+	if [ "$prev" = "-v" ]; then
+		case "$a" in *:/vol) is_fsck=1; fsck_hostdir="${a%:/vol}" ;; esac
+	fi
+	prev="$a"
+done
+if [ "$is_fsck" -eq 1 ]; then
+	last="${@: -1}"
+	case "$last" in
+		*"exit 10"*) fsck_mode=check ;;
+		*)           fsck_mode=repair ;;
+	esac
+	case "${MOCK_FSCK_STATE:-clean}" in
+		apt-fail)
+			echo "MACKAS-FSCK: installing e2fsprogs"
+			echo "MACKAS-FSCK: error apt-get update failed"
+			exit 12
+			;;
+		unrepairable)
+			echo "MACKAS-FSCK: dirty 1"
+			[ "$fsck_mode" = check ] && exit 1
+			echo "MACKAS-FSCK: repair-exit 8"
+			echo "MACKAS-FSCK: unrepairable"
+			exit 11
+			;;
+		dirty-repairable)
+			echo "MACKAS-FSCK: dirty 1"
+			[ "$fsck_mode" = check ] && exit 1
+			echo "MACKAS-FSCK: repair-exit 1"
+			# Overwrite the CLONE (never the real volume -- $fsck_hostdir is
+			# the scratch dir, structurally never the volume's own dir) with
+			# different-but-same-size bytes, so a test can tell "the clone
+			# got repaired" apart from "the original, byte for byte".
+			if [ -f "$fsck_hostdir/volume.img" ]; then
+				sz="$(stat -f %z "$fsck_hostdir/volume.img" 2>/dev/null)"
+				if [ -n "$sz" ]; then
+					/usr/bin/python3 -c '
+import sys
+p = sys.argv[1]; sz = int(sys.argv[2])
+with open(p, "r+b") as f:
+	f.write(b"REPAIRED-BY-MOCK-FSCK")
+	f.truncate(sz)
+' "$fsck_hostdir/volume.img" "$sz"
+				fi
+			fi
+			echo "MACKAS-FSCK: repaired"
+			exit 0
+			;;
+		*)
+			echo "MACKAS-FSCK: clean"
+			exit 0
+			;;
+	esac
+fi
+
 # Fall through: a `container run ... fstrim -v /mnt`. Find the volume from the
 # `-v NAME:/mnt` bind, shrink its image, and print a bogus trimmed figure.
 is_fstrim=0
@@ -1099,6 +1163,127 @@ break_volume() {
 		--set "MACKAS_WORKSPACE_IMAGE=$recorded" -y volume recover oe-build-tmp
 	[ "$status" -eq 0 ]
 	! printf '%s\n' "$output" | grep -qi 'workspace image'
+}
+
+# ---------------------------------------------------------------------------
+# fsck -- repair ext4 corruption in a volume's backing image, on a CLONE
+#
+# `volume fsck` never lets a container near the real volume.img: it `cp -c`s
+# (APFS clone) it into a scratch subdirectory FIRST, and that scratch
+# directory is the ONLY bind mount the throwaway e2fsck container ever gets
+# -- structurally, not just by convention (see the source-grep test below).
+# The fake container models the mock e2fsck run via MOCK_FSCK_STATE
+# (clean/dirty-repairable/unrepairable/apt-fail) rather than shelling out to
+# a real losetup/e2fsck/apt-get.
+# ---------------------------------------------------------------------------
+
+@test "volume fsck: a clean volume is a no-op" {
+	have_volume oe-build-tmp 120G 8192
+	MOCK_FSCK_STATE=clean vol -y fsck oe-build-tmp
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "clean -- no repair needed"
+	refute_call "[mv]"
+	# No pre-repair image kept, no leftover scratch dir.
+	[ -z "$(ls "$(VOLDIR)/oe-build-tmp"/volume.img.mackas-corrupt-* 2>/dev/null)" ]
+	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
+}
+
+@test "volume fsck: corruption is detected, backed up, rehearsed against the clone, and promoted" {
+	have_volume oe-build-tmp 120G 8192
+	local before_sum; before_sum="$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')"
+	MOCK_FSCK_STATE=dirty-repairable vol -y fsck oe-build-tmp
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "repaired 'oe-build-tmp'"
+	# The pre-repair image is kept, byte-identical to what the volume was
+	# before this run (mackas's own undo).
+	local kept; kept="$(ls "$(VOLDIR)/oe-build-tmp"/volume.img.mackas-corrupt-* 2>/dev/null | head -1)"
+	[ -n "$kept" ]
+	[ "$(shasum "$kept" | awk '{print $1}')" = "$before_sum" ]
+	# The live volume.img now carries the mock's post-repair bytes -- content
+	# actually changed, not just re-blessed in place.
+	[ "$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')" != "$before_sum" ]
+	# No leftover scratch dir once promotion finished.
+	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
+}
+
+@test "volume fsck: declining the repair confirmation leaves everything untouched" {
+	have_volume oe-build-tmp 120G 8192
+	local before_sum; before_sum="$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')"
+	# No -y, stdin not a tty => confirm() declines at GATE 1, before any clone
+	# is even made.
+	MOCK_FSCK_STATE=dirty-repairable vol fsck oe-build-tmp
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "left unchanged"
+	[ "$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')" = "$before_sum" ]
+	[ -z "$(ls "$(VOLDIR)/oe-build-tmp"/volume.img.mackas-corrupt-* 2>/dev/null)" ]
+	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
+	refute_call "[-v] [--cap-add]"
+}
+
+@test "volume fsck all: skips a volume a running container holds, still handles the others" {
+	have_volume oe-build-tmp    120G 8192
+	have_volume oe-build-dl     40G  8192
+	have_volume oe-build-sstate 40G  8192
+	MOCK_INUSE=oe-build-tmp MOCK_FSCK_STATE=clean vol -y fsck all
+	[ "$status" -eq 0 ]
+	# tmp is held, so it is skipped (warned), never cloned or checked...
+	printf '%s\n' "$output" | grep -qi "oe-build-tmp.*skipping"
+	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
+	# ...but the other two get the real treatment.
+	printf '%s\n' "$output" | grep -qi "oe-build-dl.*clean -- no repair needed"
+	printf '%s\n' "$output" | grep -qi "oe-build-sstate.*clean -- no repair needed"
+}
+
+@test "volume fsck <name>: an explicitly named busy volume refuses outright" {
+	have_volume oe-build-tmp 120G 8192
+	local before_sum; before_sum="$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')"
+	MOCK_INUSE=oe-build-tmp vol -y fsck oe-build-tmp
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'only ONE VM'
+	[ "$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')" = "$before_sum" ]
+	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
+	refute_call "[-v] [--cap-add]"
+}
+
+@test "volume fsck: --dry-run runs nothing and creates no backup" {
+	have_volume oe-build-tmp 120G 8192
+	local before_sum; before_sum="$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')"
+	MOCK_FSCK_STATE=dirty-repairable vol --dry-run fsck oe-build-tmp
+	[ "$status" -eq 0 ]
+	refute_call "[--cap-add] [CAP_SYS_ADMIN]"
+	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
+	[ -z "$(ls "$(VOLDIR)/oe-build-tmp"/volume.img.mackas-corrupt-* 2>/dev/null)" ]
+	[ "$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')" = "$before_sum" ]
+}
+
+@test "volume fsck: the original volume.img is never reachable from inside the guest (safety invariant)" {
+	# Source-grep half: the container invocation's only -v names the scratch
+	# clone, never the volume's own name/dir directly. Mirrors "volume fstrim:
+	# the exact flags are asserted against the source too".
+	grep -qF -- '-v "$work:/vol" "$(fsck_image)"' "$MACKAS"
+	! grep -qF -- '-v "$name:/vol"' "$MACKAS"
+	! grep -qF -- '-v "$dir:/vol"' "$MACKAS"
+	! grep -qF -- '-v "$img:/vol"' "$MACKAS"
+
+	# Behavioral half: confirm() declines outright whenever stdin is not a
+	# real tty (checked BEFORE it ever reads a reply -- see mackas:229-250),
+	# which a bats test can never fake with piped input, so a hermetic test
+	# cannot sequence "yes to gate 1, no to gate 2" here. Verify the
+	# invariant instead at the PROCESS level, on a run where the container
+	# genuinely IS invoked and the repair genuinely IS promoted (-y, same
+	# scenario as "corruption is detected, backed up, rehearsed... and
+	# promoted" above): the real $CLOG argv the container actually received
+	# must never carry the volume's own name -- only the scratch clone's
+	# path -- proving the mount target really is what protects the original,
+	# not merely that this run happened to decline before reaching it.
+	have_volume oe-build-tmp 120G 8192
+	MOCK_FSCK_STATE=dirty-repairable vol -y fsck oe-build-tmp
+	[ "$status" -eq 0 ]
+	assert_call "[--cap-add] [CAP_SYS_ADMIN]"
+	local vbind; vbind="$(grep -oE '\[-v\] \[[^]]*:/vol\]' "$CLOG" | head -1)"
+	[ -n "$vbind" ]
+	printf '%s\n' "$vbind" | grep -qF ".mackas-fsck-"
+	! printf '%s\n' "$vbind" | grep -qF "/oe-build-tmp:/vol"
 }
 
 # ---------------------------------------------------------------------------
