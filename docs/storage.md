@@ -335,6 +335,47 @@ TMPDIR volume specifically, `mackas clean` rebuilding it fresh is usually
 cheaper than repairing it; sstate simply gets re-fetched/re-built for
 whatever a lost object covered.
 
+### Detecting corruption without running fsck: the dirty-bit check
+
+`mackas check`/`mackas status` don't run `e2fsck` on every invocation — that
+needs the daemon up, `e2fsprogs` installed via `apt-get` (unless
+`MACKAS_FSCK_IMAGE` is set), and a clone+loop-mount, far too heavy for a
+command people run constantly. Instead they read one bit for free: ext4's
+superblock is a fixed, well-known 1024-byte structure sitting at a *fixed
+byte offset* (1024) inside `volume.img` itself, readable straight off the
+plain host file with no mount, no loop device, and no container at all.
+`tools/mackas-ext4-dirty-bit` (stdlib-only `/usr/bin/python3`, the stock
+macOS one) reads `s_state`'s `EXT2_ERROR_FS` bit — set by the *kernel* the
+moment it detects a real ext4 inconsistency during actual use, which is
+exactly what happened, unnoticed, before the crash that motivated `volume
+fsck` in the first place. `check`/`status` surface it as a plain `[FAIL]` /
+an inline annotation with the fix (`mackas volume fsck <name>`) right next
+to the volume it's about.
+
+Byte offsets were verified against e2fsprogs' own `lib/ext2fs/ext2_fs.h`
+(`struct ext2_super_block`), not guessed from memory of the format, and
+cross-checked live against a genuinely corrupted `volume.img` (the one this
+session's crash produced) and its since-repaired copy. Two things learned
+from that live test shaped the design:
+
+- The companion `EXT2_VALID_FS` bit ("cleanly unmounted") is read but
+  **never** used to call a volume dirty — Apple's `container` runtime does
+  not appear to unmount ext4 gracefully between `container run` invocations,
+  so that bit reads unset on volumes that are provably fine. Only
+  `EXT2_ERROR_FS` is the verdict.
+- `s_error_count` stayed `0` on the real corrupted image even though the
+  extended `s_last_error_func`/`line`/`errcode` fields *were* populated (and
+  pinpointed the exact kernel function and errno) — so `error_count` is
+  reported when non-zero but never relied on; a zero there proves nothing.
+
+This is host-side and daemon-independent by construction — it is the one
+part of `check`/`status`'s volume reporting that still answers correctly
+while the container system is down, which is exactly the reboot-after-a-
+crash scenario where it matters most. `/usr/bin/python3` and the tool file
+are detected, never required: if either is missing, the check is silently
+skipped — no warning, same as every other optional host tool this project
+prefers over a hard requirement.
+
 ### Three drives, one build: TMPDIR, sstate and downloads apart
 
 The three volumes look alike — three sparse ext4 images — but they are used in

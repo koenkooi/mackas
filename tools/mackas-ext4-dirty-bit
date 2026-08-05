@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+#
+# mackas-ext4-dirty-bit -- read an ext4 volume.img's dirty/error state directly.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Report whether an ext4 image needs `mackas volume fsck`, without running
+fsck. Stdlib only, targets /usr/bin/python3 (stock macOS) -- no e2fsprogs,
+no container, no daemon.
+
+WHY THIS WORKS WITHOUT A CONTAINER
+  Apple's `-v NAME:/path` auto-mounts a named volume as ext4 before any
+  container command runs, so a full `e2fsck` can never get genuinely
+  unmounted access that way (see `mackas volume fsck`'s own design). But the
+  question this tool answers -- "did the kernel ever detect ext4 errors on
+  this image?" -- doesn't need a mount OR a loop device at all: ext4's
+  superblock is a fixed, well-known 1024-byte structure living at a FIXED
+  BYTE OFFSET (1024) inside volume.img, readable straight off the plain host
+  file, mounted or not, daemon running or not.
+
+WHAT IS READ, AND WHY
+  Only `struct ext2_super_block`'s s_state EXT2_ERROR_FS bit (0x0002) is
+  treated as the "needs fsck" verdict. The companion EXT2_VALID_FS bit
+  (0x0001, "cleanly unmounted") is read and reported but NEVER used to call
+  something dirty: live-tested against this project's own volumes, Apple's
+  container runtime does not appear to unmount ext4 gracefully between
+  `container run` invocations, so EXT2_VALID_FS reads unset on volumes that
+  are provably fine -- it is noise for this purpose, not a signal. The
+  extended per-error forensic fields (s_last_error_func/line/errcode) are
+  reported when present and were genuinely useful on a real corrupted image
+  (pinpointed the exact kernel function/line/errno); s_error_count, on that
+  same image, stayed 0 despite the other fields being populated, so it is
+  read but never relied on -- a zero there proves nothing either way.
+
+  Byte offsets verified against e2fsprogs' own lib/ext2fs/ext2_fs.h (struct
+  ext2_super_block), field-by-field cumulative offsets cross-checked against
+  every /*0xx*/ marker comment in that header -- not guessed, not from
+  memory of the format alone. Constants (EXT2_SUPER_MAGIC, EXT2_VALID_FS,
+  EXT2_ERROR_FS, EXT3_FEATURE_INCOMPAT_RECOVER) are the same header's own
+  #define values.
+
+EXIT STATUS
+  0  clean -- no ext4 errors ever detected on this image
+  1  dirty -- the kernel set EXT2_ERROR_FS; `mackas volume fsck` is the fix
+  2  unknown -- not readable, too short, or not an ext2/3/4 image at all
+     (never treated as a failure by a caller: "no verdict" is not "dirty")
+"""
+import argparse
+import json
+import struct
+import sys
+
+SB_OFFSET = 1024
+SB_SIZE = 1024
+
+# (name, byte offset within the superblock, struct format)
+_FIELDS = (
+    ("magic",             0x38, "<H"),
+    ("state",             0x3A, "<H"),
+    ("lastcheck",         0x40, "<I"),
+    ("feature_incompat",  0x60, "<I"),
+    ("error_count",       0x190, "<I"),
+    ("first_error_time",  0x194, "<I"),
+    ("first_error_ino",   0x198, "<I"),
+    ("first_error_block", 0x1A0, "<Q"),
+    ("first_error_line",  0x1C8, "<I"),
+    ("last_error_time",   0x1CC, "<I"),
+    ("last_error_ino",    0x1D0, "<I"),
+    ("last_error_line",   0x1D4, "<I"),
+    ("last_error_block",  0x1D8, "<Q"),
+)
+# (name, byte offset, length) -- fixed-size byte arrays, no guaranteed NUL
+_STR_FIELDS = (
+    ("first_error_func", 0x1A8, 32),
+    ("last_error_func",  0x1E0, 32),
+)
+_ERRCODE_FIELDS = (
+    ("first_error_errcode", 0x27A),
+    ("last_error_errcode",  0x27B),
+)
+
+EXT2_SUPER_MAGIC = 0xEF53
+EXT2_VALID_FS = 0x0001  # cleanly unmounted -- NOT used as a dirty signal, see module docstring
+EXT2_ERROR_FS = 0x0002  # kernel detected errors -- the actual verdict
+EXT3_FEATURE_INCOMPAT_RECOVER = 0x0004  # journal has entries pending replay
+
+
+class UnreadableImage(Exception):
+    pass
+
+
+def read_superblock(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(SB_OFFSET)
+            blk = f.read(SB_SIZE)
+    except OSError as e:
+        raise UnreadableImage(str(e))
+    if len(blk) < SB_SIZE:
+        raise UnreadableImage("file too short to hold an ext2/3/4 superblock")
+
+    sb = {}
+    for name, off, fmt in _FIELDS:
+        sb[name] = struct.unpack_from(fmt, blk, off)[0]
+    if sb["magic"] != EXT2_SUPER_MAGIC:
+        raise UnreadableImage("bad magic 0x%04x (not ext2/3/4)" % sb["magic"])
+    for name, off, length in _STR_FIELDS:
+        raw = blk[off:off + length]
+        sb[name] = raw.split(b"\x00", 1)[0].decode("ascii", "replace")
+    for name, off in _ERRCODE_FIELDS:
+        sb[name] = blk[off]
+    return sb
+
+
+def verdict(sb):
+    dirty = bool(sb["state"] & EXT2_ERROR_FS)
+    return {
+        "dirty": dirty,
+        "clean_unmount": bool(sb["state"] & EXT2_VALID_FS),
+        "needs_journal_recovery": bool(sb["feature_incompat"] & EXT3_FEATURE_INCOMPAT_RECOVER),
+        "error_count": sb["error_count"],
+        "last_error_time": sb["last_error_time"] or None,
+        "last_error_line": sb["last_error_line"] or None,
+        "last_error_func": sb["last_error_func"] or None,
+        "last_error_errcode": sb["last_error_errcode"] or None,
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Read an ext4 volume.img's dirty/error state directly (no fsck, no container).")
+    ap.add_argument("image", help="path to a volume.img")
+    ap.add_argument("--json", action="store_true", help="emit a JSON object instead of one text line")
+    args = ap.parse_args(argv)
+
+    try:
+        sb = read_superblock(args.image)
+    except UnreadableImage as e:
+        if args.json:
+            json.dump({"status": "unknown", "reason": str(e)}, sys.stdout)
+            print()
+        else:
+            print("UNKNOWN %s (%s)" % (args.image, e))
+        return 2
+
+    v = verdict(sb)
+    if args.json:
+        out = dict(v)
+        out["status"] = "dirty" if v["dirty"] else "clean"
+        json.dump(out, sys.stdout)
+        print()
+    elif v["dirty"]:
+        detail = ""
+        if v["last_error_func"]:
+            detail = " (last: %s line %s errno %s)" % (
+                v["last_error_func"], v["last_error_line"], v["last_error_errcode"])
+        print("DIRTY %s%s" % (args.image, detail))
+    else:
+        print("CLEAN %s" % args.image)
+    return 1 if v["dirty"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

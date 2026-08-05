@@ -1601,6 +1601,28 @@ volume_exists() {
 	container volume ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qxF "$1"
 }
 
+# volume_dirty_bit NAME -- has the kernel ever recorded ext4 errors on NAME's
+# volume.img? Host-side, read-only, no daemon and no e2fsprogs: ext4's
+# superblock sits at a fixed byte offset inside the plain image file, so
+# tools/mackas-ext4-dirty-bit (stdlib-only /usr/bin/python3) reads it
+# straight off disk -- the one signal that still works while the container
+# system is down, which is exactly when a post-crash volume needs it most.
+# 0 clean, 1 dirty (the fix is '$SCRIPT_CMD volume fsck NAME'), 2 unknown
+# (no python3, the image does not exist yet, or it is not readable) -- 2 is
+# a bonus check quietly missing its answer, never a warning on its own: an
+# optional host tool being absent is detected, not required, same as every
+# other "prefer X, fall back silently" check in this project. Prints the
+# tool's one-line message on stdout for status 1 (or 2, though callers
+# generally ignore that); silent (and 2) when the image is simply absent.
+volume_dirty_bit() {
+	local name="$1" tool img
+	tool="$SCRIPT_DIR/tools/mackas-ext4-dirty-bit"
+	[ -x /usr/bin/python3 ] && [ -f "$tool" ] || return 2
+	img="$CONTAINER_VOLUMES_DIR/$name/volume.img"
+	[ -f "$img" ] || return 2
+	/usr/bin/python3 "$tool" "$img"
+}
+
 # refuse_if_stale_entity NAME -- guard every 'container volume create' against
 # a stale daemon index. Returns 0 if it is safe to proceed with create (no
 # stale entry found). Returns 1 if NAME turned out to already exist once the
@@ -2531,8 +2553,31 @@ check_one_volume() {
 	fi
 }
 
+# check_volume_dirty_bit NAME -- ck_fail if volume_dirty_bit says NAME's
+# volume.img has ext4 errors on record; silent otherwise (clean, not
+# created yet, or the check itself is unavailable -- see volume_dirty_bit's
+# own comment for why 2 is never a warning). Deliberately NOT gated behind
+# container_running: this is the one check in this whole rung that still
+# works with the daemon down, so it runs unconditionally, before that gate.
+check_volume_dirty_bit() {
+	local name="$1" dbout dbrc=0
+	dbout="$(volume_dirty_bit "$name")" || dbrc=$?
+	[ "$dbrc" -eq 1 ] || return 0
+	ck_fail "volume '$name' has ext4 errors recorded on disk${dbout#*"$name/volume.img"}" \
+		"$SCRIPT_CMD volume fsck $name"
+}
+
 check_state() {
 	hdr "8. Existing state (idempotency)"
+
+	# Host-side, no daemon needed (see volume_dirty_bit's own comment) --
+	# runs regardless of container_running below, unlike everything else in
+	# this rung. This is exactly the check that would have caught the crash
+	# this feature was built for, the moment it happened, before the next
+	# build ever hit the corrupted directory entry.
+	check_volume_dirty_bit "$MACKAS_VOL_TMP"
+	check_volume_dirty_bit "$MACKAS_VOL_DL"
+	check_volume_dirty_bit "$MACKAS_VOL_SSTATE"
 
 	# Every probe below (image_present, check_one_volume's volume_exists,
 	# find_orphaned_volume_images, the legacy-volume volume_exists) asks the
@@ -6916,6 +6961,19 @@ status_volume() {
 	fi
 }
 
+# status_volume_dirty_bit NAME -- one line, only when volume_dirty_bit says
+# NAME's volume.img has ext4 errors on record; silent otherwise (clean, not
+# created yet, or the check itself unavailable). Host-side, no daemon --
+# see check_volume_dirty_bit's matching comment in check_state().
+status_volume_dirty_bit() {
+	local name="$1" dbout dbrc=0 detail
+	dbout="$(volume_dirty_bit "$name")" || dbrc=$?
+	[ "$dbrc" -eq 1 ] || return 0
+	detail="${dbout#*"$name/volume.img"}"
+	printf '        %sext4 errors recorded on disk%s -- fix: %s volume fsck %s%s\n' \
+		"$C_RED" "$detail" "$SCRIPT_NAME" "$name" "$C_RST"
+}
+
 status_usage() {
 	cat <<EOF
 ${C_BLD}$SCRIPT_CMD status${C_RST} -- show what is configured and what exists on disk.
@@ -7056,6 +7114,11 @@ cmd_status() {
 				"$C_BLU" "$(printf '%q' "$MACKAS_VOL_LEGACY")" "$C_RST"
 		fi
 	fi
+	# Host-side, no daemon needed (see status_volume_dirty_bit's own
+	# comment) -- runs regardless of container_running above.
+	status_volume_dirty_bit "$MACKAS_VOL_TMP"
+	status_volume_dirty_bit "$MACKAS_VOL_DL"
+	status_volume_dirty_bit "$MACKAS_VOL_SSTATE"
 	show "total cap" "$(status_total_cap_gb) GiB (sparse: costs only what is used)"
 	info ""
 	info "  \"on disk\" is REAL usage (du, sparse-aware), never the cap. It only"
