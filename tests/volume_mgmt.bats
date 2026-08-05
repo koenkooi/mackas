@@ -45,6 +45,18 @@ setup() {
 	CLOG="$TESTDIR/container.log"
 	export CLOG
 
+	# Every fsck test in this file exercises the CONTAINER path deliberately
+	# (the fake container's MOCK_FSCK_STATE machinery below) -- force
+	# host_e2fsck_bin() to report "not available" (the MACKAS_FSCK_HOST_E2FSCK_BIN
+	# test seam, set-but-empty) so this stays true regardless of whether the
+	# machine actually running the suite has e2fsprogs installed. Without
+	# this, a real host e2fsck silently takes over (tests/volume_fsck_host.bats
+	# covers that path instead) and rejects this file's tiny dummy volume.img
+	# as not a valid filesystem -- a real regression this file hit the moment
+	# e2fsprogs got installed on the dev Mac.
+	MACKAS_FSCK_HOST_E2FSCK_BIN=""
+	export MACKAS_FSCK_HOST_E2FSCK_BIN
+
 	# name<TAB>size, one per line: the volumes the fake engine knows about.
 	VSTATE="$TESTDIR/volumes.state"
 	export VSTATE

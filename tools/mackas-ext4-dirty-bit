@@ -40,17 +40,29 @@ WHAT IS READ, AND WHY
   container runtime does not appear to unmount ext4 gracefully between
   `container run` invocations, so EXT2_VALID_FS reads unset on volumes that
   are provably fine -- it is noise for this purpose, not a signal. The
-  extended per-error forensic fields (s_last_error_func/line/errcode) are
-  reported when present and were genuinely useful on a real corrupted image
-  (pinpointed the exact kernel function/line/errno); s_error_count, on that
-  same image, stayed 0 despite the other fields being populated, so it is
-  read but never relied on -- a zero there proves nothing either way.
+  extended per-error forensic fields (s_error_count, s_last_error_func/
+  line/errcode) are reported when present and were genuinely useful on a
+  real corrupted image (pinpointed the exact kernel function, line, and
+  error count); never relied on for the verdict itself though -- only the
+  state bit is.
+
+  s_last_error_errcode/s_first_error_errcode are NOT a raw POSIX errno --
+  they index e2fsprogs' own small lib/e2p/errcode.c table (5 ==
+  "EFSCORRUPTED", the kernel's name for the exact corruption a crash left
+  behind here). ERRCODE_NAMES below is that same table, so this tool's
+  message reads the same as `dumpe2fs`'s, not a misleading raw number.
 
   Byte offsets verified against e2fsprogs' own lib/ext2fs/ext2_fs.h (struct
-  ext2_super_block), field-by-field cumulative offsets cross-checked against
-  every /*0xx*/ marker comment in that header -- not guessed, not from
-  memory of the format alone. Constants (EXT2_SUPER_MAGIC, EXT2_VALID_FS,
-  EXT2_ERROR_FS, EXT3_FEATURE_INCOMPAT_RECOVER) are the same header's own
+  ext2_super_block) AND cross-checked live, field-by-field, against
+  `dumpe2fs -h`'s output on a real corrupted volume.img (the one from this
+  project's own crash-and-repair incident) -- not just the header's
+  /*0xx*/ marker comments, which is how the first draft of this tool got
+  s_error_count/s_first_error_time/s_first_error_ino wrong by 4 bytes (a
+  marker attaches to the field immediately after it, not the one two
+  fields later -- easy to mis-attribute by eye, caught only by checking a
+  real image against real dumpe2fs output, not by re-reading the header
+  more carefully). Constants (EXT2_SUPER_MAGIC, EXT2_VALID_FS,
+  EXT2_ERROR_FS, EXT3_FEATURE_INCOMPAT_RECOVER) are the header's own
   #define values.
 
 EXIT STATUS
@@ -73,9 +85,9 @@ _FIELDS = (
     ("state",             0x3A, "<H"),
     ("lastcheck",         0x40, "<I"),
     ("feature_incompat",  0x60, "<I"),
-    ("error_count",       0x190, "<I"),
-    ("first_error_time",  0x194, "<I"),
-    ("first_error_ino",   0x198, "<I"),
+    ("error_count",       0x194, "<I"),
+    ("first_error_time",  0x198, "<I"),
+    ("first_error_ino",   0x19C, "<I"),
     ("first_error_block", 0x1A0, "<Q"),
     ("first_error_line",  0x1C8, "<I"),
     ("last_error_time",   0x1CC, "<I"),
@@ -97,6 +109,20 @@ EXT2_SUPER_MAGIC = 0xEF53
 EXT2_VALID_FS = 0x0001  # cleanly unmounted -- NOT used as a dirty signal, see module docstring
 EXT2_ERROR_FS = 0x0002  # kernel detected errors -- the actual verdict
 EXT3_FEATURE_INCOMPAT_RECOVER = 0x0004  # journal has entries pending replay
+
+# s_last_error_errcode/s_first_error_errcode: an index into e2fsprogs' OWN
+# table (lib/e2p/errcode.c), not a raw POSIX errno -- see module docstring.
+ERRCODE_NAMES = (
+    "", "UNKNOWN", "EIO", "ENOMEM", "EFSBADCRC", "EFSCORRUPTED", "ENOSPC",
+    "ENOKEY", "EROFS", "EFBIG", "EEXIST", "ERANGE", "EOVERFLOW", "EBUSY",
+    "ENOTDIR", "ENOTEMPTY", "ESHUTDOWN", "EFAULT",
+)
+
+
+def errcode_name(code):
+    if 0 <= code < len(ERRCODE_NAMES):
+        return ERRCODE_NAMES[code]
+    return "UNKNOWN_ERRCODE_%d" % code
 
 
 class UnreadableImage(Exception):
@@ -166,8 +192,9 @@ def main(argv=None):
     elif v["dirty"]:
         detail = ""
         if v["last_error_func"]:
-            detail = " (last: %s line %s errno %s)" % (
-                v["last_error_func"], v["last_error_line"], v["last_error_errcode"])
+            detail = " (last: %s line %s %s)" % (
+                v["last_error_func"], v["last_error_line"],
+                errcode_name(v["last_error_errcode"]) if v["last_error_errcode"] is not None else "?")
         print("DIRTY %s%s" % (args.image, detail))
     else:
         print("CLEAN %s" % args.image)
