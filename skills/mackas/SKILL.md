@@ -496,6 +496,12 @@ pre-repair image is kept alongside it afterwards, forever; mackas never
 deletes it, not even with `-y`
 ([storage.md](../../docs/storage.md#repairing-ext4-corruption-mackas-volume-fsck)).
 
+`mackas check`/`mackas status` flag this on their own, without ever running
+fsck: they read the kernel's own ext4 error bit straight off `volume.img`
+(no mount, no daemon, works even with the container system down) and print
+the `volume fsck <name>` fix hint right next to the affected volume
+([storage.md](../../docs/storage.md#detecting-corruption-without-running-fsck-the-dirty-bit-check)).
+
 ### Cleaning
 
 `mackas clean` with **no target** deletes and recreates the *whole* TMPDIR
