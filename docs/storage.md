@@ -286,8 +286,33 @@ repairs this with `e2fsck`, the same tool a real Linux box would use — but
 getting a genuinely unmounted filesystem to run it against is the same
 mounted-volume problem `resize` runs into above, solved differently here.
 
-**The volume is never touched directly, and the container never sees it.**
-`-v NAME:/path` bind-mounts a NAMED volume, which Apple's runtime auto-mounts
+**The host fast path, when a working `e2fsck` is available on the Mac
+itself.** `e2fsck` operates on `volume.img` as a plain file — it needs
+neither a mount nor a loop device nor the kernel to understand ext4 at all
+(live-tested: Homebrew's `e2fsprogs`, a macOS binary, read AND repaired a
+real corrupted `volume.img` this way, results byte-identical to the
+container+loop-device path below). When `host_e2fsck_bin()` finds a working
+`e2fsck` — `command -v e2fsck` first (any provenance: MacPorts, a manual
+build, a non-default `brew --prefix`), falling back to asking `brew`
+directly where a keg-only `e2fsprogs` actually lives, never a hardcoded
+path — `volume fsck` runs it straight against the APFS clone: no throwaway
+container, no network, no `apt-get`. Everything else about the design
+(clone first, original never touched, two separate confirmations, the
+rehearsal before promotion) is identical either way; only *how* `e2fsck`
+gets invoked differs. `mackas status`/`volume fsck`'s own plan report says
+which path will run.
+
+Install both `python3` (used by the ext4 dirty-bit check above) and
+`e2fsprogs` (used here) in one step — `brew install python3 e2fsprogs` —
+rather than separately: the former via a Command Line Tools prompt, the
+latter only if you ever need it. Neither is required; both are detected,
+never assumed, and `volume fsck` falls back to the container mechanism
+below with no difference in outcome, just more network and boot time.
+
+**Without a working host `e2fsck`: the container mechanism below, the
+original design, unchanged.** The volume is never touched directly, and the
+container never sees it. `-v NAME:/path` bind-mounts a NAMED volume, which
+Apple's runtime auto-mounts
 as ext4 before any command runs — the same fact that rules out an in-place
 resize also rules out ever getting `e2fsck` unmounted access this way, and a
 dirty journal (near-certain after a crash mid-write) would auto-replay — a
@@ -362,11 +387,18 @@ from that live test shaped the design:
   **never** used to call a volume dirty — Apple's `container` runtime does
   not appear to unmount ext4 gracefully between `container run` invocations,
   so that bit reads unset on volumes that are provably fine. Only
-  `EXT2_ERROR_FS` is the verdict.
-- `s_error_count` stayed `0` on the real corrupted image even though the
-  extended `s_last_error_func`/`line`/`errcode` fields *were* populated (and
-  pinpointed the exact kernel function and errno) — so `error_count` is
-  reported when non-zero but never relied on; a zero there proves nothing.
+  `EXT2_ERROR_FS` is the verdict; `error_count`/`last_error_*` are reported
+  as detail but never relied on for it.
+- The first draft of the byte-offset table had `s_error_count` (and the two
+  fields right after it) wrong by 4 bytes — matching the header's own
+  `/*0xx*/` marker comments isn't enough; a marker attaches to the field
+  immediately after it, not one two fields later, and it's easy to
+  mis-attribute by eye. Only cross-checking against `dumpe2fs -h`'s own
+  output on the real corrupted image (`error_count: 21695`, not `0`)
+  caught it. `s_last_error_errcode` is not a raw POSIX errno either — it
+  indexes e2fsprogs' own small table (`lib/e2p/errcode.c`; `5` means
+  `EFSCORRUPTED`), so the tool's message uses that same table rather than
+  printing a misleading number.
 
 This is host-side and daemon-independent by construction — it is the one
 part of `check`/`status`'s volume reporting that still answers correctly

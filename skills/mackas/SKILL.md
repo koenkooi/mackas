@@ -488,12 +488,14 @@ declined.
 A host crash mid-write can leave a volume's ext4 metadata inconsistent — the
 symptom is bitbake dying with `OSError: [Errno 117] Structure needs
 cleaning` on some path under `/build`. `mackas volume fsck <name> | all |
---all [--check-only]` repairs it with `e2fsck`, on a `cp -c` clone of
-`volume.img` inside a throwaway container — the real volume is never
-reachable from inside the guest, and nothing is promoted back over it until
-an independent second check pass confirms the repair is clean. The
-pre-repair image is kept alongside it afterwards, forever; mackas never
-deletes it, not even with `-y`
+--all [--check-only]` repairs it with `e2fsck` on a `cp -c` clone of
+`volume.img` — directly on the host if a working `e2fsck` is available
+there (`brew install e2fsprogs`; detected, never required), else inside a
+throwaway container. Either way the real volume is never reachable from the
+repair process, and nothing is promoted back over it until an independent
+second check pass confirms the repair is clean. The pre-repair image is
+kept alongside it afterwards, forever; mackas never deletes it, not even
+with `-y`
 ([storage.md](../../docs/storage.md#repairing-ext4-corruption-mackas-volume-fsck)).
 
 `mackas check`/`mackas status` flag this on their own, without ever running

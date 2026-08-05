@@ -11,8 +11,11 @@
 # plus a crafted 1024-byte superblock with only the fields under test set),
 # not real ext4 filesystems -- hermetic, and it pins the exact offsets the
 # tool was written against (verified live against e2fsprogs' own
-# lib/ext2fs/ext2_fs.h and cross-checked against a genuinely corrupted
-# volume.img this session, see the tool's own module docstring).
+# lib/ext2fs/ext2_fs.h AND cross-checked field-by-field against `dumpe2fs -h`
+# on a genuinely corrupted volume.img this session -- the first draft of the
+# tool got error_count/first_error_time/first_error_ino wrong by 4 bytes
+# despite matching the header's own marker comments; only the live dumpe2fs
+# cross-check caught it, see the tool's own module docstring).
 
 import importlib.machinery
 import importlib.util
@@ -51,7 +54,7 @@ def make_image(path, state, feature_incompat=0, error_count=0,
     struct.pack_into("<H", sb, 0x38, magic)
     struct.pack_into("<H", sb, 0x3A, state)
     struct.pack_into("<I", sb, 0x60, feature_incompat)
-    struct.pack_into("<I", sb, 0x190, error_count)
+    struct.pack_into("<I", sb, 0x194, error_count)
     struct.pack_into("<I", sb, 0x1D4, last_error_line)
     sb[0x1E0:0x1E0 + len(last_error_func)] = last_error_func
     sb[0x27B] = last_error_errcode
@@ -93,10 +96,22 @@ class ReadSuperblockTest(unittest.TestCase):
         self.assertFalse(v["dirty"])
         self.assertFalse(v["clean_unmount"])
 
-    def test_error_count_zero_does_not_override_a_populated_last_error(self):
-        # Live-tested finding: a real corrupted image had error_count==0
-        # while last_error_func/line/errcode WERE populated. The verdict
-        # must come from the state bit, never from error_count.
+    def test_error_count_is_read_correctly_at_its_own_offset(self):
+        # Regression guard for the tool's own first-draft bug: error_count
+        # sits 4 bytes after where a naive read of the header's marker
+        # comments suggests (that marker belongs to the PRECEDING field,
+        # s_snapshot_list) -- caught only by cross-checking a real dumpe2fs
+        # run (21695), not by re-reading ext2_fs.h more carefully.
+        path = self._tmp("error_count.img")
+        make_image(path, state=EXT2_ERROR_FS, error_count=21695)
+        v = dirty_bit.verdict(dirty_bit.read_superblock(path))
+        self.assertEqual(v["error_count"], 21695)
+
+    def test_dirty_verdict_never_depends_on_error_count(self):
+        # The verdict must come from the state bit alone: error_count==0
+        # must not suppress a dirty verdict, and a non-zero error_count with
+        # a clean state bit (should not happen in practice, but the parser
+        # must not invent a verdict from it either) must not force one.
         path = self._tmp("zero_count_but_dirty.img")
         make_image(path, state=EXT2_ERROR_FS, error_count=0,
                    last_error_func=b"ext4_mb_generate_buddy")
@@ -145,6 +160,18 @@ class ReadSuperblockTest(unittest.TestCase):
         return os.path.join(self._tmpdir, name)
 
 
+class ErrcodeNameTest(unittest.TestCase):
+    """Pins ERRCODE_NAMES against e2fsprogs' own lib/e2p/errcode.c table."""
+
+    def test_known_codes_match_e2fsprogs_table(self):
+        self.assertEqual(dirty_bit.errcode_name(2), "EIO")
+        self.assertEqual(dirty_bit.errcode_name(5), "EFSCORRUPTED")
+        self.assertEqual(dirty_bit.errcode_name(6), "ENOSPC")
+
+    def test_out_of_range_code_does_not_raise(self):
+        self.assertEqual(dirty_bit.errcode_name(255), "UNKNOWN_ERRCODE_255")
+
+
 class MainCliTest(unittest.TestCase):
     """The CLI wrapper: exit codes and both output modes."""
 
@@ -174,6 +201,10 @@ class MainCliTest(unittest.TestCase):
         self.assertTrue(out.startswith("CLEAN "))
 
     def test_dirty_exits_one_and_prints_dirty_with_detail(self):
+        # errcode 5 is e2fsprogs' own table index for "EFSCORRUPTED" (see
+        # lib/e2p/errcode.c), not a raw POSIX errno -- the message must
+        # read the same as `dumpe2fs`'s, matched live against a real
+        # corrupted image this session.
         path = self._tmp("dirty.img")
         make_image(path, state=EXT2_ERROR_FS, last_error_line=1312,
                    last_error_func=b"ext4_mb_generate_buddy", last_error_errcode=5)
@@ -182,7 +213,8 @@ class MainCliTest(unittest.TestCase):
         self.assertTrue(out.startswith("DIRTY "))
         self.assertIn("ext4_mb_generate_buddy", out)
         self.assertIn("line 1312", out)
-        self.assertIn("errno 5", out)
+        self.assertIn("EFSCORRUPTED", out)
+        self.assertNotIn("errno", out)
 
     def test_unknown_exits_two_never_treated_as_dirty(self):
         rc, out = self._run(["/nonexistent/volume.img"])

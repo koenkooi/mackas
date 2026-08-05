@@ -8444,7 +8444,82 @@ volume_resize() {
 # set_defaults() ran.
 fsck_image() { printf '%s' "${MACKAS_FSCK_IMAGE:-$KAS_IMAGE}"; }
 
-# Print the POSIX-sh script that runs INSIDE the throwaway fsck container.
+# host_e2fsck_bin -- print the path to a working host-side e2fsck, or print
+# nothing and return 1 if none is available. e2fsck operates on volume.img
+# as a plain file: it does not need a mount, a loop device, or the kernel to
+# understand ext4 at all (verified live: Homebrew's e2fsprogs, a macOS
+# binary, read AND repaired a real corrupted volume.img this way, results
+# byte-identical to the container+loop-device path) -- so when this is
+# available, volume_fsck_one() skips the throwaway container and the
+# apt-get entirely: no boot, no network dependency, no MACKAS_FSCK_IMAGE
+# needed.
+#
+# Detected by FUNCTION, not provenance: `command -v e2fsck` (any PATH
+# source -- MacPorts, a manual build, a non-default `brew --prefix`) is
+# tried first and wins if present. Only if that fails, and only if `brew`
+# itself is on PATH, does this fall back to asking brew where e2fsprogs
+# actually lives (`brew --prefix e2fsprogs`, never a hardcoded
+# /opt/homebrew|/usr/local guess) -- e2fsprogs is keg-only (macOS ships
+# similarly-named tools), so it is never first on $PATH even when
+# installed via brew.
+#
+# Test seam (undocumented, cf. MACKAS_CONTAINER_BIN/MACKAS_OVERHEAD_BIN):
+# MACKAS_FSCK_HOST_E2FSCK_BIN unset means "detect normally"; set but empty
+# forces "not available" (so a hermetic test can exercise the container
+# fallback deterministically, regardless of what happens to be installed
+# on the machine actually running the suite); set non-empty is used
+# verbatim, no detection at all.
+host_e2fsck_bin() {
+	if [ -n "${MACKAS_FSCK_HOST_E2FSCK_BIN+x}" ]; then
+		[ -n "$MACKAS_FSCK_HOST_E2FSCK_BIN" ] || return 1
+		printf '%s' "$MACKAS_FSCK_HOST_E2FSCK_BIN"
+		return 0
+	fi
+	local bin
+	bin="$(command -v e2fsck 2>/dev/null)" || bin=""
+	if [ -n "$bin" ]; then
+		printf '%s' "$bin"
+		return 0
+	fi
+	if command -v brew >/dev/null 2>&1; then
+		local prefix=""
+		prefix="$(brew --prefix e2fsprogs 2>/dev/null)" || prefix=""
+		if [ -n "$prefix" ] && [ -x "$prefix/sbin/e2fsck" ]; then
+			printf '%s' "$prefix/sbin/e2fsck"
+			return 0
+		fi
+	fi
+	return 1
+}
+
+# fsck_host_run MODE IMG -- the host-side fast path: run the SAME e2fsck
+# sequence fsck_guest_script() runs in the container, directly against IMG
+# on the host, no losetup/CAP_SYS_ADMIN/apt-get needed. Emits the identical
+# "MACKAS-FSCK: ..." marker lines volume_fsck_one()'s classification step
+# already parses, so this is a drop-in alternative output source, not a
+# second parsing path. e2fsck's own (verbose) output is left to flow to
+# this function's stdout unfiltered, interleaved with the markers -- same
+# shape the container path's captured output has.
+fsck_host_run() {
+	local mode="$1" img="$2" e2fsck st=0
+	e2fsck="$(host_e2fsck_bin)" || { echo "MACKAS-FSCK: error no host e2fsck available"; return 12; }
+	echo "MACKAS-FSCK: host e2fsck ($e2fsck)"
+	st=0; "$e2fsck" -f -n "$img" || st=$?
+	if [ "$st" -eq 0 ]; then echo "MACKAS-FSCK: clean"; return 0; fi
+	echo "MACKAS-FSCK: dirty $st"
+	if [ "$mode" = check ]; then return 10; fi
+	st=0; "$e2fsck" -f -y "$img" || st=$?
+	echo "MACKAS-FSCK: repair-exit $st"
+	if [ "$st" -ge 8 ]; then echo "MACKAS-FSCK: unrepairable"; return 11; fi
+	st=0; "$e2fsck" -f -n "$img" || st=$?
+	if [ "$st" -ne 0 ]; then echo "MACKAS-FSCK: unrepairable"; return 11; fi
+	echo "MACKAS-FSCK: repaired"
+	return 0
+}
+
+# Print the POSIX-sh script that runs INSIDE the throwaway fsck container --
+# the FALLBACK path, used only when host_e2fsck_bin() finds nothing
+# (fsck_host_run() above is the fast path and needs no container at all).
 # MODE is "check" (--check-only) or "repair". One definition, used by both
 # the real 'container run' and the --dry-run print, so the two can never
 # drift -- and so a test can grep the whole thing for the invariants it
@@ -8589,6 +8664,14 @@ volume_fsck_one() {
 	local mode
 	if [ "$check_only" -eq 1 ]; then mode=check; else mode=repair; fi
 
+	# Decide ONCE, up front: the host fast path (no container, no network)
+	# when a working e2fsck is available there, else the existing
+	# container path. Resolved before the plan is printed so the plan, the
+	# confirm() prompt and the --dry-run preview all agree on which one
+	# will actually run.
+	local host_bin=""
+	host_bin="$(host_e2fsck_bin)" || host_bin=""
+
 	# STEP D -- report the plan, and budget. Free space matters because the
 	# clone is CoW-shared at first but every metadata block e2fsck rewrites
 	# diverges it from the source.
@@ -8601,6 +8684,11 @@ volume_fsck_one() {
 	info "  image  : $img"
 	info "  on disk: $(fmt_kb "${img_kb:-0}")"
 	info "  scratch: $work/volume.img (APFS clone -- near-free until e2fsck writes)"
+	if [ -n "$host_bin" ]; then
+		info "  e2fsck : $host_bin (host, no container needed)"
+	else
+		info "  e2fsck : throwaway container ($(fsck_image)) -- installs e2fsprogs on demand"
+	fi
 	local free_gb; free_gb="$(free_gb_for "$dir")"
 	[ "$free_gb" -ge 2 ] || warn "      only ${free_gb} GiB free on that drive; e2fsck's rewritten metadata diverges the clone from its source and needs room."
 	# For the throwaway TMPDIR volume, say the cheaper answer out loud.
@@ -8611,18 +8699,27 @@ volume_fsck_one() {
 	if [ "$DRY_RUN" -eq 1 ]; then
 		run mkdir -p "$work"
 		run cp -c "$img" "$work/volume.img"
-		run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")"
+		if [ -n "$host_bin" ]; then
+			run "$host_bin" -f -n "$work/volume.img"
+		else
+			run container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")"
+		fi
 		run ln "$img" "$keep"
 		run mv -f "$work/volume.img" "$img"
 		info "  (dry-run: nothing was cloned, checked or repaired)"
 		return 0
 	fi
 
-	# STEP F -- GATE 1. The clone and the container both cost real time and
-	# (unless MACKAS_FSCK_IMAGE names an image with e2fsprogs) a network
-	# fetch, so say so plainly.
-	confirm "  Clone '$name' and run e2fsck against the COPY? ('$name' itself is not touched; installs e2fsprogs into a throwaway container)" \
-		|| { info "  Left unchanged."; return 1; }
+	# STEP F -- GATE 1. The clone always costs real time; whether the
+	# e2fsck step ALSO costs a container boot + network fetch depends on
+	# which path was resolved above, so say the one that actually applies.
+	if [ -n "$host_bin" ]; then
+		confirm "  Clone '$name' and run e2fsck against the COPY? ('$name' itself is not touched; runs directly on this Mac, no container needed)" \
+			|| { info "  Left unchanged."; return 1; }
+	else
+		confirm "  Clone '$name' and run e2fsck against the COPY? ('$name' itself is not touched; installs e2fsprogs into a throwaway container)" \
+			|| { info "  Left unchanged."; return 1; }
+	fi
 
 	# STEP G -- THE BACKUP. Unconditional, host-side, before any container
 	# exists. Same dir means same filesystem, so 'cp -c' is a genuine APFS
@@ -8656,17 +8753,27 @@ volume_fsck_one() {
 			"report this; nothing was changed"
 	fi
 
-	# STEP H -- THE CONTAINER. -v "$work:/vol" is a plain HOST DIRECTORY
-	# bind mount (an ordinary virtiofs share, exactly like retrieve's
-	# -v "$dest:/out"), NOT a named-volume mount, so Apple's
-	# auto-mount-as-ext4 special case never fires and e2fsck really does get
-	# an unmounted filesystem. $img is not inside $work, so nothing the
-	# guest can run can reach it -- that is the invariant, structurally.
-	# -u 0:0 and --cap-add CAP_SYS_ADMIN are both required and neither alone
-	# suffices, the same pair volume_fstrim_one() documents.
-	vrb "+ $(quote_cmd container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")")"
+	# STEP H -- run e2fsck against the CLONE. The host fast path
+	# (fsck_host_run(), resolved above) when available: e2fsck operates on
+	# $work/volume.img as a plain file, no mount or loop device needed, so
+	# there is nothing container-shaped to set up at all. Otherwise, THE
+	# CONTAINER: -v "$work:/vol" is a plain HOST DIRECTORY bind mount (an
+	# ordinary virtiofs share, exactly like retrieve's -v "$dest:/out"), NOT
+	# a named-volume mount, so Apple's auto-mount-as-ext4 special case never
+	# fires and e2fsck really does get an unmounted filesystem inside the
+	# guest. Either way $img (the real volume.img) is never named or
+	# reachable -- only the clone is -- so STEP I's classification is
+	# identical regardless of which path ran.
 	local out st=0
-	out="$(container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")" 2>&1)" || st=$?
+	if [ -n "$host_bin" ]; then
+		vrb "+ $(quote_cmd "$host_bin" -f -n/-y "$work/volume.img")"
+		out="$(fsck_host_run "$mode" "$work/volume.img" 2>&1)" || st=$?
+	else
+		# -u 0:0 and --cap-add CAP_SYS_ADMIN are both required and neither
+		# alone suffices, the same pair volume_fstrim_one() documents.
+		vrb "+ $(quote_cmd container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")")"
+		out="$(container run --rm -u 0:0 --cap-add CAP_SYS_ADMIN -v "$work:/vol" "$(fsck_image)" sh -c "$(fsck_guest_script "$mode")" 2>&1)" || st=$?
+	fi
 
 	# Same boot-progress filter volume_fstrim_one() uses: captured through
 	# $(...) rather than a TTY, container emits 7-8 "[3/6] Fetching kernel
