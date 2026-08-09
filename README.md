@@ -110,7 +110,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
-| `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
+| `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
