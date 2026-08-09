@@ -5271,13 +5271,15 @@ bitbake_getvar() {
 	# in the parsed config ever set X, as opposed to a real resolution
 	# failure -- swallow it and signal that specific case with return 2
 	# instead of the generic 1, rather than printing it as a warning. Only
-	# BUILDHISTORY_DIR's caller opts in: that variable is defined nowhere but
-	# inside buildhistory.bbclass itself, so "not defined" there just means
-	# "this project doesn't INHERIT buildhistory" -- the overwhelmingly
-	# common case, already explained in the caller's own follow-up message,
-	# not a bitbake-getvar problem worth a generic warning about. Every other
-	# caller queries a variable bitbake.conf itself always sets, where this
-	# exact wording would be a genuine surprise worth keeping visible.
+	# BUILDHISTORY_DIR and DEPLOY_DIR_SPDX's callers opt in: BUILDHISTORY_DIR
+	# is defined nowhere but inside buildhistory.bbclass, and DEPLOY_DIR_SPDX
+	# is defined nowhere but inside spdx-common.bbclass (pulled in by
+	# create-spdx), so "not defined" in either case just means "this project
+	# doesn't INHERIT it" -- the overwhelmingly common case for buildhistory,
+	# already explained in the caller's own follow-up message, not a
+	# bitbake-getvar problem worth a generic warning about. Every other caller
+	# queries a variable bitbake.conf itself always sets, where this exact
+	# wording would be a genuine surprise worth keeping visible.
 	local var="$1" quiet_undefined="${2:-0}" out rc errfile errmsg
 
 	# kas-container's own stderr (e.g. "configuration file '...' not found",
@@ -6010,15 +6012,15 @@ cmd_dump() {
 # Idempotent within one EXTRA: re-copying the same EXTRA overwrites in place.
 #
 # The name is historical: nothing here requires the source to sit under
-# /build/tmp, and two objects need not. A distro may move DEPLOY_DIR anywhere
-# it likes (Angstrom points it at ${TOPDIR}/deploy), and buildhistory lives at
-# ${TOPDIR}/buildhistory -- i.e. /build/buildhistory -- by its own bbclass
-# default, a sibling of tmp/ rather than a child. Only the FALLBACK
-# used when bitbake-getvar cannot answer was ever tmp-shaped, which is why
-# DEFAULT is a parameter: hardcoding "/build/tmp/$sub" here would have sent
-# every buildhistory probe to a path that cannot exist. SUB stays the
-# mackas-facing object key and names the destination, whatever the source
-# path turns out to be.
+# /build/tmp, and several objects need not. A distro may move DEPLOY_DIR
+# anywhere it likes (Angstrom points it at ${TOPDIR}/deploy), buildhistory
+# lives at ${TOPDIR}/buildhistory (a sibling of tmp/), and the SPDX tree
+# lives under DEPLOY_DIR/spdx/${SPDX_VERSION} (inheriting DEPLOY_DIR's
+# relocatability). Only the FALLBACK used when bitbake-getvar cannot answer
+# was ever tmp-shaped, which is why DEFAULT is a parameter: hardcoding
+# "/build/tmp/$sub" here would have sent every buildhistory/sbom probe to
+# paths that cannot exist. SUB stays the mackas-facing object key and names
+# the destination, whatever the source path turns out to be.
 #
 # EXTRA exists for buildstats specifically (see cmd_retrieve): a fresh,
 # mackas-generated timestamp per retrieve, so successive retrievals land in
@@ -6031,11 +6033,15 @@ cmd_dump() {
 fetch_tmp_subdir() {
 	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" guest destsub quiet_undefined=0 rc
 
-	# buildhistory is the one object whose variable is only ever defined by
-	# an optional bbclass (see bitbake_getvar): opt into its quiet-undefined
-	# signal so "this project doesn't INHERIT buildhistory" is explained once,
-	# below, rather than as a generic bitbake-getvar warning first.
-	[ "$sub" = "buildhistory" ] && quiet_undefined=1
+	# buildhistory and sbom are the objects whose variables are only ever
+	# defined by an optional bbclass (see bitbake_getvar): BUILDHISTORY_DIR
+	# by buildhistory.bbclass, DEPLOY_DIR_SPDX by spdx-common.bbclass (pulled
+	# in by create-spdx). Opt into the quiet-undefined signal so "this project
+	# doesn't INHERIT it" is explained once, below, rather than as a generic
+	# bitbake-getvar warning first.
+	case "$sub" in
+		buildhistory|sbom) quiet_undefined=1 ;;
+	esac
 
 	# Distros can redefine where these actually land (e.g. Angstrom sets
 	# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
@@ -6099,6 +6105,23 @@ fetch_tmp_subdir() {
 				warn "  no $guest in '$MACKAS_VOL_TMP' -- this project does not INHERIT buildhistory."
 				warn "  Nothing records it unless you ask: add to your kas config's local_conf_header"
 				warn "  (or conf/local.conf):  INHERIT += \"buildhistory\""
+				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
+				;;
+			sbom)
+				# Unlike buildhistory, create-spdx IS inherited by default on
+				# modern OE-core (INHERIT_DISTRO in
+				# meta/conf/distro/defaultsetup.conf lists it), so "absent"
+				# usually means one of: no build has produced SPDX yet, a
+				# distro dropped the class, or this is an older release where
+				# it was opt-in. DEPLOY_DIR_SPDX is defined nowhere but
+				# spdx-common.bbclass, so bitbake-getvar has nothing to return
+				# either when the class is not inherited -- the same "absent"
+				# symptom from a different cause. Name both, and the one-line
+				# fix, rather than a bare "no such directory".
+				warn "  no $guest in '$MACKAS_VOL_TMP' -- no SPDX/SBOM output has been generated."
+				warn "  OE-core inherits create-spdx by default, but a distro can drop it and older"
+				warn "  releases did not have it. If it is not inherited, add to your kas config's"
+				warn "  local_conf_header (or conf/local.conf):  INHERIT += \"create-spdx\""
 				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
 				;;
 			*)
@@ -6213,6 +6236,20 @@ ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matte
                        missing directory. Note it sits at \${TOPDIR}/buildhistory
                        -- inside the same volume '$SCRIPT_CMD clean' discards --
                        so retrieve it before cleaning if you want to keep it.
+  sbom                 DEPLOY_DIR_SPDX (\${DEPLOY_DIR}/spdx/\${SPDX_VERSION})
+                       -- the SPDX SBOM tree create-spdx writes: one
+                       .spdx.json per recipe and per package, under
+                       <arch>/{builds,packages,static}/. OE-core inherits
+                       create-spdx by default, but a distro can drop it and
+                       older releases did not have it, so retrieve says
+                       "no SBOM output" rather than reporting a missing
+                       directory. It lives under DEPLOY_DIR, which
+                       '$SCRIPT_CMD clean' and 'clean tmp+deploy' both
+                       discard -- retrieve it before cleaning. (The single
+                       per-image SBOM, <image>-<machine>.spdx.json, is
+                       deployed alongside the images instead, so
+                       'retrieve deploy images' already brings that one.)
+                       Lands at \$dest/sbom.
 
 ${C_BLD}OPTIONS${C_RST}
   --dest DIR      Where to copy (default \$MACKAS_BASE/artifacts).
@@ -6275,7 +6312,7 @@ cmd_retrieve() {
 					case "${1:-}" in
 						# Not a MACHINE: either nothing follows, another flag,
 						# or the next object keyword entirely.
-						''|-*|buildstats|logs|deploy|buildhistory|help)
+						''|-*|buildstats|logs|deploy|buildhistory|sbom|help)
 							objects[$idx]="deploy:images" ;;
 						*)
 							# A MACHINE substitutes straight into the trailing
@@ -6292,10 +6329,10 @@ cmd_retrieve() {
 					esac
 				fi
 				;;
-			buildstats|logs|buildhistory) objects+=("$1"); shift ;;
+			buildstats|logs|buildhistory|sbom) objects+=("$1"); shift ;;
 			-*) die "unknown option for 'retrieve': $1" "$SCRIPT_CMD retrieve --help" ;;
 			*) die "unknown object for 'retrieve': $1" \
-				"$SCRIPT_CMD retrieve --help  (objects: buildstats logs deploy buildhistory)" ;;
+				"$SCRIPT_CMD retrieve --help  (objects: buildstats logs deploy buildhistory sbom)" ;;
 		esac
 	done
 
@@ -6305,7 +6342,7 @@ cmd_retrieve() {
 	fi
 
 	[ "${#objects[@]}" -ge 1 ] || die "'retrieve' needs at least one object" \
-		"$SCRIPT_CMD retrieve <buildstats|logs|deploy|buildhistory> [<object>...] [--dest DIR]"
+		"$SCRIPT_CMD retrieve <buildstats|logs|deploy|buildhistory|sbom> [<object>...] [--dest DIR]"
 
 	require_mackas_root
 
@@ -6361,10 +6398,12 @@ cmd_retrieve() {
 	# default is the guest path to fall back on when bitbake-getvar cannot
 	# answer (no checkout wired up, a query that failed, a variable the project
 	# never defines). It is per-object because the objects do NOT share a
-	# layout: three are children of TMPDIR, but buildhistory.bbclass puts
-	# BUILDHISTORY_DIR at ${TOPDIR}/buildhistory, and TOPDIR inside the
-	# container is /build itself -- so its default is a SIBLING of tmp/, not a
-	# subdirectory of it.
+	# layout: buildstats/logs/deploy are children of TMPDIR (or elsewhere if
+	# TMPDIR is redefined), buildhistory.bbclass puts BUILDHISTORY_DIR at
+	# ${TOPDIR}/buildhistory, and DEPLOY_DIR_SPDX lives under DEPLOY_DIR
+	# (which Angstrom points at ${TOPDIR}/deploy, not the default's tmp/deploy)
+	# -- so their defaults may be siblings of tmp/ or off the TMPDIR volume
+	# entirely, depending on what each project configures.
 	local it sub var extra default machine fetched=0 got_buildstats=0 got_buildhistory=0
 	for it in "${objects[@]}"; do
 		sub="$it"
@@ -6376,6 +6415,7 @@ cmd_retrieve() {
 			logs)         sub="log"; var="LOG_DIR"; default="/build/tmp/log" ;;
 			buildstats)   var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
 			buildhistory) var="BUILDHISTORY_DIR"; default="/build/buildhistory" ;;
+			sbom)         var="DEPLOY_DIR_SPDX"; default="/build/tmp/deploy/spdx" ;;
 			deploy:images|deploy:images:*)
 				var="DEPLOY_DIR_IMAGE"
 				# Everything after the second ':' is the optional MACHINE
@@ -9289,8 +9329,8 @@ ${C_BLD}COMMANDS${C_RST}
   exec       Run a one-off read-only command against the checkout, with
              kas's repo-mutating setup steps always skipped.
              '$SCRIPT_CMD exec --help'.
-  retrieve   Copy build outputs (buildstats/logs/deploy/buildhistory) out of
-             the ext4 TMPDIR volume, where macOS cannot see them.
+  retrieve   Copy build outputs (buildstats/logs/deploy/buildhistory/sbom)
+             out of the ext4 TMPDIR volume, where macOS cannot see them.
              '$SCRIPT_CMD retrieve --help'.
   buildstats Work with buildstats already retrieved (currently: analyze).
              '$SCRIPT_CMD buildstats --help'.

@@ -68,6 +68,11 @@ EOF
 	# it sits alongside the others here; the probe path is what the tests pin.
 	mkdir -p "$FIXTURE/buildhistory/packages" "$FIXTURE/buildhistory/images"
 	echo 'PV = 1.36.1' > "$FIXTURE/buildhistory/packages/latest"
+	# sbom is the SPDX/SBOM tree under DEPLOY_DIR, with arch subdirs. The
+	# fixture mirrors the real layout: flat with arch-specific subdirs.
+	mkdir -p "$FIXTURE/spdx/x86_64/packages" "$FIXTURE/spdx/x86_64/builds"
+	echo '{}' > "$FIXTURE/spdx/x86_64/packages/package-base-files.spdx.json"
+	echo '{}' > "$FIXTURE/spdx/bitbake.spdx.json"
 	export FIXTURE
 
 	# MOCK_BUSY_VOLUME, if set, is a volume the modelled runtime reports as held
@@ -850,6 +855,156 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# sbom -- DEPLOY_DIR_SPDX, the SPDX/SBOM tree create-spdx writes. Under
+# DEPLOY_DIR (so a distro moves it the way Angstrom moves deploy), and absent
+# on any project that does not inherit create-spdx.
+# ---------------------------------------------------------------------------
+
+@test "retrieve: fetches sbom into MACKAS_BASE/artifacts" {
+	MOCK_TMP_HAS="spdx" mk retrieve sbom
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/sbom/x86_64/packages" ]
+	[ -f "$ROOT/artifacts/sbom/bitbake.spdx.json" ]
+	printf '%s\n' "$output" | grep -qF "Retrieved to $ROOT/artifacts"
+}
+
+@test "retrieve: sbom probes DEPLOY_DIR_SPDX's version-agnostic parent when bitbake-getvar cannot answer" {
+	# DEPLOY_DIR_SPDX can include ${SPDX_VERSION}, which varies per release;
+	# retrieve must probe a version-agnostic parent when bitbake-getvar cannot
+	# answer, not the whole DEPLOY_DIR tree and not a specific subdirectory.
+	MOCK_TMP_HAS="spdx" mk retrieve sbom
+	[ "$status" -eq 0 ]
+	assert_call "-d /build/tmp/deploy/spdx ]"
+	refute_call "-d /build/tmp/deploy ]"
+	refute_call "-d /build/tmp/deploy/images ]"
+}
+
+@test "retrieve: sbom asks bitbake-getvar for DEPLOY_DIR_SPDX, not an assumed default" {
+	# DEPLOY_DIR_SPDX is as redefinable as DEPLOY_DIR -- a project may point it
+	# at a directory that survives 'mackas clean'. The resolved path must win
+	# over the class default, and the host destination must still be named after
+	# the object key.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR_SPDX "*) echo "/build/deploy/spdx/3.0.1" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	mkdir -p "$FIXTURE/3.0.1/x86_64/packages"
+	echo '{}' > "$FIXTURE/3.0.1/x86_64/packages/pkg.spdx.json"
+
+	MOCK_TMP_HAS="3.0.1" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve sbom
+	[ "$status" -eq 0 ]
+	assert_call "-d /build/deploy/spdx/3.0.1 ]"
+	! grep -qF 'test] [-d] [/build/tmp/deploy/spdx]' "$CLOG"
+	# Named after the object key, not the resolved path's own basename.
+	[ -d "$ROOT/artifacts/sbom/x86_64" ]
+	[ ! -d "$ROOT/artifacts/3.0.1" ]
+}
+
+@test "retrieve: says no SBOM output was generated when sbom is absent" {
+	# The common case by far: create-spdx is not inherited by default on many
+	# projects, so there is nothing to copy and nothing wrong. A bare "no such
+	# directory" reads like a broken build; this must name the cause and the
+	# one-line fix.
+	MOCK_TMP_HAS="" mk retrieve sbom
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'no SPDX/SBOM output'
+	printf '%s\n' "$output" | grep -qF 'INHERIT += "create-spdx"'
+	# Not the generic per-object "skipping" wording, and not buildstats' one.
+	! printf '%s\n' "$output" | grep -qi 'has a build run yet'
+	refute_call "cp -r"
+}
+
+@test "retrieve: sbom swallows bitbake-getvar's real 'not defined' wording" {
+	# bitbake-getvar's own source (bin/bitbake-getvar) does exactly this for an
+	# undefined variable: exit 1, "The variable 'X' is not defined" on stderr,
+	# not a quiet empty value. DEPLOY_DIR_SPDX is defined nowhere but inside
+	# spdx-common.bbclass, so a project that does not inherit create-spdx hits
+	# this exact wording on every retrieve -- a real, expected outcome, not the
+	# generic bitbake-getvar failure. Both generic warnings must stay silent
+	# here: the sbom-specific message already says everything there is to say.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR_SPDX "*)
+		echo "The variable 'DEPLOY_DIR_SPDX' is not defined" >&2
+		exit 1
+		;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+
+	MOCK_TMP_HAS="" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve sbom
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'no SPDX/SBOM output'
+	! printf '%s\n' "$output" | grep -qF 'bitbake-getvar failed for DEPLOY_DIR_SPDX'
+	! printf '%s\n' "$output" | grep -qF 'could not resolve DEPLOY_DIR_SPDX'
+	assert_call "-d /build/tmp/deploy/spdx ]"
+}
+
+@test "retrieve: reports the real measured size for sbom" {
+	MOCK_TMP_HAS="spdx" MOCK_DU_KB=131072 mk retrieve sbom
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "sbom: 128.0M to transfer"
+}
+
+@test "retrieve: --dry-run sbom prints the copy but creates nothing" {
+	MOCK_TMP_HAS="spdx" mk --dry-run retrieve sbom
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF '/build/tmp/deploy/spdx'
+	[ ! -d "$ROOT/artifacts/sbom" ]
+	[ ! -d "$ROOT/artifacts" ]
+	refute_call "cp -r"
+	refute_call ":/out]"
+}
+
+@test "retrieve: sbom composes with the other objects in one call" {
+	MOCK_TMP_HAS="buildstats spdx" mk retrieve buildstats sbom
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+	[ -d "$ROOT/artifacts/sbom/x86_64" ]
+	assert_call "-d /build/tmp/buildstats ]"
+	assert_call "-d /build/tmp/deploy/spdx ]"
+}
+
+@test "retrieve: a missing sbom does not sink the other objects" {
+	# Per-object, best-effort: buildstats is retrieved and reported even though
+	# sbom is absent, and the exit status reflects that something was retrieved.
+	MOCK_TMP_HAS="buildstats" mk retrieve buildstats sbom
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+	printf '%s\n' "$output" | grep -qi 'no SPDX/SBOM output'
+	[ ! -d "$ROOT/artifacts/sbom" ]
+}
+
+@test "retrieve: deploy images does not swallow 'sbom' as a MACHINE" {
+	# Item 24's deploy images can take a MACHINE override, which must not
+	# swallow the next object as a machine name. sbom takes no such argument.
+	MOCK_TMP_HAS="images spdx" mk retrieve deploy images sbom
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/images" ]
+	[ -d "$ROOT/artifacts/sbom/x86_64" ]
+	assert_call "-d /build/tmp/deploy/images ]"
+	assert_call "-d /build/tmp/deploy/spdx ]"
+	refute_call "-d /build/tmp/deploy/images/sbom ]"
+}
+
+@test "retrieve: sbom takes no MACHINE argument" {
+	# Guards against the deploy-images shape being incorrectly assumed for sbom.
+	mk retrieve sbom qemuarm64
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'unknown object'
+}
+
+# ---------------------------------------------------------------------------
 # --help
 # ---------------------------------------------------------------------------
 
@@ -857,8 +1012,9 @@ EOF
 	mk retrieve --help
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'retrieve'
-	# Every object is documented, buildhistory included.
+	# Every object is documented, buildhistory and sbom included.
 	printf '%s\n' "$output" | grep -qF 'buildhistory'
+	printf '%s\n' "$output" | grep -qF 'sbom'
 	refute_call "cp -r"
 }
 

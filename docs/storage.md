@@ -1066,6 +1066,37 @@ The retrieved copy is a plain directory on the Mac, and a git repository when
 `BUILDHISTORY_COMMIT` is on — one commit per build, readable with ordinary
 `git -C $MACKAS_BASE/artifacts/buildhistory log`, no container needed.
 
+## SPDX/SBOM output — `DEPLOY_DIR_SPDX`
+
+`meta/classes/create-spdx.bbclass` (and its version-specific subclasses
+`create-spdx-3.0.bbclass` / `create-spdx-2.2.bbclass`) produces SPDX SBOM
+output — one `.spdx.json` file per recipe and per package — under
+`DEPLOY_DIR_SPDX`, which is defined by `meta/classes/spdx-common.bbclass` as
+`${DEPLOY_DIR}/spdx/${SPDX_VERSION}`. The `${SPDX_VERSION}` component varies
+across releases (3.0.1 on current trunk, 2.2 on older releases, `${MACHINE}` on
+kirkstone), so the trailing component is never substituted by mackas — the real
+answer always comes from `bitbake-getvar DEPLOY_DIR_SPDX`.
+
+**It lives under `DEPLOY_DIR`, which may be under `tmp/` or off the volume.** On
+OE-core defaults it is `/build/tmp/deploy/spdx`, but Angstrom's distro config
+points `DEPLOY_DIR` to `/build/deploy` (outside `tmp/`), so the SPDX tree lands
+at `/build/deploy/spdx` there. Bare `mackas clean tmp+deploy` clears both,
+silently dropping the SPDX tree if you have not retrieved it first — the same
+hazard as `deploy/` itself.
+
+**It is inherited by default on modern OE-core.** `meta/conf/distro/defaultsetup.conf`
+includes `create-spdx` in `INHERIT_DISTRO`, so SBOM output appears on any build
+unless a distro explicitly drops the class. Older releases did not have it (SPDX
+support was added to OE-core over time), so `mackas retrieve sbom` finding
+nothing usually means either no build has run yet, or this is a release predating
+create-spdx. If the class is inherited but the output is missing, it may mean
+the build never reached a task that produces SPDX (e.g. a kernel-only build that
+skips recipes with do_create_spdx or similar).
+
+Unlike the per-image SBOM — which create-spdx-image-3.0.bbclass deploys
+alongside the images into `DEPLOY_DIR_IMAGE` — the full recipe/package tree
+lands in `DEPLOY_DIR_SPDX` and is brought out with `mackas retrieve sbom`.
+
 ## The workspace image
 
 `work/` — `KAS_WORK_DIR`, the layer checkouts: oe-core, bitbake, the `meta-*`

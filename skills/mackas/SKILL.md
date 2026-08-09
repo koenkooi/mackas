@@ -378,9 +378,9 @@ mackas retrieve buildstats --dest ~/out
 mackas buildstats analyze                 # summarise the newest retrieved build
 ```
 
-Four objects: `buildstats`, `logs`, `deploy`, `buildhistory`. Every one resolves
+Five objects: `buildstats`, `logs`, `deploy`, `buildhistory`, `sbom`. Every one resolves
 its real guest path from bitbake (`BUILDSTATS_BASE`, `LOG_DIR`, `DEPLOY_DIR`,
-`BUILDHISTORY_DIR`), never a guessed layout. Same one-VM rule: stop the build
+`BUILDHISTORY_DIR`, `DEPLOY_DIR_SPDX`), never a guessed layout. Same one-VM rule: stop the build
 first.
 
 That resolution needs `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG`. **Exporting them
