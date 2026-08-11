@@ -126,7 +126,7 @@ cost.
 | Credential theft from disk | The password is stored as a salted PBKDF2-SHA256 hash (200k iterations), never plaintext. The daemon **refuses to start** if the credential file is group/world-accessible. |
 | Credential theft from `ps` | The password never goes on argv (`/proc/PID/cmdline` is world-readable). `--hash-password` prompts; the daemon reads a file, or an env var as second-best. |
 | Timing attacks on the password | `hmac.compare_digest`, never `==`. An unknown username burns a decoy derivation, so latency is not a username oracle. The decoy copies its cost from a real loaded credential rather than from our own defaults, so a cred file with different parameters cannot make it cheaper or dearer than the real thing. |
-| **PBKDF2 as a CPU amplifier** | A verification cache plus a per-IP KDF budget (`--kdf-rate` 4/s, burst 16). See below. |
+| **PBKDF2 as a CPU amplifier** | A verification cache plus a per-IP KDF budget (4 derivations/s, burst 16). Deliberately not a flag — no legitimate client can reach it, so there is nothing to tune. See below. |
 | Password sniffing | **Basic auth over plain HTTP sends the password in the clear.** Use `--tls-cert/--tls-key` (TLS 1.2 minimum) or rely on the IP allowlist on a trusted LAN. |
 | Unauthorized clients | HTTP Basic **and/or** an `ipaddress`-based CIDR allowlist. Allowlist-only is supported and reasonable on a trusted wired LAN. Auth runs **before any filesystem access**, so an unauthenticated client cannot even learn whether a file exists. |
 

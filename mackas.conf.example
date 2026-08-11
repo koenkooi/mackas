@@ -37,9 +37,11 @@
 # Values are checked before they are used: any setting mackas interpolates
 # into the env.sh or kas fragment it generates may not contain a double quote,
 # a backtick, or a control character (a newline especially) -- those corrupt
-# the generated file rather than appearing in it. Spaces, '$' and apostrophes
-# are all fine; a MACKAS_ROOT with a space in it (a volume named "My Disk")
-# is fully supported.
+# the generated file rather than appearing in it. A literal backslash is
+# refused too: what actually produces one is MACKAS_ROOT="/a\ path", where the
+# backslash is not special inside double quotes and survives into the value
+# instead of escaping the space. Spaces, '$' and apostrophes are all fine; a
+# MACKAS_ROOT with a space in it (a volume named "My Disk") is fully supported.
 #
 # PRECEDENCE, lowest to highest:
 #
@@ -252,14 +254,22 @@
 #MACKAS_KAS_AUTO_PROJECT=1
 
 
-# The image `mackas volume fsck` runs e2fsck from, inside a throwaway
-# container. Empty (the default) means the kas image.
+# The image `mackas volume fsck` falls back to when it has to run e2fsck
+# inside a throwaway container. Empty (the default) means the kas image.
 #
-# The kas image does NOT ship e2fsprogs (verified: no e2fsck, fsck.ext4,
-# dumpe2fs or debugfs anywhere on its PATH), so mackas apt-gets it into the
-# throwaway container on demand -- it is Debian 13 trixie with a working
-# apt, and a build already needs network. Set this to an image that already
-# has e2fsprogs to skip that install and let `volume fsck` work offline.
+# Only consulted when there is NO e2fsck on this Mac. e2fsck treats volume.img
+# as a plain file -- no mount, no loop device, no kernel ext4 support -- so
+# `volume fsck` prefers a host-side one and skips the container, the apt-get
+# and the network entirely. It looks for `e2fsck` on $PATH first (any source),
+# then asks `brew --prefix e2fsprogs`, since e2fsprogs is keg-only and never
+# lands on $PATH by itself. `brew install e2fsprogs` is therefore the simplest
+# way to make `volume fsck` work offline.
+#
+# Without one, mackas apt-gets e2fsprogs into the throwaway container on
+# demand: the kas image does NOT ship it (verified: no e2fsck, fsck.ext4,
+# dumpe2fs or debugfs anywhere on its PATH), but it is Debian 13 trixie with a
+# working apt, and a build already needs network. Set this to an image that
+# already has e2fsprogs to skip that install on that fallback path.
 #MACKAS_FSCK_IMAGE=""
 
 

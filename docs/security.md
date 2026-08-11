@@ -26,8 +26,13 @@ fetches. mackas orchestrates these; it does not vouch for them.
 
 ## Security by design and default
 
-- **No telemetry, no phone-home.** mackas makes no network calls of its own.
-  Network access is only ever the build's own fetches (git/https, driven by
+- **No telemetry, no phone-home.** mackas never reports anything about you or
+  your builds to anyone. The network it uses on its own account is short,
+  named and inspectable: `setup` downloads the pinned, sha256-verified
+  `kas-container` and runs `container image pull` for the pinned kas image;
+  `check` probes `https://ghcr.io/v2/` for reachability, and — only when you
+  have configured them — HEADs the HTTP mirror and pings the NFS server.
+  Everything else is the build's own fetches (git/https, driven by
   kas/bitbake) and, if you explicitly enable it, the optional mirror.
 - **No default secrets or open ports.** The two network-facing pieces are both
   off by default. The mirror server, when enabled, warns loudly unless the
@@ -38,16 +43,23 @@ fetches. mackas orchestrates these; it does not vouch for them.
   below.
 - **Least privilege.** Builds run inside Apple `container` micro-VMs, not on the
   host. Each ext4 build volume is mounted by exactly one VM at a time — never a
-  second, not even read-only. The `docker` shim deliberately refuses
-  `--privileged`, `--device` and host networking rather than passing them
-  through.
-- **Input/config safety.** A config file is *sourced as shell*, so it is executed
+  second, not even read-only. The `docker` shim never forwards `--privileged`
+  (it is dropped before the call reaches Apple `container`), and hard-refuses
+  `--device` and `--network host` rather than guessing a translation.
+- **Input/config safety.** A config file is *sourced as shell*, so one mackas
+  finds on its own (`~/.config/mackas/config`, `~/.mackas.conf`) is executed
   only if it is owned by you (or root) and not group/world-writable — file and
-  directory both (`config_file_is_safe`). Every setting written into a generated
+  directory both (`config_file_is_safe`); one you name yourself with
+  `--config` or `$MACKAS_CONF` is deliberately exempt, being a request rather
+  than an ambush. `./mackas.conf` is *not* in the search path at all, for the
+  same reason: a cwd-relative config any untrusted tree could drop in was code
+  execution needing no exploit. Every setting written into a generated
   file is validated first (`validate_settings` rejects `"`, backticks and control
   characters) so a value cannot break out of the shell or YAML it lands in. The
   git "dubious ownership" workaround is scoped to a generated `GITCONFIG_FILE`,
-  never applied globally, and never overrides one you set.
+  never applied globally, and never silently changes one you set — if your own
+  `GITCONFIG_FILE` is missing, or lacks `safe.directory = *`, `setup` asks
+  before writing or appending it.
 
 ## Supply-chain integrity
 
@@ -64,7 +76,12 @@ fetches. mackas orchestrates these; it does not vouch for them.
 - **Minimal dependency surface.** The Python components are **stdlib-only**
   (3.7+): no `pip install`, no third-party packages, nothing to compromise via a
   transitive dependency. The rest is POSIX shell plus tools already on a Mac
-  (bash, coreutils) and Apple `container`.
+  (bash, coreutils) and Apple `container`. One fetch is worth naming: when
+  `volume fsck` finds no host-side `e2fsck` it falls back to a throwaway
+  container and `apt-get install`s `e2fsprogs` there — from Debian's repos,
+  unpinned. That install lives and dies with the one container and never
+  touches the host; having e2fsprogs on the host, or pointing
+  `MACKAS_FSCK_IMAGE` at an image that already has it, skips both entirely.
 - **SBOM.** The dependency set is small and enumerable — bash 3.2, GNU coreutils
   (`realpath`), Apple `container`, the pinned `kas-container` (hash recorded in
   the source), the pinned kas container image, and Python 3.7+ stdlib. A

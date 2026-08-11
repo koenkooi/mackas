@@ -6,7 +6,7 @@ the thing such an app codes against (the bridge's JSON, and how it behaves
 around a real smoketest) is defined here, and because the two sharp edges below
 are expensive to rediscover.
 
-Why a separate repo: mackas is POSIX shell plus stdlib-only Python, buildable
+Why a separate repo: mackas is bash 3.2 plus stdlib-only Python, buildable
 and reviewable with what is already on a Mac. A Swift app drags in Xcode, a
 signing identity and a release cadence that has nothing to do with the CLI's.
 The bridge is a stable HTTP contract precisely so the two can be versioned
@@ -59,7 +59,8 @@ This is the API. It is small on purpose.
 | **Endpoint** | `GET http://127.0.0.1:<port>/` |
 | **Port** | `MACKAS_MONITOR_PORT`, default **8801**, published `-p PORT:PORT` so the host port equals the container port |
 | **Other paths** | `404`, empty body |
-| **`HEAD`, and every other method** | `405`, empty body |
+| **`HEAD`** | `405`, empty body |
+| **Every other method** (`POST`, `PUT`, …) | `501` with `BaseHTTPRequestHandler`'s own HTML error body — only `do_GET`/`do_HEAD` exist, so the stdlib default answers |
 | **Response** | `Content-Type: application/json`, `Content-Length` always set, never chunked |
 | **Auth / TLS / CORS** | none, none, none |
 
@@ -88,7 +89,7 @@ this document.
 | `targets` | array of string | What the build was asked to produce, from bitbake's own parsed command line (`params.options.pkgs_to_build`). Populated **before the build starts**, so it is the one useful thing to show at the `building` edge, when no task is running yet. Empty when bitbake was given no explicit target (it then builds whatever the kas config names) — treat empty as "unknown", not as "nothing". |
 | `machine` | string \| null | `MACHINE`, read from the cooker via `server.runCommand(["getVariable", …])` on the **first event-loop call after `bb.ui.knotty.main()` has started** — deliberately not at UI startup, since a pre-knotty round-trip was traced to a real build-killing crash (see [architecture.md](architecture.md#live-build-progress-the-monitor-bridge)). `null` until that first call; it lands at essentially the same instant `status` first becomes `"building"`, so a `"building"` payload with `machine: null` is possible only for a sub-millisecond window, never for a whole poll interval. On a **multiconfig** build this is only the default `MACHINE`; per-multiconfig builds legitimately have several, so treat it as a label rather than a complete description of what was built. |
 | `distro` | string \| null | `DISTRO`, same source, same timing, same caveats. |
-| `current.recipe` | string \| null | The **basename of the task's recipe file**, e.g. `busybox_1.36.0.bb` — not a `PN`. `null` until a task has started, and left at the last known value afterwards (task-completion events carry no recipe, so this is the last *started* recipe, not necessarily the one that just finished). |
+| `current.recipe` | string \| null | The **basename of the task's recipe file**, e.g. `busybox_1.36.0.bb` — not a `PN`. `null` until a task has started, and left at the last known value afterwards. Every runQueue event carries `taskfile` — completion, failure and skip included — so this is the recipe of the most recent task *event*, not necessarily one that is still running. |
 | `current.task` | string \| null | bitbake's task name, e.g. `do_compile`. Same staleness rule. |
 | `progress.done` | int | **Phase-dependent.** During parsing it is parsed-recipe count; during the run queue it is `stats.completed`. |
 | `progress.total` | int | Same phase split. **It jumps**: the parse total is replaced by the task total, and setscene and the main run queue report their own totals. Do not assume it is monotonic, and never assume `done <= total` across a phase change. |
@@ -153,8 +154,9 @@ connected", never as "the build failed".
 
 ## The rough edge that will define your app's design
 
-**The bridge does not survive across smoketest rungs.** Recorded in TODO.md
-item 22; it is the single most important thing to know here.
+**The bridge does not survive across smoketest rungs.** Tracked in [GitHub
+issue #45](https://github.com/koenkooi/mackas/issues/45); it is the single
+most important thing to know here.
 
 `mackas smoketest` climbs a ladder — a parse rung, then one build rung per
 target — and **each rung is a separate `kas-container` invocation**, so each
@@ -298,8 +300,9 @@ is just an executable file, and the entire protocol is stdout:
 So the whole thing is: fetch the JSON, print a summary line, print a few detail
 lines. Near-zero logic, no signing, no release process, and the
 disappearing-endpoint problem collapses to "print `mackas: idle` when curl
-fails". TODO.md item 22 suggests shipping it from this repo as
-`menubar/mackas.plugin.sh` — small enough to belong here, unlike the app.
+fails". [GitHub issue #44](https://github.com/koenkooi/mackas/issues/44)
+suggests shipping it from this repo as `menubar/mackas.plugin.sh` — small
+enough to belong here, unlike the app.
 
 Build the real app only when you need what a plugin cannot do: notifications
 with actions, history across rungs, several builds at once, or a UI that is

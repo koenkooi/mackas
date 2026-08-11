@@ -27,6 +27,15 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
   playbook needs to reason about it.
 - Every layer checkout is an ordinary macOS-visible directory under `work/`, as
   a sibling. Only build *output* is hidden.
+- On a case-insensitive `MACKAS_ROOT`, `work/` may itself be a case-sensitive
+  APFS sparse image that `setup` offered to create (`MACKAS_WORKSPACE_IMAGE`
+  records it in the config). `hdiutil attach` does not survive a reboot, so
+  after one, `work/` is a dangling symlink until something reattaches it:
+  `mackas smoketest`/`shell`/`exec`/`lock`/`dump` reattach automatically, a
+  hand-typed `kas-container` does not. If `cd "$MACKAS_BASE/work"` fails, run
+  something like `mackas exec true` first — never recreate `work/` by hand, a
+  plain directory there is on the case-insensitive drive and is exactly the
+  corruption the image exists to prevent.
 - Build output lives in three ext4 volumes (names stem from
   `MACKAS_VOLUME_NAME`, default `oe-build`):
   - `oe-build-tmp` → `/build` (`KAS_BUILD_DIR`/`TOPDIR`) → `TMPDIR` =
@@ -49,7 +58,7 @@ three volumes exist, and `docker resolves to` the shim under
 `$MACKAS_ROOT/bin/docker` — **not** `/usr/local/bin/docker`. If anything is
 off, `mackas check` names the fix for each item.
 
-**Prefer the sourced shell function, but a bypass is no longer dangerous.** `env.sh` defines a `kas-container` shell function that appends the generated tuning fragment and derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG`, then hands off to `$MACKAS_BIN/kas-container` — a generated protection wrapper *script*, not the raw upstream binary, that computes `--runtime-args` (the three volumes, the `-c`/`-m` limits) live and blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side so kas's own bind-mount logic stays out of the way. Because that wrapper script is what `$PATH` itself resolves `kas-container` to, `command kas-container`, an absolute path, `nohup`, `env`, or an unsourced shell all still reach it — the only things such a bypass loses are the auto-appended fragment and the project-variable derivation, not the volumes or limits. The one separate, still-real concern: a pipx/pip-installed kas sitting earlier on `PATH` than `$MACKAS_BIN` makes a bare `kas-container` resolve to a *different* kas-container script entirely, at whatever version that install happens to be. `mackas check` reports which one wins.
+**Prefer the sourced shell function, but a bypass is no longer dangerous.** `env.sh` defines a `kas-container` shell function that appends the generated tuning fragment and derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG`, then hands off to `$MACKAS_BIN/kas-container` — a generated protection wrapper *script*, not the raw upstream binary, that computes `--runtime-args` (the three volumes, the `-c`/`-m` limits) live and blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side so kas's own bind-mount logic stays out of the way. Because that wrapper script is what `$PATH` itself resolves `kas-container` to, `command kas-container`, an absolute path, `nohup`, `env`, or an unsourced shell all still reach it — the only things such a bypass loses are the auto-appended fragment and the project-variable derivation, not the volumes or limits. The one separate, still-real concern: a pipx/pip-installed kas sitting earlier on `PATH` than `$MACKAS_BIN` makes a bare `kas-container` resolve to a *different* kas-container script entirely, at whatever version that install happens to be. **`mackas check` does not catch that**: it verifies the file at `$MACKAS_BIN/kas-container` is present and is still a generated wrapper rather than the raw upstream script, but it never resolves the name through `$PATH`. Check that yourself — `command -v kas-container` must print `$MACKAS_BIN/kas-container`.
 
 **This used to be true, and it was silently dangerous: `nohup`, `env`, `xargs`, or anything else that resolves `kas-container` via `$PATH` instead of the shell function used to reach the *raw upstream* `kas-container` script directly, completely skipping `env.sh`'s function** — with no error, no warning, nothing to distinguish it in the output from a real mackas-driven build until much later. The build still ran, but unprotected: no ext4 volumes, Apple's bare 4 CPU / 1 GB defaults, and — because `KAS_BUILD_DIR` was genuinely unset rather than pointed at `/build` — kas fell back to `KAS_WORK_DIR/build` on the virtiofs bind mount, where `bitbake-server`'s control sockets got permanently stuck (a fresh `bind()` still works, but every later `stat`/`unlink` on that socket file fails with `OSError: [Errno 95] Operation not supported`, so a later restart just fails the identical way). This is exactly how a real multi-machine batch build failed repeatedly in practice: backgrounded with `nohup kas-container build ... &`, each run silently unprotected.
 
@@ -413,9 +422,10 @@ build in the same shell, `retrieve` just works. If you rely on derivation:
   ([architecture.md](../../docs/architecture.md#deriving-mackas_project_dir-and-mackas_kas_config)).
 - **Requires a fresh `env.sh`** (see Preflight).
 - `mackas clean tmp+deploy` resolves the same way, but without it now refuses
-  outright (an in-place `rm -rf` has no safe default to guess); `buildstats
-  analyze` resolves the same way too but still falls back to a possibly-wrong
-  default without it.
+  outright (an in-place `rm -rf` has no safe default to guess).
+- `mackas buildstats analyze` needs **neither** variable: it never runs kas or
+  bitbake at all. It reads what `retrieve buildstats` already copied to the
+  host (`$MACKAS_BASE/artifacts/buildstats` by default, or an explicit `PATH`).
 
 **Never run Apple's `container` CLI directly to work around any of this.**
 mackas's volume-attachment guard only runs when the operation goes through
@@ -445,8 +455,11 @@ mackas exec cat /build/tmp/work/.../temp/log.do_<task>
 ```
 
 or pull a bundle out (`mackas retrieve buildstats logs`, then
-`mackas buildstats analyze`). Same one-VM rule and the same
-derivation caveats as `retrieve deploy`.
+`mackas buildstats analyze`). The `retrieve` half is under the same one-VM
+rule and the same derivation caveats as `retrieve deploy`; `analyze` is
+pure host-side work on what was already copied out and touches no volume (its
+bootchart-SVG step does start a throwaway container, but only over host
+directories).
 
 Note that many projects inherit `rm_work`, which wipes each recipe's work dir
 after it succeeds — a *failed* task's log is still there, but a *succeeded*
@@ -625,16 +638,26 @@ that step.
 `kas/angstrom.yml` on `wrynose` carries one against `openembedded-core`, sourced
 from a sibling layer's `patches/` directory.)
 
-### `mackas` commands never reset repos
+### `mackas` commands never reset repos — except `lock`
 
-`mackas exec`, `mackas retrieve`, `mackas buildstats analyze` and
-`mackas clean tmp+deploy` all resolve variables through one shared
-`kas_shell_ro()` helper that passes those four `--skip` flags unconditionally,
-on every call. No variable lookup and no `exec` can reset a checkout. This lives
-in the mackas script, not `env.sh`, so it cannot go stale the way the wrapper
-can.
+`mackas exec`, `mackas retrieve` and `mackas clean tmp+deploy` all resolve
+variables through one shared `kas_shell_ro()` helper that passes those four
+`--skip` flags unconditionally, on every call. No variable lookup and no `exec`
+can reset a checkout. This lives in the mackas script, not `env.sh`, so it
+cannot go stale the way the wrapper can. (`mackas buildstats analyze` is not on
+that list because it never runs kas at all — it only reads already-retrieved
+files on the host.)
 
-If a `retrieve`/`buildstats analyze`/`exec` call ever *does* reset a repo, treat
+**`mackas lock` is the one exception, by design.** It runs `kas-container lock`,
+whose entire job is to write a resolved lockfile into the checkout, so it is
+deliberately *not* wrapped in the repo-preserving skips — and kas's own lock
+plugin skips only `setup_dir`/`repos_apply_patches`/`setup_environ`/
+`write_bbconfig`, leaving `repos_checkout` to run. Treat it like a build, not
+like a query: run it when you actually want a fresh lock, and not while a
+sibling layer carries local-only commits. `mackas dump` (resolved config to
+`$MACKAS_LOGS/dump-<timestamp>.yml`) writes nothing into the checkout.
+
+If a `retrieve`/`exec` call ever *does* reset a repo, treat
 it as a signal that the mackas checkout is outdated or the fix regressed, and
 check `git log <upstream>..HEAD` on the affected layer immediately (`git reflog`
 holds the lost commits as recoverable entries).
