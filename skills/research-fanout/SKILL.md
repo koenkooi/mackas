@@ -88,16 +88,15 @@ any of them for real.
 
 ## Known gotcha: pass data as script literals, not via `args`
 
-As of this writing, the `Workflow` tool's `args` parameter does not
-reliably reach the script — `const topics = args.topics` came back
-`undefined` even for a single-item test payload, across both `script`
-(inline) and `scriptPath` (resume) invocation paths, three times in a row.
-**Don't debug this further — just embed the topic list directly as a
-literal array in the script body** (`const topics = [ {...}, {...} ]`,
-written straight into the script text you pass to `script`/edit at
-`scriptPath`). JSON and JS object-literal syntax are close enough that you
-can paste a `JSON.stringify`'d structure in directly. This sidesteps the
-issue entirely and costs nothing.
+The `Workflow` tool's `args` parameter does not reliably reach the script —
+`const topics = args.topics` can come back `undefined` even for a
+single-item test payload, in both `script` (inline) and `scriptPath`
+(resume) invocation paths. **Don't rely on it — embed the topic list
+directly as a literal array in the script body** (`const topics = [ {...},
+{...} ]`, written straight into the script text you pass to
+`script`/edit at `scriptPath`). JSON and JS object-literal syntax are close
+enough that you can paste a `JSON.stringify`'d structure in directly. This
+sidesteps the issue entirely and costs nothing.
 
 ## Skeleton
 
