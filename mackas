@@ -1601,6 +1601,21 @@ volume_exists() {
 	container volume ls 2>/dev/null | awk 'NR>1 {print $1}' | grep -qxF "$1"
 }
 
+# require_runtime_for_volumes -- shared by every volume subcommand that would
+# otherwise gate on volume_exists()/volume_in_use() (both backed by
+# `container volume ls`/`container ls`, which return nothing useful when the
+# daemon is simply down, not when the volume itself is absent). Mirrors
+# ensure_container_running() being called directly from run_kas()/
+# kas_shell_ro(): start the daemon first so a merely-stopped `container`
+# reads as exactly that, not as a missing volume (issue #33). Never called
+# from volume_list() -- that stays read-only and short-circuits instead, the
+# same choice cmd_status/cmd_check already make for their own daemon-down
+# case; and never from volume_recover(), which exists specifically to run
+# BEFORE assuming a healthy daemon.
+require_runtime_for_volumes() {
+	ensure_container_running
+}
+
 # volume_dirty_bit NAME -- has the kernel ever recorded ext4 errors on NAME's
 # volume.img? Host-side, read-only, no daemon and no e2fsprogs: ext4's
 # superblock sits at a fixed byte offset inside the plain image file, so
@@ -5848,6 +5863,11 @@ kas_project_subcommand_preflight() {
 	ensure_workspace_attached
 	ensure_kas_container_installed
 	ensure_project_checked_out
+	# The daemon does not survive a reboot; start it before the volume_in_use
+	# checks below so a merely-stopped daemon reads as "not in use" for the
+	# right reason (queried and confirmed) rather than by the down-daemon
+	# short-circuit in volume_in_use() itself.
+	ensure_container_running
 
 	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
 		if volume_in_use "$v"; then
@@ -6363,6 +6383,12 @@ cmd_retrieve() {
 		*)  dest="$PWD/$dest" ;;
 	esac
 
+	# The daemon does not survive a reboot; start it before the volume_in_use
+	# and volume_exists checks below, otherwise a merely-stopped daemon reads
+	# as "does not exist yet" (volume_exists' 'container volume ls' returns
+	# nothing useful with the daemon down) instead of the actual problem.
+	ensure_container_running
+
 	# One-VM rule: never attach the volume a build might still hold. Refuse
 	# loudly rather than corrupt an ext4 image mounted by two VMs at once.
 	if volume_in_use "$MACKAS_VOL_TMP"; then
@@ -6753,6 +6779,10 @@ sstate_prune() {
 	esac
 
 	require_mackas_root
+	# The daemon does not survive a reboot; start it before the volume_in_use
+	# check below and the 'container run' scan further down, same reasoning
+	# as run_kas()/kas_shell_ro().
+	ensure_container_running
 
 	# One-VM rule: never attach the volume a build might still hold. Refuse
 	# loudly rather than corrupt an ext4 image mounted by two VMs at once.
@@ -7725,6 +7755,18 @@ volume_list() {
 	hdr "Container volumes"
 	printf '  %-24s %-14s %-8s %-10s %s\n' "NAME" "ROLE" "CAP" "ON DISK" "IN USE"
 
+	# Read-only: never force-starts the daemon (unlike the volume subcommands
+	# that mutate a volume, which call require_runtime_for_volumes). With the
+	# daemon down, `container volume ls` returns nothing useful -- the same
+	# blind spot cmd_status's own "ext4 volumes" section already works around
+	# (issue #33) -- so say so plainly instead of printing "(no volumes)",
+	# which reads as "none exist" rather than "cannot tell right now".
+	if ! container_running; then
+		info "  container system is not running -- volume existence cannot be checked"
+		info "  this way; everything below is UNKNOWN, not necessarily absent"
+		return 0
+	fi
+
 	# One `container volume ls`. Its OPTIONS column carries `size=<cap>`; pull
 	# the name (field 1) and that cap out in one pass, tab-separated so a value
 	# can never be confused for a column boundary.
@@ -7783,6 +7825,8 @@ EOF
 # 'all' a missing/busy volume is skipped (warned) rather than fatal.
 volume_fstrim_one() {
 	local name="$1" from_all="${2:-0}"
+
+	require_runtime_for_volumes
 
 	if ! volume_exists "$name"; then
 		if [ "$from_all" -eq 1 ]; then
@@ -7934,6 +7978,8 @@ volume_duplicate() {
 	[ "$src" != "$dst" ] || die "source and duplicate name must differ" \
 		"$SCRIPT_CMD volume duplicate <source> <duplicate>"
 
+	require_runtime_for_volumes
+
 	volume_exists "$src" || die "source volume '$src' does not exist" "$SCRIPT_CMD volume list"
 	if volume_exists "$dst"; then
 		die "destination volume '$dst' already exists" \
@@ -8004,6 +8050,8 @@ volume_destroy() {
 				;;
 		esac
 	done
+
+	require_runtime_for_volumes
 
 	if [ "$do_all" -eq 1 ]; then
 		[ -z "$name" ] || die "'volume destroy --all' takes no volume name" \
@@ -8137,6 +8185,8 @@ volume_move() {
 		"$SCRIPT_CMD volume move <name> <dir>"
 	[ "$#" -le 2 ] || die "'volume move' takes exactly <name> <dir>" \
 		"$SCRIPT_CMD volume move <name> <dir>"
+
+	require_runtime_for_volumes
 
 	volume_exists "$name" || die "volume '$name' does not exist" "$SCRIPT_CMD volume list"
 
@@ -8402,6 +8452,7 @@ volume_resize() {
 	# the same reason: without a root, a bare name would resolve against
 	# whatever install happens to share it.
 	require_mackas_root
+	require_runtime_for_volumes
 	local name="${1:-}" want="${2:-}"
 	[ -n "$name" ] && [ -n "$want" ] || die "'volume resize' needs <name> and <size>" \
 		"$SCRIPT_CMD volume resize <name> <size>   # e.g. $SCRIPT_CMD volume resize $MACKAS_VOL_TMP 1T"
@@ -8646,6 +8697,8 @@ EOS
 # had its size verified equal to the original's.
 volume_fsck_one() {
 	local name="$1" from_all="${2:-0}" check_only="${3:-0}"
+
+	require_runtime_for_volumes
 
 	# STEP A -- guards, before anything at all is created on disk.
 	if ! volume_exists "$name"; then
