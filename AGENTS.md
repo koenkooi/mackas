@@ -138,10 +138,8 @@ a partial run.
   `tests:`, `readme:`, or a subcommand/file name), with the body wrapped at 72
   columns. Sign off with `-s` (`Signed-off-by:`); AI-assisted commits add an
   `Assisted-by:` trailer too. Never add a `Co-Authored-By:` or
-  `Claude-Session:` line — both crept into a run of commits despite this file
-  always prescribing `Signed-off-by:`/`Assisted-by:`, and both have since been
-  scrubbed from history; do not reintroduce either. Use `Fixes #N` / `Closes
-  #N` when a commit finishes a tracked GitHub issue.
+  `Claude-Session:` line. Use `Fixes #N` / `Closes #N` when a commit finishes
+  a tracked GitHub issue.
 - Security policy and how to report issues: see [SECURITY.md](SECURITY.md).
 
 ## Where to look first
