@@ -113,7 +113,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
-| `monitor` | `monitor [--port N] [--once]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
+| `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
 | `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
@@ -191,7 +191,7 @@ a container rather than a second mount ([TODO.md](TODO.md) item 5).
 ./mackas volume duplicate oe-build-sstate sstate-backup   # CoW clone under a new name you choose
 ./mackas volume destroy sstate-backup       # remove ONE volume
 ./mackas volume move oe-build-tmp /Volumes/Fast/oe   # relocate one image to another disk
-./mackas volume resize oe-build-tmp 1T      # GROW one in place, keeping its contents
+./mackas volume resize oe-build-tmp 1T      # GROW one, keeping its contents, by copying
 ```
 
 A sparse ext4 image only ever grows: deleting files inside the guest never
@@ -509,9 +509,10 @@ The design decisions, the negative results, and the reasons behind both:
 - `container` v1.1.0 has no `container system property set`, so per-container
   cpu/memory must be passed on every run.
 - **Apple `container` cannot resize a volume.** `mackas volume resize` grows
-  one anyway (sparse-image extend + daemon metadata + `resize2fs`), but only
-  grows — shrinking means copying into a new volume. Splitting TMPDIR from
-  the caches limits the blast radius: resizing TMPDIR never costs you sstate.
+  one anyway, by creating a new volume at the requested size and copying the
+  old volume's contents across (twice, to land back under the original
+  name) — there is no in-place grow. Splitting TMPDIR from the caches limits
+  the blast radius: resizing TMPDIR never costs you sstate.
 - **`DL_DIR`/`SSTATE_DIR` live inside ext4 images and are not visible from
   macOS** — the deliberate cost of correct filesystem semantics. Read them
   via `mackas shell`, or serve them with `mackas-mirrord`.
@@ -556,11 +557,16 @@ against a real build, and a container can reach an HTTP server on the Mac
 via both the vmnet gateway (`192.168.64.1`) and the Mac's LAN IP
 ([details](docs/storage.md#serving-local-files-instead-of-bind-mounting-them)).
 
-Standing unknowns — an NFS-backed mirror root, the container →
-separate-LAN-host network leg, and whether `BB_DISKMON_DIRS`'s HALT actually
-fires at its 2 GiB / 100k inode thresholds (the syntax is accepted by a real
-bitbake; the trigger needs a volume driven near full, which no run has done)
-— are tracked, with everything else unproven, in [TODO.md](TODO.md).
+`BB_DISKMON_DIRS`'s HALT is confirmed firing at its 2 GiB / 100k inode
+thresholds — `tests/diskmon_real.bats` drives a real bitbake run to the
+threshold and observes it (see [docs/testing.md](docs/testing.md#diskmon_realbats--proving-bb_diskmon_dirs-halt-actually-fires));
+the open question is just the safety margin between the 1s heartbeat check
+and how fast a task can write, tracked as
+[koenkooi/mackas#34](https://github.com/koenkooi/mackas/issues/34).
+
+Standing unknowns — an NFS-backed mirror root and the container →
+separate-LAN-host network leg — are tracked, with everything else unproven,
+in [TODO.md](TODO.md).
 
 ## Licence
 
