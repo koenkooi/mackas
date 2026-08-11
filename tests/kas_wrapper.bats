@@ -402,3 +402,39 @@ rec_runtime_args_value() {
 	grep -qF 'CALL: system start' "$CONTAINER_LOG"
 	[ ! -e "$KREC" ]
 }
+
+# ---------------------------------------------------------------------------
+# 10: MACKAS_KAS_FRAGMENT_DONE dedup. The wrapper's own "this did not go
+# through env.sh" note must agree with what env.sh's kas-container() shell
+# function actually does -- it sets MACKAS_KAS_FRAGMENT_DONE=1 right before
+# handing off to this same generated wrapper (see mackas's kas-container()
+# function, and tests/volumes.bats' "kas-container function: delegates to
+# the wrapper -- one call, FRAGMENT_DONE=1..." for the function-side half of
+# this pin: that test proves the function sets exactly "1"; this one proves
+# the wrapper's note is gated on exactly that value). Together the two
+# cannot silently drift apart -- if either side ever changes the literal
+# value, one of the two tests catches it.
+#
+# Neither call sets MACKAS_KAS_WRAPPED, so the unrelated re-entry guard
+# (test 8, above) never short-circuits this: both calls run the wrapper's
+# full normal path down to the FRAGMENT_DONE check.
+# ---------------------------------------------------------------------------
+
+@test "FRAGMENT_DONE dedup: MACKAS_KAS_FRAGMENT_DONE=1 (as env.sh's kas-container() function sets it) silences the bypass note; unset (a direct invocation) still prints it" {
+	cd "$TESTDIR"
+
+	# Shell-function-routed path, simulated the same way env.sh's
+	# kas-container() function itself hands off: FRAGMENT_DONE already 1.
+	out="$( (MACKAS_KAS_FRAGMENT_DONE=1 "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	! printf '%s\n' "$out" | grep -qF 'did not go through the env.sh shell function'
+	rm -f "$KREC"
+
+	# Direct generated-wrapper path: nothing set FRAGMENT_DONE, so the note
+	# must still print -- this is the whole point of the wrapper existing.
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	printf '%s\n' "$out" | grep -qF 'did not go through the env.sh shell function'
+}

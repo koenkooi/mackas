@@ -1551,12 +1551,16 @@ assert_only_kas_container_real() {
 # there. If mackas's OWN code ever invoked that same path, --runtime-args
 # would get computed and injected TWICE: once by the wrapper, once by us.
 # run_kas() and kas_shell_ro() must always exec the pinned upstream binary,
-# KAS_CONTAINER_REAL, never the wrapper. Pinned by source-grep since neither
-# function's choice of binary is otherwise observable from bats (both are
-# exercised above with a fake standing in for whichever variable is named).
+# KAS_CONTAINER_REAL, never the wrapper. The actual exec now lives in the
+# shared kas_invoke_env() helper (run_kas/kas_shell_ro/cmd_lock/cmd_dump all
+# delegate to it rather than invoking kas-container themselves), so that is
+# where the real invariant is pinned; the source-grep on run_kas/kas_shell_ro
+# themselves now just confirms they still delegate to it instead of ever
+# reimplementing the invocation inline again.
 @test "run_kas and kas_shell_ro: invoke KAS_CONTAINER_REAL, never KAS_CONTAINER_BIN (source-grep)" {
-	assert_only_kas_container_real run_kas
-	assert_only_kas_container_real kas_shell_ro
+	assert_only_kas_container_real kas_invoke_env
+	awk '/^run_kas\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$MACKAS" | grep -qF 'kas_invoke_env'
+	awk '/^kas_shell_ro\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$MACKAS" | grep -qF 'kas_invoke_env'
 }
 
 # ---------------------------------------------------------------------------
