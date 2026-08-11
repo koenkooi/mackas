@@ -155,6 +155,15 @@ refute_clog() {
 	assert_klog "[shell]"
 }
 
+@test "exec: a missing/incomplete gitconfig warns with the path and the setup fix, not silent failure" {
+	rm -f "$ROOT/gitconfig"
+	MACKAS_PROJECT_DIR=meta-angstrom mk exec du -sh meta-angstrom
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "missing or incomplete: $ROOT/gitconfig"
+	printf '%s\n' "$output" | grep -qF "$MACKAS setup"
+	[ ! -f "$KLOG" ]
+}
+
 @test "exec: the joined command reaches kas as one quoted -c argument" {
 	MACKAS_PROJECT_DIR=meta-angstrom mk exec du -sh meta-angstrom
 	[ "$status" -eq 0 ]

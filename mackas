@@ -5194,7 +5194,11 @@ kas_shell_ro() {
 	ensure_container_running
 	rt_args="$(kas_runtime_args)"
 	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
-	[ -r "$gitconfig" ] && has_safe_directory_star "$gitconfig" || return 1
+	if [ ! -r "$gitconfig" ] || ! has_safe_directory_star "$gitconfig"; then
+		warn "  gitconfig for the container's dubious-ownership workaround is missing or incomplete: $gitconfig"
+		warn "  $SCRIPT_CMD setup   # offers to fix a GITCONFIG_FILE you set yourself too, not just the one it generates"
+		return 1
+	fi
 
 	# MACKAS_KAS_CONFIG alone does not say WHERE to run kas-container from --
 	# that is MACKAS_PROJECT_DIR's job (it is what MACKAS_PROJECT derives
