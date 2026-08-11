@@ -97,10 +97,12 @@ the guest deletes afterwards. Whenever disk headroom is tight — a smaller SSD,
 a disk shared with other work — that reclaim matters.
 
 The fix is `mackas volume fstrim <name>` (or `mackas volume fstrim all` for
-the three mackas volumes -- `all` is a plain positional argument, not a
-`--all` flag). It runs `fstrim` **inside the guest**, which issues ext4 DISCARDs;
-Apple's own tooling never triggers a discard, but the hypervisor's virtio-blk
-backend implements DISCARD as a host **hole-punch** (the guest's
+the three mackas volumes; `all` is the primary, documented form of this
+command's object, and `--all`/`-a` are accepted synonyms for it, matching
+`volume destroy`/`volume fsck`). It runs `fstrim` **inside the guest**, which
+issues ext4 DISCARDs; Apple's own tooling never triggers a discard, but the
+hypervisor's virtio-blk backend implements DISCARD as a host **hole-punch**
+(the guest's
 `discard_max_bytes` is non-zero), so the punched blocks become sparse again on
 the host `volume.img`. Measured: an 800M image with 600M deleted inside fell to
 202M in 0.01s.
@@ -299,15 +301,19 @@ path — `volume fsck` runs it straight against the APFS clone: no throwaway
 container, no network, no `apt-get`. Everything else about the design
 (clone first, original never touched, two separate confirmations, the
 rehearsal before promotion) is identical either way; only *how* `e2fsck`
-gets invoked differs. `mackas status`/`volume fsck`'s own plan report says
-which path will run.
+gets invoked differs. `volume fsck`'s own plan report says which path will
+run, before it asks for the first confirmation (`status` and `check` do not
+report it).
 
-Install both `python3` (used by the ext4 dirty-bit check above) and
-`e2fsprogs` (used here) in one step — `brew install python3 e2fsprogs` —
-rather than separately: the former via a Command Line Tools prompt, the
-latter only if you ever need it. Neither is required; both are detected,
-never assumed, and `volume fsck` falls back to the container mechanism
-below with no difference in outcome, just more network and boot time.
+The two optional host tools this document mentions are **separate installs,
+and only one of them is a `brew` package.** The ext4 dirty-bit check (below)
+runs `/usr/bin/python3` by path — macOS's own stock python3, which a Command
+Line Tools prompt (or `xcode-select --install`) supplies; a Homebrew
+`python3` lands somewhere else entirely and does **not** satisfy it.
+`e2fsprogs` (used here) is `brew install e2fsprogs`, and only if you ever
+want the host fast path. Neither is required; both are detected, never
+assumed, and `volume fsck` falls back to the container mechanism below with
+no difference in outcome, just more network and boot time.
 
 **Without a working host `e2fsck`: the container mechanism below, the
 original design, unchanged.** The volume is never touched directly, and the
@@ -502,7 +508,8 @@ itself as `[ no]` because the runtime can no longer see it. `mackas volume
 list` prints the same `-> moved to:` note. `mackas volume recover` names it
 outright: *"does not resolve to a volume.img"*.
 
-Two standing gaps, established from the source rather than assumed:
+One standing gap, and one hazard that is now refused rather than hit — both
+established from the source rather than assumed:
 
 - **`mackas check` does not mention per-volume placement at all.** It asks the
   container daemon whether each volume exists, so once that daemon has restarted
@@ -512,13 +519,20 @@ Two standing gaps, established from the source rather than assumed:
   — correct when every image lives there, wrong once they are split across
   drives. Read those two check lines as being about the volumes you have *not*
   moved.
-- **Neither `setup` nor `adopt` refuses to run with a drive missing.** The
-  guard that protects an *existing* moved volume from being re-created over
-  (`refuse_if_stale_entity`, which spots the volume's `entity.json` through the
-  symlink) cannot see through a *dangling* symlink, so `setup` goes on to issue
-  a plain `container volume create` for that name. What the real runtime does
-  with that create has not been verified — do not find out; plug the drive in
-  first. `tests/adopt.bats` pins this behaviour as it currently stands.
+- **`setup` and `adopt` refuse to run with a drive missing** — they no longer
+  create over it. The guard that protects an *existing* moved volume from
+  being re-created over (`refuse_if_stale_entity`) spots the volume's
+  `entity.json` through the symlink; that probe alone cannot see a *dangling*
+  symlink, since `-e` follows symlinks and reads false through one, which used
+  to let `setup` issue a plain `container volume create` for that name —
+  orphaning whatever sat on the absent drive and handing back an empty volume
+  (a mysteriously cold cache, for sstate or downloads). It now checks for the
+  dangling link explicitly and dies instead, naming the recorded target and
+  the two non-destructive fixes: plug the drive in, or `mackas volume recover
+  <name>` if it really moved. Abandoning that copy and starting empty means
+  removing the symlink yourself — mackas will not choose the destructive
+  option for you. `tests/adopt.bats` pins the refusal, including that nothing
+  is created over the link.
 
 #### Adopting a root whose volumes are already split
 
@@ -702,6 +716,7 @@ Exactly what `MACKAS_USE_HTTP_MIRRORS=1` generates:
 SSTATE_MIRRORS ?= "file://.* http://linux-computer:8100/sstate/PATH;downloadfilename=PATH"
 SOURCE_MIRROR_URL ?= "http://linux-computer:8100/downloads"
 INHERIT += "own-mirrors"
+BB_GENERATE_MIRROR_TARBALLS ?= "0"
 ```
 
 `downloadfilename=` is only meaningful for `http://` mirrors and is **not**
@@ -867,11 +882,15 @@ a separate non-fatal quirk consistent with `crossmnt`'s general reputation.
 This is not *proof* that v4 alone is the culprit — v4-without-crossmnt has
 not been tried in isolation — so `vers=3` stays the safe rule regardless.
 
-`MACKAS_USE_NFS_MIRRORS=1` implements the host-side mount, but it is off by
-default and unproven end-to-end. `check` verifies the server is reachable, that
-`showmount -e` lists the export, and that this host's IP is inside the export
-ACL — reporting the IP either way. To sidestep the NFSv4 risk entirely, bridge
-an NFS cache over HTTP instead: mount on the Mac and serve it with
+`MACKAS_USE_NFS_MIRRORS=1` bind-mounts an already-mounted host-side export
+into the container, but it is off by default and unproven end-to-end. mackas
+never performs the mount itself — `check` and the end of `setup` print the
+exact `sudo mkdir` + `sudo mount -t nfs -o resvport,vers=3,ro,nolocks,locallocks`
+pair and leave it to you, since it needs an interactive sudo. `check` verifies
+the server is reachable, that `showmount -e` lists the export, and that this
+host's IP is inside the export ACL — reporting the IP either way. To sidestep
+the NFSv4 risk entirely, bridge an NFS cache over HTTP instead: mount on the
+Mac and serve it with
 `mackas-mirrord`, topology 2
 [above](#http-mirrors--optional-and-not-just-an-nfs-bridge).
 

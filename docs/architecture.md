@@ -40,8 +40,11 @@ calls kas actually makes:
 | Anything after the IMAGE positional | Forwarded verbatim, so a `--privileged` inside the container's own command line is never touched. |
 
 Arguments are held in bash arrays throughout and never round-tripped through
-a string, so paths with spaces survive — a build volume named e.g. `My Disk`
-works, and the suite tests exactly that.
+a string, so values with spaces survive — a host path like `/Volumes/My Build
+Disk/oe` reaches `container run` as a single argument, and the suite tests
+exactly that. (An Apple-`container` *named volume* whose own name contains a
+space is a different problem, one the shim cannot fix: see
+`MACKAS_VOLUME_NAME` below.)
 
 > **The shim must come before `/usr/local/bin` on `PATH`**, where the real
 > Docker CLI lives and will happily answer instead. `env.sh` handles this;
@@ -101,9 +104,12 @@ returns `/repo` and the full parse succeeds.
 `directory = *` trusts every path git is pointed at — do **not** put it in
 your own `~/.gitconfig`. It is acceptable here only because the file is
 forwarded exclusively into a throwaway, single-user container, never onto
-the host. `check` reports whether the file exists and has the entry; if you
-export your own `GITCONFIG_FILE`, `setup`/`check` warn (without touching it)
-when `safe.directory = *` is missing.
+the host. `check` reports whether the file exists and has the entry, and never
+touches a `GITCONFIG_FILE` you export yourself. `setup` does not stop at
+warning about one: when the file you named is missing `safe.directory = *` —
+or does not exist at all — it says so and then *asks* (a `confirm()` prompt,
+never silently) whether to append the stanza, or create the file, at the path
+you chose.
 
 ## The ext4 volumes
 
@@ -143,7 +149,7 @@ kas-container's `forward_dir()` **bind-mounts the host directory** that
 forward_dir KAS_BUILD_DIR "/build" "rw"     # -v $KAS_BUILD_DIR:/build:rw -e KAS_BUILD_DIR=/build
 ```
 
-This runs on the **host** side of the invocation — the process that goes on to call Apple `container run`. Setting any of the three to a Mac path there would bind-mount that path onto the guest, putting TMPDIR straight back on APFS over virtiofs — the exact thing the volumes exist to avoid. So on the host side, all three **must stay blank — set to an empty string, not merely left unset**: an old `env.sh` sourced into the same shell may still export one of them at a stale APFS path, and only an explicit empty value beats that export. `forward_dir()` returns early only on an **empty** value, never on a merely-unset one, and that empty-vs-unset distinction is the hook mackas relies on.
+This runs on the **host** side of the invocation — the process that goes on to call Apple `container run`. Setting any of the three to a Mac path there would bind-mount that path onto the guest, putting TMPDIR straight back on APFS over virtiofs — the exact thing the volumes exist to avoid. So on the host side, all three **must stay blank — set to an empty string, not merely left unset**: an old `env.sh` sourced into the same shell may still export one of them at a stale APFS path, and only an explicit empty value beats that export. `forward_dir()` itself cannot tell the two apart — its first line is `[ -z "$_varval" ] && return`, and under kas-container's plain `set -e` (no `set -u`) an unset variable reads as empty and takes the same early return. The distinction that matters therefore lives one level up, in the *environment*: an `env KAS_BUILD_DIR= ...` prefix overrides an inherited export, where simply not mentioning the variable cannot.
 
 Blanking the host-side vars is not the whole story, and conflating the two halves is exactly what made an earlier theory of this bug plausible but wrong. `--runtime-args` separately carries `-e KAS_BUILD_DIR=/build` (and the `DL_DIR`/`SSTATE_DIR` equivalents):
 
@@ -310,9 +316,9 @@ declared repo to its pinned revision and re-apply patches. On a checkout with
 local commits that is destructive, not merely slow.
 
 **`mackas exec CMD` is the tool form of this** — `mackas exec du -sh
-openembedded-core` runs exactly the invocation below, with the four flags
-baked in and no way to omit them, so there is no hand-typed command left to
-get wrong:
+openembedded-core` runs exactly the invocation below with `-c 'du -sh
+openembedded-core'` appended — the four flags baked in and no way to omit
+them, so there is no hand-typed command left to get wrong:
 
 ```sh
 kas-container shell --skip setup_dir --skip finish_setup_repos \

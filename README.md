@@ -43,9 +43,10 @@ adaptation surface stays small enough to reason about.
 
 ## Quick start
 
-Requirements: Apple silicon, Apple `container` v1.1.0
-(`brew install container`), and a case-sensitive filesystem with room for the
-build.
+Requirements: Apple silicon, macOS 26 (Tahoe) or newer, Apple `container`
+v1.0.0 or newer (`brew install container`) — v1.1.0 is what mackas is
+tested against, and `check` warns below it — and a case-sensitive filesystem
+with room for the build.
 
 `MACKAS_ROOT` has no baked-in default. Leave it unset and every command falls
 back to the current directory, with a loud warning — fine for a quick look,
@@ -110,6 +111,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
+| `exec` | `exec CMD` runs a one-off read-only command against the checkout with kas's repo-mutating setup steps always skipped — see [below](#driving-kas-directly). `mackas exec --help`. |
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
@@ -181,7 +183,7 @@ vary per build, where bitbake never resets `tmp/buildstats` between builds
 `MACKAS_BUILDSTATS_ACCUMULATE`). Because only **one VM may hold an ext4
 image at a time**, `retrieve` refuses while a build still has the volume
 attached — stop it first. That constraint is also why the copy runs through
-a container rather than a second mount ([TODO.md](TODO.md) item 5).
+a container rather than a second mount.
 
 ### Managing the volumes
 
@@ -283,19 +285,23 @@ kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml
 ```
 
 `kas-container` here is a **shell function**, not the program on your
-`PATH`. `env.sh` defines it to supply `--runtime-args` (the ext4 volumes,
-CPU/memory limits, and the live-progress-bridge args when `MACKAS_MONITOR=1`
-— recomputed live per call via `mackas runtime-args`, not frozen at `setup`
-time, so exporting a setting takes effect on the very next hand-typed build),
-point `GITCONFIG_FILE` at the generated `safe.directory`
-config, blank `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, append the generated
-tuning fragment `:kas/macos-local.yml` (parallelism, `BB_DISKMON_DIRS`,
-`BB_HASHSERVE_DB_DIR`, mirrors) onto the file list, and derive
+`PATH`. `env.sh` defines it to do the two things only code running in *your*
+shell can do: append the generated tuning fragment `:kas/macos-local.yml`
+(parallelism, `BB_DISKMON_DIRS`, `BB_HASHSERVE_DB_DIR`, mirrors) onto the
+file list, and derive
 `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` from that list — exported into the
 shell, never written to a config file, never overriding a value you set —
 so a later `mackas retrieve` or `buildstats analyze` resolves
 `DEPLOY_DIR`/`LOG_DIR`/`BUILDHISTORY_DIR` through bitbake instead of refusing
-(or silently falling back to defaults your distro has redefined).
+(or silently falling back to defaults your distro has redefined). It then
+hands off to `$MACKAS_BIN/kas-container`, the generated protection wrapper
+script, and that wrapper — not the function — is what supplies
+`--runtime-args` (the ext4 volumes, CPU/memory limits, and the
+live-progress-bridge args when `MACKAS_MONITOR=1`, recomputed live per call
+via `mackas runtime-args`, not frozen at `setup` time, so exporting a setting
+takes effect on the very next hand-typed build), points `GITCONFIG_FILE` at
+the generated `safe.directory` config, and blanks
+`KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`.
 `MACKAS_KAS_AUTO_FRAGMENT=0` / `MACKAS_KAS_AUTO_PROJECT=0` disable the two
 conveniences. **Piping the invocation loses the export**: `kas-container ... |
 tail -3` runs the function in a subshell (any pipeline's left-hand side
@@ -321,8 +327,10 @@ shell-function-only conveniences (see
 [architecture.md](docs/architecture.md#running-kas-container-by-hand)).
 The separate, still-real concern is a pipx/pip kas earlier on `PATH` than
 `$MACKAS_BIN`: it resolves to a *different* kas-container release entirely,
-not the 5.4 mackas pins. `mackas check` reports which
-`kas-container` wins ([architecture.md](docs/architecture.md#the-ext4-volumes)).
+not the 5.4 mackas pins. `check` does not inspect that ordering — it reports
+the resolution order for `docker`, not for `kas-container` — so confirm it
+yourself with `type -a kas-container`
+([architecture.md](docs/architecture.md#running-kas-container-by-hand)).
 
 > **For a one-off read-only command, use `mackas exec CMD` instead of typing
 > `kas-container` by hand** (e.g. `mackas exec du -sh openembedded-core`) —
@@ -380,7 +388,7 @@ volume-relocation symlink already belongs to a different live project,
 | `mirror-server/mackas-mirrord.service` | Hardened systemd unit for it (Debian 13). |
 | `mirror-server/mackas-mirrord.conf.example` | Annotated config for it. |
 | `mackas-uibridge/` | The live-progress bridge (`MACKAS_MONITOR=1`): a bitbake UI module (`mackasjson.py`) and the `bitbake` wrapper mounted over the checkout's own. **Optional.** |
-| `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller). |
+| `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller), `mackas-ext4-dirty-bit` (the superblock dirty-bit probe `check` runs). |
 | `tests/`, `run-tests.sh`, `Makefile` | bats test suite and its entry points (`./run-tests.sh` or `make test`). See [testing.md](docs/testing.md). |
 | `COPYING` | GPLv3. |
 | `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`. |
@@ -434,7 +442,7 @@ The settings a new user actually needs:
 
 [mackas.conf.example](mackas.conf.example) is the authoritative, annotated
 full list — mirrors, the host-overhead sampler, auto-`fstrim`, buildstats
-accumulation, monitor port/notifications, `volume resize`'s e2fsprogs image,
+accumulation, monitor port/notifications, `volume fsck`'s e2fsprogs image,
 volume relocation, the free-space margin, and the rest all live there.
 `MACKAS_CONTAINER_BIN` (read by `bin/docker`) overrides which `container`
 binary the shim calls; it exists so the test suite can point the shim at a
@@ -495,7 +503,7 @@ The design decisions, the negative results, and the reasons behind both:
 | [docs/testing.md](docs/testing.md) | The test suite and what it deliberately does not cover; debugging against upstream kas; recovering from a crash. |
 | [docs/security.md](docs/security.md) | Security posture: dependency surface, isolation, supply-chain integrity, CRA readiness. |
 | [docs/monitor-app.md](docs/monitor-app.md) | The progress bridge's JSON contract as a stable API, for anyone building a menubar or notification app against it. |
-| [TODO.md](TODO.md) | Every known gap, prioritised. |
+| [GitHub issues](https://github.com/koenkooi/mackas/issues) | Every known gap, prioritised. |
 
 ## Known limitations
 
@@ -528,8 +536,9 @@ The design decisions, the negative results, and the reasons behind both:
   *ordering*: if pipx or pip installed their own `kas-container` earlier on
   `PATH` than `$MACKAS_BIN` (typically `~/.local/bin/kas-container`), a bare
   `kas-container` resolves to *that* script instead — a different kas
-  version entirely, with none of mackas's protection. `check` reports which
-  one wins.
+  version entirely, with none of mackas's protection. `type -a
+  kas-container` shows which one wins; `check` does not inspect that
+  ordering itself.
 
 ## Verification status
 
@@ -566,7 +575,7 @@ and how fast a task can write, tracked as
 
 Standing unknowns — an NFS-backed mirror root and the container →
 separate-LAN-host network leg — are tracked, with everything else unproven,
-in [TODO.md](TODO.md).
+in [the issue tracker](https://github.com/koenkooi/mackas/issues).
 
 ## Licence
 

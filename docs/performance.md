@@ -13,8 +13,8 @@ wall deltas as indicative, not significant — see
 ## How the host side is measured
 
 `mackas smoketest` samples the host process set around each rung
-(`MACKAS_OVERHEAD`, via `tools/mackas-overhead`), while `mackas buildstats`
-reports the guest's own per-task CPU. The host set is the
+(`MACKAS_OVERHEAD`, via `tools/mackas-overhead`), while `mackas buildstats
+analyze` reports the guest's own per-task CPU. The host set is the
 Virtualization.framework VM — a child XPC service
 (`com.apple.Virtualization.VirtualMachine.xpc`) of the per-run
 `container-runtime-linux` launchd job, which carries the guest's CPU and the
@@ -82,9 +82,11 @@ the same target.
 ## Local SSD vs a network share for the working volume
 
 Three runs of the same target, identical config. The only variables: where the
-**TMPDIR** `volume.img` lives (local SSD vs an SMB share, relocated with the
-per-volume symlink trick in
-[storage.md](storage.md#disk-images-on-network-shares)), and whether the
+**TMPDIR** `volume.img` lives (local SSD vs an SMB share — the image nested in a
+sparsebundle as [storage.md](storage.md#disk-images-on-network-shares)
+describes, put there with `mackas volume move`, which leaves the runtime a
+[per-volume symlink](storage.md#relocating-a-volume-and-recovering-a-hand-moved-one)),
+and whether the
 downloads + sstate caches are warm. `DL_DIR`/`SSTATE_DIR` were on local volumes
 in every run.
 
@@ -180,10 +182,15 @@ storage you have; TMPDIR can be recreated on demand (see item 14 in
 
 ## Run-to-run variance
 
-A full repeat of C and E on the reference host reproduced the headline figures
-closely: wall 2380.8 s vs 2131 s for C, 106.3 s vs 107 s for E; bytes written,
+A full repeat of C and E on the reference host reproduced the headline figures:
+wall 2380.8 s vs 2131 s for C, 106.3 s vs 107 s for E; bytes written,
 parallelism and sstate match % all within noise. (D, the SMB run, did not
-reproduce at all — see [SMB durability](#smb-durability).)
+reproduce at all — see [SMB durability](#smb-durability).) Note the size of C's
+own spread, though: 2380.8 s vs 2131 s is **+11.7 %**, the same order as the
++14.8 % wall penalty D showed. The C-vs-D headline percentage is therefore not
+tightly bounded by one run each; what carries the network finding is the
+per-task-type structure — io-bound tasks 171→359, `do_rootfs` +72 % — which
+varies far less than wall time does.
 
 One figure did not reproduce closely: C's host RSS came in at peak 45.0 GiB /
 mean 26.3 GiB against the original 73.0 / 58.9 GiB — only ~1.07× the 42 GiB
