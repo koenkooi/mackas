@@ -508,6 +508,19 @@ mk_reloc() {
 	[ ! -L "$HOME/oe-meta-ai" ]
 }
 
+@test "adopt accepts --dry-run after the subcommand word too" {
+	# cmd_adopt used to be one of the two tail-parsers (alongside cmd_setup)
+	# that hit a bare "unknown option" die for global flags placed after the
+	# subcommand word -- despite adopt_usage() explicitly documenting that
+	# placement as supported.
+	make_foreign_root_with_project
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf" --dry-run
+	[ "$status" -eq 0 ]
+	[ ! -f "$TESTDIR/newconfig.conf" ]
+	[ ! -f "$FOREIGN/env.sh" ]
+	[ ! -L "$HOME/oe-meta-ai" ]
+}
+
 # ---------------------------------------------------------------------------
 # --help
 # ---------------------------------------------------------------------------

@@ -714,9 +714,14 @@ branch the config does not reference, not just the working-tree state.
   two volumes — never point them at anything machine- or layer-specific.
 - kas printing "Repo <x> is dirty - no checkout" is **expected and harmless**
   whenever sibling repos have uncommitted work; it does not fail the build.
-- `mackas` global flags (`--dry-run`, `--config`, `--set`) go **before** the
-  subcommand; a subcommand's own flags go after. `mackas --dry-run setup <root>`,
-  not `mackas setup --dry-run <root>`.
+- `mackas` global flags (`--dry-run`, `-y`/`--yes`, `-f`/`--force`, `-v`,
+  `--version`) are always safe **before** the subcommand, and that placement
+  is recommended; every subcommand, including `setup` and `adopt`, also
+  accepts them after its own command word (e.g. `mackas setup <root>
+  --dry-run` works the same as `mackas --dry-run setup <root>`). `--config`
+  and `--set` are the exception: they are resolved before any subcommand
+  runs, so they only work **before** the subcommand word — placed after,
+  they die with a redirect to the correct order.
 - Most destructive commands are two-phase: they scan for real (even under
   `--dry-run`), report what they would reclaim, and only act after confirmation
   or `-y`.
