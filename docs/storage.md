@@ -239,16 +239,16 @@ no online-resize support for a filesystem carrying it. An *offline* resize
 would not care, but that requires the filesystem unmounted, and a container
 volume attached the normal way (`-v NAME:/path`) can only ever be mounted —
 Apple's runtime bind-mounts it as ext4 before any command in the container
-even runs. **Correction (found while building `volume fsck`, below): a loop
-device does NOT need `--privileged`** — `losetup` against a raw image file
-works with just `--cap-add CAP_SYS_ADMIN`, verified live. That is a real,
-unmounted block device, and it is genuinely open whether `resize2fs` would
-work against one the same way `e2fsck` now does for repair — untried, and a
-bigger change than this item's own copy-based mechanism, so not pursued
-here. Filed as a follow-on to this item's own TODO entry. All three of
-image, daemon record and filesystem still cannot be made to move together
-via the mounted-volume path, so the copy mechanism below remains what
-`resize` actually does today.
+even runs. A loop device is the way around that: `losetup` against a raw
+image file gives a real, unmounted block device, and needs only
+`--cap-add CAP_SYS_ADMIN` — not `--privileged` — verified live (`volume
+fsck`, below, uses exactly this). Whether `resize2fs` would work against
+that unmounted loop device the same way `e2fsck` now does for repair is
+genuinely open — untried, and a bigger change than this item's own
+copy-based mechanism, so not pursued here; filed as a follow-on to this
+item's own TODO entry. All three of image, daemon record and filesystem
+still cannot be made to move together via the mounted-volume path, so the
+copy mechanism below remains what `resize` actually does today.
 
 The copy needs no `resize2fs`, no hand-edited `entity.json` and no daemon
 restart, so it rests on none of those assumptions. Because Apple `container`
@@ -338,7 +338,7 @@ Instead:
    an actual repair, not merely a read-only check. This needs only
    `--cap-add CAP_SYS_ADMIN` (the same capability `fstrim` already uses),
    not `--privileged` (which Apple `container` does not have) — verified
-   live; see the correction above resize's own similar-sounding claim.
+   live; see resize's own similar-sounding claim above.
 4. `e2fsck -f -y` repairs the clone; an independent second `e2fsck -f -n`
    pass must then come back completely clean before mackas will even offer
    to promote it — the rehearsal the whole design rests on.
