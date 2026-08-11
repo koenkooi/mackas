@@ -41,6 +41,14 @@ KAS_CONTAINER_VERSION="5.4"
 KAS_CONTAINER_URL="https://raw.githubusercontent.com/siemens/kas/${KAS_CONTAINER_VERSION}/kas-container"
 KAS_CONTAINER_SHA256="9707355d1eba19e334e663ab9fcf6881ac323aed16ff7f4fd7e217f879a3894c"
 
+# The KAS_CONTAINER_ENGINE value every direct kas-container invocation in this
+# file forces, instead of relying on kas-container's own 'docker -v | grep
+# ^Docker' probe (see env.sh's matching export for the same reasoning, kept
+# separate since it is generated code, not a function body). One constant so
+# kas_invoke_env(), kas_env_prefix() and write_kas_wrapper()'s generated
+# wrapper can never disagree on it.
+MACKAS_KAS_ENGINE="docker"
+
 # The Apple `container` releases mackas is developed and tested against, and
 # the macOS it needs.
 #
@@ -938,29 +946,42 @@ set_target_config_file() {
 # generation uses, so it round-trips exactly when the file is next sourced --
 # spaces, '$' and apostrophes survive intact, matching what --set already
 # allows on the command line.
+#
+# OP (4th arg, optional, default "write"): "delete" drops the "$name="* line
+# instead of replacing it, and adds nothing when NAME was never there --
+# cmd_unset's whole job. In that case VALUE is ignored (callers pass ""), and
+# the function returns 1 with the file left untouched (not even created) if
+# NAME was not found, so the caller can tell "removed" from "nothing to do".
 config_write_setting() {
-	local file="$1" name="$2" value="$3" tmp mode found=0 line
+	local file="$1" name="$2" value="$3" op="${4:-write}" tmp perm found=0 line
 	tmp="$(mktemp "${TMPDIR:-/tmp}/mackas-conf.XXXXXX")"
 	if [ -f "$file" ]; then
 		while IFS= read -r line || [ -n "$line" ]; do
 			case "$line" in
-				"$name="*) printf '%s=%s\n' "$name" "$(shq "$value")" >>"$tmp"; found=1 ;;
-				*)         printf '%s\n' "$line" >>"$tmp" ;;
+				"$name="*)
+					found=1
+					[ "$op" = "delete" ] || printf '%s=%s\n' "$name" "$(shq "$value")" >>"$tmp"
+					;;
+				*) printf '%s\n' "$line" >>"$tmp" ;;
 			esac
 		done <"$file"
 	fi
 	if [ "$found" -eq 0 ]; then
+		if [ "$op" = "delete" ]; then
+			rm -f "$tmp"
+			return 1
+		fi
 		printf '%s=%s\n' "$name" "$(shq "$value")" >>"$tmp"
 	fi
 	# Preserve an existing file's mode; a brand new one gets 600 --
 	# config_file_is_safe() only requires "not group/other-writable", but
 	# there is no reason to default to more open than that.
 	if [ -f "$file" ]; then
-		mode="$(stat -f '%Lp' "$file" 2>/dev/null || echo 600)"
+		perm="$(stat -f '%Lp' "$file" 2>/dev/null || echo 600)"
 	else
-		mode="600"
+		perm="600"
 	fi
-	chmod "$mode" "$tmp"
+	chmod "$perm" "$tmp"
 	run mv "$tmp" "$file"
 }
 
@@ -1103,30 +1124,17 @@ cmd_unset() {
 		"$SCRIPT_CMD status lists the valid names"
 
 	local file; file="$(set_target_config_file)"
-	if [ ! -f "$file" ]; then
+	# config_write_setting's "delete" op does the anchored "$name=" glob
+	# match/rewrite/mode-preserve work (a case pattern always matches the
+	# whole string, so this cannot false-positive on some OTHER setting whose
+	# name merely ends in the same suffix); it returns 1, file untouched, if
+	# NAME was never persisted -- including "no config file at all" -- rather
+	# than 'unset' hand-rolling that same read/rewrite loop a second time.
+	if config_write_setting "$file" "$name" "" delete; then
+		did "$name removed from $file"
+	else
 		info "$name is not persisted in $file -- nothing to do"
-		return 0
 	fi
-	# Same anchored "$name=" glob match config_write_setting() uses (a case
-	# pattern always matches the whole string, so this cannot false-positive
-	# on some OTHER setting whose name merely ends in the same suffix).
-	local tmp found=0 line
-	tmp="$(mktemp "${TMPDIR:-/tmp}/mackas-conf.XXXXXX")"
-	while IFS= read -r line || [ -n "$line" ]; do
-		case "$line" in
-			"$name="*) found=1 ;;
-			*)         printf '%s\n' "$line" >>"$tmp" ;;
-		esac
-	done <"$file"
-	if [ "$found" -eq 0 ]; then
-		rm -f "$tmp"
-		info "$name is not persisted in $file -- nothing to do"
-		return 0
-	fi
-	local mode; mode="$(stat -f '%Lp' "$file" 2>/dev/null || echo 600)"
-	chmod "$mode" "$tmp"
-	run mv "$tmp" "$file"
-	did "$name removed from $file"
 }
 
 # The kas files kas-container is actually given: the project's own config
@@ -4215,11 +4223,12 @@ if [ -z "\$rt" ] || [ "\$_mackas_kas_ok" != "1" ]; then
 fi
 
 # The fragment-append (macos-local.yml: parallelism, BB_DISKMON_DIRS,
-# BB_HASHSERVE_DB_DIR, mirrors) only happens in the env.sh shell function,
-# which this direct invocation bypassed entirely. MACKAS_KAS_FRAGMENT_DONE is
-# not set yet by anything as of this mackas version, so this note always
-# prints for now -- expected, and it will stop once a later change makes the
-# env.sh function set it before calling into this wrapper.
+# BB_HASHSERVE_DB_DIR, mirrors) only happens in env.sh's kas-container() shell
+# function, which sets MACKAS_KAS_FRAGMENT_DONE=1 right before handing off
+# here -- so this note stays quiet for any call that went through it. It
+# prints only when THIS invocation bypassed that function entirely (nohup,
+# env, a bare \$PATH lookup, or a shell that never sourced env.sh), the one
+# case where the fragment genuinely was never appended.
 if [ "\$MACKAS_KAS_FRAGMENT_DONE" != "1" ]; then
 	echo "\$SCRIPT_NAME: macos-local.yml was not appended to this invocation (it did not go through the env.sh shell function) -- '$SCRIPT_NAME smoketest'/'$SCRIPT_NAME shell' are the fully-featured path" >&2
 fi
@@ -4240,7 +4249,7 @@ fi
 # themselves always wins over the one baked in here at generation time.
 exec env PATH="\$SHIM_DIR:/opt/homebrew/bin:\$PATH" \\
 	MACKAS_KAS_WRAPPED=1 \\
-	KAS_CONTAINER_ENGINE=docker \\
+	KAS_CONTAINER_ENGINE=$MACKAS_KAS_ENGINE \\
 	KAS_WORK_DIR="\$MACKAS_WORK" \\
 	KAS_CONTAINER_IMAGE="\$KAS_IMAGE" \\
 	GITCONFIG_FILE="\${GITCONFIG_FILE:-\$MACKAS_GITCONFIG}" \\
@@ -4953,13 +4962,67 @@ cmd_adopt() {
 # ---------------------------------------------------------------------------
 
 kas_env_prefix() {
-	# Emitted for the log header so a failure is reproducible by hand.
+	# Emitted for the log header so a failure is reproducible by hand. Must
+	# mirror run_kas()'s own _kas_exec invocation (via kas_invoke_env(),
+	# below) variable for variable -- it used to omit KAS_CONTAINER_ENGINE,
+	# KAS_CONTAINER_IMAGE, BB_NUMBER_THREADS and PARALLEL_MAKE, so pasting the
+	# printed header back verbatim did not actually reproduce a real build.
 	# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are deliberately blanked, not set: see
 	# kas_runtime_args().
 	# shellcheck disable=SC2016  # literal text: $PATH must appear verbatim in
 	# the printed command line, to be expanded by the user's shell, not ours.
-	printf 'PATH=%s:/opt/homebrew/bin:$PATH KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s --runtime-args %s' \
-		"$SHIM_DIR" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$(printf '%q' "$(kas_runtime_args)")"
+	printf 'PATH=%s:/opt/homebrew/bin:$PATH KAS_CONTAINER_ENGINE=%s KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s KAS_CONTAINER_IMAGE=%s BB_NUMBER_THREADS=%s PARALLEL_MAKE=%s --runtime-args %s' \
+		"$SHIM_DIR" "$MACKAS_KAS_ENGINE" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$KAS_IMAGE" \
+		"$MACKAS_CPUS" "-j $MACKAS_CPUS" "$(printf '%q' "$(kas_runtime_args)")"
+}
+
+# kas_invoke_env RT_ARGS GITCONFIG WANT_BUILD_VARS CMD... -- exec
+# KAS_CONTAINER_REAL with the invocation environment every direct
+# kas-container call site in this file needs (PATH prepended with the shim
+# dir, the container engine/image, KAS_WORK_DIR, GITCONFIG_FILE, and
+# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR deliberately blanked rather than unset --
+# see kas_runtime_args() for why a non-empty value here would make
+# kas-container's forward_dir() bind-mount an APFS path over the ext4 volume
+# RT_ARGS just asked for). Was four copy-pasted blocks (run_kas()'s own
+# _kas_exec, kas_shell_ro(), cmd_lock(), cmd_dump()); now the one place that
+# shape lives, so it cannot drift between them.
+#
+# WANT_BUILD_VARS (0/1) gates BB_NUMBER_THREADS/PARALLEL_MAKE: run_kas() and
+# kas_shell_ro() set them (a real build/shell needs bitbake's own parallelism
+# told what MACKAS_CPUS is), cmd_lock()/cmd_dump() never did and still don't
+# -- neither runs bitbake, so there is nothing for either variable to tune.
+# Left unset rather than exported empty in that case, matching the pre-refactor
+# behaviour exactly: an unset BB_NUMBER_THREADS/PARALLEL_MAKE lets kas-container
+# fall back to its own default, which an explicit empty value would not.
+#
+# The caller is responsible for `cd`-ing into MACKAS_PROJECT first (some
+# callers need to do that inside their own subshell, before rt_args/gitconfig
+# are even computed) and for capturing/propagating the exit status.
+kas_invoke_env() {
+	local rt_args="$1" gitconfig="$2" want_build_vars="$3"; shift 3
+	if [ "$want_build_vars" = "1" ]; then
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE="$MACKAS_KAS_ENGINE" \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		BB_NUMBER_THREADS="$MACKAS_CPUS" \
+		PARALLEL_MAKE="-j $MACKAS_CPUS" \
+		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" "$@"
+	else
+		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		KAS_CONTAINER_ENGINE="$MACKAS_KAS_ENGINE" \
+		KAS_WORK_DIR="$MACKAS_WORK" \
+		KAS_BUILD_DIR='' \
+		DL_DIR='' \
+		SSTATE_DIR='' \
+		GITCONFIG_FILE="$gitconfig" \
+		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
+		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" "$@"
+	fi
 }
 
 # auto_fstrim <before|after> [<log>] -- reclaim the three sparse volume images
@@ -5107,21 +5170,12 @@ run_kas() {
 
 	_kas_exec() {
 		cd "$MACKAS_PROJECT" || return 1
-		# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are set EMPTY, not unset: the user may
-		# have an old env.sh sourced that exports them at APFS paths, and a
-		# non-empty one would make kas bind-mount that path over the ext4 volume
-		# we just asked for. forward_dir() returns early on an empty value.
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
-		KAS_CONTAINER_ENGINE=docker \
-		KAS_WORK_DIR="$MACKAS_WORK" \
-		KAS_BUILD_DIR='' \
-		DL_DIR='' \
-		SSTATE_DIR='' \
-		GITCONFIG_FILE="$gitconfig" \
-		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
-		BB_NUMBER_THREADS="$MACKAS_CPUS" \
-		PARALLEL_MAKE="-j $MACKAS_CPUS" \
-		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" "$@"
+		# The invocation environment (KAS_BUILD_DIR/DL_DIR/SSTATE_DIR set EMPTY
+		# rather than unset among it -- see kas_invoke_env()'s own comment) is
+		# shared with kas_shell_ro()/cmd_lock()/cmd_dump() via kas_invoke_env();
+		# "1" here asks for BB_NUMBER_THREADS/PARALLEL_MAKE too, same as
+		# kas_shell_ro() -- a real build/shell needs bitbake told MACKAS_CPUS.
+		kas_invoke_env "$rt_args" "$gitconfig" 1 "$@"
 	}
 
 	# Reclaim the images before the run (they may have ratcheted up last time)
@@ -5279,17 +5333,7 @@ kas_shell_ro() {
 
 	(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
-		KAS_CONTAINER_ENGINE=docker \
-		KAS_WORK_DIR="$MACKAS_WORK" \
-		KAS_BUILD_DIR='' \
-		DL_DIR='' \
-		SSTATE_DIR='' \
-		GITCONFIG_FILE="$gitconfig" \
-		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
-		BB_NUMBER_THREADS="$MACKAS_CPUS" \
-		PARALLEL_MAKE="-j $MACKAS_CPUS" \
-		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" shell $kflag "$KAS_FILES_ARG" -c "$cmdstring"
+		kas_invoke_env "$rt_args" "$gitconfig" 1 shell $kflag "$KAS_FILES_ARG" -c "$cmdstring"
 	)
 }
 
@@ -5941,15 +5985,7 @@ cmd_lock() {
 	local rc=0
 	(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
-		KAS_CONTAINER_ENGINE=docker \
-		KAS_WORK_DIR="$MACKAS_WORK" \
-		KAS_BUILD_DIR='' \
-		DL_DIR='' \
-		SSTATE_DIR='' \
-		GITCONFIG_FILE="$gitconfig" \
-		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
-		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" lock "$KAS_FILES_ARG"
+		kas_invoke_env "$rt_args" "$gitconfig" 0 lock "$KAS_FILES_ARG"
 	) || rc=$?
 	[ "$rc" -eq 0 ] || die "kas lock failed (rc=$rc)" "$SCRIPT_CMD shell to investigate"
 	did "kas lock finished -- see its own output above for the lockfile's path"
@@ -6001,15 +6037,7 @@ cmd_dump() {
 	local rc=0
 	(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
-		KAS_CONTAINER_ENGINE=docker \
-		KAS_WORK_DIR="$MACKAS_WORK" \
-		KAS_BUILD_DIR='' \
-		DL_DIR='' \
-		SSTATE_DIR='' \
-		GITCONFIG_FILE="$gitconfig" \
-		KAS_CONTAINER_IMAGE="$KAS_IMAGE" \
-		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
+		kas_invoke_env "$rt_args" "$gitconfig" 0 dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
 	) > "$out" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		rm -f "$out"

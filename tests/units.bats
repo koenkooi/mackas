@@ -237,6 +237,39 @@ teardown() {
 	[ "$MACKAS_BASE" = "$MACKAS_ROOT" ]
 }
 
+# ---------------------------------------------------------------------------
+# kas_env_prefix -- the "paste this back to reproduce it by hand" log header
+# ---------------------------------------------------------------------------
+
+@test "kas_env_prefix: includes KAS_CONTAINER_ENGINE, KAS_CONTAINER_IMAGE, BB_NUMBER_THREADS and PARALLEL_MAKE" {
+	# These four used to be silently missing from the printed header, so
+	# pasting it back verbatim did not actually reproduce run_kas()'s own
+	# _kas_exec invocation (now kas_invoke_env(), shared with it). Pin all
+	# four so none of them can quietly drop out again.
+	set_defaults
+	MACKAS_ROOT="$TESTDIR/root"
+	MACKAS_SHORT_LINK="/nonexistent-short-link-xyzzy"
+	MACKAS_CPUS=6
+	derive_paths
+	out="$(kas_env_prefix)"
+	printf '%s\n' "$out" | grep -qF 'KAS_CONTAINER_ENGINE=docker'
+	printf '%s\n' "$out" | grep -qF "KAS_CONTAINER_IMAGE=$KAS_IMAGE"
+	printf '%s\n' "$out" | grep -qF 'BB_NUMBER_THREADS=6'
+	printf '%s\n' "$out" | grep -qF 'PARALLEL_MAKE=-j 6'
+}
+
+@test "kas_env_prefix: still carries the pre-existing PATH/KAS_WORK_DIR/blanked-dirs/GITCONFIG_FILE fields" {
+	set_defaults
+	MACKAS_ROOT="$TESTDIR/root"
+	MACKAS_SHORT_LINK="/nonexistent-short-link-xyzzy"
+	derive_paths
+	out="$(kas_env_prefix)"
+	printf '%s\n' "$out" | grep -qF "PATH=$SHIM_DIR:/opt/homebrew/bin:\$PATH"
+	printf '%s\n' "$out" | grep -qF "KAS_WORK_DIR=$MACKAS_WORK"
+	printf '%s\n' "$out" | grep -qF 'KAS_BUILD_DIR= DL_DIR= SSTATE_DIR='
+	printf '%s\n' "$out" | grep -qF "GITCONFIG_FILE=$MACKAS_GITCONFIG"
+}
+
 @test "sourcing with MACKAS_LIB_ONLY=1 does not run a command" {
 	# If main had run, setup() would have emitted preflight output or exited.
 	# Reaching this point at all is the assertion.
