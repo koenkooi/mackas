@@ -6846,7 +6846,7 @@ cmd_sstate() {
 monitor_usage() {
 	cat <<EOF
 ${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build
-started with MACKAS_MONITOR=1 (TODO.md item 22).
+started with MACKAS_MONITOR=1.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD monitor [--port N] [--once] [--notify]
@@ -9341,7 +9341,8 @@ ${C_BLD}COMMANDS${C_RST}
   clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the
              checkout. Or one target at a time (tmp+deploy/downloads/sstate);
              '$SCRIPT_CMD clean --help'.
-  destroy    Remove all three volumes, $MACKAS_ROOT and the short symlink.
+  destroy    Remove all four volumes (the three active ones plus a
+             rarely-present legacy one), $MACKAS_ROOT and the short symlink.
              Makes you type DESTROY.
   volume     Manage the ext4 volumes: list, fstrim (reclaim disk), duplicate,
              destroy one, move one to another disk, resize one, fsck a

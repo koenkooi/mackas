@@ -182,9 +182,10 @@
 
 # The three caps. They total 200G, which is what the SSD can spare alongside
 # Time Machine (it has ~296 GiB free). Sparse, so this is a ceiling, not a
-# cost. A volume CANNOT be grown after creation -- container 1.1.0 has no grow
-# command -- so getting one badly wrong means `destroy` and start over, which
-# is the other reason TMPDIR is not in the same volume as the caches.
+# cost. Getting one wrong is not fatal -- `mackas volume resize` grows a
+# volume later by copying it into a new, larger one -- but that copy needs
+# roughly twice the used space free, which is the other reason TMPDIR is not
+# in the same volume as the caches.
 #MACKAS_VOLUME_SIZE_TMP="120G"
 #MACKAS_VOLUME_SIZE_DL="40G"
 #MACKAS_VOLUME_SIZE_SSTATE="40G"
