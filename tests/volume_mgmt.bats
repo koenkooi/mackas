@@ -78,9 +78,19 @@ setup() {
 voldir="$HOME/Library/Application Support/com.apple.container/volumes"
 
 case "$1 $2" in
-	"system status") echo "status running"; exit 0 ;;
+	"system status")
+		# MOCK_CONTAINER_DOWN models the daemon simply not being started (it
+		# does not survive a reboot) -- distinct from every volume-state
+		# fixture below, which models a REAL daemon answering. Same
+		# marker-file shape tests/exec.bats and tests/retrieve.bats already
+		# use for the same thing.
+		if [ "${MOCK_CONTAINER_DOWN:-0}" = "1" ] && [ ! -f "${CONTAINER_STARTED_MARKER:-/nonexistent-marker-xyzzy}" ]; then
+			exit 1
+		fi
+		echo "status running"; exit 0 ;;
 	"system stop") exit 0 ;;
 	"system start")
+		[ -n "${CONTAINER_STARTED_MARKER:-}" ] && touch "$CONTAINER_STARTED_MARKER"
 		# Simulate a REAL start: the daemon scans volumes/*/entity.json
 		# into its index -- exactly what refuse_if_stale_entity relies on.
 		# There is NO 'system restart' subcommand; mackas does stop+start.
@@ -394,6 +404,26 @@ refute_call() {
 # ---------------------------------------------------------------------------
 # fstrim -- the headline
 # ---------------------------------------------------------------------------
+
+@test "volume fstrim: daemon merely stopped -- auto-starts instead of dying 'does not exist'" {
+	# Issue #33 follow-up: volume_fstrim_one() (like every other volume
+	# subcommand that mutates a volume) used to gate on volume_exists()
+	# ('container volume ls', which returns nothing useful with the daemon
+	# down) with no chance to auto-start first -- so a volume that genuinely
+	# exists on disk, just unreachable because the daemon has not been
+	# started since a reboot, died as "does not exist" instead of the daemon
+	# simply coming up. require_runtime_for_volumes() fixes that. Same
+	# marker-file shape tests/exec.bats and tests/retrieve.bats use for
+	# run_kas()/kas_shell_ro()/cmd_retrieve's own version of this.
+	have_volume oe-build-tmp 120G
+	marker="$TESTDIR/container-started"
+	MOCK_CONTAINER_DOWN=1 CONTAINER_STARTED_MARKER="$marker" vol fstrim oe-build-tmp
+	[ "$status" -eq 0 ]
+	[ -f "$marker" ]
+	assert_call "[system] [start]"
+	! printf '%s\n' "$output" | grep -qi 'does not exist'
+	assert_call "[fstrim]"
+}
 
 @test "volume fstrim: refuses an in-use volume (one-VM rule)" {
 	have_volume oe-build-tmp 120G

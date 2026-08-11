@@ -87,7 +87,18 @@ EOF
 } >> "$CLOG"
 
 case "$1 $2" in
-	"system status") echo "status running"; exit 0 ;;
+	"system status")
+		# MOCK_CONTAINER_DOWN models the daemon simply not being started (it
+		# does not survive a reboot) -- distinct from every other absent/busy
+		# fixture here, which models a REAL daemon answering. Same
+		# marker-file shape tests/exec.bats already uses for the same thing.
+		if [ "${MOCK_CONTAINER_DOWN:-0}" = "1" ] && [ ! -f "${CONTAINER_STARTED_MARKER:-/nonexistent-marker-xyzzy}" ]; then
+			exit 1
+		fi
+		echo "status running"; exit 0 ;;
+	"system start")
+		[ -n "${CONTAINER_STARTED_MARKER:-}" ] && touch "$CONTAINER_STARTED_MARKER"
+		exit 0 ;;
 	"volume ls")
 		# volume_exists() gates cmd_retrieve's whole run (item 33 follow-up:
 		# fetch_tmp_subdir's probe always attaches the volume for real, so
@@ -551,6 +562,25 @@ EOF
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'does not exist yet'
 	refute_call "-d "
+}
+
+@test "retrieve: daemon merely stopped -- auto-starts instead of misreporting 'does not exist yet'" {
+	# Issue #33 follow-up: cmd_retrieve used to gate on volume_exists()
+	# ('container volume ls', which returns nothing useful with the daemon
+	# down) BEFORE ever reaching ensure_container_running -- so a volume that
+	# genuinely exists on disk, just unreachable because the daemon has not
+	# been started since a reboot, was misreported as never having been
+	# created. The default fakebin/container from setup() already reports
+	# 'oe-build-tmp' present via 'volume ls' once it is up; MOCK_CONTAINER_DOWN
+	# makes 'system status' fail until 'system start' runs, same as
+	# tests/exec.bats models this for run_kas()/kas_shell_ro().
+	marker="$TESTDIR/container-started"
+	MOCK_CONTAINER_DOWN=1 CONTAINER_STARTED_MARKER="$marker" mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	[ -f "$marker" ]
+	assert_call "[system] [start]"
+	! printf '%s\n' "$output" | grep -qi 'does not exist yet'
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
 # ---------------------------------------------------------------------------
