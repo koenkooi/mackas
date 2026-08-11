@@ -136,11 +136,12 @@ a partial run.
   `README.md` are part of the change, not a follow-up.
 - **Commit style:** `area: lowercase imperative summary` (`docs:`, `ci:`,
   `tests:`, `readme:`, or a subcommand/file name), with the body wrapped at 72
-  columns. AI-assisted commits carry a `Co-Authored-By:` trailer (plus a
-  `Claude-Session:` line from Claude Code) — that is what every commit in this
-  repo's history actually uses. There are no `Signed-off-by:` or `Assisted-by:`
-  trailers anywhere; do not start adding them. Use `Fixes #N` / `Closes #N`
-  when a commit finishes a tracked GitHub issue.
+  columns. Sign off with `-s` (`Signed-off-by:`); AI-assisted commits add an
+  `Assisted-by:` trailer too. Never add a `Co-Authored-By:` or
+  `Claude-Session:` line — both crept into a run of commits despite this file
+  always prescribing `Signed-off-by:`/`Assisted-by:`, and both have since been
+  scrubbed from history; do not reintroduce either. Use `Fixes #N` / `Closes
+  #N` when a commit finishes a tracked GitHub issue.
 - Security policy and how to report issues: see [SECURITY.md](SECURITY.md).
 
 ## Where to look first
