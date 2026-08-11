@@ -226,3 +226,15 @@ EXPECT_FILES="kas/base.yml:kas/macos-local.yml"
 	# The fragment path was excluded from the checkout exactly once.
 	[ "$(grep -c '^kas/macos-local.yml$' "$PROJECT/.git/info/exclude")" -eq 1 ]
 }
+
+# ---------------------------------------------------------------------------
+# Global flags after the subcommand word (cmd_setup used to be one of the two
+# tail-parsers -- alongside cmd_adopt -- that hit a bare "unknown option" die
+# for these; every other tail-capturing command already accepted them here).
+# ---------------------------------------------------------------------------
+
+@test "setup accepts --dry-run after the subcommand word" {
+	mk setup "$ROOT" --dry-run
+	[ "$status" -eq 0 ]
+	[ ! -e "$ROOT" ]
+}

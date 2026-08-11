@@ -4568,6 +4568,11 @@ cmd_setup() {
 			# itself rather than fall through to "unknown option"/"the root
 			# path is literally the word help".
 			-h|--help|help) want_help=1; shift ;;
+			--dry-run)     DRY_RUN=1; shift; continue ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1; shift; continue ;;
+			-v|--verbose)  VERBOSE=1; shift; continue ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" setup ;;
 			--tmpdir-size|--sstate-size|--downloads-size)
 				a="$1"; val="${2:-}"
 				[ -n "$val" ] || die "$a needs a value" "$SCRIPT_CMD setup --help"
@@ -4814,6 +4819,10 @@ cmd_adopt() {
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
+			--dry-run)     DRY_RUN=1; shift ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1; shift ;;
+			-v|--verbose)  VERBOSE=1; shift ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
 			--project-dir)   project_dir_opt="${2:-}"
 				[ -n "$project_dir_opt" ] || die "--project-dir needs a value" "$SCRIPT_CMD adopt --help"
 				shift 2 ;;
