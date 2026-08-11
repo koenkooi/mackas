@@ -278,10 +278,22 @@ tmp_deploy_ok() { fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/tmp/
 @test "clean tmp+deploy: a container holding a DIFFERENT volume does not block it" {
 	have_volumes oe-build-tmp
 	tmp_deploy_ok
-	MOCK_TMP_HAS="/build/tmp" MOCK_BUSY_VOLUME=oe-build-sstate MACKAS_PROJECT_DIR=meta-angstrom \
+	MOCK_TMP_HAS="/build/tmp" MOCK_BUSY_VOLUME=some-other-volume MACKAS_PROJECT_DIR=meta-angstrom \
 		mk -y clean tmp+deploy
 	[ "$status" -eq 0 ]
 	assert_call "rm -rf"
+}
+
+@test "clean tmp+deploy: one-VM refusal when the sstate volume is busy, not just TMPDIR" {
+	# bitbake_getvar() goes through kas_shell_ro(), which attaches all three
+	# volumes -- a busy sstate (or dl) volume must refuse the same as a busy
+	# TMPDIR, not pass through and hit a raw error from the second attach.
+	have_volumes oe-build-tmp
+	MOCK_BUSY_VOLUME=oe-build-sstate mk clean tmp+deploy
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'attached to a running container'
+	printf '%s\n' "$output" | grep -qF 'oe-build-sstate'
+	refute_call "rm -rf"
 }
 
 @test "clean tmp+deploy: --dry-run probes for real but deletes nothing" {

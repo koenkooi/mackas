@@ -6389,12 +6389,19 @@ cmd_retrieve() {
 	# nothing useful with the daemon down) instead of the actual problem.
 	ensure_container_running
 
-	# One-VM rule: never attach the volume a build might still hold. Refuse
-	# loudly rather than corrupt an ext4 image mounted by two VMs at once.
-	if volume_in_use "$MACKAS_VOL_TMP"; then
-		die "volume '$MACKAS_VOL_TMP' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD retrieve'"
-	fi
+	# One-VM rule: bitbake_getvar() goes through kas_shell_ro(), which attaches
+	# ALL THREE volumes via kas_runtime_args() -- not just TMPDIR -- so all
+	# three must be checked here, the same loop cmd_exec/
+	# kas_project_subcommand_preflight use, rather than let a concurrent
+	# holder of just the sstate or downloads volume slip past a TMPDIR-only
+	# guard and hit a raw Virtualization.framework error instead.
+	local v
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		if volume_in_use "$v"; then
+			die "volume '$v' is attached to a running container" \
+				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD retrieve'"
+		fi
+	done
 	# fetch_tmp_subdir's existence+size probe now always attaches the volume
 	# for real, dry-run or not (item 33) -- refuse before that if it does not
 	# exist yet at all, the same guard clean_tmp_deploy/sstate_prune already
@@ -7533,10 +7540,19 @@ refuse_unsafe_guest_path() {
 # -- see check_buildstats_accumulation() for the same reasoning applied to one
 # buildstats subdirectory.
 clean_tmp_deploy() {
-	if volume_in_use "$MACKAS_VOL_TMP"; then
-		die "volume '$MACKAS_VOL_TMP' is attached to a running container" \
-			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean tmp+deploy'"
-	fi
+	# One-VM rule: bitbake_getvar() goes through kas_shell_ro(), which attaches
+	# ALL THREE volumes via kas_runtime_args() -- not just TMPDIR -- so all
+	# three must be checked here, the same loop cmd_exec/
+	# kas_project_subcommand_preflight use, rather than let a concurrent
+	# holder of just the sstate or downloads volume slip past a TMPDIR-only
+	# guard and hit a raw Virtualization.framework error instead.
+	local v
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		if volume_in_use "$v"; then
+			die "volume '$v' is attached to a running container" \
+				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean tmp+deploy'"
+		fi
+	done
 	if ! volume_exists "$MACKAS_VOL_TMP"; then
 		info "Nothing to clean -- '$MACKAS_VOL_TMP' does not exist yet ($SCRIPT_CMD setup)"
 		return 0

@@ -636,6 +636,17 @@ EOF
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
+@test "retrieve: refuses when a running container holds the sstate volume, not just TMPDIR" {
+	# bitbake_getvar() goes through kas_shell_ro(), which attaches all three
+	# volumes -- a busy sstate (or dl) volume must refuse the same as a busy
+	# TMPDIR, not pass through and hit a raw error from the second attach.
+	MOCK_BUSY_VOLUME="oe-build-sstate" mk retrieve buildstats
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'only ONE VM'
+	printf '%s\n' "$output" | grep -qF 'oe-build-sstate'
+	refute_call "cp -r"
+}
+
 # ---------------------------------------------------------------------------
 # --dry-run mutates nothing
 # ---------------------------------------------------------------------------
