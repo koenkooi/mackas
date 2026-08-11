@@ -2,6 +2,11 @@
 mackas.conf
 *.log
 
+# Local-only backlog. Completed work lives in git history and the docs;
+# this is a working list, not a tracked artifact.
+TODO.md
+TODO-archive.md
+
 # Scratch reproduction notes -- personal working notes, not for the tree.
 REPRODUCE-*.md
 
