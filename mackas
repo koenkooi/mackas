@@ -9464,6 +9464,8 @@ ${C_BLD}USAGE${C_RST}
 ${C_BLD}COMMANDS${C_RST}
   check      Preflight only. Changes nothing. ${C_BLD}This is the default.${C_RST}
   setup      Do the full setup. Idempotent -- safe to re-run after a crash.
+  adopt      Bring a MACKAS_ROOT set up by another Mac back to a working
+             build here. '$SCRIPT_CMD adopt --help'.
   smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
   status     Show what is configured and what exists on disk.
   shell      Drop into a kas shell for the project's kas config.

@@ -6,8 +6,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Runs shellcheck (if present), a bash 3.2 syntax check, the bats suite, and
-# the Python unittest suite (the mirror server, the buildstats analyzer and
-# the overhead sampler).
+# the Python unittest suite -- every tests/test_*.py, one per Python-side
+# component (the mirror server, the tools/ helpers, the uibridge). Discovery
+# is by that glob, so a new component's tests run here the moment the file
+# exists; an enumerated list in this comment would only rot.
 #
 # None of this touches the real Apple container runtime, the build SSD, the
 # network, sudo, NFS, or the mirror host -- it is safe to run anywhere, any time.
