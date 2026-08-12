@@ -17,9 +17,9 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Poll http://127.0.0.1:<port>/ (published by kas_runtime_args() when
-MACKAS_MONITOR=1 -- see TODO.md item 22) and print progress lines until the
-build reports success/failed or this process is interrupted. Stdlib only,
-matching every other mackas-side tool.
+MACKAS_MONITOR=1 -- see docs/monitor-app.md for the JSON contract) and print
+progress lines until the build reports success/failed or this process is
+interrupted. Stdlib only, matching every other mackas-side tool.
 
 `mackas monitor` is a thin wrapper: it does not start anything, it only
 polls an already-running build's already-published bridge.
@@ -47,6 +47,12 @@ def _float_env(name, default):
 
 POLL_INTERVAL = _float_env("MACKAS_MONITOR_POLL_INTERVAL", 2.0)
 REQUEST_TIMEOUT = 2.0
+
+# Distinct exit codes so a script can tell "no bridge reachable at all" apart
+# from "reached it, and the build itself failed" -- both used to return 1.
+EXIT_OK = 0
+EXIT_BUILD_FAILED = 1
+EXIT_UNREACHABLE = 2
 
 # A notifier that hangs must not stall the poll loop; it is a side-channel,
 # not the job.
@@ -88,15 +94,116 @@ def fetch(port):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def render(state):
-    current = state.get("current") or {}
-    progress = state.get("progress") or {}
-    recipe = current.get("recipe") or "-"
-    task = current.get("task") or "-"
-    done = progress.get("done", 0)
-    total = progress.get("total", 0)
+def _underlying_os_error(exc):
+    """The OSError a failure actually is, whether urllib wrapped it in a
+    URLError or it propagated bare -- both forms are observed in practice
+    depending on exactly where in the socket/HTTP stack the failure lands,
+    and the caller wants to switch on the real errno either way."""
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, OSError):
+        return exc.reason
+    if isinstance(exc, OSError):
+        return exc
+    return None
+
+
+def connection_error_message(port, exc):
+    """One of three genuinely different situations, not one errno. A user
+    hitting this needs to know which before they know what to do next."""
+    real = _underlying_os_error(exc)
+    if isinstance(real, ConnectionRefusedError):
+        return (
+            f"nothing is listening on 127.0.0.1:{port} -- no monitored build "
+            f"is running right now (MACKAS_MONITOR=1 has to be set before a "
+            f"build starts, not after)"
+        )
+    if isinstance(real, ConnectionResetError):
+        return (
+            f"something is publishing 127.0.0.1:{port} but reset the "
+            f"connection instead of answering -- the build may not have "
+            f"reached bitbake yet, or the progress bridge did not come up "
+            f"inside the container; try again in a few seconds"
+        )
+    if isinstance(real, TimeoutError) or isinstance(exc, TimeoutError):
+        return f"127.0.0.1:{port} did not respond within {REQUEST_TIMEOUT}s -- try again"
+    return f"could not reach the bridge at 127.0.0.1:{port}: {exc}"
+
+
+def _format_elapsed(seconds):
+    """H:MM:SS, or M:SS under an hour -- no leading zero on the leftmost unit."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def new_render_context():
+    """Per-run state render() needs that a single JSON payload does not
+    carry: when the build actually started (progress.total jumps between
+    phases -- see docs/monitor-app.md -- so elapsed wall time is tracked
+    locally, not derived from it), whether the one-time header line has
+    printed yet, the last line shown (to de-duplicate an unchanged poll),
+    and whether stdout is a real terminal at all."""
+    return {
+        "started_at": None,
+        "header_printed": False,
+        "last_line": None,
+        "last_len": 0,
+        "is_tty": sys.stdout.isatty(),
+    }
+
+
+def render(state, ctx):
     status = state.get("status", "?")
-    print(f"[{status}] {done}/{total}  {recipe}:{task}", flush=True)
+
+    if ctx["started_at"] is None and status not in ("idle", "?"):
+        ctx["started_at"] = time.monotonic()
+
+    if not ctx["header_printed"] and status != "idle":
+        header = describe_targets(state)
+        if header:
+            print(f"watching: {header}", flush=True)
+        ctx["header_printed"] = True
+
+    if status == "idle":
+        line = "waiting for the build to start..."
+    else:
+        current = state.get("current") or {}
+        progress = state.get("progress") or {}
+        recipe = current.get("recipe") or "-"
+        task = current.get("task") or "-"
+        done = progress.get("done", 0)
+        total = progress.get("total", 0)
+        # The core "[status] done/total  recipe:task" shape is unchanged --
+        # percent/elapsed/failures are appended after it, never inserted
+        # into it, so anything that greps for that substring still matches.
+        line = f"[{status}] {done}/{total}  {recipe}:{task}"
+        if total:
+            line += f"  {done * 100 // total}%"
+        if ctx["started_at"] is not None:
+            line += f"  {_format_elapsed(time.monotonic() - ctx['started_at'])}"
+        failed = state.get("failed_count") or 0
+        if failed and status == "building":
+            line += f"  ({failed} failed so far)"
+
+    changed = line != ctx["last_line"]
+    if ctx["is_tty"]:
+        # Overwrite the previous line in place instead of scrolling -- a
+        # ~2s poll over a 90-minute build would otherwise print roughly
+        # 2700 near-identical lines. Only committed to a real newline (so
+        # the shell prompt lands cleanly below it) once the build reaches
+        # a terminal status.
+        if changed or status in ("success", "failed"):
+            pad = max(0, ctx["last_len"] - len(line))
+            print("\r" + line + (" " * pad), end="", flush=True)
+            ctx["last_len"] = len(line)
+            if status in ("success", "failed"):
+                print(flush=True)
+    else:
+        if changed:
+            print(line, flush=True)
+    ctx["last_line"] = line
 
 
 # ---------------------------------------------------------------------------
@@ -305,26 +412,26 @@ def main(argv=None):
 
     want_notify = args.notify or os.environ.get("MACKAS_MONITOR_NOTIFY", "0") == "1"
     prev_status = None
+    ctx = new_render_context()
 
     try:
         while True:
             try:
                 state = fetch(args.port)
             except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
-                print(f"could not reach the bridge at 127.0.0.1:{args.port}: {exc}",
-                      file=sys.stderr)
-                return 1
-            render(state)
+                print(connection_error_message(args.port, exc), file=sys.stderr)
+                return EXIT_UNREACHABLE
+            render(state, ctx)
             if want_notify:
                 message = transition_message(prev_status, state)
                 if message:
                     notify(*message)
             prev_status = state.get("status") or "?"
             if args.once or state.get("status") in ("success", "failed"):
-                return 0 if state.get("status") != "failed" else 1
+                return EXIT_BUILD_FAILED if state.get("status") == "failed" else EXIT_OK
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
-        return 0
+        return EXIT_OK
 
 
 if __name__ == "__main__":

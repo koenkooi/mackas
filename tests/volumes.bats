@@ -194,21 +194,23 @@ teardown() {
 	printf '%s\n' "$args" | grep -qF -- "-v $REPO_ROOT/mackas-uibridge/bitbake:/work/some-custom-name/bin/bitbake:ro"
 }
 
-@test "runtime-args: MACKAS_MONITOR=1 with no bitbake checkout yet is a silent no-op" {
+@test "runtime-args: MACKAS_MONITOR=1 with no bitbake checkout yet warns and skips (not silent)" {
 	MACKAS_MONITOR=1
 	# MACKAS_WORK exists (derive_paths created it in spirit, but not on disk
 	# here) -- create it empty, matching "project not cloned yet".
 	mkdir -p "$MACKAS_WORK"
-	args="$(kas_runtime_args)"
+	args="$(kas_runtime_args 2>"$TESTDIR/stderr.log")"
 	! printf '%s\n' "$args" | grep -q 'mackas-uibridge'
 	! printf '%s\n' "$args" | grep -qE -- '(^| )-p '
+	grep -qF "no bitbake checkout found yet" "$TESTDIR/stderr.log"
 }
 
-@test "runtime-args: MACKAS_MONITOR=1 with MACKAS_WORK not existing yet is a silent no-op" {
+@test "runtime-args: MACKAS_MONITOR=1 with MACKAS_WORK not existing yet warns and skips (not silent)" {
 	MACKAS_MONITOR=1
 	rm -rf "$MACKAS_WORK"
-	args="$(kas_runtime_args)"
+	args="$(kas_runtime_args 2>"$TESTDIR/stderr.log")"
 	! printf '%s\n' "$args" | grep -q 'mackas-uibridge'
+	grep -qF "does not exist yet" "$TESTDIR/stderr.log"
 }
 
 # ---------------------------------------------------------------------------

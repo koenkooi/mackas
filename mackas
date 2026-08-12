@@ -1359,20 +1359,23 @@ monitor_runtime_args() {
 
 	case "$SCRIPT_DIR" in
 		*' '*)
-			vrb "MACKAS_MONITOR=1 but mackas's own path has a space in it ($SCRIPT_DIR); skipping the bridge this run"
+			warn "MACKAS_MONITOR=1 but mackas's own path has a space in it ($SCRIPT_DIR) -- skipping the progress bridge this run"
 			return
 			;;
 	esac
 
-	[ -d "$MACKAS_WORK" ] || return
+	if [ ! -d "$MACKAS_WORK" ]; then
+		warn "MACKAS_MONITOR=1 but $MACKAS_WORK does not exist yet -- skipping the progress bridge this run ($SCRIPT_CMD setup)"
+		return
+	fi
 	real_bitbake="$(find "$MACKAS_WORK" -maxdepth 3 -type f -path '*/bin/bitbake' 2>/dev/null | head -1)"
 	[ -n "$real_bitbake" ] || {
-		vrb "MACKAS_MONITOR=1 but no bitbake checkout found yet under $MACKAS_WORK; skipping the bridge this run"
+		warn "MACKAS_MONITOR=1 but no bitbake checkout found yet under $MACKAS_WORK -- skipping the progress bridge this run"
 		return
 	}
 	case "$real_bitbake" in
 		*' '*)
-			vrb "MACKAS_MONITOR=1 but the bitbake checkout's path has a space in it; skipping the bridge this run"
+			warn "MACKAS_MONITOR=1 but the bitbake checkout's path has a space in it -- skipping the progress bridge this run"
 			return
 			;;
 	esac
@@ -5168,6 +5171,20 @@ run_kas() {
 		return 0
 	fi
 
+	# The one place a user finds out MACKAS_MONITOR=1 actually took effect.
+	# monitor_runtime_args() already warns on every path that skips the
+	# bridge, so silence here means it is genuinely in rt_args -- checking
+	# the string is simpler than threading a second return value out of
+	# kas_runtime_args() for this alone.
+	if [ "$MACKAS_MONITOR" = "1" ]; then
+		case "$rt_args" in
+			*mackas-uibridge*)
+				printf '%slive progress bridge: publishing 127.0.0.1:%s (watch with: %s monitor)%s\n' \
+					"$C_DIM" "$MACKAS_MONITOR_PORT" "$SCRIPT_CMD" "$C_RST" >&2
+				;;
+		esac
+	fi
+
 	_kas_exec() {
 		cd "$MACKAS_PROJECT" || return 1
 		# The invocation environment (KAS_BUILD_DIR/DL_DIR/SSTATE_DIR set EMPTY
@@ -6940,11 +6957,17 @@ want to watch first, e.g.:
 ${C_BLD}OPTIONS${C_RST}
   --port N   Poll this port instead of MACKAS_MONITOR_PORT.
   --once     Print a single snapshot and exit, instead of following until
-             the build reports success/failed.
+             the build reports success/failed. Exit status distinguishes
+             success (0), a build that failed (1) and no bridge reachable
+             at all (2) -- usable as a scripted probe.
   --notify   Also post a native macOS notification on exactly three
              transitions -- build started, succeeded, failed -- never per
              task. MACKAS_MONITOR_NOTIFY=1 turns it on without the flag.
              Uses terminal-notifier when it is installed, else osascript.
+
+MACKAS_MONITOR_POLL_INTERVAL sets the poll interval in seconds (default 2);
+there is no flag for it, since it is a display-only knob, not a setting
+'mackas set' persists.
 
 ${C_BLD}NOTIFICATION PERMISSIONS${C_RST}
 If the terminal app has no Notification Center entry, osascript
@@ -6954,7 +6977,9 @@ through System Settings > Notifications that no CLI can do for you.
 Installing terminal-notifier (brew install terminal-notifier) sidesteps it
 by carrying its own bundle identity, and is preferred automatically.
 
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+--dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted here for
+consistency with every other command, but have no effect: monitor only
+polls and prints, it never mutates anything or asks for confirmation.
 EOF
 }
 
@@ -6986,9 +7011,15 @@ cmd_monitor() {
 	fi
 
 	local tool="$SCRIPT_DIR/tools/mackas-monitor"
-	if [ ! -f "$tool" ] || [ ! -x /usr/bin/python3 ]; then
-		warn "monitor tool not found at $tool; skipping"
-		return 1
+	[ -f "$tool" ] || die "monitor tool missing at $tool" \
+		"reinstall/re-clone mackas -- this should ship with every checkout"
+	[ -x /usr/bin/python3 ] || die "no /usr/bin/python3 -- mackas-monitor needs macOS's own stock python3" \
+		"xcode-select --install   # or open Terminal once to trigger the CLT prompt"
+
+	if [ "$MACKAS_MONITOR" != "1" ]; then
+		warn "MACKAS_MONITOR is not 1 in this shell/config -- a build started now will not publish a bridge for this to poll"
+		printf '%s  start one with: MACKAS_MONITOR=1 %s smoketest &, or make it permanent with: %s set MACKAS_MONITOR 1%s\n' \
+			"$C_BLU" "$SCRIPT_CMD" "$SCRIPT_CMD" "$C_RST" >&2
 	fi
 
 	local args=(--port "$port")

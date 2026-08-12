@@ -170,6 +170,13 @@ notifier_calls() {
 	printf '%s\n' "$output" | grep -qi 'bitbake progress'
 }
 
+@test "monitor --help documents MACKAS_MONITOR_POLL_INTERVAL and is honest that --dry-run/-v have no effect" {
+	run "$MACKAS" monitor --help
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_MONITOR_POLL_INTERVAL'
+	printf '%s\n' "$output" | grep -qi 'have no effect'
+}
+
 @test "monitor: an unknown option is refused" {
 	run "$MACKAS" monitor --bogus
 	[ "$status" -ne 0 ]
@@ -192,10 +199,71 @@ notifier_calls() {
 # Unreachable bridge
 # ---------------------------------------------------------------------------
 
-@test "monitor: an unreachable port gives a clear error, not a stack trace" {
+@test "monitor: an unreachable port gives a clear, specific error, not a stack trace or a bare errno" {
 	run "$MACKAS" monitor --port 18801 --once
-	[ "$status" -ne 0 ]
-	printf '%s\n' "$output" | grep -qi 'could not reach the bridge'
+	[ "$status" -eq 2 ]
+	printf '%s\n' "$output" | grep -qi 'nothing is listening on 127.0.0.1:18801'
+	printf '%s\n' "$output" | grep -qi 'no monitored build is running'
+}
+
+# ---------------------------------------------------------------------------
+# The three genuinely different "can't reach it" cases (finding 2): refused,
+# reset, and MACKAS_MONITOR not even on. Each used to collapse to one bare
+# errno; each now says something different and actionable.
+# ---------------------------------------------------------------------------
+
+@test "monitor: connection refused (nothing listening) is distinguished from reset" {
+	run_monitor --port 18802 --once
+	[ "$status" -eq 2 ]
+	printf '%s\n' "$output" | grep -qi 'nothing is listening'
+	printf '%s\n' "$output" > "$TESTDIR/refused.out"
+	assert_fails grep -qi 'reset the connection' "$TESTDIR/refused.out"
+}
+
+@test "monitor: connection reset (published but nothing answering) says so, not a bare errno" {
+	# A listener that accepts and immediately closes reproduces ECONNRESET
+	# without needing a real container -- python's http.server has no
+	# built-in for this, so a raw socket that accepts and closes does it.
+	cat > "$TESTDIR/reset_server.py" <<'PYEOF'
+import socket
+import sys
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+print(s.getsockname()[1], flush=True)
+while True:
+    conn, _ = s.accept()
+    conn.close()
+PYEOF
+	python3 "$TESTDIR/reset_server.py" > "$TESTDIR/reset_port.txt" &
+	SERVER_PID=$!
+	for _ in $(seq 1 50); do
+		[ -s "$TESTDIR/reset_port.txt" ] && break
+		sleep 0.1
+	done
+	local reset_port
+	reset_port="$(cat "$TESTDIR/reset_port.txt")"
+	[ -n "$reset_port" ]
+	run_monitor --port "$reset_port" --once
+	[ "$status" -eq 2 ]
+	printf '%s\n' "$output" | grep -qi 'reset the connection'
+	printf '%s\n' "$output" | grep -qi 'progress bridge did not come up'
+}
+
+@test "monitor: cmd_monitor warns up front when MACKAS_MONITOR is not 1" {
+	run "$MACKAS" monitor --port 18803 --once
+	printf '%s\n' "$output" | grep -qi 'MACKAS_MONITOR is not 1'
+	printf '%s\n' "$output" | grep -qF 'MACKAS_MONITOR=1'
+}
+
+@test "monitor: no warning about MACKAS_MONITOR when it actually is 1" {
+	start_fake_bridge '{"status": "success", "current": {"recipe": null, "task": null}, "progress": {"done": 10, "total": 10}, "recent_events": []}'
+	MACKAS_MONITOR=1 run "$MACKAS" monitor --port "$FAKE_PORT" --once
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" > "$TESTDIR/warned.out"
+	assert_fails grep -qi 'MACKAS_MONITOR is not 1' "$TESTDIR/warned.out"
 }
 
 # ---------------------------------------------------------------------------
@@ -262,8 +330,8 @@ notifier_calls() {
 }
 
 @test "monitor --notify: MACKAS_MONITOR_NOTIFY=1 also works through 'mackas monitor'" {
-	# The wrapper has no --notify flag of its own, so the env var is the only
-	# way to reach this feature via `mackas monitor`. Both fakes are installed
+	# Confirms the env var reaches the same effect as cmd_monitor's own
+	# --notify flag, not that the flag is absent. Both fakes are installed
 	# and PATH-prepended (not replaced -- mackas itself needs a real PATH), so
 	# no real notifier can be reached.
 	fake_notifier osascript
