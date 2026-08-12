@@ -23,6 +23,10 @@ interrupted. Stdlib only, matching every other mackas-side tool.
 
 `mackas monitor` is a thin wrapper: it does not start anything, it only
 polls an already-running build's already-published bridge.
+
+If that published port resets instead of answering -- an Apple `container`
+port-forward bug, not a bridge one (see resolve_direct_endpoint) -- the poll
+switches to the container's own address and carries on.
 """
 
 import argparse
@@ -47,6 +51,15 @@ def _float_env(name, default):
 
 POLL_INTERVAL = _float_env("MACKAS_MONITOR_POLL_INTERVAL", 2.0)
 REQUEST_TIMEOUT = 2.0
+
+# Where the bridge is published on the host, and where it is polled until
+# something proves that address unusable.
+LOOPBACK = "127.0.0.1"
+
+# `container ls` + `container inspect` are cheap, but they are still two
+# subprocesses and a daemon round-trip; nothing on the working path may wait
+# on them, so this bounds only the already-broken case.
+CONTAINER_QUERY_TIMEOUT = 5.0
 
 # Distinct exit codes so a script can tell "no bridge reachable at all" apart
 # from "reached it, and the build itself failed" -- both used to return 1.
@@ -87,11 +100,139 @@ output and the exit status are unchanged either way.
 """
 
 
-def fetch(port):
+def fetch(port, host=LOOPBACK):
     with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/", timeout=REQUEST_TIMEOUT
+        f"http://{host}:{port}/", timeout=REQUEST_TIMEOUT
     ) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Reaching the container directly when its published port will not answer
+#
+# Apple's `container -p HOST:CONTAINER` forward can complete the TCP handshake
+# and then reset instead of proxying the request: `nc -z 127.0.0.1 PORT`
+# succeeds, an HTTP GET through the same port gets ECONNRESET, while the
+# bridge inside the container answers that exact request correctly on the
+# container's own IP, every time. That is a runtime bug, not a bridge one, so
+# the poller routes around it by asking the runtime where the container
+# actually lives -- the same `container ls` -> `container inspect` walk
+# mackas's own volume_in_use() does, and for the same reason (no jq, no
+# third-party anything).
+#
+# The address is not knowable ahead of time and not stable: each build run is
+# a new container with a new IP off the runtime's own subnet, so this is
+# resolved live, on demand, never configured or cached across runs.
+# ---------------------------------------------------------------------------
+
+
+def _container_cli(*args):
+    """stdout of `container ARGS...`, or None if it could not be run.
+
+    None is 'no answer available', never an error to report: the container
+    CLI may not be on PATH at all, the daemon may be down, and the caller's
+    fallback in every one of those cases is the same -- keep the message the
+    user would have got anyway."""
+    exe = shutil.which("container")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe] + list(args),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=CONTAINER_QUERY_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or b"").decode("utf-8", "replace")
+
+
+def _running_container_ids():
+    """Every running container's ID, from `container ls`'s first column --
+    the header line dropped exactly as volume_in_use()'s `awk 'NR>1'` does."""
+    out = _container_cli("ls")
+    if out is None:
+        return []
+    ids = []
+    for line in out.splitlines()[1:]:
+        fields = line.split()
+        if fields:
+            ids.append(fields[0])
+    return ids
+
+
+def _ipv4_of(entry):
+    """The container's own IPv4, without the prefix length.
+
+    `container inspect` reports status.networks[].ipv4Address as CIDR
+    ("192.168.64.76/24"), which is not something urlopen can be handed."""
+    for net in (entry.get("status") or {}).get("networks") or []:
+        addr = net.get("ipv4Address") or ""
+        addr = addr.split("/")[0].strip()
+        if addr:
+            return addr
+    return None
+
+
+def _direct_endpoint(entry, host_port):
+    """(ip, port) for reaching HOST_PORT's container directly, or None.
+
+    Matched on the PUBLISHED PORT rather than on the image name: that
+    identifies the one build this `monitor --port N` is about, even when
+    other containers (another mackas build, anything else) are running too.
+
+    The port returned is the containerPort of the matching entry, not
+    host_port -- going straight to the container's address bypasses the
+    forward, so the mapping has to be undone. mackas itself publishes
+    N:N, but --port takes whatever the caller passes.
+    """
+    config = entry.get("configuration") or {}
+    state = (entry.get("status") or {}).get("state")
+    # Absent means an inspect shape that does not report it, which is not a
+    # reason to skip a container `container ls` just listed as running.
+    if state is not None and state != "running":
+        return None
+    for pub in config.get("publishedPorts") or []:
+        if pub.get("proto") not in (None, "tcp"):
+            continue
+        if pub.get("hostPort") != host_port:
+            continue
+        ip = _ipv4_of(entry)
+        if not ip:
+            return None
+        return (ip, pub.get("containerPort") or host_port)
+    return None
+
+
+def resolve_direct_endpoint(host_port):
+    """(ip, port) of the running container publishing HOST_PORT, or None.
+
+    Best-effort throughout: a missing CLI, a down daemon, a container that
+    exits mid-walk, or an inspect payload in a shape this does not recognise
+    all read as 'no answer', because the caller's fallback is to report the
+    original connection failure exactly as before."""
+    for cid in _running_container_ids():
+        out = _container_cli("inspect", cid)
+        if not out:
+            continue
+        try:
+            entries = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            found = _direct_endpoint(entry, host_port)
+            if found:
+                return found
+    return None
 
 
 def _underlying_os_error(exc):
@@ -106,26 +247,31 @@ def _underlying_os_error(exc):
     return None
 
 
-def connection_error_message(port, exc):
+def connection_error_message(port, exc, host=LOOPBACK):
     """One of three genuinely different situations, not one errno. A user
-    hitting this needs to know which before they know what to do next."""
+    hitting this needs to know which before they know what to do next.
+
+    HOST defaults to the published loopback address, and is only ever
+    something else once the poll has already been re-pointed at a container's
+    own IP -- these stay the messages for a failure IP resolution could not
+    help with (nothing running, wrong port, a bridge that really is down)."""
     real = _underlying_os_error(exc)
     if isinstance(real, ConnectionRefusedError):
         return (
-            f"nothing is listening on 127.0.0.1:{port} -- no monitored build "
+            f"nothing is listening on {host}:{port} -- no monitored build "
             f"is running right now (MACKAS_MONITOR=1 has to be set before a "
             f"build starts, not after)"
         )
     if isinstance(real, ConnectionResetError):
         return (
-            f"something is publishing 127.0.0.1:{port} but reset the "
+            f"something is publishing {host}:{port} but reset the "
             f"connection instead of answering -- the build may not have "
             f"reached bitbake yet, or the progress bridge did not come up "
             f"inside the container; try again in a few seconds"
         )
     if isinstance(real, TimeoutError) or isinstance(exc, TimeoutError):
-        return f"127.0.0.1:{port} did not respond within {REQUEST_TIMEOUT}s -- try again"
-    return f"could not reach the bridge at 127.0.0.1:{port}: {exc}"
+        return f"{host}:{port} did not respond within {REQUEST_TIMEOUT}s -- try again"
+    return f"could not reach the bridge at {host}:{port}: {exc}"
 
 
 def _format_elapsed(seconds):
@@ -414,13 +560,35 @@ def main(argv=None):
     prev_status = None
     ctx = new_render_context()
 
+    # Where this poll is actually talking to. Starts at the published
+    # loopback port and only ever moves once, to the container's own address,
+    # and only after that port has already failed -- a working poll never
+    # asks the runtime anything.
+    host, port = LOOPBACK, args.port
+    asked_runtime = False
+
     try:
         while True:
             try:
-                state = fetch(args.port)
+                state = fetch(port, host)
             except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
-                print(connection_error_message(args.port, exc), file=sys.stderr)
-                return EXIT_UNREACHABLE
+                direct = None
+                if not asked_runtime and isinstance(
+                    _underlying_os_error(exc), ConnectionResetError
+                ):
+                    asked_runtime = True
+                    direct = resolve_direct_endpoint(args.port)
+                if direct is None:
+                    print(connection_error_message(port, exc, host), file=sys.stderr)
+                    return EXIT_UNREACHABLE
+                host, port = direct
+                print(
+                    f"{LOOPBACK}:{args.port} reset the connection (Apple "
+                    f"container's port-forward); polling the container "
+                    f"directly at {host}:{port}",
+                    file=sys.stderr,
+                )
+                continue
             render(state, ctx)
             if want_notify:
                 message = transition_message(prev_status, state)

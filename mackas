@@ -6969,6 +6969,15 @@ MACKAS_MONITOR_POLL_INTERVAL sets the poll interval in seconds (default 2);
 there is no flag for it, since it is a display-only knob, not a setting
 'mackas set' persists.
 
+${C_BLD}WHEN THE PUBLISHED PORT RESETS${C_RST}
+Apple's 'container' can accept the connection on a published port and then
+reset it instead of answering -- the forward's bug, not the bridge's, which
+answers that same request correctly on the container's own address. When
+that happens the poll asks the runtime which running container publishes
+this port, switches to that container's IP (saying so once), and carries
+on. A working port is never delayed by any of this: nothing is asked of the
+runtime unless a poll has already been reset.
+
 ${C_BLD}NOTIFICATION PERMISSIONS${C_RST}
 If the terminal app has no Notification Center entry, osascript
 notifications are dropped SILENTLY, with no error and no exit code to
