@@ -50,6 +50,35 @@ The notification half already covers the common case. An app that also
 notifies should say so, and let the user run one or the other — two things
 watching the same bridge means two notifications per event.
 
+**The published port can reset instead of answering, and an app will hit that
+too.** Apple `container`'s `-p` forward sometimes completes the TCP handshake
+on the published port and then resets the request rather than proxying it:
+`nc -z 127.0.0.1 8801` succeeds while an HTTP `GET` through the same port gets
+`ECONNRESET`. The bridge is not the problem — inside the container it is
+correctly bound on `0.0.0.0:<port>`, and that same `GET` to the container's own
+IP returns the full, correct payload every time. `tools/mackas-monitor` routes
+around it, and the recipe is worth copying: on a reset, and only a reset —
+never a refusal, never a timeout — it asks the runtime where the container
+actually is. `container ls` gives the running IDs, `container inspect` each
+one, and the build being watched is the first whose
+`configuration.publishedPorts[]` names the polled port as its `hostPort`.
+Matching on the published port rather than on the image picks out the right
+container even with others running. What it then polls is that entry's
+`containerPort` at `status.networks[].ipv4Address` with the prefix length
+stripped (inspect reports CIDR, `192.168.64.76/24`) — going direct bypasses the
+forward, so the host→container port mapping has to be undone.
+
+Three properties of that fallback are not optional. The address cannot be
+resolved ahead of time or cached: every build run is a new container on a new
+IP off the runtime's own subnet, so it is resolved live, on the first reset,
+and never on the working path — a poll that answers should not spawn a
+subprocess. The runtime is asked at most once per outage, so a bridge that
+resets on both addresses gives up instead of looping. And every way the query
+can come up empty — no `container` on `PATH`, a daemon that is down, an ID that
+exits mid-walk, an inspect payload in a shape you do not recognise — reads as
+"no answer available" rather than as an error of its own, because the fallback
+is the connection message you would have shown anyway.
+
 **The osascript permission gotcha, since an app author will hit the other side
 of it:** `osascript` notifications from a terminal are *silently dropped* —
 exit 0, no output, nothing on screen — until that terminal application has an
@@ -64,7 +93,7 @@ This is the API. It is small on purpose.
 
 | | |
 |---|---|
-| **Endpoint** | `GET http://127.0.0.1:<port>/` |
+| **Endpoint** | `GET http://127.0.0.1:<port>/`, or the container's own address when the forward resets that port ([above](#what-already-exists-before-you-write-anything)) |
 | **Port** | `MACKAS_MONITOR_PORT`, default **8801**, published `-p PORT:PORT` so the host port equals the container port |
 | **Other paths** | `404`, empty body |
 | **`HEAD`** | `405`, empty body |
@@ -117,6 +146,18 @@ Rules for a consumer, in rough order of how much pain they save:
   poll interval you can actually use will miss events. Drive your UI from
   `status`/`current`/`progress`; use `recent_events` for a "what happened
   lately" panel, never for counting or for reconstructing history.
+- **Progress is task-level, so on a healthy build it can sit still for a very
+  long time.** `progress.done`/`total` count bitbake *tasks*, and a task is
+  indivisible here: a recipe with one large `do_compile` holds the counter at
+  the same number for tens of minutes while only the cheap tasks around it
+  (`do_fetch`, `do_rm_work`, …) move it along. That reads as a stuck build and
+  is not one. The fine-grained progress inside such a task reaches the bridge
+  through no event at all — it exists only in that task's own log file inside
+  the guest (`${WORKDIR}/temp/log.do_compile.<pid>`), and the bridge should not
+  be taught to parse those generically, since each recipe's task log is
+  whatever its build system prints. So put `current.recipe`/`current.task` and
+  elapsed time next to the counter: a long single task then reads as "still on
+  `linux-yocto:do_compile`" rather than as "frozen".
 - **Treat every field as optional.** The bridge's event observer is
   best-effort by design — it swallows any surprise from a bitbake event schema
   rather than take the real build down with it — so a field can be missing,
@@ -183,12 +224,17 @@ What follows for a long-running app:
 - **Connection refused is a normal steady state**, not an error to surface. It
   means "between rungs, or no build running". Show it as idle; log it at most
   once.
-- **Connection *reset* is a different, also-normal state.** Something holds the
-  port — the container is up and Apple `container` is publishing it — but the
-  bridge inside is not answering yet, typically because the rung has not
-  reached bitbake. It resolves on its own within seconds. Distinguish it from
-  refused, as `tools/mackas-monitor` does, rather than reporting one errno for
-  both; "starting up" and "nothing there" want different words in a UI.
+- **Connection *reset* is a different, also-normal state**, and it has two
+  causes. Something holds the port — the container is up and Apple `container`
+  is publishing it — but either the bridge inside is not answering yet,
+  typically because the rung has not reached bitbake, or the forward is
+  resetting a bridge that is up and would answer on the container's own
+  address. The first clears on its own within seconds; the second clears only
+  by going direct, per ["the published port can reset instead of
+  answering"](#what-already-exists-before-you-write-anything) above. Either
+  way, distinguish reset from refused, as `tools/mackas-monitor` does, rather
+  than reporting one errno for both; "starting up" and "nothing there" want
+  different words in a UI.
 - **Reconnect forever**, with a small backoff (a second or so — this is
   loopback, there is nothing to be gentle to). Never exit on `ECONNREFUSED`,
   never require the user to restart the app to pick up the next rung.
@@ -336,20 +382,26 @@ Non-negotiables, consistent with [security.md](security.md):
 - **No telemetry, no phone-home, no crash reporting to a third party.** mackas
   makes no network calls of its own; an app that watches it must not be the
   exception that does.
-- **Connect to `127.0.0.1` only.** Never bind a port, never advertise over
-  Bonjour/mDNS, never offer to watch another machine's build. The bridge binds
-  `0.0.0.0` *inside the container* only because that loopback is the
-  container's, not the Mac's — it is not an invitation to go over the LAN.
+- **Connect to this Mac only** — the published `127.0.0.1` port, or, when that
+  port resets, the address the runtime itself reports for the container
+  publishing it. Never bind a port, never advertise over Bonjour/mDNS, never
+  offer to watch another machine's build. The bridge binds `0.0.0.0` *inside
+  the container* only because that loopback is the container's, not the Mac's —
+  it is not an invitation to go over the LAN.
 - **Read-only.** `GET /` is the entire API. There are no write endpoints and
   none should be invented — especially not ones that would shell into a running
   build.
 - **No credentials, nothing in the Keychain.** There is nothing to
   authenticate; if a future version needs auth, that belongs in the bridge, not
   in an app-side secret.
-- **Never invoke `container` directly.** Everything mackas does through the
-  Apple `container` runtime goes through mackas so the one-VM-per-volume rule
-  holds; an ext4 volume mounted by two VMs at once corrupts. If the app needs
-  to *act*, it shells out to `mackas <subcommand>`, or it does nothing.
+- **Never make the `container` runtime *do* anything.** Everything that acts on
+  it goes through mackas so the one-VM-per-volume rule holds; an ext4 volume
+  mounted by two VMs at once corrupts. If the app needs to *act*, it shells out
+  to `mackas <subcommand>`, or it does nothing. The single exception is the
+  read-only `container ls` / `container inspect` lookup above, used to find the
+  address of the container publishing the polled port: it starts nothing,
+  mounts nothing and changes nothing, which is why `tools/mackas-monitor` is
+  allowed to run it too.
 
 Two practical notes: a sandboxed app needs
 `com.apple.security.network.client` even to reach `127.0.0.1`; and keeping the
