@@ -344,7 +344,9 @@
 
 # Live bitbake progress bridge (OPTIONAL, opt-in). With MACKAS_MONITOR=1 a build
 # publishes its progress as JSON over HTTP from inside its own container, and
-# `mackas monitor` polls it and prints one line per update. OFF by default: it
+# `mackas monitor` polls it and prints live progress (status, counts, percent,
+# current recipe:task, elapsed). A build that publishes the bridge says so as it
+# starts, and one that cannot warns instead. OFF by default: it
 # bind-mounts an overlay, shadows the container's bitbake and runs a background
 # HTTP thread on every build, so unlike MACKAS_OVERHEAD/MACKAS_FSTRIM_AUTO (which
 # cost near nothing) it stays opt-in. See docs/architecture.md and README.

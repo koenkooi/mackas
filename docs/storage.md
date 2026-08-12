@@ -713,8 +713,8 @@ well as a port does.
 Exactly what `MACKAS_USE_HTTP_MIRRORS=1` generates:
 
 ```
-SSTATE_MIRRORS ?= "file://.* http://linux-computer:8100/sstate/PATH;downloadfilename=PATH"
-SOURCE_MIRROR_URL ?= "http://linux-computer:8100/downloads"
+SSTATE_MIRRORS ?= "file://.* http://linux-computer.local:8100/sstate/PATH;downloadfilename=PATH"
+SOURCE_MIRROR_URL ?= "http://linux-computer.local:8100/downloads"
 INHERIT += "own-mirrors"
 BB_GENERATE_MIRROR_TARBALLS ?= "0"
 ```
@@ -737,7 +737,7 @@ container:
 
 ```sh
 cat > ~/.netrc <<'EOF'
-machine linux-computer
+machine linux-computer.local
   login builder
   password ...
 EOF
