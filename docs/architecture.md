@@ -434,6 +434,25 @@ fetch can fail — refused, reset, timed out — each get their own message,
 because "nothing is running" and "the bridge has not come up yet" call for
 different next steps.
 
+A reset gets one more thing tried before that message. Apple `container`'s
+`-p` forward can complete the handshake on the published port and then reset
+the request instead of proxying it, while the bridge inside answers that exact
+request correctly on the container's own address — a runtime bug, not a bridge
+one. So on a reset, and only a reset, the poller asks the runtime where the
+container actually lives: `container ls` for the running IDs and `container
+inspect` on each (the same walk `volume_in_use()` does, and for the same
+reason — no `jq`, no third-party anything), taking the first whose
+`configuration.publishedPorts` names the polled port as its `hostPort`, and
+re-polling that entry's `containerPort` at `status.networks[].ipv4Address`
+with the CIDR prefix stripped. Matching on the published port rather than on
+the image picks out the one build this `monitor --port N` is about even with
+other containers running, and the address can only ever be resolved live: each
+run is a new container on a new IP, so there is nothing to configure or cache
+between runs. The switch is announced on stderr, so nothing lands in the
+progress output a script may be parsing. A poll that answers never runs a
+subprocess, and the runtime is asked at most once per invocation, so a bridge
+that resets on both addresses terminates rather than loops.
+
 ## The short symlink
 
 `MACKAS_SHORT_LINK` (default `$HOME/oe`) points at `MACKAS_ROOT`, and

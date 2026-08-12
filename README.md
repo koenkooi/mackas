@@ -255,7 +255,11 @@ posts a native macOS notification on build start/success/failure, after a
 one-time Notification Center grant (`mackas monitor --help`). A build that
 publishes the bridge says so in one line as it starts, and one that cannot —
 no checkout yet, a space in a path — warns instead of leaving you watching a
-port that will never open. The bridge is a real bitbake UI module tee'd into
+port that will never open. If Apple `container`'s port forward accepts the
+connection and then resets it — a runtime bug, not a bridge one — the poller
+asks the runtime which running container publishes that port and re-polls it
+on the container's own address instead, so the build stays watchable. The
+bridge is a real bitbake UI module tee'd into
 the event stream, not a second observer client;
 it stays **off by default** because enabling it mounts an overlay, shadows
 the container's `bitbake`, and runs a background HTTP thread on every build.
