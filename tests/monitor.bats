@@ -24,11 +24,13 @@ setup() {
 	unset MACKAS_MONITOR_NOTIFY MACKAS_MONITOR_POLL_INTERVAL
 	export HOME="$TESTDIR"
 	SERVER_PID=""
+	RESET_PID=""
 	MONITOR_TOOL="$REPO_ROOT/tools/mackas-monitor"
 	mkdir -p "$TESTDIR/bin"
 }
 
 teardown() {
+	[ -n "$RESET_PID" ] && kill "$RESET_PID" 2>/dev/null
 	[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
 	cd /
 	rm -rf "$TESTDIR"
@@ -220,10 +222,11 @@ notifier_calls() {
 	assert_fails grep -qi 'reset the connection' "$TESTDIR/refused.out"
 }
 
-@test "monitor: connection reset (published but nothing answering) says so, not a bare errno" {
-	# A listener that accepts and immediately closes reproduces ECONNRESET
-	# without needing a real container -- python's http.server has no
-	# built-in for this, so a raw socket that accepts and closes does it.
+# A listener that accepts and immediately closes reproduces ECONNRESET -- what
+# Apple container's own -p forward does to a monitored build (issue #49) --
+# without needing a real container. Python's http.server has no built-in for
+# it, so a raw socket that accepts and closes does. Sets RESET_PORT/RESET_PID.
+start_reset_server() {
 	cat > "$TESTDIR/reset_server.py" <<'PYEOF'
 import socket
 import sys
@@ -238,18 +241,68 @@ while True:
     conn.close()
 PYEOF
 	python3 "$TESTDIR/reset_server.py" > "$TESTDIR/reset_port.txt" &
-	SERVER_PID=$!
+	RESET_PID=$!
 	for _ in $(seq 1 50); do
 		[ -s "$TESTDIR/reset_port.txt" ] && break
 		sleep 0.1
 	done
-	local reset_port
-	reset_port="$(cat "$TESTDIR/reset_port.txt")"
-	[ -n "$reset_port" ]
-	run_monitor --port "$reset_port" --once
+	RESET_PORT="$(cat "$TESTDIR/reset_port.txt" 2>/dev/null)"
+	[ -n "$RESET_PORT" ]
+}
+
+@test "monitor: connection reset (published but nothing answering) says so, not a bare errno" {
+	start_reset_server
+	# No `container` on run_monitor's PATH, so nothing can resolve the
+	# container's own address: this is the plain reset case, unchanged.
+	run_monitor --port "$RESET_PORT" --once
 	[ "$status" -eq 2 ]
 	printf '%s\n' "$output" | grep -qi 'reset the connection'
 	printf '%s\n' "$output" | grep -qi 'progress bridge did not come up'
+}
+
+@test "monitor: a reset published port is re-polled on the container's own address" {
+	# End to end over real sockets: the published port resets, the bridge
+	# answers somewhere else, and the runtime is what says where. `container`
+	# is a stub -- run_monitor's PATH is $TESTDIR/bin and nothing else, so no
+	# real runtime can be reached even on a Mac that has one -- and the
+	# stand-in for a guest IP is loopback on a DIFFERENT port, which is the
+	# one part of this a test cannot have for real.
+	start_fake_bridge '{"status": "success", "targets": ["core-image-base"], "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 9, "total": 10}, "recent_events": []}'
+	start_reset_server
+
+	cat > "$TESTDIR/inspect.json" <<EOF
+[
+  {
+    "configuration": {
+      "publishedPorts": [
+        { "containerPort": $FAKE_PORT, "count": 1, "hostAddress": "0.0.0.0",
+          "hostPort": $RESET_PORT, "proto": "tcp" }
+      ]
+    },
+    "id": "deadbeef-0000-0000-0000-000000000000",
+    "status": {
+      "networks": [ { "ipv4Address": "127.0.0.1/24", "network": "default" } ],
+      "state": "running"
+    }
+  }
+]
+EOF
+	# /bin/cat by absolute path: PATH inside the stub is $TESTDIR/bin too.
+	cat > "$TESTDIR/bin/container" <<EOF
+#!/bin/sh
+case "\$1" in
+	ls)      printf 'ID  IMAGE  STATE\n'
+	         printf 'deadbeef-0000-0000-0000-000000000000  ghcr.io/siemens/kas/kas:5.4  running\n' ;;
+	inspect) /bin/cat "$TESTDIR/inspect.json" ;;
+	*)       exit 1 ;;
+esac
+EOF
+	chmod +x "$TESTDIR/bin/container"
+
+	run_monitor --port "$RESET_PORT" --once
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "polling the container directly at 127.0.0.1:$FAKE_PORT"
+	printf '%s\n' "$output" | grep -qF '[success] 9/10  busybox:do_compile'
 }
 
 @test "monitor: cmd_monitor warns up front when MACKAS_MONITOR is not 1" {
