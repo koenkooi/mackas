@@ -407,19 +407,32 @@ than only ever seeing `building` followed by the port disappearing.
 `monitor_runtime_args()` (in `mackas`) assembles the mounts and the `-p`
 publish when `MACKAS_MONITOR=1`, appending them to `--runtime-args`. It is
 best-effort and never fatal — an opt-in extra, not something a build should
-fail over — so it silently skips when there is no checkout yet or a path
-involved contains a space (which would corrupt the whitespace-split
-`--runtime-args` string). Both files are mounted as **individual single-file
-`-v`s**, never a directory mount plus a mount of a file inside it: Apple
+fail over — so it skips when the work directory or the checkout does not
+exist yet, or when a path involved contains a space (which would corrupt the
+whitespace-split `--runtime-args` string). Every skip warns, and `run_kas()`
+prints one confirmation line naming the published port when the bridge really
+did make it into `--runtime-args`: opting in and getting nothing is the
+failure mode worth spending two lines of output on, since the alternative is
+discovering it only when `mackas monitor` finds no port minutes into a build.
+Both files are mounted as **individual single-file `-v`s**, never a directory
+mount plus a mount of a file inside it: Apple
 `container` silently drops the first mount whenever a second `-v`'s host
 source is nested inside the first's host directory, even with unrelated
 container-side targets.
 
 `tools/mackas-monitor` is the host-side poller `mackas monitor` runs —
 stdlib Python, polling `http://127.0.0.1:<port>/` every 2 s
-(`POLL_INTERVAL`) and printing `[status] done/total  recipe:task` until the
-build reports `success`/`failed`, or once with `--once`. It only reads an
-already-published port; it never starts a build.
+(`MACKAS_MONITOR_POLL_INTERVAL`) and printing a
+`[status] done/total  recipe:task` line plus percent, elapsed time and any
+failures so far, until the
+build reports `success`/`failed`, or once with `--once`. On a terminal it
+redraws one line in place; piped, it prints only lines that changed. It only
+reads an already-published port; it never starts a build, which is why its
+exit status describes what it found rather than what it did: 0 the build
+succeeded, 1 it failed, 2 no bridge was reachable at all. The three ways a
+fetch can fail — refused, reset, timed out — each get their own message,
+because "nothing is running" and "the bridge has not come up yet" call for
+different next steps.
 
 ## The short symlink
 

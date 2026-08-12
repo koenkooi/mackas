@@ -18,10 +18,18 @@ apart.
   runs *inside* the build container and re-serves live progress as JSON. See
   [architecture.md](architecture.md#live-build-progress-the-monitor-bridge)
   for how it gets there without patching bitbake.
-- **The poller** — `tools/mackas-monitor` (`mackas monitor`), which prints
-  `[status] done/total  recipe:task` lines and, with `--notify` /
-  `MACKAS_MONITOR_NOTIFY=1`, posts native notifications on exactly three
-  transitions: build started, build succeeded, build failed. It prefers
+- **The poller** — `tools/mackas-monitor` (`mackas monitor`). A progress line
+  starts with `[status] done/total  recipe:task` and appends percent, elapsed
+  wall time and, while `building`, a failed-so-far count; that leading
+  substring is fixed, and anything new goes *after* it, so a consumer
+  grepping for it keeps matching. One `watching: <targets> for
+  <machine>/<distro>` header precedes them, and on a real terminal the line
+  is redrawn in place rather than scrolled — a 90-minute build at the default
+  poll interval would otherwise emit thousands of near-identical lines.
+  Elapsed time is measured by the poller itself, not derived from the
+  payload, which carries no start timestamp. With `--notify` /
+  `MACKAS_MONITOR_NOTIFY=1` it also posts native notifications on exactly
+  three transitions: build started, build succeeded, build failed. It prefers
   `terminal-notifier` when that is on `PATH` and otherwise uses `osascript`.
   Its notification bodies encode deliberate choices and are worth copying:
 
@@ -146,11 +154,16 @@ are not something to impose on a build that did not ask. See
 [security.md](security.md): do not enable it where the published port is
 reachable by anything you do not trust.
 
-It is also **best-effort**: `monitor_runtime_args()` silently adds nothing when
-there is no checkout yet, or when a path involved contains a space (which would
-corrupt the whitespace-split `--runtime-args` string). So `MACKAS_MONITOR=1`
-does not guarantee a listening port. An app must render that as "not
-connected", never as "the build failed".
+It is also **best-effort**: `monitor_runtime_args()` adds nothing when the work
+directory does not exist yet, when there is no bitbake checkout yet, or when a
+path involved contains a space (which would corrupt the whitespace-split
+`--runtime-args` string). So `MACKAS_MONITOR=1` does not guarantee a listening
+port, and an app must render a port that never appears as "not connected",
+never as "the build failed". Every one of those skips warns on stderr, and a
+build that really does carry the bridge prints one `live progress bridge:
+publishing 127.0.0.1:<port>` line, so the human who opted in learns at build
+start which of the two happened — but that is the terminal's story, and an app
+watching the port sees neither line.
 
 ## The rough edge that will define your app's design
 
@@ -170,6 +183,12 @@ What follows for a long-running app:
 - **Connection refused is a normal steady state**, not an error to surface. It
   means "between rungs, or no build running". Show it as idle; log it at most
   once.
+- **Connection *reset* is a different, also-normal state.** Something holds the
+  port — the container is up and Apple `container` is publishing it — but the
+  bridge inside is not answering yet, typically because the rung has not
+  reached bitbake. It resolves on its own within seconds. Distinguish it from
+  refused, as `tools/mackas-monitor` does, rather than reporting one errno for
+  both; "starting up" and "nothing there" want different words in a UI.
 - **Reconnect forever**, with a small backoff (a second or so — this is
   loopback, there is nothing to be gentle to). Never exit on `ECONNREFUSED`,
   never require the user to restart the app to pick up the next rung.
@@ -181,11 +200,12 @@ What follows for a long-running app:
   a new build. Reset your own derived state (elapsed time, peak counts) on the
   `idle`/reset edge rather than smoothing over it.
 - **Do not copy `tools/mackas-monitor` here.** The CLI poller deliberately
-  exits with a connection error on the first failed fetch, because a
-  foreground command that hangs forever on a dead port is worse than one that
-  says so. An app has the opposite obligation. (The CLI is likely to grow an
-  opt-in watch mode — see below — but exiting stays its default, so the rules
-  above, not the CLI's control flow, are what an app should follow.)
+  exits (status 2) with a connection error on the first failed fetch, because
+  a foreground command that hangs forever on a dead port is worse than one
+  that says so. An app has the opposite obligation. (The CLI is likely to
+  grow an opt-in watch mode — see below — but exiting stays its default, so
+  the rules above, not the CLI's control flow, are what an app should
+  follow.)
 
 ### The same gap, from the CLI side: multi-build batches
 
@@ -200,7 +220,7 @@ the sequence differs (a human's shell history instead of `cmd_smoketest`).
 
 What that user wants is one `mackas monitor --notify` running all evening,
 announcing start and outcome per machine. What they get is one machine's
-worth: `tools/mackas-monitor`'s loop `return 1`s the first time `fetch()`
+worth: `tools/mackas-monitor`'s loop returns the first time `fetch()`
 raises, and it also returns as soon as it sees a terminal `status`, so the
 process is gone before machine 2's container is up. The workaround that gets
 reached for instead is polling each machine's build *log* for a completion
@@ -211,8 +231,9 @@ not only in a future app.
 **Recommended direction: reconnect-and-wait, ended by the human.** As an
 opt-in flag (`--watch`, working name), not a change of default. Exiting on a
 dead port is right for the common `mackas monitor` typed when a build should
-already be running, and the current exit status mirrors the build (0 success,
-1 failed), which a script may lean on.
+already be running, and the exit status is a usable probe — 0 success, 1 the
+build itself failed, 2 no bridge reachable at all — which a script may lean
+on. Whatever watch mode does, it must not collapse those three back into one.
 
 Deliberately *not* a "watch N builds" count. A hand-typed batch changes shape
 mid-evening; a count one too high hangs, one too low exits early, and nothing

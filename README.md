@@ -115,11 +115,12 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
-| `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. |
+| `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. Exits 0 on a build that succeeded, 1 on one that failed, 2 when no bridge is reachable — a usable scripted probe. |
 | `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
+| `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The `env.sh` wrapper calls it itself on every hand-typed `kas-container`; you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
 | `dump` | `kas dump --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. |
 
@@ -232,8 +233,8 @@ risk. The scan is real even under `--dry-run` (so the reported count/size
 are real); deletion happens only after confirmation or `-y`, and the one-VM
 rule applies. A successful prune fstrims the sstate volume automatically
 afterward, so freed space is reclaimed on the host without a separate
-`mackas volume fstrim sstate` step (`MACKAS_FSTRIM_AUTO=1`, same knob `clean
-tmp+deploy` uses). For surgical pruning — keep only what one checkout's
+`mackas volume fstrim oe-build-sstate` step (`MACKAS_FSTRIM_AUTO=1`, the same
+knob `clean tmp+deploy` uses). For surgical pruning — keep only what one checkout's
 stamps still reference — use openembedded-core's own
 `scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
 "nothing has touched this in months" case. For a full wipe instead of
@@ -246,10 +247,16 @@ A build inside the container is invisible to macOS in real time beyond
 mackas's own coarse rung/log reporting. `MACKAS_MONITOR=1` opts a build into
 a live progress bridge; `mackas monitor` polls it (`--once` for a single
 snapshot) on `MACKAS_MONITOR_PORT` (default `8801`) — it never starts a
-build. With `MACKAS_MONITOR_NOTIFY=1` (or `--notify`) it also posts a native
-macOS notification on build start/success/failure, after a one-time
-Notification Center grant (`mackas monitor --help`). The bridge is a real
-bitbake UI module tee'd into the event stream, not a second observer client;
+build. Each poll shows status, task counts and percent, the current
+recipe:task and elapsed time, redrawn in place rather than scrolled; the
+`MACKAS_MONITOR_POLL_INTERVAL` environment variable (default 2 seconds) sets
+how often it polls. With `MACKAS_MONITOR_NOTIFY=1` (or `--notify`) it also
+posts a native macOS notification on build start/success/failure, after a
+one-time Notification Center grant (`mackas monitor --help`). A build that
+publishes the bridge says so in one line as it starts, and one that cannot —
+no checkout yet, a space in a path — warns instead of leaving you watching a
+port that will never open. The bridge is a real bitbake UI module tee'd into
+the event stream, not a second observer client;
 it stays **off by default** because enabling it mounts an overlay, shadows
 the container's `bitbake`, and runs a background HTTP thread on every build.
 How it becomes the real UI client without patching bitbake:
