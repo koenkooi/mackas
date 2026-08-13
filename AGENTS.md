@@ -81,7 +81,9 @@ a partial run.
 - Every source file carries `SPDX-License-Identifier: GPL-3.0-or-later` and a
   copyright line. Keep them.
 - Match the surrounding comment density and idiom. Comments explain *why* /
-  constraints, not *what*.
+  constraints, not *what*. **Be terse.** A short comment that carries the
+  one non-obvious fact beats a paragraph that also restates what the code
+  already shows.
 
 ## Hard invariants — do not break these
 
@@ -136,10 +138,11 @@ a partial run.
   `README.md` are part of the change, not a follow-up.
 - **Commit style:** `area: lowercase imperative summary` (`docs:`, `ci:`,
   `tests:`, `readme:`, or a subcommand/file name), with the body wrapped at 72
-  columns. Sign off with `-s` (`Signed-off-by:`); AI-assisted commits add an
-  `Assisted-by:` trailer too. Never add a `Co-Authored-By:` or
-  `Claude-Session:` line. Use `Fixes #N` / `Closes #N` when a commit finishes
-  a tracked GitHub issue.
+  columns. **Keep the body short** — a few sentences of why, not a
+  walkthrough of the investigation. Sign off with `-s` (`Signed-off-by:`);
+  AI-assisted commits add an `Assisted-by:` trailer too. Never add a
+  `Co-Authored-By:` or `Claude-Session:` line. Use `Fixes #N` / `Closes #N`
+  when a commit finishes a tracked GitHub issue.
 - Security policy and how to report issues: see [SECURITY.md](SECURITY.md).
 
 ## Where to look first
