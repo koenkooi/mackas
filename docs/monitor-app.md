@@ -31,13 +31,14 @@ for genuine *progress* — a menubar app, a live percentage, a human watching
   for how it gets there without patching bitbake.
 - **The poller** — `tools/mackas-monitor` (`mackas monitor`). A progress line
   starts with `[status] done/total  recipe:task` and appends percent, elapsed
-  wall time, progress from inside whichever tasks are reporting any, and,
-  while `building`, a failed-so-far count; that leading substring is fixed,
-  and anything new goes *after* it, so a consumer
-  grepping for it keeps matching. One `watching: <targets> for
-  <machine>/<distro>` header precedes them, and on a real terminal the line
-  is redrawn in place rather than scrolled — a 90-minute build at the default
-  poll interval would otherwise emit thousands of near-identical lines.
+  wall time, sstate coverage, progress (and per-task elapsed time) from
+  inside whichever tasks are reporting any, and, while `building`, a
+  failed-so-far count; that leading substring is fixed, and anything new
+  goes *after* it, so a consumer grepping for it keeps matching. One
+  `watching: <targets> for <machine>/<distro>` header precedes them, and on
+  a real terminal the line is redrawn in place rather than scrolled — a
+  90-minute build at the default poll interval would otherwise emit
+  thousands of near-identical lines.
   Elapsed time is measured by the poller itself, not derived from the
   payload, which carries no start timestamp. With `--notify` /
   `MACKAS_MONITOR_NOTIFY=1` it also posts native notifications on exactly
@@ -128,7 +129,8 @@ this document.
   "failed_tasks": [{"recipe": "linux-yocto_6.6.bb", "task": "do_compile"}],
   "failed_count": 1,
   "task_progress": [{"recipe": "systemd_257.bb", "task": "do_compile",
-                     "percent": 42, "rate": null}],
+                     "percent": 42, "rate": null, "elapsed": 862}],
+  "sstate": {"covered": 412, "notcovered": 38, "total": 450, "skipped": 1204},
   "recent_events": [{"ts": 1769000000.123, "type": "runQueueTaskStarted",
                      "recipe": "busybox_1.36.0.bb", "task": "do_compile"}]
 }
@@ -146,7 +148,8 @@ this document.
 | `progress.total` | int | Same phase split. **It jumps**: the parse total is replaced by the task total, and setscene and the main run queue report their own totals. Do not assume it is monotonic, and never assume `done <= total` across a phase change. |
 | `failed_tasks` | array | Tasks that **genuinely failed**, newest last, each `{recipe, task}` with the same recipe-basename convention as `current`. **Setscene failures are deliberately excluded**: a failed setscene task is not a build failure, it only means the sstate object could not be reused and the real task runs instead — bitbake's own knotty treats `runQueueTaskFailed` as fatal and `sceneQueueTaskFailed` as a warning. Listing the latter would name innocent recipes. Capped at 20. |
 | `failed_count` | int | The **true** number of distinct failed tasks, which may exceed `len(failed_tasks)` when the cap bites (`bitbake -k` keeps going after a failure). Show this, not the array length, when reporting a total. |
-| `task_progress` | array | Progress **inside** the tasks that are running *right now* and report any, each `{recipe, task, percent, rate}` with the same recipe-basename convention as `current`. Empty is the normal case, not an error: most tasks report nothing (see ["what actually reports"](#what-actually-reports-sub-task-progress) below), and an entry disappears the moment its task ends, so a stale percentage can never outlive the recipe it described. `percent` is an int 0–100, or `null` for bitbake's own "progress is happening but we cannot say how much" — draw an indeterminate bar for that, never a zero. `rate` is an extra display string when the producer has one (`"1.2M/s"` from the download fetchers) and `null` otherwise. Bounded by `BB_NUMBER_THREADS` in practice and hard-capped at 32. |
+| `task_progress` | array | Progress **inside** the tasks that are running *right now* and report any, each `{recipe, task, percent, rate, elapsed}` with the same recipe-basename convention as `current`. Empty is the normal case, not an error: most tasks report nothing (see ["what actually reports"](#what-actually-reports-sub-task-progress) below), and an entry disappears the moment its task ends, so a stale percentage can never outlive the recipe it described. `percent` is an int 0–100, or `null` for bitbake's own "progress is happening but we cannot say how much" — draw an indeterminate bar for that, never a zero. `rate` is an extra display string when the producer has one (`"1.2M/s"` from the download fetchers) and `null` otherwise. `elapsed` is int seconds since that task's `bb.build.TaskStarted`, re-computed on every request rather than cached from the last report — it is the only scale a `percent: null` "busy" entry has. Bounded by `BB_NUMBER_THREADS` in practice and hard-capped at 32. |
+| `sstate` | object \| null | `{covered, notcovered, total, skipped}`, copied off bitbake's own `RunQueueStats` the moment it settles. `null` until then. Always all four fields or none — a partial tally would read as a real hit rate when it isn't one. Published only from `runQueue*` events, never `sceneQueue*`: the scene queue can still reopen (hash equivalence) while it's accumulating, so only the settled run queue's numbers are trustworthy. This is an **observation**, not a forecast — see ["why there's no build-wide ETA"](#why-theres-no-build-wide-eta) below. |
 | `recent_events` | array | Newest last, **capped at 50**. Each entry has `ts` (float, Unix seconds, on the *container's* clock) and `type` (the bitbake event name), plus whatever that event carried — `recipe`, `task`. `done`/`total` are deliberately not repeated per event. |
 
 Event `type` values currently produced: `ParseStarted`, `ParseProgress`,
@@ -237,6 +240,23 @@ underlying **N of M**. `OutOfProgressHandler` divides the pair out to a
 percentage before firing, and `TaskProgress` carries only that number plus an
 optional `rate` string. So `systemd:do_compile 42%` is available and
 `systemd:do_compile 762/1814` is not, without patching bitbake.
+
+### Why there's no build-wide ETA
+
+sstate makes task count and wall time anti-correlated: on real builds it is
+routine for 90%+ of the run queue to finish in the first quarter of the wall
+clock, then one uncovered `do_rootfs` or `do_compile` grinds alone for the
+rest. A naive `done/total * elapsed` estimate is therefore not just noisy but
+**confidently wrong in the direction that matters most** — it undershoots
+right when the build is about to get slow. bitbake's own `knotty` reached the
+same conclusion: its `BBProgress` widget list includes `ETA()` by default, but
+the "Running tasks" bar explicitly overrides that to `[Percentage, Bar]`.
+
+`sstate` and `task_progress[].elapsed` exist instead as **observations**
+rather than a forecast: what the cache already covered, and how long the task
+holding the counter has actually been running. Neither can be wrong the way a
+projection can — show them as-is rather than deriving a build-wide time
+remaining from them.
 
 ## Enabling the bridge, and why it is opt-in
 
