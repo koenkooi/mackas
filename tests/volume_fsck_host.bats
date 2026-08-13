@@ -182,10 +182,12 @@ have_volume() {
 	[ "$(stat -f %z "$img")" = "$orig_sz" ]
 }
 
-@test "volume fsck: declining the confirmation via the host path leaves everything untouched" {
-	# No -y, stdin not a tty => confirm() declines at GATE 1, before any
-	# clone (or host e2fsck call) happens at all -- same shape as
-	# volume_mgmt.bats' matching container-path test.
+@test "volume fsck: declining the promotion via the host path leaves everything untouched" {
+	# No -y, stdin not a tty: the clone and the host e2fsck rehearsal both
+	# run on their own -- neither touches '$name' itself, so neither is
+	# gated on a confirmation. The only question is whether to promote the
+	# rehearsed repair, and with no -y and no tty confirm() declines that
+	# one -- same shape as volume_mgmt.bats' matching container-path test.
 	have_volume oe-build-tmp 120G 8192
 	img="$(VOLDIR)/oe-build-tmp/volume.img"
 	before_sum="$(shasum "$img" | awk '{print $1}')"
@@ -193,7 +195,9 @@ have_volume() {
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi "left unchanged"
 	[ "$(shasum "$img" | awk '{print $1}')" = "$before_sum" ]
-	[ ! -f "$E2FSCK_LOG" ]
+	# The host e2fsck DID run (this is the behavior change: no longer gated
+	# behind a confirmation) -- only the promotion was declined.
+	[ -f "$E2FSCK_LOG" ]
 }
 
 @test "volume fsck --check-only via the host path: dirty is reported, nothing repaired or promoted" {

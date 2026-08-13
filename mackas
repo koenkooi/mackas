@@ -8900,16 +8900,16 @@ volume_fsck_one() {
 		return 0
 	fi
 
-	# STEP F -- GATE 1. The clone always costs real time; whether the
-	# e2fsck step ALSO costs a container boot + network fetch depends on
-	# which path was resolved above, so say the one that actually applies.
-	if [ -n "$host_bin" ]; then
-		confirm "  Clone '$name' and run e2fsck against the COPY? ('$name' itself is not touched; runs directly on this Mac, no container needed)" \
-			|| { info "  Left unchanged."; return 1; }
-	else
-		confirm "  Clone '$name' and run e2fsck against the COPY? ('$name' itself is not touched; installs e2fsprogs into a throwaway container)" \
-			|| { info "  Left unchanged."; return 1; }
-	fi
+	# STEP F used to be a confirm() gate here ("Clone and run e2fsck against
+	# the COPY?"), asked before any check had even run. That question came
+	# too early to be answerable -- '$name' itself is never touched by the
+	# clone-and-check below, so there was no real risk on the other side of
+	# "yes", and no way for the user to judge it (nothing had been found
+	# yet). STEP D already printed the full plan (image, size, scratch path,
+	# which e2fsck path will run); proceed straight into it rather than
+	# stopping to ask a question nothing above has earned yet. The one place
+	# this command asks anything is GATE 2 below, once a real repair exists
+	# and there is an actual decision (and actual information) to weigh.
 
 	# STEP G -- THE BACKUP. Unconditional, host-side, before any container
 	# exists. Same dir means same filesystem, so 'cp -c' is a genuine APFS
