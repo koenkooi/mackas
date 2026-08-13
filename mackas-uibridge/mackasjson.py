@@ -97,6 +97,13 @@ MAX_RECENT_EVENTS = 50
 # omission.
 MAX_FAILED_TASKS = 20
 
+# One entry per RUNNING task, so both maps below are naturally bounded by
+# BB_NUMBER_THREADS. The cap exists only so a TaskStarted whose matching
+# TaskSucceeded/TaskFailed never arrives (a worker killed outright) cannot
+# grow them without limit; it evicts oldest-first, which is exactly the
+# stale entry in that case.
+MAX_TASK_PROGRESS = 32
+
 _lock = threading.Lock()
 
 # See item 31's fix in main()/do_GET() below: after _finish() sets a terminal
@@ -129,8 +136,132 @@ _state = {
     # Only genuine task failures, never setscene ones -- see _observe.
     "failed_tasks": [],
     "failed_count": 0,
+    # Progress INSIDE a still-running task, for the tasks that report any --
+    # see _observe_task_progress and _publish_task_progress.
+    "task_progress": [],
     "recent_events": [],
 }
+
+# ---------------------------------------------------------------------------
+# Sub-task progress
+#
+# bitbake has a real progress framework, bb/progress.py, and its events reach
+# every UI client -- no patch to bitbake or OE-core is involved in any of
+# this. A task opts in with a `progress` varflag on its shell function
+# (bb/build.py exec_func_shell -> create_progress_handler), which wraps the
+# task's own stdout in a handler that scrapes it: "percent" for a bare NN%,
+# "outof:REGEX" for an N-of-M pair, or a custom handler class. Python-side
+# code can instantiate a handler directly instead, which is what bitbake's
+# own git/wget/s3/perforce fetchers do, so do_fetch reports download progress
+# too. Every one of those fires bb.build.TaskProgress, the same event
+# knotty's own inline progress bars are drawn from.
+#
+# TaskProgress deliberately does NOT inherit from TaskBase, so it carries no
+# recipe or task of its own -- bb/build.py's own comment says "The event PID
+# can be used to determine which task it came from". So attribution is a
+# pidmap keyed off TaskStarted, exactly as bitbake's bb/ui/uihelper.py builds
+# one for knotty. That helper is created inside knotty's main() and is not
+# reachable from here, hence a second, equivalent map rather than a peek at
+# knotty's.
+#
+# knotty's own event mask (bb/ui/knotty.py's _evt_list) already requests
+# bb.build.TaskStarted/TaskSucceeded/TaskFailed/TaskFailedSilent and
+# bb.build.TaskProgress, and this module's tee sits in front of the handler
+# knotty drives -- so these arrive here with no extra registration, and would
+# keep arriving even if the mask were narrowed, since knotty needs them for
+# its own progress bars.
+#
+# Note what this is NOT recorded as: a TaskProgress entry never lands in
+# recent_events. A single instrumented compile fires one per percentage
+# point, which would flush that 50-deep ring several times a second and
+# destroy the one thing it is for. TaskStarted/TaskSucceeded/TaskFailed are
+# kept out for the same reason -- they duplicate the runQueue events already
+# recorded there, at twice the volume.
+# ---------------------------------------------------------------------------
+
+# pid -> (recipe, task), from TaskStarted; dropped when the task ends.
+_task_pids = {}
+# pid -> {"percent": int|None, "rate": str|None}, from TaskProgress. Only
+# tasks that have actually reported anything appear here, so a build whose
+# recipes are all plain make-based keeps this empty rather than listing every
+# running task with nothing to say about it.
+_task_reports = {}
+
+
+def _evict_oldest(mapping, cap):
+    """Drop oldest-first until MAPPING is under CAP. Caller holds _lock.
+
+    dicts preserve insertion order (3.7+, which is this module's floor), so
+    the first key is the longest-tracked pid -- the one a missed end-of-task
+    event would have leaked."""
+    while len(mapping) >= cap:
+        del mapping[next(iter(mapping))]
+
+
+def _publish_task_progress():
+    """Rebuild the served list from the two maps. Caller holds _lock.
+
+    Rebuilt wholesale rather than patched incrementally so the served value
+    can never outlive the tasks it describes: an entry is present exactly
+    while its pid is both running and reporting."""
+    out = []
+    for pid, report in _task_reports.items():
+        recipe, task = _task_pids.get(pid, (None, None))
+        out.append({
+            "recipe": recipe,
+            "task": task,
+            "percent": report["percent"],
+            "rate": report["rate"],
+        })
+    _state["task_progress"] = out
+
+
+def _track_task(pid, recipe, task):
+    if not pid or pid <= 0:
+        return
+    with _lock:
+        if pid not in _task_pids:
+            _evict_oldest(_task_pids, MAX_TASK_PROGRESS)
+        _task_pids[pid] = (recipe, task)
+
+
+def _untrack_task(pid):
+    if not pid or pid <= 0:
+        return
+    with _lock:
+        _task_pids.pop(pid, None)
+        if _task_reports.pop(pid, None) is not None:
+            _publish_task_progress()
+
+
+def _observe_task_progress(pid, progress, rate):
+    """Record one TaskProgress against the task that fired it.
+
+    Ignored for a pid no TaskStarted has claimed -- bitbake's own uihelper
+    does the same (`if event.pid > 0 and event.pid in self.pidmap`), because
+    an unattributed percentage names nothing and pids get reused.
+
+    bitbake's own scale is 0-100, or NEGATIVE for "progress is happening but
+    we cannot say how much" (bb/build.py TaskProgress's docstring); git's
+    fetcher fires exactly that while counting objects. That becomes a null
+    percent here rather than a made-up number -- the entry's presence is
+    what says the task is alive."""
+    try:
+        value = float(progress)
+    except (TypeError, ValueError):
+        return
+    with _lock:
+        if pid not in _task_pids:
+            return
+        if pid not in _task_reports:
+            _evict_oldest(_task_reports, MAX_TASK_PROGRESS)
+        _task_reports[pid] = {
+            "percent": None if value < 0 else max(0, min(100, int(value))),
+            # An extra display string when the producer has one (wget/git/s3
+            # report a transfer rate); most do not.
+            "rate": str(rate) if rate else None,
+        }
+        _publish_task_progress()
 
 
 def _set_targets(params):
@@ -225,6 +356,15 @@ def _record(event_type, **fields):
 def _finish(status):
     with _lock:
         _state["status"] = status
+        # Nothing is running once the build has ended, so nothing may still
+        # claim to be mid-task. Normally every task's own end event has
+        # already cleared this; a build that died with workers still up (or
+        # one whose last events never arrived) would otherwise serve a
+        # frozen percentage next to a terminal status for the whole linger
+        # window -- see TERMINAL_LINGER_SECONDS.
+        _task_pids.clear()
+        _task_reports.clear()
+        _state["task_progress"] = []
 
 
 def _observe(event):
@@ -246,6 +386,22 @@ def _observe(event):
                 fields["done"] = stats.completed
                 fields["total"] = stats.total
             _record(name, **fields)
+        elif name == "TaskStarted":
+            # bb.build.TaskStarted, not the runQueue one: this is the event
+            # fired in the worker, and its pid is what TaskProgress will be
+            # keyed by. TaskBase carries taskfile/taskname, so the recipe
+            # basename convention is the same one `current` uses.
+            _track_task(
+                getattr(event, "pid", 0),
+                os.path.basename(getattr(event, "taskfile", "") or "") or None,
+                getattr(event, "taskname", None),
+            )
+        elif name in ("TaskSucceeded", "TaskFailed", "TaskFailedSilent"):
+            _untrack_task(getattr(event, "pid", 0))
+        elif name == "TaskProgress":
+            _observe_task_progress(getattr(event, "pid", 0),
+                                   getattr(event, "progress", None),
+                                   getattr(event, "rate", None))
         elif name in ("runQueueTaskCompleted", "sceneQueueTaskCompleted",
                       "runQueueTaskFailed", "sceneQueueTaskFailed",
                       "runQueueTaskSkipped"):

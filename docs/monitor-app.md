@@ -31,8 +31,9 @@ for genuine *progress* — a menubar app, a live percentage, a human watching
   for how it gets there without patching bitbake.
 - **The poller** — `tools/mackas-monitor` (`mackas monitor`). A progress line
   starts with `[status] done/total  recipe:task` and appends percent, elapsed
-  wall time and, while `building`, a failed-so-far count; that leading
-  substring is fixed, and anything new goes *after* it, so a consumer
+  wall time, progress from inside whichever tasks are reporting any, and,
+  while `building`, a failed-so-far count; that leading substring is fixed,
+  and anything new goes *after* it, so a consumer
   grepping for it keeps matching. One `watching: <targets> for
   <machine>/<distro>` header precedes them, and on a real terminal the line
   is redrawn in place rather than scrolled — a 90-minute build at the default
@@ -126,6 +127,8 @@ this document.
   "progress": {"done": 412, "total": 3170},
   "failed_tasks": [{"recipe": "linux-yocto_6.6.bb", "task": "do_compile"}],
   "failed_count": 1,
+  "task_progress": [{"recipe": "systemd_257.bb", "task": "do_compile",
+                     "percent": 42, "rate": null}],
   "recent_events": [{"ts": 1769000000.123, "type": "runQueueTaskStarted",
                      "recipe": "busybox_1.36.0.bb", "task": "do_compile"}]
 }
@@ -143,12 +146,22 @@ this document.
 | `progress.total` | int | Same phase split. **It jumps**: the parse total is replaced by the task total, and setscene and the main run queue report their own totals. Do not assume it is monotonic, and never assume `done <= total` across a phase change. |
 | `failed_tasks` | array | Tasks that **genuinely failed**, newest last, each `{recipe, task}` with the same recipe-basename convention as `current`. **Setscene failures are deliberately excluded**: a failed setscene task is not a build failure, it only means the sstate object could not be reused and the real task runs instead — bitbake's own knotty treats `runQueueTaskFailed` as fatal and `sceneQueueTaskFailed` as a warning. Listing the latter would name innocent recipes. Capped at 20. |
 | `failed_count` | int | The **true** number of distinct failed tasks, which may exceed `len(failed_tasks)` when the cap bites (`bitbake -k` keeps going after a failure). Show this, not the array length, when reporting a total. |
+| `task_progress` | array | Progress **inside** the tasks that are running *right now* and report any, each `{recipe, task, percent, rate}` with the same recipe-basename convention as `current`. Empty is the normal case, not an error: most tasks report nothing (see ["what actually reports"](#what-actually-reports-sub-task-progress) below), and an entry disappears the moment its task ends, so a stale percentage can never outlive the recipe it described. `percent` is an int 0–100, or `null` for bitbake's own "progress is happening but we cannot say how much" — draw an indeterminate bar for that, never a zero. `rate` is an extra display string when the producer has one (`"1.2M/s"` from the download fetchers) and `null` otherwise. Bounded by `BB_NUMBER_THREADS` in practice and hard-capped at 32. |
 | `recent_events` | array | Newest last, **capped at 50**. Each entry has `ts` (float, Unix seconds, on the *container's* clock) and `type` (the bitbake event name), plus whatever that event carried — `recipe`, `task`. `done`/`total` are deliberately not repeated per event. |
 
 Event `type` values currently produced: `ParseStarted`, `ParseProgress`,
 `runQueueTaskStarted`, `sceneQueueTaskStarted`, `runQueueTaskCompleted`,
 `sceneQueueTaskCompleted`, `runQueueTaskFailed`, `sceneQueueTaskFailed`,
 `runQueueTaskSkipped`.
+
+The events behind `task_progress` are deliberately **not** among them.
+`bb.build.TaskProgress` fires roughly once per percentage point per
+instrumented task, which would flush that 50-deep ring several times a second
+and destroy the one thing it is for; `bb.build.TaskStarted`/`TaskSucceeded`/
+`TaskFailed`/`TaskFailedSilent` are consumed only to attribute those
+percentages to a task, and would otherwise duplicate the `runQueue` events
+already listed, at twice the volume. So `task_progress` is the whole of what
+the bridge exposes from them.
 
 Rules for a consumer, in rough order of how much pain they save:
 
@@ -157,18 +170,18 @@ Rules for a consumer, in rough order of how much pain they save:
   poll interval you can actually use will miss events. Drive your UI from
   `status`/`current`/`progress`; use `recent_events` for a "what happened
   lately" panel, never for counting or for reconstructing history.
-- **Progress is task-level, so on a healthy build it can sit still for a very
-  long time.** `progress.done`/`total` count bitbake *tasks*, and a task is
-  indivisible here: a recipe with one large `do_compile` holds the counter at
-  the same number for tens of minutes while only the cheap tasks around it
+- **`progress.done`/`total` are task-level, so on a healthy build they can sit
+  still for a very long time.** They count bitbake *tasks*, and a task is
+  indivisible to them: a recipe with one large `do_compile` holds the counter
+  at the same number for tens of minutes while only the cheap tasks around it
   (`do_fetch`, `do_rm_work`, …) move it along. That reads as a stuck build and
-  is not one. The fine-grained progress inside such a task reaches the bridge
-  through no event at all — it exists only in that task's own log file inside
-  the guest (`${WORKDIR}/temp/log.do_compile.<pid>`), and the bridge should not
-  be taught to parse those generically, since each recipe's task log is
-  whatever its build system prints. So put `current.recipe`/`current.task` and
-  elapsed time next to the counter: a long single task then reads as "still on
-  `linux-yocto:do_compile`" rather than as "frozen".
+  is not one. `task_progress` covers some of that gap and `current.recipe`/
+  `current.task` plus elapsed time cover the rest: with all three, a long
+  single task reads as "still on `linux-yocto:do_compile`, 42%" or at worst
+  "still on `linux-yocto:do_compile`, 14 minutes" rather than as "frozen".
+  Never fold `task_progress` back into `progress` — one task at 42% has still
+  completed zero tasks, and a counter that moves in fractions would make the
+  totals meaningless.
 - **Treat every field as optional.** The bridge's event observer is
   best-effort by design — it swallows any surprise from a bitbake event schema
   rather than take the real build down with it — so a field can be missing,
@@ -178,6 +191,52 @@ Rules for a consumer, in rough order of how much pain they save:
   no start timestamp. If you need to tell one build from the next you must
   infer it (an `idle`→`building` edge, or a `progress` reset), or propose
   adding a field to the bridge rather than guessing in the app.
+
+### What actually reports sub-task progress
+
+`task_progress` is thin on purpose: it relays what bitbake already publishes,
+and nothing more. Knowing which tasks that covers is what keeps an empty array
+from looking like a bug.
+
+bitbake's progress framework is `bb/progress.py`. A task opts in with a
+`progress` varflag on its shell function — `bb/build.py`'s `exec_func_shell`
+hands it to `create_progress_handler`, which wraps the task's own stdout in a
+handler that scrapes it: `percent` for a bare `NN%`, `outof:REGEX` for an
+N-of-M pair, or `custom:CLASS` for a handler supplied by the metadata.
+Python-side code can construct a handler directly instead. Every one of them
+fires `bb.build.TaskProgress`, which is the same event bitbake's own `knotty`
+terminal UI draws its inline progress bars from — so this needs **no patch to
+bitbake and none to OE-core**, and the bridge sees it purely by tee'ing the
+handler `knotty.main()` already drives.
+
+What opts in today:
+
+- **ninja-generated compiles**, which is the common case. `cmake.bbclass` sets
+  `do_compile[progress] = "outof:^\[(\d+)/(\d+)\]\s+"` for its default `Ninja`
+  generator (and `"percent"` when told to use `Unix Makefiles` instead);
+  `meson.bbclass` sets the same ninja regex. So most of a modern image's
+  expensive compiles report.
+- **`cargo`/`cargo_c`/`waf`** `do_compile`, and `libc-package.bbclass`'s
+  `oe_runmake`, each with their own regex.
+- **`do_rootfs`**, via `image.bbclass`'s `MultiStageProgressReporter` — the
+  single longest opaque task in an image build.
+- **downloads**, from bitbake's own fetchers rather than from any bbclass:
+  `git` (which is also where `percent: null` comes from — it reports
+  indeterminate progress while counting objects), `wget`, `s3` and `perforce`
+  each construct a handler directly, so `do_fetch` reports, and `wget`/`git`/
+  `s3` are the ones that fill in `rate`.
+
+What does **not**, and will not without a change to OE-core that mackas does
+not carry: plain `autotools`/`make` `do_compile`, which is a large minority of
+recipes and has no `progress` varflag at all, and every task nobody has
+instrumented (`do_configure`, `do_install`, `do_package`, …). A build can
+therefore be perfectly healthy with `task_progress` empty for minutes.
+
+One thing the event cannot give you, however the task was instrumented: the
+underlying **N of M**. `OutOfProgressHandler` divides the pair out to a
+percentage before firing, and `TaskProgress` carries only that number plus an
+optional `rate` string. So `systemd:do_compile 42%` is available and
+`systemd:do_compile 762/1814` is not, without patching bitbake.
 
 ## Enabling the bridge, and why it is opt-in
 

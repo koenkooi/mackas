@@ -93,8 +93,14 @@ class BridgeTestCase(unittest.TestCase):
             "progress": {"done": 0, "total": 0},
             "failed_tasks": [],
             "failed_count": 0,
+            "task_progress": [],
             "recent_events": [],
         })
+        # The sub-task progress pidmaps are module globals too, and a pid
+        # left over from a previous test would attribute the next test's
+        # TaskProgress to the wrong recipe.
+        bridge._task_pids.clear()
+        bridge._task_reports.clear()
 
 
 class TargetsTest(BridgeTestCase):
@@ -239,12 +245,179 @@ class ProgressTest(BridgeTestCase):
         self.assertEqual(len(bridge._state["recent_events"]), bridge.MAX_RECENT_EVENTS)
 
 
+class TaskProgressTest(BridgeTestCase):
+    """Progress from inside a running task -- bb.build.TaskProgress, the same
+    event knotty draws its inline progress bars from.
+
+    The distinction pinned here: TaskProgress does NOT inherit from TaskBase,
+    so it names no recipe and no task; bb/build.py's own comment says the
+    event PID is what identifies the task it came from. So everything below
+    hangs off a TaskStarted-built pidmap, exactly as bitbake's own
+    bb/ui/uihelper.py does for knotty."""
+
+    @staticmethod
+    def _started(pid, taskfile, taskname):
+        return _event("TaskStarted", pid=pid, taskfile=taskfile, taskname=taskname)
+
+    @staticmethod
+    def _progress(pid, progress, rate=None):
+        return _event("TaskProgress", pid=pid, progress=progress, rate=rate)
+
+    def test_progress_is_attributed_to_the_task_that_fired_it(self):
+        bridge._observe(self._started(4242, "/l/meta/recipes/systemd_257.bb", "do_compile"))
+        bridge._observe(self._progress(4242, 42))
+        self.assertEqual(bridge._state["task_progress"], [
+            {"recipe": "systemd_257.bb", "task": "do_compile",
+             "percent": 42, "rate": None},
+        ])
+
+    def test_a_rate_string_is_carried_through(self):
+        # wget/git/s3 fetchers pass one; a compile does not.
+        bridge._observe(self._started(7, "/l/zlib_1.3.bb", "do_fetch"))
+        bridge._observe(self._progress(7, 30, "1.2M/s"))
+        self.assertEqual(bridge._state["task_progress"][0]["rate"], "1.2M/s")
+
+    def test_a_negative_percent_means_unknown_not_a_number(self):
+        # bitbake's own convention: negative == "progress is happening but we
+        # cannot say how much" (git counting objects). Inventing a percentage
+        # here would draw a bar that lies.
+        bridge._observe(self._started(9, "/l/linux-yocto_6.6.bb", "do_fetch"))
+        bridge._observe(self._progress(9, -1))
+        self.assertEqual(bridge._state["task_progress"], [
+            {"recipe": "linux-yocto_6.6.bb", "task": "do_fetch",
+             "percent": None, "rate": None},
+        ])
+
+    def test_percent_is_clamped_to_0_100(self):
+        bridge._observe(self._started(11, "/l/a_1.0.bb", "do_compile"))
+        bridge._observe(self._progress(11, 150))
+        self.assertEqual(bridge._state["task_progress"][0]["percent"], 100)
+
+    def test_a_float_percent_is_accepted(self):
+        # MultiStageProgressReporter (OE-core's image.bbclass do_rootfs)
+        # fires floats, not ints.
+        bridge._observe(self._started(13, "/l/core-image-base.bb", "do_rootfs"))
+        bridge._observe(self._progress(13, 12.7))
+        self.assertEqual(bridge._state["task_progress"][0]["percent"], 12)
+
+    def test_a_later_report_replaces_the_earlier_one(self):
+        bridge._observe(self._started(21, "/l/zlib_1.3.bb", "do_compile"))
+        bridge._observe(self._progress(21, 10))
+        bridge._observe(self._progress(21, 55))
+        self.assertEqual(len(bridge._state["task_progress"]), 1)
+        self.assertEqual(bridge._state["task_progress"][0]["percent"], 55)
+
+    def test_progress_for_an_unknown_pid_is_ignored(self):
+        # bitbake's uihelper guards the same way. An unattributed percentage
+        # names nothing, and pids are reused.
+        bridge._observe(self._progress(31337, 50))
+        self.assertEqual(bridge._state["task_progress"], [])
+
+    def test_a_finished_task_stops_being_reported(self):
+        # The entry must not outlive the task: a stale "42%" next to a recipe
+        # that finished ten minutes ago is worse than no number at all.
+        bridge._observe(self._started(55, "/l/zlib_1.3.bb", "do_compile"))
+        bridge._observe(self._progress(55, 42))
+        self.assertEqual(len(bridge._state["task_progress"]), 1)
+        bridge._observe(_event("TaskSucceeded", pid=55,
+                                taskfile="/l/zlib_1.3.bb", taskname="do_compile"))
+        self.assertEqual(bridge._state["task_progress"], [])
+
+    def test_a_failed_task_stops_being_reported_too(self):
+        for ending in ("TaskFailed", "TaskFailedSilent"):
+            bridge._task_pids.clear()
+            bridge._task_reports.clear()
+            bridge._state["task_progress"] = []
+            bridge._observe(self._started(66, "/l/busybox_1.36.bb", "do_compile"))
+            bridge._observe(self._progress(66, 5))
+            bridge._observe(_event(ending, pid=66, taskfile="/l/busybox_1.36.bb",
+                                    taskname="do_compile"))
+            self.assertEqual(bridge._state["task_progress"], [], ending)
+
+    def test_several_tasks_report_independently(self):
+        bridge._observe(self._started(1, "/l/a_1.0.bb", "do_compile"))
+        bridge._observe(self._started(2, "/l/b_2.0.bb", "do_compile"))
+        bridge._observe(self._progress(1, 10))
+        bridge._observe(self._progress(2, 90))
+        self.assertEqual(
+            [(e["recipe"], e["percent"]) for e in bridge._state["task_progress"]],
+            [("a_1.0.bb", 10), ("b_2.0.bb", 90)])
+
+    def test_a_started_task_that_never_reports_is_not_listed(self):
+        # Most tasks have no progress varflag at all; listing them with
+        # nothing to say would make the field useless noise.
+        bridge._observe(self._started(3, "/l/plainmake_1.0.bb", "do_compile"))
+        self.assertEqual(bridge._state["task_progress"], [])
+
+    def test_progress_events_never_enter_recent_events(self):
+        # One per percentage point would flush the 50-deep ring several times
+        # a second and destroy the one thing it is for.
+        bridge._observe(self._started(4, "/l/a_1.0.bb", "do_compile"))
+        for pct in range(100):
+            bridge._observe(self._progress(4, pct))
+        self.assertEqual(bridge._state["recent_events"], [])
+
+    def test_task_lifecycle_events_never_enter_recent_events_either(self):
+        # They duplicate the runQueue events already recorded there.
+        bridge._observe(self._started(5, "/l/a_1.0.bb", "do_compile"))
+        bridge._observe(_event("TaskSucceeded", pid=5, taskfile="/l/a_1.0.bb",
+                                taskname="do_compile"))
+        self.assertEqual(bridge._state["recent_events"], [])
+
+    def test_progress_does_not_move_the_build_wide_counter(self):
+        # progress.done/total count bitbake TASKS; a task at 42% has still
+        # completed zero of them.
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile", 3, 10))
+        bridge._observe(self._started(6, "/l/a_1.0.bb", "do_compile"))
+        bridge._observe(self._progress(6, 42))
+        self.assertEqual(bridge._state["progress"], {"done": 3, "total": 10})
+
+    def test_a_leaked_pid_cannot_grow_the_maps_without_limit(self):
+        # A worker killed outright never fires TaskSucceeded/TaskFailed, so
+        # the cap (evicting oldest-first) is what keeps a long build bounded.
+        n = bridge.MAX_TASK_PROGRESS + 10
+        for pid in range(1, n + 1):
+            bridge._observe(self._started(pid, f"/l/p{pid}_1.0.bb", "do_compile"))
+            bridge._observe(self._progress(pid, 50))
+        listed = [e["recipe"] for e in bridge._state["task_progress"]]
+        self.assertLessEqual(len(listed), bridge.MAX_TASK_PROGRESS)
+        # ...and it is the OLDEST that went, which is the stale one in the
+        # only case this cap exists for: the newest task is still reported,
+        # the first one is not.
+        self.assertIn(f"p{n}_1.0.bb", listed)
+        self.assertNotIn("p1_1.0.bb", listed)
+
+    def test_a_malformed_progress_event_never_raises(self):
+        bridge._observe(self._started(8, "/l/a_1.0.bb", "do_compile"))
+        for bad in (None, "nope", object()):
+            bridge._observe(self._progress(8, bad))
+        self.assertEqual(bridge._state["task_progress"], [])
+
+    def test_a_started_event_missing_everything_never_raises(self):
+        bridge._observe(_event("TaskStarted"))
+        bridge._observe(_event("TaskProgress"))
+        bridge._observe(_event("TaskSucceeded"))
+        self.assertEqual(bridge._state["task_progress"], [])
+
+
 class FinishTest(BridgeTestCase):
     def test_finish_sets_the_terminal_status(self):
         bridge._finish("success")
         self.assertEqual(bridge._state["status"], "success")
         bridge._finish("failed")
         self.assertEqual(bridge._state["status"], "failed")
+
+    def test_finish_clears_any_task_still_claiming_to_be_running(self):
+        # A build that died with workers up never fires their end events, and
+        # the terminal payload is served for the whole linger window -- a
+        # frozen "42%" next to "failed" would be a lie for all of it.
+        bridge._observe(_event("TaskStarted", pid=77, taskfile="/l/a_1.0.bb",
+                                taskname="do_compile"))
+        bridge._observe(_event("TaskProgress", pid=77, progress=42, rate=None))
+        self.assertEqual(len(bridge._state["task_progress"]), 1)
+        bridge._finish("failed")
+        self.assertEqual(bridge._state["task_progress"], [])
 
 
 class TeeEventHandlerMachineFetchTest(BridgeTestCase):

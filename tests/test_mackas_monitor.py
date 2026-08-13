@@ -259,6 +259,127 @@ class RenderTest(unittest.TestCase):
         self.assertIn("4/10", second)
 
 
+class TaskProgressRenderTest(unittest.TestCase):
+    """The `task_progress` field -- progress from INSIDE a running task,
+    which the build-wide counter structurally cannot show (a task is
+    indivisible to it, so one large do_compile holds it still for tens of
+    minutes). Same appended-never-inserted rule as percent/elapsed."""
+
+    def _render(self, state, ctx):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mon.render(state, ctx)
+        return buf.getvalue()
+
+    def _ctx(self):
+        ctx = mon.new_render_context()
+        ctx["is_tty"] = False
+        return ctx
+
+    @staticmethod
+    def _state(entries):
+        return {
+            "status": "building",
+            "current": {"recipe": "busybox", "task": "do_compile"},
+            "progress": {"done": 3, "total": 10},
+            "task_progress": entries,
+        }
+
+    def test_nothing_rendered_when_no_task_reports_progress(self):
+        self.assertEqual(mon.describe_task_progress({"task_progress": []}), "")
+        self.assertEqual(mon.describe_task_progress({}), "")
+
+    def test_a_reporting_task_names_itself_and_its_percent(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "systemd_257.bb", "task": "do_compile",
+             "percent": 42, "rate": None},
+        ]})
+        self.assertEqual(got, "systemd_257.bb:do_compile 42%")
+
+    def test_a_rate_is_shown_when_the_producer_has_one(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "zlib_1.3.bb", "task": "do_fetch",
+             "percent": 30, "rate": "1.2M/s"},
+        ]})
+        self.assertEqual(got, "zlib_1.3.bb:do_fetch 30% at 1.2M/s")
+
+    def test_an_unknown_percent_reads_as_busy_not_as_a_number(self):
+        # bitbake's negative progress ("happening, amount unknown") reaches
+        # the bridge as null. Printing "0%" for it would read as stalled.
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "linux-yocto_6.6.bb", "task": "do_fetch",
+             "percent": None, "rate": None},
+        ]})
+        self.assertEqual(got, "linux-yocto_6.6.bb:do_fetch busy")
+
+    def test_a_boolean_percent_is_not_rendered_as_a_number(self):
+        # bool is an int subclass; a schema surprise must not print "1%".
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "a_1.0.bb", "task": "do_compile", "percent": True},
+        ]})
+        self.assertEqual(got, "a_1.0.bb:do_compile busy")
+
+    def test_a_missing_recipe_or_task_is_marked_not_dropped(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"percent": 5},
+        ]})
+        self.assertEqual(got, "?:? 5%")
+
+    def test_two_tasks_are_both_named(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "a_1.0.bb", "task": "do_compile", "percent": 10},
+            {"recipe": "b_2.0.bb", "task": "do_compile", "percent": 90},
+        ]})
+        self.assertEqual(got, "a_1.0.bb:do_compile 10%, b_2.0.bb:do_compile 90%")
+
+    def test_more_than_the_cap_collapses_into_a_count(self):
+        entries = [{"recipe": f"p{i}.bb", "task": "do_compile", "percent": i}
+                   for i in range(5)]
+        got = mon.describe_task_progress({"task_progress": entries})
+        self.assertTrue(got.endswith("+3 more"), got)
+        self.assertIn("p0.bb:do_compile 0%", got)
+        self.assertNotIn("p4.bb", got)
+
+    def test_a_non_dict_entry_is_skipped_not_fatal(self):
+        got = mon.describe_task_progress({"task_progress": [
+            "nonsense",
+            {"recipe": "a_1.0.bb", "task": "do_compile", "percent": 7},
+        ]})
+        self.assertEqual(got, "a_1.0.bb:do_compile 7%")
+
+    def test_it_is_appended_after_the_fixed_core_shape(self):
+        ctx = self._ctx()
+        out = self._render(self._state([
+            {"recipe": "systemd_257.bb", "task": "do_compile", "percent": 42},
+        ]), ctx)
+        self.assertIn("[building] 3/10  busybox:do_compile", out)
+        self.assertGreater(out.index("systemd_257.bb:do_compile 42%"),
+                            out.index("busybox:do_compile"))
+
+    def test_the_line_is_unchanged_when_the_field_is_absent(self):
+        # Additive: a bridge that does not serve task_progress (an older one,
+        # or a build where nothing reports) renders exactly as before.
+        ctx = self._ctx()
+        without = self._render({
+            "status": "building",
+            "current": {"recipe": "busybox", "task": "do_compile"},
+            "progress": {"done": 3, "total": 10},
+        }, ctx)
+        empty = self._render(self._state([]), self._ctx())
+        self.assertEqual(without.strip(), empty.strip())
+        # Not even an empty pair of brackets: nothing to say means say
+        # nothing, the same rule the notification bodies follow.
+        self.assertNotIn("()", without)
+
+    def test_it_precedes_the_failed_count(self):
+        ctx = self._ctx()
+        state = dict(self._state([
+            {"recipe": "systemd_257.bb", "task": "do_compile", "percent": 42},
+        ]), failed_count=2)
+        out = self._render(state, ctx)
+        self.assertLess(out.index("systemd_257.bb"), out.index("2 failed so far"))
+
+
 # ---------------------------------------------------------------------------
 # Routing around Apple container's resetting port-forward (issue #49)
 # ---------------------------------------------------------------------------

@@ -248,7 +248,9 @@ mackas's own coarse rung/log reporting. `MACKAS_MONITOR=1` opts a build into
 a live progress bridge; `mackas monitor` polls it (`--once` for a single
 snapshot) on `MACKAS_MONITOR_PORT` (default `8801`) — it never starts a
 build. Each poll shows status, task counts and percent, the current
-recipe:task and elapsed time, redrawn in place rather than scrolled; the
+recipe:task, elapsed time and — for tasks that report it, which covers
+ninja-generated compiles, `do_rootfs` and downloads — how far along the
+running task itself is, redrawn in place rather than scrolled; the
 `MACKAS_MONITOR_POLL_INTERVAL` environment variable (default 2 seconds) sets
 how often it polls. With `MACKAS_MONITOR_NOTIFY=1` (or `--notify`) it also
 posts a native macOS notification on build start/success/failure, after a
