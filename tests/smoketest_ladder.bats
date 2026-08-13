@@ -38,6 +38,11 @@ setup() {
 	# A checkout that cmd_smoketest's three preconditions accept.
 	mkdir -p "$ROOT/bin" "$ROOT/logs" "$PROJ/.git" "$PROJ/kas"
 	touch "$PROJ/kas/macos-local.yml"
+	# A real-looking bitbake, so monitor_runtime_args() (only exercised by
+	# tests that opt in with MACKAS_MONITOR=1) finds a checkout to mount
+	# instead of skipping for "no bitbake found yet" -- harmless for every
+	# other test here, which leaves MACKAS_MONITOR at its default (off).
+	mkdir -p "$PROJ/bin"; touch "$PROJ/bin/bitbake"
 	# run_kas refuses before ever reaching kas-container if the gitconfig it
 	# would forward is missing/incomplete -- matching what a real 'setup' run
 	# leaves behind at $ROOT/gitconfig.
@@ -249,6 +254,43 @@ EOF
 		--set "MACKAS_SMOKETEST_TARGETS=a" smoketest
 	[ "$status" -eq 0 ]
 	[ "$(printf '%s\n' "$output" | grep -cF '✓ ')" -eq 1 ]
+}
+
+@test "smoketest ladder: MACKAS_MONITOR=1 does not publish a bridge for the parse-only rung, only for the real build rung" {
+	# The shared fake kas-container.real strips '--runtime-args <value>'
+	# before recording (the composed kas SUBCOMMAND argv is what the other
+	# tests here care about) -- override it just for this test to keep the
+	# full argv, so the runtime-args string itself (where the bridge mount
+	# would appear) is inspectable per rung.
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+{
+	line="PWD=$PWD"
+	for a in "$@"; do line="$line|ARG=$a"; done
+	printf '%s\n' "$line"
+} >> "$KLOG"
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/no-such-link" \
+		--set MACKAS_RELOCATE_VOLUMES=0 --set MACKAS_OVERHEAD=0 \
+		--set MACKAS_PROJECT_DIR=meta-ai --set MACKAS_KAS_CONFIG=kas/base.yml \
+		--set MACKAS_MONITOR=1 --set "MACKAS_SMOKETEST_TARGETS=a" smoketest
+	[ "$status" -eq 0 ]
+	[ "$(grep -c '^PWD=' "$KLOG")" -eq 2 ]
+	# Rung 1 (parse-only, "ARG=shell|...|ARG=bitbake -p") carries no bridge --
+	# a watcher attached from the very start of the ladder must not see the
+	# parse rung's own "success" and think the whole thing is done.
+	local rung1; rung1="$(sed -n '1p' "$KLOG")"
+	printf '%s\n' "$rung1" | grep -qF 'ARG=bitbake -p'
+	! printf '%s\n' "$rung1" | grep -qF 'mackas-uibridge'
+	! printf '%s\n' "$rung1" | grep -qF 'MACKAS_MONITOR_PORT'
+	# Rung 2 (the real build) gets it.
+	local rung2; rung2="$(sed -n '2p' "$KLOG")"
+	printf '%s\n' "$rung2" | grep -qF 'ARG=build'
+	printf '%s\n' "$rung2" | grep -qF 'mackas-uibridge'
+	printf '%s\n' "$rung2" | grep -qF 'MACKAS_MONITOR_PORT'
 }
 
 @test "smoketest ladder: --dry-run never prints a fabricated completion summary" {

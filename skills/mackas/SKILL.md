@@ -296,6 +296,39 @@ touch the batch gap above.) The bridge (with `--notify`, or
 *one* build interactively. Note also: "disconnected while `building`" means
 **outcome unknown** — say nothing, never report it as a failure.
 
+**A single build's completion, without polling anything, including from a
+Claude workflow.** `mackas smoketest`/`mackas build`-shaped commands already
+give a real done-signal: background the command itself and read its exit
+code once it returns — `mackas smoketest -y > log 2>&1 & wait $!`, or the
+backgrounding pattern this harness already uses for any long shell command.
+That's a genuine non-polling wait (nothing here loops on HTTP), and it's
+more reliable than `mackas monitor` for exactly the reasons above: it covers
+kas-level failures the bridge can't see (a bad kas config, a container that
+never starts), not just bitbake's own outcome, and `smoketest`'s parse-only
+first rung no longer publishes a bridge at all (it used to, and made a
+watcher see a false "done" the moment recipes finished parsing, minutes
+before any real build started — fixed, not just documented). `mackas
+monitor --once` is still fine as a cheap progress *check* alongside the
+backgrounded build; it just should not be the thing a script blocks on for
+the *result*. If genuinely following one build live is what's wanted,
+`monitor --wait-for-start SECONDS` now tolerates the bridge not being up yet
+(the parse rung + checkout + container start can take a while) instead of
+failing the instant it's launched — still single-container-only, still not
+the answer for a batch.
+
+If driving `kas-container` by hand, two things matter for a background exit
+code to actually mean what it looks like it means: background it with
+`> log 2>&1 &` in a shell that has **sourced** `env.sh`, never by piping it
+(`kas-container ... | tail -3` runs the function in a subshell, so its own
+exports — including the derived `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` —
+vanish the moment the pipe closes); and `nohup`/`env`/an absolute path/
+anything else that resolves `kas-container` via `$PATH` instead of the
+sourced shell function still reaches the generated protection wrapper (real
+volumes, real CPU/memory limits, a genuine exit code) but skips the shell
+function's own auto-appended tuning fragment and project derivation — fine
+for a trustworthy background exit code, not fine if the build also needs
+either of those derived for you.
+
 ## Analysing results
 
 ### Buildhistory (what changed in package/image content)

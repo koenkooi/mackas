@@ -5726,9 +5726,20 @@ smoketest_ladder() {
 		return 0
 	fi
 
+	# The progress bridge wraps every bitbake invocation in the container for
+	# that container's whole life, parse-only included -- so with
+	# MACKAS_MONITOR=1 left on here, this rung's own "bitbake -p" would
+	# publish a bridge, reach status "success" once parsing finishes, and a
+	# caller watching for the ladder's completion (mackas monitor, or
+	# anything polling the same port) would see a false "done" minutes
+	# before any real build has even started. Suppress the bridge for this
+	# one rung only; it comes back for the real build rungs below.
+	local saved_monitor="$MACKAS_MONITOR"
+	MACKAS_MONITOR=0
 	smoketest_rung 1 "$total" "parse-only (bitbake -p)" \
 		"all layers fetched, recipes parse, no build" \
-		shell "$KAS_FILES_ARG" -c "bitbake -p" || return 1
+		shell "$KAS_FILES_ARG" -c "bitbake -p" || { MACKAS_MONITOR="$saved_monitor"; return 1; }
+	MACKAS_MONITOR="$saved_monitor"
 
 	local n=1
 	if [ -n "$MACKAS_SMOKETEST_TARGETS" ]; then
@@ -6944,7 +6955,7 @@ ${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build
 started with MACKAS_MONITOR=1.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD monitor [--port N] [--once] [--notify]
+  $SCRIPT_CMD monitor [--port N] [--once] [--notify] [--wait-for-start SECONDS]
 
 Polls the in-container progress bridge and prints one line per update:
 '[status] done/total  recipe:task'. This only polls an already-published
@@ -6954,20 +6965,77 @@ want to watch first, e.g.:
   $SCRIPT_CMD --set MACKAS_MONITOR=1 smoketest &
   $SCRIPT_CMD monitor
 
+If you want a completion SIGNAL rather than a progress view -- for a script
+or a Claude workflow that just needs to know when a build finished -- the
+build's own exit code is the more reliable choice; see 'A DONE-SIGNAL
+WITHOUT POLLING' below before reaching for this command.
+
 ${C_BLD}OPTIONS${C_RST}
-  --port N   Poll this port instead of MACKAS_MONITOR_PORT.
-  --once     Print a single snapshot and exit, instead of following until
-             the build reports success/failed. Exit status distinguishes
-             success (0), a build that failed (1) and no bridge reachable
-             at all (2) -- usable as a scripted probe.
-  --notify   Also post a native macOS notification on exactly three
-             transitions -- build started, succeeded, failed -- never per
-             task. MACKAS_MONITOR_NOTIFY=1 turns it on without the flag.
-             Uses terminal-notifier when it is installed, else osascript.
+  --port N              Poll this port instead of MACKAS_MONITOR_PORT.
+  --once                Print a single snapshot and exit, instead of
+                         following until the build reports success/failed.
+                         Exit status distinguishes success (0), a build
+                         that failed (1) and no bridge reachable at all
+                         (2) -- usable as a scripted probe.
+  --notify              Also post a native macOS notification on exactly
+                         three transitions -- build started, succeeded,
+                         failed -- never per task. MACKAS_MONITOR_NOTIFY=1
+                         turns it on without the flag. Uses
+                         terminal-notifier when it is installed, else
+                         osascript.
+  --wait-for-start SECONDS
+                         Tolerate the bridge not being up yet for up to
+                         SECONDS, instead of failing on the very first
+                         poll (the default: 0, today's behavior). Makes it
+                         possible to launch 'monitor' at the same moment
+                         as the build it watches -- kas's own
+                         checkout/patch/container-start plus reaching
+                         bitbake can take anywhere from seconds to
+                         minutes. Only covers the FIRST connection: once
+                         the bridge has answered even once, a later
+                         failure is still reported immediately -- a bridge
+                         that goes away mid-build is a real problem, not a
+                         startup race.
 
 MACKAS_MONITOR_POLL_INTERVAL sets the poll interval in seconds (default 2);
 there is no flag for it, since it is a display-only knob, not a setting
 'mackas set' persists.
+
+${C_BLD}A DONE-SIGNAL WITHOUT POLLING${C_RST}
+'monitor' (without --once) already blocks until the build finishes and
+returns a distinct exit code (0 success, 1 the build failed, 2 no bridge
+reachable) -- backgrounding it is a real, non-polling way to be told when
+a build ends. But it only ever sees ONE container's bitbake: it cannot
+tell you a multi-rung 'smoketest' ladder or a hand-typed multi-machine
+batch is fully done, only that the container it happened to be watching
+ended, and it cannot see a failure that happens before bitbake ever
+starts (a bad kas config, a container that never comes up).
+
+For that reason, THE BUILD'S OWN EXIT CODE IS THE MORE RELIABLE SIGNAL --
+background the build itself, not this command:
+
+  $SCRIPT_CMD smoketest -y > smoketest.log 2>&1 &
+  wait \$!   # \$? is the ladder's real result, covering everything
+
+  $SCRIPT_CMD monitor --once   # a cheap progress check meanwhile, if wanted
+
+If you drive kas-container BY HAND instead of through 'smoketest'/'build',
+two things matter for the exit code to stay trustworthy:
+
+- Background it with '> log 2>&1 &' in a shell that has SOURCED env.sh,
+  never by PIPING it ('kas-container ... | tail -3' runs the function in
+  a subshell, so any exports it makes -- including the derived
+  MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG -- vanish the moment the pipe
+  closes, which can silently point a later command at the wrong project).
+- 'nohup'/'env'/an absolute path/anything else that resolves
+  'kas-container' via \$PATH instead of the sourced shell function still
+  reaches the generated protection wrapper (the real volumes and CPU/
+  memory limits apply, and the exit code is genuine) -- but it skips the
+  shell function's own conveniences, the auto-appended tuning fragment
+  and the MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG derivation. That trade is
+  fine for getting a trustworthy background exit code specifically; it is
+  not fine if the build also depends on either of those being derived for
+  you -- export them yourself first in that case.
 
 ${C_BLD}WHEN THE PUBLISHED PORT RESETS${C_RST}
 Apple's 'container' can accept the connection on a published port and then
@@ -6993,7 +7061,7 @@ EOF
 }
 
 cmd_monitor() {
-	local port="$MACKAS_MONITOR_PORT" once=0 want_help=0
+	local port="$MACKAS_MONITOR_PORT" once=0 want_help=0 wait_for_start=0
 	local notify="${MACKAS_MONITOR_NOTIFY:-0}"
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
@@ -7004,6 +7072,10 @@ cmd_monitor() {
 			--port=*)  port="${1#*=}"; shift ;;
 			--once)    once=1; shift ;;
 			--notify)  notify=1; shift ;;
+			--wait-for-start) wait_for_start="${2:-}"
+				[ -n "$wait_for_start" ] || die "--wait-for-start needs a value" "$SCRIPT_CMD monitor --help"
+				shift 2 ;;
+			--wait-for-start=*) wait_for_start="${1#*=}"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
@@ -7034,6 +7106,7 @@ cmd_monitor() {
 	local args=(--port "$port")
 	[ "$once" -eq 1 ] && args+=(--once)
 	[ "$notify" = "1" ] && args+=(--notify)
+	[ "$wait_for_start" != "0" ] && args+=(--wait-for-start "$wait_for_start")
 	/usr/bin/python3 "$tool" "${args[@]}"
 }
 
