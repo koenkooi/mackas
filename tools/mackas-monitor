@@ -274,6 +274,12 @@ def connection_error_message(port, exc, host=LOOPBACK):
     return f"could not reach the bridge at {host}:{port}: {exc}"
 
 
+def _is_number(value):
+    """A real number from the payload. bool is an int subclass, so a schema
+    surprise carrying True must never render as "1"."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _format_elapsed(seconds):
     """H:MM:SS, or M:SS under an hour -- no leading zero on the leftmost unit."""
     seconds = max(0, int(seconds))
@@ -303,21 +309,22 @@ def describe_task_progress(state, limit=MAX_SHOWN_TASK_PROGRESS):
 
     A null `percent` is bitbake's "progress is happening but we cannot say
     how much" (git counting objects, for one), which reads as `busy`: the
-    entry existing at all is the useful part. Empty string means say nothing,
-    the same rule the notification bodies follow."""
+    entry existing at all is the useful part. The task's own elapsed time
+    follows, and matters most in exactly that case -- a bare "busy" has no
+    scale, while "busy 14:22" does. Empty string means say nothing, the same
+    rule the notification bodies follow."""
     entries = [e for e in (state.get("task_progress") or []) if isinstance(e, dict)]
     shown = []
     for entry in entries[:limit]:
         what = f"{entry.get('recipe') or '?'}:{entry.get('task') or '?'}"
         percent = entry.get("percent")
-        # bool is an int subclass; a stray True must not render as "1%".
-        if isinstance(percent, (int, float)) and not isinstance(percent, bool):
-            detail = f"{int(percent)}%"
-        else:
-            detail = "busy"
+        detail = f"{int(percent)}%" if _is_number(percent) else "busy"
         rate = entry.get("rate")
         if rate:
             detail += f" at {rate}"
+        elapsed = entry.get("elapsed")
+        if _is_number(elapsed):
+            detail += f"  {_format_elapsed(elapsed)}"
         shown.append(f"{what} {detail}")
     if not shown:
         return ""
@@ -325,6 +332,26 @@ def describe_task_progress(state, limit=MAX_SHOWN_TASK_PROGRESS):
     if extra > 0:
         return f"{', '.join(shown)} +{extra} more"
     return ", ".join(shown)
+
+
+def describe_sstate(state):
+    """How many of this build's setscene tasks sstate could actually cover.
+
+    What explains an otherwise baffling build shape: with a warm cache the
+    task counter races through the run queue and then crawls through the few
+    recipes that really have to be built. That anti-correlation is also why
+    there is no build-wide ETA here -- everything shown is measured.
+
+    Deliberately the setscene counts, not the run queue's `skipped`: the
+    latter also counts tasks whose stamp was merely already current, which is
+    not sstate. Empty string when the bridge has not settled them yet."""
+    sstate = state.get("sstate")
+    if not isinstance(sstate, dict):
+        return ""
+    covered, total = sstate.get("covered"), sstate.get("total")
+    if not _is_number(covered) or not _is_number(total) or not total:
+        return ""
+    return f"sstate {int(covered)}/{int(total)} covered"
 
 
 def new_render_context():
@@ -365,14 +392,17 @@ def render(state, ctx):
         done = progress.get("done", 0)
         total = progress.get("total", 0)
         # The core "[status] done/total  recipe:task" shape is unchanged --
-        # percent/elapsed/sub-task progress/failures are appended after it,
-        # never inserted into it, so anything that greps for that substring
-        # still matches.
+        # percent/elapsed/sstate/sub-task progress/failures are appended after
+        # it, never inserted into it, so anything that greps for that
+        # substring still matches.
         line = f"[{status}] {done}/{total}  {recipe}:{task}"
         if total:
             line += f"  {done * 100 // total}%"
         if ctx["started_at"] is not None:
             line += f"  {_format_elapsed(time.monotonic() - ctx['started_at'])}"
+        sstate = describe_sstate(state)
+        if sstate:
+            line += f"  {sstate}"
         inside = describe_task_progress(state)
         if inside:
             line += f"  ({inside})"

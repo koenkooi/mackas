@@ -330,6 +330,18 @@ EOF
 	printf '%s\n' "$output" | grep -qF '[building] 3/10  busybox:do_compile'
 }
 
+@test "monitor --once shows sstate coverage and how long each task has run" {
+	# The two things a build-wide ETA cannot be replaced by anything else:
+	# what the cache already covered, and how long the task that is holding
+	# the counter still has been at it. Both are observations, never guesses.
+	start_fake_bridge '{"status": "building", "current": {"recipe": "core-image-base.bb", "task": "do_rootfs"}, "progress": {"done": 3100, "total": 3170}, "sstate": {"covered": 412, "notcovered": 38, "total": 450, "skipped": 1204}, "task_progress": [{"recipe": "core-image-base.bb", "task": "do_rootfs", "percent": null, "rate": null, "elapsed": 862}], "recent_events": []}'
+	run "$MACKAS" monitor --port "$FAKE_PORT" --once
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF '[building] 3100/3170  core-image-base.bb:do_rootfs'
+	printf '%s\n' "$output" | grep -qF 'sstate 412/450 covered'
+	printf '%s\n' "$output" | grep -qF 'core-image-base.bb:do_rootfs busy  14:22'
+}
+
 @test "monitor follows until the bridge reports success, then exits 0" {
 	start_fake_bridge '{"status": "success", "current": {"recipe": null, "task": null}, "progress": {"done": 10, "total": 10}, "recent_events": []}'
 	run "$MACKAS" monitor --port "$FAKE_PORT"
