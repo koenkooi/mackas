@@ -379,6 +379,137 @@ class TaskProgressRenderTest(unittest.TestCase):
         out = self._render(state, ctx)
         self.assertLess(out.index("systemd_257.bb"), out.index("2 failed so far"))
 
+    def test_a_reporting_task_shows_how_long_it_has_been_running(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "systemd_257.bb", "task": "do_compile",
+             "percent": 42, "rate": None, "elapsed": 862},
+        ]})
+        self.assertEqual(got, "systemd_257.bb:do_compile 42%  14:22")
+
+    def test_a_busy_task_gets_the_scale_a_bare_busy_lacks(self):
+        # The specific gap this closes: "busy" alone says nothing about
+        # whether the task started a second ago or forty minutes ago.
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "linux-yocto_6.6.bb", "task": "do_compile",
+             "percent": None, "elapsed": 862},
+        ]})
+        self.assertEqual(got, "linux-yocto_6.6.bb:do_compile busy  14:22")
+
+    def test_elapsed_follows_the_rate_rather_than_splitting_it(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "zlib_1.3.bb", "task": "do_fetch",
+             "percent": 30, "rate": "1.2M/s", "elapsed": 5},
+        ]})
+        self.assertEqual(got, "zlib_1.3.bb:do_fetch 30% at 1.2M/s  0:05")
+
+    def test_no_elapsed_is_simply_left_out(self):
+        # Additive: an older bridge serves no `elapsed` at all, and must
+        # render exactly as it did before -- not as "0:00", which would claim
+        # the task just started.
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "a_1.0.bb", "task": "do_compile", "percent": 7},
+        ]})
+        self.assertEqual(got, "a_1.0.bb:do_compile 7%")
+
+    def test_a_null_elapsed_is_left_out_too(self):
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "a_1.0.bb", "task": "do_compile", "percent": 7,
+             "elapsed": None},
+        ]})
+        self.assertEqual(got, "a_1.0.bb:do_compile 7%")
+
+    def test_a_boolean_elapsed_is_not_rendered_as_a_time(self):
+        # bool is an int subclass, same schema-surprise guard as percent.
+        got = mon.describe_task_progress({"task_progress": [
+            {"recipe": "a_1.0.bb", "task": "do_compile", "percent": 7,
+             "elapsed": True},
+        ]})
+        self.assertEqual(got, "a_1.0.bb:do_compile 7%")
+
+
+class SstateRenderTest(unittest.TestCase):
+    """The `sstate` field -- how many setscene tasks the cache could cover.
+
+    An observation of what already happened, which is the only kind of
+    build-wide number this tool shows: sstate makes task count and wall time
+    anti-correlated (most of the run queue can finish in a small fraction of
+    the wall clock, then one do_rootfs grinds alone), so a build-wide ETA
+    would be confidently wrong and is deliberately absent."""
+
+    def _render(self, state, ctx):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mon.render(state, ctx)
+        return buf.getvalue()
+
+    def _ctx(self):
+        ctx = mon.new_render_context()
+        ctx["is_tty"] = False
+        return ctx
+
+    @staticmethod
+    def _state(sstate):
+        return {
+            "status": "building",
+            "current": {"recipe": "busybox", "task": "do_compile"},
+            "progress": {"done": 3, "total": 10},
+            "sstate": sstate,
+        }
+
+    def test_coverage_is_named_as_a_share_of_the_setscene_total(self):
+        self.assertEqual(
+            mon.describe_sstate({"sstate": {"covered": 412, "notcovered": 38,
+                                            "total": 450, "skipped": 1204}}),
+            "sstate 412/450 covered")
+
+    def test_nothing_is_said_before_the_bridge_knows(self):
+        self.assertEqual(mon.describe_sstate({"sstate": None}), "")
+        self.assertEqual(mon.describe_sstate({}), "")
+
+    def test_a_build_with_no_setscene_tasks_says_nothing(self):
+        # 0/0 would be a division-free but meaningless "0% cache hit".
+        self.assertEqual(
+            mon.describe_sstate({"sstate": {"covered": 0, "total": 0}}), "")
+
+    def test_a_completely_cold_cache_is_still_reported(self):
+        # 0 of 450 is real information -- it is the answer to "why is this
+        # build taking four hours".
+        self.assertEqual(
+            mon.describe_sstate({"sstate": {"covered": 0, "total": 450}}),
+            "sstate 0/450 covered")
+
+    def test_a_non_dict_payload_is_ignored_not_fatal(self):
+        for bad in ("nope", 42, [], {"covered": "x", "total": 10},
+                    {"covered": True, "total": 10}, {"total": 450}):
+            self.assertEqual(mon.describe_sstate({"sstate": bad}), "", repr(bad))
+
+    def test_it_is_appended_after_the_fixed_core_shape(self):
+        ctx = self._ctx()
+        out = self._render(self._state({"covered": 412, "total": 450}), ctx)
+        self.assertIn("[building] 3/10  busybox:do_compile", out)
+        self.assertGreater(out.index("sstate 412/450 covered"),
+                            out.index("busybox:do_compile"))
+
+    def test_it_follows_the_elapsed_time_and_precedes_the_task_detail(self):
+        ctx = self._ctx()
+        state = dict(self._state({"covered": 412, "total": 450}),
+                     task_progress=[{"recipe": "systemd_257.bb",
+                                     "task": "do_compile", "percent": 42}])
+        out = self._render(state, ctx)
+        self.assertLess(out.index("0:00"), out.index("sstate 412/450"))
+        self.assertLess(out.index("sstate 412/450"), out.index("systemd_257.bb"))
+
+    def test_the_line_is_unchanged_when_the_field_is_absent(self):
+        # Additive: an older bridge serves no `sstate` and renders as before.
+        without = self._render({
+            "status": "building",
+            "current": {"recipe": "busybox", "task": "do_compile"},
+            "progress": {"done": 3, "total": 10},
+        }, self._ctx())
+        null = self._render(self._state(None), self._ctx())
+        self.assertEqual(without.strip(), null.strip())
+        self.assertNotIn("sstate", without)
+
 
 # ---------------------------------------------------------------------------
 # Routing around Apple container's resetting port-forward (issue #49)

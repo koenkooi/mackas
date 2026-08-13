@@ -59,9 +59,18 @@ bridge = _load_bridge()
 
 
 class _Stats:
-    def __init__(self, completed=0, total=0):
+    """bb/runqueue.py's RunQueueStats, with the attribute names it really
+    has -- one instance is created per build and .copy()'d onto every
+    runQueue/sceneQueue event."""
+
+    def __init__(self, completed=0, total=0, setscene_covered=0,
+                 setscene_notcovered=0, setscene_total=0, skipped=0):
         self.completed = completed
         self.total = total
+        self.setscene_covered = setscene_covered
+        self.setscene_notcovered = setscene_notcovered
+        self.setscene_total = setscene_total
+        self.skipped = skipped
 
 
 def _event(cls_name, **attrs):
@@ -69,13 +78,13 @@ def _event(cls_name, **attrs):
     return type(cls_name, (), attrs)()
 
 
-def _task_event(cls_name, taskfile, taskname, done=0, total=0):
+def _task_event(cls_name, taskfile, taskname, done=0, total=0, stats=None):
     return _event(
         cls_name,
         taskfile=taskfile,
         taskname=taskname,
         taskstring=f"{taskfile}:{taskname}",
-        stats=_Stats(done, total),
+        stats=_Stats(done, total) if stats is None else stats,
     )
 
 
@@ -91,6 +100,7 @@ class BridgeTestCase(unittest.TestCase):
             "distro": None,
             "current": {"recipe": None, "task": None},
             "progress": {"done": 0, "total": 0},
+            "sstate": None,
             "failed_tasks": [],
             "failed_count": 0,
             "task_progress": [],
@@ -268,7 +278,7 @@ class TaskProgressTest(BridgeTestCase):
         bridge._observe(self._progress(4242, 42))
         self.assertEqual(bridge._state["task_progress"], [
             {"recipe": "systemd_257.bb", "task": "do_compile",
-             "percent": 42, "rate": None},
+             "percent": 42, "rate": None, "elapsed": 0},
         ])
 
     def test_a_rate_string_is_carried_through(self):
@@ -285,7 +295,7 @@ class TaskProgressTest(BridgeTestCase):
         bridge._observe(self._progress(9, -1))
         self.assertEqual(bridge._state["task_progress"], [
             {"recipe": "linux-yocto_6.6.bb", "task": "do_fetch",
-             "percent": None, "rate": None},
+             "percent": None, "rate": None, "elapsed": 0},
         ])
 
     def test_percent_is_clamped_to_0_100(self):
@@ -399,6 +409,182 @@ class TaskProgressTest(BridgeTestCase):
         bridge._observe(_event("TaskProgress"))
         bridge._observe(_event("TaskSucceeded"))
         self.assertEqual(bridge._state["task_progress"], [])
+
+
+class TaskElapsedTest(BridgeTestCase):
+    """How long each reporting task has been running.
+
+    An observation, not a prediction -- which is the whole reason it is here
+    and a build-wide ETA is not: sstate makes task count and wall time
+    anti-correlated, so a percentage-derived estimate would be confidently
+    wrong. This one cannot be."""
+
+    @staticmethod
+    def _started(pid, taskfile, taskname):
+        return _event("TaskStarted", pid=pid, taskfile=taskfile, taskname=taskname)
+
+    @staticmethod
+    def _progress(pid, progress, rate=None):
+        return _event("TaskProgress", pid=pid, progress=progress, rate=rate)
+
+    def _age(self, pid, seconds):
+        """Backdate PID's recorded start, so elapsed is deterministic."""
+        recipe, task, started = bridge._task_pids[pid]
+        bridge._task_pids[pid] = (recipe, task, started - seconds)
+
+    def test_elapsed_counts_from_the_task_start_not_the_first_report(self):
+        # An instrumented compile fires its first TaskProgress well after it
+        # began; dating the age from that would understate every task.
+        bridge._observe(self._started(101, "/l/systemd_257.bb", "do_compile"))
+        self._age(101, 90)
+        bridge._observe(self._progress(101, 42))
+        self.assertEqual(bridge._state["task_progress"][0]["elapsed"], 90)
+
+    def test_a_busy_task_with_no_percent_still_has_an_age(self):
+        # The gap this closes: bitbake's negative progress means "happening,
+        # amount unknown", and a bare "busy" has no scale at all.
+        bridge._observe(self._started(102, "/l/linux-yocto_6.6.bb", "do_fetch"))
+        self._age(102, 3661)
+        bridge._observe(self._progress(102, -1))
+        entry = bridge._state["task_progress"][0]
+        self.assertIsNone(entry["percent"])
+        self.assertEqual(entry["elapsed"], 3661)
+
+    def test_each_task_is_aged_independently(self):
+        bridge._observe(self._started(103, "/l/a_1.0.bb", "do_compile"))
+        bridge._observe(self._started(104, "/l/b_2.0.bb", "do_compile"))
+        self._age(103, 10)
+        self._age(104, 500)
+        bridge._observe(self._progress(103, 5))
+        bridge._observe(self._progress(104, 5))
+        self.assertEqual(
+            [e["elapsed"] for e in bridge._state["task_progress"]], [10, 500])
+
+    def test_a_reused_pid_starts_its_clock_over(self):
+        # No end event in between -- the case _track_task's unconditional
+        # assignment exists for. A worker whose TaskSucceeded never arrived
+        # leaves its pid in the map, and the next task to get that pid must
+        # not inherit its age.
+        bridge._observe(self._started(105, "/l/a_1.0.bb", "do_compile"))
+        self._age(105, 600)
+        bridge._observe(self._started(105, "/l/b_2.0.bb", "do_compile"))
+        bridge._observe(self._progress(105, 5))
+        entry = bridge._state["task_progress"][0]
+        self.assertEqual(entry["recipe"], "b_2.0.bb")
+        self.assertEqual(entry["elapsed"], 0)
+
+    def test_an_unknown_start_time_is_null_not_zero(self):
+        # A report whose pid is no longer in the pidmap already renders
+        # recipe/task as null; a fabricated "0 seconds" would be worse than
+        # saying nothing, and would read as a task that just began.
+        with bridge._lock:
+            bridge._task_reports[106] = {"percent": 50, "rate": None}
+            bridge._publish_task_progress()
+        self.assertEqual(bridge._state["task_progress"], [
+            {"recipe": None, "task": None, "percent": 50,
+             "rate": None, "elapsed": None},
+        ])
+
+
+class SstateCoverageTest(BridgeTestCase):
+    """How much of the build sstate covered, off the RunQueueStats object
+    every runQueue/sceneQueue event already carries (bb/runqueue.py creates
+    one per build and .copy()s it onto each event).
+
+    The distinction pinned here: this is only read from runQueue events.
+    bb/runqueue.py sets sqdone before it ever asks the scheduler for a real
+    task, so the setscene counts are settled by then -- a sceneQueue event
+    carries a tally still being built up, and serving that would report a
+    warm cache as a cold one for the whole scene-queue phase."""
+
+    @staticmethod
+    def _stats(**kwargs):
+        return _Stats(**kwargs)
+
+    def test_coverage_is_read_off_a_runqueue_event(self):
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/busybox_1.36.bb", "do_compile",
+            stats=self._stats(completed=1200, total=3170, setscene_covered=412,
+                              setscene_notcovered=38, setscene_total=450,
+                              skipped=1204)))
+        self.assertEqual(bridge._state["sstate"], {
+            "covered": 412, "notcovered": 38, "total": 450, "skipped": 1204,
+        })
+
+    def test_it_starts_out_unknown_rather_than_zero(self):
+        self.assertIsNone(bridge._state["sstate"])
+
+    def test_a_scenequeue_event_does_not_publish_a_half_built_tally(self):
+        bridge._observe(_task_event(
+            "sceneQueueTaskStarted", "/l/busybox_1.36.bb", "do_populate_sysroot",
+            stats=self._stats(setscene_covered=3, setscene_notcovered=0,
+                              setscene_total=450, skipped=0)))
+        self.assertIsNone(bridge._state["sstate"])
+
+    def test_every_runqueue_event_type_publishes_it(self):
+        for name in ("runQueueTaskStarted", "runQueueTaskCompleted",
+                      "runQueueTaskFailed", "runQueueTaskSkipped"):
+            bridge._state["sstate"] = None
+            bridge._observe(_task_event(
+                name, "/l/a_1.0.bb", "do_compile",
+                stats=self._stats(setscene_covered=7, setscene_notcovered=1,
+                                  setscene_total=8, skipped=9)))
+            self.assertEqual(bridge._state["sstate"]["covered"], 7, name)
+
+    def test_a_later_event_refreshes_it(self):
+        # Hash equivalence can reopen the scene queue mid-build, so this keeps
+        # tracking rather than latching on the first value it sees.
+        bridge._observe(_task_event(
+            "runQueueTaskCompleted", "/l/a_1.0.bb", "do_compile",
+            stats=self._stats(setscene_covered=10, setscene_total=20, skipped=5)))
+        bridge._observe(_task_event(
+            "runQueueTaskCompleted", "/l/b_2.0.bb", "do_compile",
+            stats=self._stats(setscene_covered=14, setscene_total=20, skipped=9)))
+        self.assertEqual(bridge._state["sstate"]["covered"], 14)
+        self.assertEqual(bridge._state["sstate"]["skipped"], 9)
+
+    def test_a_stats_object_without_the_coverage_fields_leaves_it_unknown(self):
+        # Some other bitbake, or a schema surprise: all four fields or none,
+        # since a partial tally reads as a real, terrible hit rate.
+        stats = _event("Stats", completed=3, total=10)
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile", stats=stats))
+        self.assertIsNone(bridge._state["sstate"])
+        # ...and the build-wide counter it does understand still landed.
+        self.assertEqual(bridge._state["progress"], {"done": 3, "total": 10})
+
+    def test_a_partially_populated_stats_object_publishes_nothing(self):
+        stats = _event("Stats", completed=0, total=10, setscene_covered=5,
+                       setscene_total=10)
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile", stats=stats))
+        self.assertIsNone(bridge._state["sstate"])
+
+    def test_a_non_integer_coverage_value_publishes_nothing(self):
+        for bad in (None, "12", 4.5, True):
+            bridge._state["sstate"] = None
+            bridge._observe(_task_event(
+                "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile",
+                stats=self._stats(setscene_covered=bad, setscene_total=10)))
+            self.assertIsNone(bridge._state["sstate"], repr(bad))
+
+    def test_coverage_never_enters_recent_events(self):
+        # It is build-wide state, not a per-event fact; repeating it 50 times
+        # over would crowd out the ring's actual contents.
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile",
+            stats=self._stats(setscene_covered=1, setscene_total=2, skipped=3)))
+        self.assertEqual(len(bridge._state["recent_events"]), 1)
+        self.assertNotIn("sstate", bridge._state["recent_events"][0])
+
+    def test_it_survives_the_end_of_the_build(self):
+        # Unlike task_progress, this describes what already happened, so it
+        # stays true (and useful) next to a terminal status.
+        bridge._observe(_task_event(
+            "runQueueTaskCompleted", "/l/a_1.0.bb", "do_compile",
+            stats=self._stats(setscene_covered=412, setscene_total=450)))
+        bridge._finish("success")
+        self.assertEqual(bridge._state["sstate"]["covered"], 412)
 
 
 class FinishTest(BridgeTestCase):
@@ -602,11 +788,80 @@ class _HandlerFixture:
         self.thread.join(timeout=5)
 
 
+class ServedPayloadTest(BridgeTestCase):
+    """What a poller actually receives, over real HTTP -- not just what
+    _state holds."""
+
+    def setUp(self):
+        super().setUp()
+        bridge._terminal_fetched.clear()
+        self.fixture = _HandlerFixture()
+        self.addCleanup(self.fixture.close)
+
+    def _payload(self):
+        status, body = self.fixture.get("/")
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def test_a_task_is_re_aged_at_serve_time_not_at_its_last_report(self):
+        # The whole point: a task that reports once and then goes quiet for
+        # ten minutes must not serve a ten-minute-old "0s". TaskProgress
+        # genuinely does go quiet (a fetch counting objects fires rarely).
+        bridge._observe(_event("TaskStarted", pid=201,
+                                taskfile="/l/systemd_257.bb", taskname="do_compile"))
+        bridge._observe(_event("TaskProgress", pid=201, progress=42, rate=None))
+        self.assertEqual(bridge._state["task_progress"][0]["elapsed"], 0)
+        recipe, task, started = bridge._task_pids[201]
+        bridge._task_pids[201] = (recipe, task, started - 600)
+        self.assertEqual(self._payload()["task_progress"][0]["elapsed"], 600)
+
+    def test_serving_does_not_resurrect_a_finished_task(self):
+        # do_GET rebuilds task_progress; that rebuild must stay driven by
+        # what is REPORTING, so a task that ended stays gone...
+        bridge._observe(_event("TaskStarted", pid=202, taskfile="/l/a_1.0.bb",
+                                taskname="do_compile"))
+        bridge._observe(_event("TaskProgress", pid=202, progress=42, rate=None))
+        bridge._observe(_event("TaskSucceeded", pid=202, taskfile="/l/a_1.0.bb",
+                                taskname="do_compile"))
+        self.assertEqual(self._payload()["task_progress"], [])
+
+    def test_serving_does_not_list_a_task_that_never_reported(self):
+        # ...and a running task with nothing to say about itself is still not
+        # listed, which is what keeps the field meaningful on a build whose
+        # recipes are all plain make-based.
+        bridge._observe(_event("TaskStarted", pid=203, taskfile="/l/plain_1.0.bb",
+                                taskname="do_compile"))
+        self.assertEqual(self._payload()["task_progress"], [])
+
+    def test_sstate_coverage_is_in_the_served_json(self):
+        self.assertIsNone(self._payload()["sstate"])
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile",
+            stats=_Stats(completed=1, total=3170, setscene_covered=412,
+                         setscene_notcovered=38, setscene_total=450,
+                         skipped=1204)))
+        self.assertEqual(self._payload()["sstate"], {
+            "covered": 412, "notcovered": 38, "total": 450, "skipped": 1204,
+        })
+
+
 class TerminalStatusLingerTest(BridgeTestCase):
     """Pins TODO.md item 31's fix at the HTTP-handler level: do_GET() only
     flips _terminal_fetched after a client has actually received a
     terminal-status body -- never for "building", never for a 404 (or any
-    other request this handler doesn't serve with a 200 JSON body)."""
+    other request this handler doesn't serve with a 200 JSON body).
+
+    Every assertion here waits rather than sampling. do_GET sets the flag
+    AFTER the body write, deliberately -- item 31's whole point is that a
+    terminal status has actually REACHED a client -- so the client is often
+    back from read() before the handler thread gets there, and an immediate
+    is_set() is a coin flip. The negative direction needs the same treatment
+    for the opposite reason: an instant check passes just as happily against
+    a handler that sets the flag a millisecond late, which is the bug those
+    tests exist to catch."""
+
+    _FLAG_TIMEOUT = 5.0
+    _NOT_SET_GRACE = 0.25
 
     def setUp(self):
         super().setUp()
@@ -621,27 +876,27 @@ class TerminalStatusLingerTest(BridgeTestCase):
         status, body = self.fixture.get("/")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "building")
-        self.assertFalse(bridge._terminal_fetched.is_set())
+        self.assertFalse(bridge._terminal_fetched.wait(self._NOT_SET_GRACE))
 
     def test_a_fetch_after_success_sets_the_flag(self):
         bridge._finish("success")
         status, body = self.fixture.get("/")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "success")
-        self.assertTrue(bridge._terminal_fetched.is_set())
+        self.assertTrue(bridge._terminal_fetched.wait(self._FLAG_TIMEOUT))
 
     def test_a_fetch_after_failed_sets_the_flag(self):
         bridge._finish("failed")
         status, body = self.fixture.get("/")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "failed")
-        self.assertTrue(bridge._terminal_fetched.is_set())
+        self.assertTrue(bridge._terminal_fetched.wait(self._FLAG_TIMEOUT))
 
     def test_a_404_never_sets_the_flag_even_when_status_is_terminal(self):
         bridge._finish("success")
         status, body = self.fixture.get("/nonexistent")
         self.assertEqual(status, 404)
-        self.assertFalse(bridge._terminal_fetched.is_set())
+        self.assertFalse(bridge._terminal_fetched.wait(self._NOT_SET_GRACE))
 
     def test_an_unserved_method_never_sets_the_flag_even_when_terminal(self):
         # _Handler.do_HEAD() is a fixed 405 -- it never reaches the
@@ -649,7 +904,7 @@ class TerminalStatusLingerTest(BridgeTestCase):
         bridge._finish("success")
         status = self.fixture.head("/")
         self.assertEqual(status, 405)
-        self.assertFalse(bridge._terminal_fetched.is_set())
+        self.assertFalse(bridge._terminal_fetched.wait(self._NOT_SET_GRACE))
 
 
 class MainTerminalLingerTest(BridgeTestCase):

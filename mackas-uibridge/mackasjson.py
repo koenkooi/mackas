@@ -133,6 +133,9 @@ _state = {
     "distro": None,
     "current": {"recipe": None, "task": None},
     "progress": {"done": 0, "total": 0},
+    # How much of this build sstate could cover -- see _observe_sstate. null
+    # until the scene queue has settled, never a half-built tally.
+    "sstate": None,
     # Only genuine task failures, never setscene ones -- see _observe.
     "failed_tasks": [],
     "failed_count": 0,
@@ -179,7 +182,9 @@ _state = {
 # recorded there, at twice the volume.
 # ---------------------------------------------------------------------------
 
-# pid -> (recipe, task), from TaskStarted; dropped when the task ends.
+# pid -> (recipe, task, started), from TaskStarted; dropped when the task
+# ends. `started` is time.time() at the event, which is what makes a task's
+# own age reportable -- an observation, never an estimate of what is left.
 _task_pids = {}
 # pid -> {"percent": int|None, "rate": str|None}, from TaskProgress. Only
 # tasks that have actually reported anything appear here, so a build whose
@@ -203,15 +208,22 @@ def _publish_task_progress():
 
     Rebuilt wholesale rather than patched incrementally so the served value
     can never outlive the tasks it describes: an entry is present exactly
-    while its pid is both running and reporting."""
+    while its pid is both running and reporting. Also re-run on every GET, so
+    `elapsed` is measured against the clock at serve time rather than frozen
+    at whenever the task last had a percentage to report."""
+    now = time.time()
     out = []
     for pid, report in _task_reports.items():
-        recipe, task = _task_pids.get(pid, (None, None))
+        recipe, task, started = _task_pids.get(pid, (None, None, None))
         out.append({
             "recipe": recipe,
             "task": task,
             "percent": report["percent"],
             "rate": report["rate"],
+            # Wall seconds since this task started. Unlike a build-wide ETA
+            # this cannot be wrong -- it is an observation -- and it is the
+            # only scale a null percent has.
+            "elapsed": None if started is None else max(0, int(now - started)),
         })
     _state["task_progress"] = out
 
@@ -222,7 +234,9 @@ def _track_task(pid, recipe, task):
     with _lock:
         if pid not in _task_pids:
             _evict_oldest(_task_pids, MAX_TASK_PROGRESS)
-        _task_pids[pid] = (recipe, task)
+        # Unconditional, so a reused pid starts its clock over rather than
+        # inheriting the age of whatever task held it before.
+        _task_pids[pid] = (recipe, task, time.time())
 
 
 def _untrack_task(pid):
@@ -316,6 +330,40 @@ def _set_machine(server):
             pass
 
 
+# JSON key -> RunQueueStats attribute (bb/runqueue.py). All four or none:
+# a partially-populated tally would read as a real, terrible sstate hit rate.
+SSTATE_FIELDS = (
+    ("covered", "setscene_covered"),
+    ("notcovered", "setscene_notcovered"),
+    ("total", "setscene_total"),
+    ("skipped", "skipped"),
+)
+
+
+def _observe_sstate(stats):
+    """Record how much of this build sstate covered, from a runQueue event.
+
+    Only runQueue ones: bb/runqueue.py sets sqdone before it ever asks the
+    scheduler for a real task, so these counts have settled by the first one,
+    whereas a sceneQueue event still carries a tally being built up. It keeps
+    updating rather than latching, since hash equivalence can reopen the
+    scene queue mid-build.
+
+    `covered`/`notcovered`/`total` are setscene tasks -- unambiguously sstate.
+    `skipped` is real tasks that did not have to run, which is mostly sstate
+    but also counts already-current stamps, hence served alongside rather
+    than as the sstate number."""
+    values = {}
+    for key, attr in SSTATE_FIELDS:
+        value = getattr(stats, attr, None)
+        # bool is an int subclass; nothing here is ever a flag.
+        if not isinstance(value, int) or isinstance(value, bool):
+            return
+        values[key] = value
+    with _lock:
+        _state["sstate"] = values
+
+
 def _record(event_type, **fields):
     """Update the shared state under lock. Called only from the event tee,
     a single thread, but the HTTP handler thread reads concurrently."""
@@ -385,6 +433,8 @@ def _observe(event):
             if stats is not None:
                 fields["done"] = stats.completed
                 fields["total"] = stats.total
+                if name.startswith("runQueue"):
+                    _observe_sstate(stats)
             _record(name, **fields)
         elif name == "TaskStarted":
             # bb.build.TaskStarted, not the runQueue one: this is the event
@@ -416,6 +466,8 @@ def _observe(event):
             if stats is not None:
                 fields["done"] = stats.completed
                 fields["total"] = stats.total
+                if name.startswith("runQueue"):
+                    _observe_sstate(stats)
             _record(name, **fields)
     except Exception:
         # Best-effort observation only -- never let a schema surprise here
@@ -467,6 +519,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         with _lock:
             status = _state["status"]
+            # Re-age the running tasks against the clock now, not whenever
+            # they last reported: TaskProgress can go quiet for minutes (a
+            # "busy" fetch counting objects), and a frozen age is exactly the
+            # reading this field exists to disprove.
+            _publish_task_progress()
             body = json.dumps(_state).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
