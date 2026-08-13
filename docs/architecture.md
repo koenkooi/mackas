@@ -423,8 +423,9 @@ container-side targets.
 `tools/mackas-monitor` is the host-side poller `mackas monitor` runs —
 stdlib Python, polling `http://127.0.0.1:<port>/` every 2 s
 (`MACKAS_MONITOR_POLL_INTERVAL`) and printing a
-`[status] done/total  recipe:task` line plus percent, elapsed time, how far
-along the running task itself is where bitbake reports that, and any
+`[status] done/total  recipe:task` line plus percent, elapsed time, sstate
+coverage once the run queue has settled, how far along and how long the
+running task itself has been at it where bitbake reports that, and any
 failures so far, until the
 build reports `success`/`failed`, or once with `--once`. On a terminal it
 redraws one line in place; piped, it prints only lines that changed. It only
