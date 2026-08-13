@@ -12,6 +12,17 @@ signing identity and a release cadence that has nothing to do with the CLI's.
 The bridge is a stable HTTP contract precisely so the two can be versioned
 apart.
 
+**Before building against this bridge at all, check whether you actually
+need it.** If the only thing your consumer wants is "tell me when this build
+finished" — a script, a CI-style caller, a Claude Code workflow — the
+build's own exit code is a more reliable signal than anything the bridge can
+give: it covers kas-level failures the bridge never sees, and (for
+`smoketest`) it isn't fooled by the parse-only first rung reaching `success`
+before any real build starts. `mackas monitor --help`'s "A DONE-SIGNAL
+WITHOUT POLLING" section spells out the pattern. The bridge earns its keep
+for genuine *progress* — a menubar app, a live percentage, a human watching
+— which is what the rest of this document is actually scoped to.
+
 ## What already exists, before you write anything
 
 - **The bridge** — `mackas-uibridge/mackasjson.py`, a bitbake UI module that

@@ -554,6 +554,20 @@ def main(argv=None):
                          "MACKAS_MONITOR_NOTIFY=1. See NOTIFICATIONS below -- "
                          "osascript notifications are silently dropped until "
                          "the terminal has a Notification Center entry.")
+    p.add_argument("--wait-for-start", type=float, default=0.0, metavar="SECONDS",
+                    help="tolerate the bridge not being up yet for up to "
+                         "SECONDS before giving up, instead of failing on the "
+                         "first unreachable poll (0, the default: today's "
+                         "behavior). Makes it possible to launch this at the "
+                         "same moment as the build it watches, rather than "
+                         "needing to already know the bridge is live -- kas's "
+                         "checkout/patch/container-start plus reaching "
+                         "bitbake can take anywhere from seconds to minutes. "
+                         "Only covers the FIRST connection: once the bridge "
+                         "has answered even once, a later failure is reported "
+                         "immediately, exactly as without this flag -- a "
+                         "bridge that goes away mid-build is a real problem, "
+                         "not a startup race.")
     args = p.parse_args(argv)
 
     want_notify = args.notify or os.environ.get("MACKAS_MONITOR_NOTIFY", "0") == "1"
@@ -566,6 +580,9 @@ def main(argv=None):
     # asks the runtime anything.
     host, port = LOOPBACK, args.port
     asked_runtime = False
+    ever_connected = False
+    wait_deadline = time.monotonic() + args.wait_for_start if args.wait_for_start > 0 else None
+    waiting_notice_printed = False
 
     try:
         while True:
@@ -578,17 +595,35 @@ def main(argv=None):
                 ):
                     asked_runtime = True
                     direct = resolve_direct_endpoint(args.port)
-                if direct is None:
-                    print(connection_error_message(port, exc, host), file=sys.stderr)
-                    return EXIT_UNREACHABLE
-                host, port = direct
-                print(
-                    f"{LOOPBACK}:{args.port} reset the connection (Apple "
-                    f"container's port-forward); polling the container "
-                    f"directly at {host}:{port}",
-                    file=sys.stderr,
-                )
-                continue
+                if direct is not None:
+                    host, port = direct
+                    print(
+                        f"{LOOPBACK}:{args.port} reset the connection (Apple "
+                        f"container's port-forward); polling the container "
+                        f"directly at {host}:{port}",
+                        file=sys.stderr,
+                    )
+                    continue
+                # The startup grace only ever covers the FIRST connection --
+                # once the bridge has answered once, this is a real failure,
+                # not a race, and is reported immediately exactly as before.
+                if (
+                    not ever_connected
+                    and wait_deadline is not None
+                    and time.monotonic() < wait_deadline
+                ):
+                    if not waiting_notice_printed:
+                        print(
+                            f"waiting up to {args.wait_for_start:g}s for the "
+                            f"bridge at {host}:{port} to come up...",
+                            file=sys.stderr,
+                        )
+                        waiting_notice_printed = True
+                    time.sleep(POLL_INTERVAL)
+                    continue
+                print(connection_error_message(port, exc, host), file=sys.stderr)
+                return EXIT_UNREACHABLE
+            ever_connected = True
             render(state, ctx)
             if want_notify:
                 message = transition_message(prev_status, state)

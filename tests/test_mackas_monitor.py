@@ -29,11 +29,16 @@
 #     monkeypatched with canned output, the same way tests/test_overhead.py
 #     fakes `ps`, and the inspect payload below is the real shape read off a
 #     running kas build.
+#   * --wait-for-start -- the poll loop tolerates the bridge not being up
+#     yet, but only before the first successful fetch; a failure after that
+#     is still immediate. time.monotonic/time.sleep are monkeypatched (a
+#     deterministic counter and a no-op) so this is instant, not a real wait.
 
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import itertools
 import json
 import os
 import unittest
@@ -540,6 +545,90 @@ class PollLoopFallbackTest(unittest.TestCase):
         self.assertEqual(
             urlopen.call_args_list[1][0][0], "http://192.168.64.76:8801/"
         )
+
+
+class WaitForStartTest(unittest.TestCase):
+    """--wait-for-start: tolerate the bridge not being up yet, but only
+    before the first successful fetch -- issue R1 from the monitor UX
+    review. time.monotonic is a deterministic counter (each call advances
+    by 1) and time.sleep is a no-op, so a "wait N seconds" test costs
+    nothing real."""
+
+    def _main(self, urlopen, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mon.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(mon.time, "monotonic", side_effect=itertools.count()), \
+                mock.patch.object(mon.time, "sleep"), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mon.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_default_is_unchanged_fail_on_the_first_poll(self):
+        # No --wait-for-start at all: today's behavior, byte for byte.
+        urlopen = mock.Mock(side_effect=ConnectionRefusedError(61, "refused"))
+        rc, _, err = self._main(urlopen, ["--port", "8801", "--once"])
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertNotIn("waiting up to", err)
+
+    def test_retries_until_the_bridge_answers_within_the_grace(self):
+        urlopen = mock.Mock(side_effect=[
+            ConnectionRefusedError(61, "refused"),
+            ConnectionRefusedError(61, "refused"),
+            _FakeResponse(BRIDGE_JSON),
+        ])
+        rc, out, err = self._main(
+            urlopen, ["--port", "8801", "--once", "--wait-for-start", "10"]
+        )
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertIn("[building] 3/10  busybox:do_compile", out)
+        # The "still waiting" notice prints, but once, not per retry.
+        self.assertEqual(err.count("waiting up to 10s"), 1)
+
+    def test_gives_up_once_the_grace_deadline_passes(self):
+        urlopen = mock.Mock(side_effect=ConnectionRefusedError(61, "refused"))
+        rc, _, err = self._main(
+            urlopen, ["--port", "8801", "--once", "--wait-for-start", "3"]
+        )
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        self.assertIn("nothing is listening on 127.0.0.1:8801", err)
+        # It genuinely retried (more than the single bare-default attempt)
+        # before giving up -- the grace was not simply ignored.
+        self.assertGreater(urlopen.call_count, 1)
+
+    def test_grace_does_not_apply_after_a_successful_connection(self):
+        # A bridge that answers once and then goes away mid-build is a real
+        # failure, not a startup race -- must not be retried under the same
+        # grace, even with plenty of it left.
+        urlopen = mock.Mock(side_effect=[
+            _FakeResponse(BRIDGE_JSON),  # first poll: a real, non-terminal read
+            ConnectionRefusedError(61, "refused"),  # then it's gone
+        ])
+        rc, _, err = self._main(
+            urlopen, ["--port", "8801", "--wait-for-start", "60"]
+        )
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertIn("nothing is listening", err)
+
+    def test_a_reset_still_tries_the_container_address_before_waiting(self):
+        # The existing reset-resolution fallback stays the first thing
+        # tried; the startup grace is what happens when THAT can't help
+        # either, not a replacement for it.
+        urlopen = mock.Mock(side_effect=[
+            ConnectionResetError(54, "reset"),
+            _FakeResponse(BRIDGE_JSON),
+        ])
+        run = mock.Mock(side_effect=fake_container())
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run", run):
+            rc, _, err = self._main(
+                urlopen, ["--port", "8801", "--once", "--wait-for-start", "10"]
+            )
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertIn("192.168.64.76:8801", err)
+        self.assertNotIn("waiting up to", err)
 
 
 if __name__ == "__main__":
