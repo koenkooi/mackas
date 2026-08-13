@@ -284,6 +284,49 @@ def _format_elapsed(seconds):
     return f"{m}:{s:02d}"
 
 
+# How many concurrently-reporting tasks the progress line names before it
+# collapses the rest into "+N more". Two keeps the line short enough to stay
+# readable when it is redrawn in place, and a parallel build rarely has more
+# than a couple of instrumented tasks running at once anyway.
+MAX_SHOWN_TASK_PROGRESS = 2
+
+
+def describe_task_progress(state, limit=MAX_SHOWN_TASK_PROGRESS):
+    """Progress from INSIDE the running tasks that report any, or "".
+
+    The build-wide counter cannot move while one large `do_compile` grinds;
+    this is the only thing that can say that recipe is at 42% rather than
+    wedged. It names its own recipe:task rather than assuming `current`,
+    because the task that is reporting is very often not the most recent task
+    *event* -- a long instrumented compile is precisely the one other tasks
+    start and finish around.
+
+    A null `percent` is bitbake's "progress is happening but we cannot say
+    how much" (git counting objects, for one), which reads as `busy`: the
+    entry existing at all is the useful part. Empty string means say nothing,
+    the same rule the notification bodies follow."""
+    entries = [e for e in (state.get("task_progress") or []) if isinstance(e, dict)]
+    shown = []
+    for entry in entries[:limit]:
+        what = f"{entry.get('recipe') or '?'}:{entry.get('task') or '?'}"
+        percent = entry.get("percent")
+        # bool is an int subclass; a stray True must not render as "1%".
+        if isinstance(percent, (int, float)) and not isinstance(percent, bool):
+            detail = f"{int(percent)}%"
+        else:
+            detail = "busy"
+        rate = entry.get("rate")
+        if rate:
+            detail += f" at {rate}"
+        shown.append(f"{what} {detail}")
+    if not shown:
+        return ""
+    extra = len(entries) - len(shown)
+    if extra > 0:
+        return f"{', '.join(shown)} +{extra} more"
+    return ", ".join(shown)
+
+
 def new_render_context():
     """Per-run state render() needs that a single JSON payload does not
     carry: when the build actually started (progress.total jumps between
@@ -322,13 +365,17 @@ def render(state, ctx):
         done = progress.get("done", 0)
         total = progress.get("total", 0)
         # The core "[status] done/total  recipe:task" shape is unchanged --
-        # percent/elapsed/failures are appended after it, never inserted
-        # into it, so anything that greps for that substring still matches.
+        # percent/elapsed/sub-task progress/failures are appended after it,
+        # never inserted into it, so anything that greps for that substring
+        # still matches.
         line = f"[{status}] {done}/{total}  {recipe}:{task}"
         if total:
             line += f"  {done * 100 // total}%"
         if ctx["started_at"] is not None:
             line += f"  {_format_elapsed(time.monotonic() - ctx['started_at'])}"
+        inside = describe_task_progress(state)
+        if inside:
+            line += f"  ({inside})"
         failed = state.get("failed_count") or 0
         if failed and status == "building":
             line += f"  ({failed} failed so far)"
