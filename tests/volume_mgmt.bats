@@ -1248,18 +1248,37 @@ break_volume() {
 	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
 }
 
-@test "volume fsck: declining the repair confirmation leaves everything untouched" {
+@test "volume fsck: a clean check runs with no confirmation needed at all" {
+	# The clone-and-check step is never gated on a y/N answer -- it never
+	# touches the real volume, so there is nothing to ask permission for.
+	# No -y and stdin not a tty; if a confirmation were still required here,
+	# confirm() would decline it outright and this would fail.
+	have_volume oe-build-tmp 120G 8192
+	MOCK_FSCK_STATE=clean vol fsck oe-build-tmp
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "clean -- no repair needed"
+	assert_call "[--cap-add] [CAP_SYS_ADMIN]"
+	refute_call "[mv]"
+}
+
+@test "volume fsck: the check and repair rehearsal run without asking; only promotion needs confirmation" {
 	have_volume oe-build-tmp 120G 8192
 	local before_sum; before_sum="$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')"
-	# No -y, stdin not a tty => confirm() declines at GATE 1, before any clone
-	# is even made.
+	# No -y, stdin not a tty: the clone, the check and the repair rehearsal
+	# all run on their own (nothing to ask about -- '$name' itself is never
+	# touched by any of them). The ONLY question is whether to promote the
+	# rehearsed repair, and with no -y and no tty confirm() declines that one.
 	MOCK_FSCK_STATE=dirty-repairable vol fsck oe-build-tmp
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi "left unchanged"
+	# The repair rehearsal DID run against the clone (this is the behavior
+	# change from before: it is no longer gated behind a confirmation).
+	assert_call "[--cap-add] [CAP_SYS_ADMIN]"
+	# But the real volume was never promoted -- still untouched, and the
+	# rehearsed copy is left in place for inspection rather than discarded.
 	[ "$(shasum "$(VOLDIR)/oe-build-tmp/volume.img" | awk '{print $1}')" = "$before_sum" ]
 	[ -z "$(ls "$(VOLDIR)/oe-build-tmp"/volume.img.mackas-corrupt-* 2>/dev/null)" ]
-	[ -z "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
-	refute_call "[-v] [--cap-add]"
+	[ -n "$(ls -d "$(VOLDIR)/oe-build-tmp"/.mackas-fsck-* 2>/dev/null)" ]
 }
 
 @test "volume fsck all: skips a volume a running container holds, still handles the others" {
@@ -1307,17 +1326,13 @@ break_volume() {
 	! grep -qF -- '-v "$dir:/vol"' "$MACKAS"
 	! grep -qF -- '-v "$img:/vol"' "$MACKAS"
 
-	# Behavioral half: confirm() declines outright whenever stdin is not a
-	# real tty (checked BEFORE it ever reads a reply -- see mackas:229-250),
-	# which a bats test can never fake with piped input, so a hermetic test
-	# cannot sequence "yes to gate 1, no to gate 2" here. Verify the
-	# invariant instead at the PROCESS level, on a run where the container
-	# genuinely IS invoked and the repair genuinely IS promoted (-y, same
-	# scenario as "corruption is detected, backed up, rehearsed... and
-	# promoted" above): the real $CLOG argv the container actually received
-	# must never carry the volume's own name -- only the scratch clone's
-	# path -- proving the mount target really is what protects the original,
-	# not merely that this run happened to decline before reaching it.
+	# Behavioral half, at the PROCESS level: on a run where the container
+	# genuinely IS invoked and the repair genuinely IS promoted (-y carries
+	# it through the one remaining confirmation, promotion -- same scenario
+	# as "corruption is detected, backed up, rehearsed... and promoted"
+	# above), the real $CLOG argv the container actually received must
+	# never carry the volume's own name -- only the scratch clone's path --
+	# proving the mount target really is what protects the original.
 	have_volume oe-build-tmp 120G 8192
 	MOCK_FSCK_STATE=dirty-repairable vol -y fsck oe-build-tmp
 	[ "$status" -eq 0 ]

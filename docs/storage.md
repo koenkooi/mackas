@@ -299,11 +299,10 @@ build, a non-default `brew --prefix`), falling back to asking `brew`
 directly where a keg-only `e2fsprogs` actually lives, never a hardcoded
 path — `volume fsck` runs it straight against the APFS clone: no throwaway
 container, no network, no `apt-get`. Everything else about the design
-(clone first, original never touched, two separate confirmations, the
-rehearsal before promotion) is identical either way; only *how* `e2fsck`
-gets invoked differs. `volume fsck`'s own plan report says which path will
-run, before it asks for the first confirmation (`status` and `check` do not
-report it).
+(clone first, original never touched, the rehearsal before promotion) is
+identical either way; only *how* `e2fsck` gets invoked differs. `volume
+fsck`'s own plan report says which path will run, printed before the clone
+and check start (`status` and `check` do not report it).
 
 The two optional host tools this document mentions are **separate installs,
 and only one of them is a `brew` package.** The ext4 dirty-bit check (below)
@@ -323,7 +322,9 @@ as ext4 before any command runs — the same fact that rules out an in-place
 resize also rules out ever getting `e2fsck` unmounted access this way, and a
 dirty journal (near-certain after a crash mid-write) would auto-replay — a
 write — the moment anything, even a read-only check, tried to mount it.
-Instead:
+Instead, none of it gated on a confirmation — the real `volume.img` is
+never at risk until step 5, so there is nothing to ask permission for
+before then:
 
 1. `cp -c` (an APFS clonefile, same directory so it is a genuine
    copy-on-write clone, not a slow full copy) `volume.img` into a scratch
@@ -342,11 +343,11 @@ Instead:
 4. `e2fsck -f -y` repairs the clone; an independent second `e2fsck -f -n`
    pass must then come back completely clean before mackas will even offer
    to promote it — the rehearsal the whole design rests on.
-5. Only after that rehearsal succeeds does a **second**, separate
-   confirmation offer to promote the repaired clone over the real
-   `volume.img` (`ln` then an atomic same-filesystem `mv -f`, interrupts
-   blocked across the window — the same care `volume move` takes over its
-   own transfer). The pre-repair image is kept alongside it afterwards,
+5. Only after that rehearsal succeeds does a confirmation offer to promote
+   the repaired clone over the real `volume.img` (`ln` then an atomic
+   same-filesystem `mv -f`, interrupts blocked across the window — the
+   same care `volume move` takes over its own transfer). The pre-repair
+   image is kept alongside it afterwards,
    forever — mackas never deletes it, not even with `-y` — as the one undo
    a mistaken repair would need; `volume list` reports it until removed by
    hand.
