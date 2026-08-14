@@ -9,14 +9,20 @@
 # These drive `mackas retrieve` as a subprocess with a fake `container` on
 # PATH that records every call and MODELS the two things that matter here: the
 # combined existence+size probe (`... sh -c "[ -d ... ] || exit 1; du -sk
-# ..."`), and the copy itself (`... sh -c 'tar -S -C ... -cf - . | tar -S -C
-# ... -xf -'` -- a piped tar, not `cp -r`: a real >18G deploy image came back
-# with the right size but wrong content via `cp -r`, so fetch_tmp_subdir was
-# moved to a copy that cannot take `cp`'s copy_file_range()/reflink fast path
-# at all; `-S` keeps the sparse-file win a plain pipe would otherwise lose)
-# which actually populates the host --dest so `buildstats analyze` (tested
-# separately in buildstats_analyze.bats) would have real files to chew on. It
-# also models `container ls` / `container inspect` so the one-VM refusal can
+# ..."`), and the copy itself -- `cp -r` (fast) plus a checksum manifest of
+# what it just copied, VERIFIED against retrieve_verify_local()'s own
+# manifest of the real destination (unmocked -- it runs for real against
+# whatever actually landed in --dest), falling back to a piped `tar -S` copy
+# on a mismatch. A real >18G deploy image once came back from `cp -r` with
+# the right size but wrong content, which is what this whole verify/fallback
+# dance exists for; see fetch_tmp_subdir's own comment for the fuller story.
+# The mock extracts retrieve_verify_local() fresh from $REAL_MACKAS to
+# generate the "source" side of that comparison, rather than a hand-rolled
+# stand-in -- the real function must agree with itself against identical
+# content, which a second implementation could silently drift from. It also
+# actually populates the host --dest so `buildstats analyze` (tested
+# separately in buildstats_analyze.bats) would have real files to chew on,
+# and models `container ls` / `container inspect` so the one-VM refusal can
 # be exercised. Nothing touches the real Apple container runtime, a volume,
 # or the build SSD.
 
@@ -39,6 +45,12 @@ setup() {
 
 	CLOG="$TESTDIR/container.log"
 	export CLOG
+
+	# The mock (a separate process) needs the real script's path to extract
+	# retrieve_verify_local() from it at runtime -- see the copy handler
+	# below for why reusing the real function, not a hand-rolled mock
+	# algorithm, matters here.
+	export REAL_MACKAS="$MACKAS"
 
 	# retrieve buildstats nests each retrieval under its own timestamp
 	# (fetch_tmp_subdir's EXTRA param -- see cmd_retrieve) so successive
@@ -172,38 +184,91 @@ case "${@: -1}" in
 		;;
 esac
 
-# The copy: `... sh -c "mkdir -p '/out/<sub>' && tar -S -C '<guest>' -cf - . |
-# tar -S -C '/out/<sub>' -xf -"`. destsub (the mackas-facing object key, e.g.
-# "deploy") and guestsub (the resolved guest path's own basename, or -- for
-# item 24's nested deploy/images object specifically -- its path relative to
-# the fixture root) are extracted independently -- they can differ when
+# destsub/guestdir/guestsub extraction is shared by both branches below --
+# destsub is the mackas-facing object key (e.g. "deploy"), guestsub is the
+# resolved guest path's own basename, or -- for item 24's nested
+# deploy/images object specifically -- its path relative to the fixture
+# root. They are extracted independently because they can differ when
 # bitbake-getvar resolves a distro-redefined path, and the destination must
-# be named after destsub regardless. The mock still uses `cp -r` to populate
-# the fixture data (a plain copy is fine for a test double); only the real
-# retrieved shape has to match what fetch_tmp_subdir now actually runs.
+# be named after destsub regardless.
 last="${@: -1}"
+resolve_destsub_guestsub() {
+	# $1: the sh -c string, $2: the pattern marking where the guest path
+	# starts (e.g. "cp -r '"), $3: the pattern immediately after it (e.g.
+	# "/\\.'" -- cp -r's 'GUEST/.' trick). $3 disambiguates the fallback's
+	# tar command specifically: it has TWO "tar -S -C '" occurrences (its
+	# own source -C and destination -C), and a bare greedy sed match picks
+	# the LAST one -- the destination, wrongly -- without an anchor that
+	# only the source's trailing text (' -cf) satisfies. $4, if given, is
+	# an alternate destsub-extraction pattern for shapes with no "mkdir -p
+	# '/out/...'" of their own (the fallback's mkdir happens as a separate
+	# HOST-side `run mkdir -p` before the container, not embedded in this
+	# string) -- default "mkdir -p '/out/" for the primary path, which does
+	# embed it. Only the FIRST line of $1 matters (the mkdir -p/copy
+	# command) -- $1 can now be many lines long (the primary path embeds
+	# retrieve_verify_script's whole heredoc after it), and sed's default
+	# per-line pass-through would otherwise leak every OTHER line of that
+	# script straight into destsub/guestdir via the command substitutions
+	# below.
+	local first_line destsub_pat="$4"
+	[ -n "$destsub_pat" ] || destsub_pat="mkdir -p '/out/"
+	first_line="$(printf '%s\n' "$1" | head -1)"
+	destsub="$(printf '%s\n' "$first_line" | sed -E "s#.*$destsub_pat([^']*)'.*#\1#")"
+	guestdir="$(printf '%s\n' "$first_line" | sed -E "s#.*$2([^']*)$3.*#\1#")"
+	case "$guestdir" in
+		*/deploy/images|*/deploy/images/*)
+			guestsub="deploy/images${guestdir#*/deploy/images}"
+			;;
+		*) guestsub="${guestdir##*/}" ;;
+	esac
+}
+
 case "$last" in
-	*"tar -S -C"*"-cf - . | tar -S -C"*)
-		destsub="$(printf '%s\n' "$last" | sed -E "s#.*mkdir -p '/out/([^']*)'.*#\1#")"
-		guestdir="$(printf '%s\n' "$last" | sed -E "s#.*tar -S -C '([^']*)' -cf.*#\1#")"
-		case "$guestdir" in
-			*/deploy/images|*/deploy/images/*)
-				# Nested object: keep it relative to the fixture root
-				# ($FIXTURE/deploy/images[/machine]) rather than a bare
-				# basename, which would look for a same-named top-level dir
-				# that does not exist.
-				guestsub="deploy/images${guestdir#*/deploy/images}"
-				;;
-			*) guestsub="${guestdir##*/}" ;;
-		esac
-		# mkdir -p is unconditional in the REAL sh -c string (it runs before
-		# `&&`), so it is unconditional here too; only the tar half depends
-		# on a matching fixture existing (a test that just wants to see the
-		# destination land in the right place, without needing real fixture
-		# content there, still gets a real "$outdir/$destsub" directory).
+	# The primary path: cp -r, then a checksum manifest of the guest tree
+	# (fetch_tmp_subdir's own retrieve_verify_script) -- .mackas-verify-jobs
+	# is a marker string unique to that script, safe to match on.
+	*".mackas-verify-jobs"*)
+		resolve_destsub_guestsub "$last" "cp -r '" "/\\.'"
 		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
 			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+			if [ -n "${MOCK_VERIFY_CORRUPT:-}" ] || [ -n "${MOCK_VERIFY_CORRUPT_ALWAYS:-}" ]; then
+				# Simulate cp -r's rare real corruption: flip one byte in
+				# the DESTINATION after the copy, so retrieve_verify_local()
+				# (run for real, below and again unmocked by mackas itself)
+				# disagrees with the source manifest this handler prints,
+				# and fetch_tmp_subdir's fallback path actually runs.
+				f="$(find "$outdir/$destsub" -type f | head -1)"
+				[ -n "$f" ] && printf 'X' | dd of="$f" bs=1 seek=0 count=1 conv=notrunc 2>/dev/null
+			fi
+		fi
+		# The "source manifest": retrieve_verify_local(), extracted fresh
+		# from the real mackas, run against the FIXTURE it just copied
+		# FROM. mackas itself calls the identical function again afterward,
+		# unmocked, against whatever actually landed at $outdir/$destsub --
+		# same algorithm, so an uncorrupted copy agrees and a
+		# MOCK_VERIFY_CORRUPT one does not, without a second hand-written
+		# implementation to keep in sync.
+		eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$REAL_MACKAS")"
+		[ -d "$FIXTURE/$guestsub" ] && retrieve_verify_local "$FIXTURE/$guestsub"
+		exit 0
+		;;
+	# The fallback path, only reached after a verification mismatch: piped
+	# `tar -S`. The mock still uses `cp -r` to populate the fixture data (a
+	# plain copy is fine for a test double); only the real retrieved shape
+	# has to match what fetch_tmp_subdir actually runs.
+	*"tar -S -C"*"-cf - . | tar -S -C"*)
+		resolve_destsub_guestsub "$last" "tar -S -C '" "' -cf" "-C '/out/"
+		if [ -n "$outdir" ]; then
+			mkdir -p "$outdir/$destsub"
+			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+			if [ -n "${MOCK_VERIFY_CORRUPT_ALWAYS:-}" ]; then
+				# Corrupts the FALLBACK's own copy too, unlike
+				# MOCK_VERIFY_CORRUPT (primary path only) -- for the "even
+				# the safer copy disagrees" die() path, both must fail.
+				f="$(find "$outdir/$destsub" -type f | head -1)"
+				[ -n "$f" ] && printf 'X' | dd of="$f" bs=1 seek=0 count=1 conv=notrunc 2>/dev/null
+			fi
 		fi
 		exit 0
 		;;
@@ -251,6 +316,32 @@ refute_call() {
 	[ "$status" -eq 0 ]
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	printf '%s\n' "$output" | grep -qF "Retrieved to $ROOT/artifacts"
+}
+
+@test "retrieve: a checksum mismatch after cp -r falls back to the tar copy, and still succeeds" {
+	MOCK_VERIFY_CORRUPT=1 mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "'buildstats' failed verification after cp -r -- falling back"
+	printf '%s\n' "$output" | grep -qF "'buildstats' needed the tar fallback -- cp -r produced wrong content this time"
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+	# The fallback's own copy is clean in this fixture, so the final content
+	# is correct -- the point of a fallback is that it recovers, not just
+	# that it gets tried.
+	diff -r "$FIXTURE/buildstats/20260717121723" "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723"
+}
+
+@test "retrieve: no verification mismatch means no fallback and no warning" {
+	mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	refute_call "tar -S -C"
+	! printf '%s\n' "$output" | grep -qi "falling back\|fallback"
+}
+
+@test "retrieve: a mismatch that survives the tar fallback too is a hard failure, not a silent bad copy" {
+	MOCK_VERIFY_CORRUPT_ALWAYS=1 mk retrieve buildstats
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "'buildstats' still fails verification after the tar fallback"
+	printf '%s\n' "$output" | grep -qF "was left in place for inspection"
 }
 
 @test "retrieve: the copy container run uses -u 0:0 (uid 30000 cannot read root-owned paths)" {
@@ -598,7 +689,7 @@ EOF
 	mk retrieve
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'needs at least one object'
-	refute_call "tar -S"
+	refute_call "cp -r"
 }
 
 @test "retrieve: --dest with no object is still a usage error" {
@@ -622,7 +713,7 @@ EOF
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'has a build run yet'
 	# It must NOT have attempted the copy.
-	refute_call "tar -S"
+	refute_call "cp -r"
 }
 
 # ---------------------------------------------------------------------------
@@ -651,7 +742,7 @@ EOF
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'only ONE VM'
 	printf '%s\n' "$output" | grep -qF 'oe-build-sstate'
-	refute_call "tar -S"
+	refute_call "cp -r"
 }
 
 # ---------------------------------------------------------------------------
@@ -671,7 +762,7 @@ EOF
 	[ ! -d "$ROOT/artifacts/buildstats" ]
 	[ ! -d "$ROOT/artifacts" ]
 	printf '%s\n' "$output" | grep -qF 'buildstats: 4.0M to transfer'
-	refute_call "tar -S"
+	refute_call "cp -r"
 	refute_call ":/out]"
 }
 
@@ -831,7 +922,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF 'INHERIT += "buildhistory"'
 	# Not the generic per-object "skipping" wording, and not buildstats' one.
 	! printf '%s\n' "$output" | grep -qi 'has a build run yet'
-	refute_call "tar -S"
+	refute_call "cp -r"
 }
 
 @test "retrieve: buildhistory swallows bitbake-getvar's real 'not defined' wording" {
@@ -874,7 +965,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF '/build/buildhistory'
 	[ ! -d "$ROOT/artifacts/buildhistory" ]
 	[ ! -d "$ROOT/artifacts" ]
-	refute_call "tar -S"
+	refute_call "cp -r"
 	refute_call ":/out]"
 }
 
@@ -965,7 +1056,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF 'INHERIT += "create-spdx"'
 	# Not the generic per-object "skipping" wording, and not buildstats' one.
 	! printf '%s\n' "$output" | grep -qi 'has a build run yet'
-	refute_call "tar -S"
+	refute_call "cp -r"
 }
 
 @test "retrieve: sbom swallows bitbake-getvar's real 'not defined' wording" {
@@ -1010,7 +1101,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF '/build/tmp/deploy/spdx'
 	[ ! -d "$ROOT/artifacts/sbom" ]
 	[ ! -d "$ROOT/artifacts" ]
-	refute_call "tar -S"
+	refute_call "cp -r"
 	refute_call ":/out]"
 }
 
@@ -1063,7 +1154,7 @@ EOF
 	# Every object is documented, buildhistory and sbom included.
 	printf '%s\n' "$output" | grep -qF 'buildhistory'
 	printf '%s\n' "$output" | grep -qF 'sbom'
-	refute_call "tar -S"
+	refute_call "cp -r"
 }
 
 @test "retrieve: bitbake-getvar can NEVER run kas's repo-mutating steps" {
