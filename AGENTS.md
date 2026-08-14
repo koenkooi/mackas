@@ -136,6 +136,12 @@ a partial run.
   workflow.** `./run-tests.sh` covers the same hermetic suite for free.
 - **Keep docs current in the same commit that makes them stale.** `docs/` and
   `README.md` are part of the change, not a follow-up.
+- **Versioning:** SemVer-ish, but pre-1.0 (`0.y.z`), so nothing is promised
+  stable yet. `SCRIPT_VERSION` near the top of `mackas` is the single source of
+  truth — it is printed and stamped in several places (grep `SCRIPT_VERSION`);
+  releasing a version means cutting a matching `vX.Y.Z` git tag. Unrelated to
+  `KAS_CONTAINER_VERSION` and the `CONTAINER_*_VERSION` pins, which name
+  upstream dependencies.
 - **Commit style:** `area: lowercase imperative summary` (`docs:`, `ci:`,
   `tests:`, `readme:`, or a subcommand/file name), with the body wrapped at 72
   columns. **Keep the body short** — a few sentences of why, not a
