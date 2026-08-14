@@ -6234,7 +6234,7 @@ fetch_tmp_subdir() {
 		# Warn, never refuse: retrieve is a copy, not a destructive operation,
 		# and a df estimate can be wrong (sparse files, other things writing
 		# to the same filesystem concurrently) -- a real ENOSPC failing the
-		# cp -r partway is an acceptable fallback for what is fundamentally
+		# transfer partway is an acceptable fallback for what is fundamentally
 		# just a heads-up. Walk up to the nearest existing ancestor: $dest
 		# itself may not be created yet (the mkdir -p below, or --dry-run,
 		# which never creates it at all).
@@ -6250,11 +6250,24 @@ fetch_tmp_subdir() {
 		esac
 	fi
 
+	# tar through a pipe, NOT `cp -r`: a real >18G deploy image was retrieved
+	# with the right size but WRONG content (full-file md5 diverged deep in
+	# the file; a 1MB-prefix check missed it) -- while `cat`-streaming the
+	# same source, same volume, was correct. An isolated retest of plain
+	# `cp -r` against that same file afterwards did NOT reproduce it, so this
+	# looks conditional (likely concurrent volume/container activity at the
+	# time) rather than a deterministic property of `cp -r` itself -- the
+	# exact trigger is still unconfirmed. A pipe is the precaution: it cannot
+	# take cp's copy_file_range()/reflink fast path at all (that needs two
+	# real file descriptors, and stdin/stdout here are neither), matching
+	# what the proven-safe `cat` control already does. `-S` keeps the
+	# sparse-file win `cp -r` had -- GNU tar's own hole detection, a
+	# different code path from cp's.
 	destsub="$sub${extra:+/$extra}"
 	run mkdir -p "$dest"
 	run container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p '/out/$destsub' && cp -r '$guest/.' '/out/$destsub/'"
+		sh -c "mkdir -p '/out/$destsub' && tar -S -C '$guest' -cf - . | tar -S -C '/out/$destsub' -xf -"
 	did "retrieved $sub -> $dest/$destsub"
 
 	[ "$sub" = "buildstats" ] && check_buildstats_accumulation "$dest/$destsub" "$guest"
