@@ -9,11 +9,16 @@
 # These drive `mackas retrieve` as a subprocess with a fake `container` on
 # PATH that records every call and MODELS the two things that matter here: the
 # combined existence+size probe (`... sh -c "[ -d ... ] || exit 1; du -sk
-# ..."`), and the copy itself (`... sh -c 'cp -r ...'`) which actually
-# populates the host --dest so `buildstats analyze` (tested separately in
-# buildstats_analyze.bats) would have real files to chew on. It also models
-# `container ls` / `container inspect` so the one-VM refusal can be exercised.
-# Nothing touches the real Apple container runtime, a volume, or the build SSD.
+# ..."`), and the copy itself (`... sh -c 'tar -S -C ... -cf - . | tar -S -C
+# ... -xf -'` -- a piped tar, not `cp -r`: a real >18G deploy image came back
+# with the right size but wrong content via `cp -r`, so fetch_tmp_subdir was
+# moved to a copy that cannot take `cp`'s copy_file_range()/reflink fast path
+# at all; `-S` keeps the sparse-file win a plain pipe would otherwise lose)
+# which actually populates the host --dest so `buildstats analyze` (tested
+# separately in buildstats_analyze.bats) would have real files to chew on. It
+# also models `container ls` / `container inspect` so the one-VM refusal can
+# be exercised. Nothing touches the real Apple container runtime, a volume,
+# or the build SSD.
 
 bats_require_minimum_version 1.5.0
 
@@ -167,18 +172,20 @@ case "${@: -1}" in
 		;;
 esac
 
-# The copy: `... sh -c "mkdir -p '/out/<sub>' && cp -r '<guest>/.' '/out/<sub>/'"`.
-# destsub (the mackas-facing object key, e.g. "deploy") and guestsub (the
-# resolved guest path's own basename, or -- for item 24's nested deploy/images
-# object specifically -- its path relative to the fixture root) are extracted
-# independently -- they can differ when bitbake-getvar resolves a
-# distro-redefined path, and the destination must be named after destsub
-# regardless.
+# The copy: `... sh -c "mkdir -p '/out/<sub>' && tar -S -C '<guest>' -cf - . |
+# tar -S -C '/out/<sub>' -xf -"`. destsub (the mackas-facing object key, e.g.
+# "deploy") and guestsub (the resolved guest path's own basename, or -- for
+# item 24's nested deploy/images object specifically -- its path relative to
+# the fixture root) are extracted independently -- they can differ when
+# bitbake-getvar resolves a distro-redefined path, and the destination must
+# be named after destsub regardless. The mock still uses `cp -r` to populate
+# the fixture data (a plain copy is fine for a test double); only the real
+# retrieved shape has to match what fetch_tmp_subdir now actually runs.
 last="${@: -1}"
 case "$last" in
-	*"cp -r"*)
+	*"tar -S -C"*"-cf - . | tar -S -C"*)
 		destsub="$(printf '%s\n' "$last" | sed -E "s#.*mkdir -p '/out/([^']*)'.*#\1#")"
-		guestdir="$(printf '%s\n' "$last" | sed -E "s#.*cp -r '([^']*)/\.'.*#\1#")"
+		guestdir="$(printf '%s\n' "$last" | sed -E "s#.*tar -S -C '([^']*)' -cf.*#\1#")"
 		case "$guestdir" in
 			*/deploy/images|*/deploy/images/*)
 				# Nested object: keep it relative to the fixture root
@@ -190,7 +197,7 @@ case "$last" in
 			*) guestsub="${guestdir##*/}" ;;
 		esac
 		# mkdir -p is unconditional in the REAL sh -c string (it runs before
-		# `&&`), so it is unconditional here too; only the cp -r half depends
+		# `&&`), so it is unconditional here too; only the tar half depends
 		# on a matching fixture existing (a test that just wants to see the
 		# destination land in the right place, without needing real fixture
 		# content there, still gets a real "$outdir/$destsub" directory).
@@ -591,7 +598,7 @@ EOF
 	mk retrieve
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'needs at least one object'
-	refute_call "cp -r"
+	refute_call "tar -S"
 }
 
 @test "retrieve: --dest with no object is still a usage error" {
@@ -615,7 +622,7 @@ EOF
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'has a build run yet'
 	# It must NOT have attempted the copy.
-	refute_call "cp -r"
+	refute_call "tar -S"
 }
 
 # ---------------------------------------------------------------------------
@@ -644,7 +651,7 @@ EOF
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'only ONE VM'
 	printf '%s\n' "$output" | grep -qF 'oe-build-sstate'
-	refute_call "cp -r"
+	refute_call "tar -S"
 }
 
 # ---------------------------------------------------------------------------
@@ -664,7 +671,7 @@ EOF
 	[ ! -d "$ROOT/artifacts/buildstats" ]
 	[ ! -d "$ROOT/artifacts" ]
 	printf '%s\n' "$output" | grep -qF 'buildstats: 4.0M to transfer'
-	refute_call "cp -r"
+	refute_call "tar -S"
 	refute_call ":/out]"
 }
 
@@ -824,7 +831,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF 'INHERIT += "buildhistory"'
 	# Not the generic per-object "skipping" wording, and not buildstats' one.
 	! printf '%s\n' "$output" | grep -qi 'has a build run yet'
-	refute_call "cp -r"
+	refute_call "tar -S"
 }
 
 @test "retrieve: buildhistory swallows bitbake-getvar's real 'not defined' wording" {
@@ -867,7 +874,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF '/build/buildhistory'
 	[ ! -d "$ROOT/artifacts/buildhistory" ]
 	[ ! -d "$ROOT/artifacts" ]
-	refute_call "cp -r"
+	refute_call "tar -S"
 	refute_call ":/out]"
 }
 
@@ -958,7 +965,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF 'INHERIT += "create-spdx"'
 	# Not the generic per-object "skipping" wording, and not buildstats' one.
 	! printf '%s\n' "$output" | grep -qi 'has a build run yet'
-	refute_call "cp -r"
+	refute_call "tar -S"
 }
 
 @test "retrieve: sbom swallows bitbake-getvar's real 'not defined' wording" {
@@ -1003,7 +1010,7 @@ EOF
 	printf '%s\n' "$output" | grep -qF '/build/tmp/deploy/spdx'
 	[ ! -d "$ROOT/artifacts/sbom" ]
 	[ ! -d "$ROOT/artifacts" ]
-	refute_call "cp -r"
+	refute_call "tar -S"
 	refute_call ":/out]"
 }
 
@@ -1056,7 +1063,7 @@ EOF
 	# Every object is documented, buildhistory and sbom included.
 	printf '%s\n' "$output" | grep -qF 'buildhistory'
 	printf '%s\n' "$output" | grep -qF 'sbom'
-	refute_call "cp -r"
+	refute_call "tar -S"
 }
 
 @test "retrieve: bitbake-getvar can NEVER run kas's repo-mutating steps" {
