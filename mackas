@@ -6119,6 +6119,94 @@ cmd_dump() {
 # overwrite/merge into the identical host path on top of what a PRIOR
 # retrieval already put there -- on top of the accumulation buildstats.bbclass
 # itself already does guest-side (see check_buildstats_accumulation).
+# Print the POSIX-sh script that, run from inside the directory being
+# verified, emits a sorted "<relpath>#<chunk>\t<cksum-line>" manifest of
+# every regular file under it -- fetch_tmp_subdir's way of checking a cp -r
+# copy actually matches its source instead of trusting it blind. A file over
+# 256M (keep in sync with retrieve_verify_local()'s own threshold) is split
+# into up to 8 whole-MiB byte-range chunks so one huge deploy image
+# checksums in parallel instead of serially; everything else is checksummed
+# whole. `dd bs=1M skip=N count=M` chunk boundaries are deliberately
+# whole-MiB so the identical invocation shape works against both GNU dd
+# (here) and BSD dd (retrieve_verify_local, the host side) -- verified live
+# to produce byte-identical output for the same tree, sub-file chunks
+# included. cksum (POSIX CRC) over md5sum/sha*sum: measured ~5x faster than
+# md5sum on a real 10G file on this runtime, and ARM64's SHA hardware
+# extensions only help the sha*sum tools it has no equivalent for.
+retrieve_verify_script() {
+	cat <<'EOS'
+: > /tmp/.mackas-verify-jobs
+find . -type f -printf '%s %p\n' | while read -r size path; do
+	rel="${path#./}"
+	if [ "$size" -gt 268435456 ]; then
+		size_mb=$(( (size + 1048575) / 1048576 ))
+		chunk_mb=$(( (size_mb + 7) / 8 ))
+		i=0
+		while [ "$i" -lt 8 ]; do
+			skip_mb=$(( i * chunk_mb ))
+			if [ "$skip_mb" -lt "$size_mb" ]; then
+				printf '%s %s %s %s %s\n' "$rel" "$i" "$path" "$skip_mb" "$chunk_mb" >> /tmp/.mackas-verify-jobs
+			fi
+			i=$((i+1))
+		done
+	else
+		printf '%s 0 %s - -\n' "$rel" "$path" >> /tmp/.mackas-verify-jobs
+	fi
+done
+sort /tmp/.mackas-verify-jobs | xargs -P 8 -L 1 sh -c '
+	if [ "$5" = "-" ]; then
+		sum=$(cksum < "$3")
+	else
+		sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
+	fi
+	printf "%s#%s\t%s\n" "$1" "$2" "$sum"
+' _ | sort
+EOS
+}
+
+# Host-side (macOS/BSD) counterpart to retrieve_verify_script() above: the
+# SAME manifest algorithm against a plain directory (retrieve's --dest is
+# always a real host path, never a volume, so this needs no container at
+# all) -- stat -f%z instead of find -printf (BSD find has neither), sort/dd
+# invoked the same way BSD and GNU agree on. Verified live to produce
+# byte-identical output against the guest-side script for the same tree.
+retrieve_verify_local() {
+	local root="$1"
+	# Job generation AND the xargs workers below run in ONE subshell so a
+	# relative $path resolves the same way throughout -- splitting these
+	# across two subshells (an earlier version of this function did) loses
+	# the cd on the second one, and a dd/cksum against a now-wrong relative
+	# path fails silently under 2>/dev/null: every chunk reads as empty
+	# instead of erroring, which is worse than not verifying at all.
+	(
+		cd "$root" || exit 1
+		find . -type f | while IFS= read -r path; do
+			local size rel size_mb chunk_mb i skip_mb
+			size="$(stat -f%z "$path")"
+			rel="${path#./}"
+			if [ "$size" -gt 268435456 ]; then
+				size_mb=$(( (size + 1048575) / 1048576 ))
+				chunk_mb=$(( (size_mb + 7) / 8 ))
+				i=0
+				while [ "$i" -lt 8 ]; do
+					skip_mb=$(( i * chunk_mb ))
+					[ "$skip_mb" -lt "$size_mb" ] && printf '%s %s %s %s %s\n' "$rel" "$i" "$path" "$skip_mb" "$chunk_mb"
+					i=$((i+1))
+				done
+			else
+				printf '%s 0 %s - -\n' "$rel" "$path"
+			fi
+		done | sort | xargs -P 8 -L 1 sh -c '
+			if [ "$5" = "-" ]; then
+				sum=$(cksum < "$3")
+			else
+				sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
+			fi
+			printf "%s#%s\t%s\n" "$1" "$2" "$sum"
+		' _
+	) | sort
+}
+
 fetch_tmp_subdir() {
 	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" guest destsub quiet_undefined=0 rc
 
@@ -6250,24 +6338,49 @@ fetch_tmp_subdir() {
 		esac
 	fi
 
-	# tar through a pipe, NOT `cp -r`: a real >18G deploy image was retrieved
-	# with the right size but WRONG content (full-file md5 diverged deep in
-	# the file; a 1MB-prefix check missed it) -- while `cat`-streaming the
-	# same source, same volume, was correct. An isolated retest of plain
-	# `cp -r` against that same file afterwards did NOT reproduce it, so this
-	# looks conditional (likely concurrent volume/container activity at the
-	# time) rather than a deterministic property of `cp -r` itself -- the
-	# exact trigger is still unconfirmed. A pipe is the precaution: it cannot
-	# take cp's copy_file_range()/reflink fast path at all (that needs two
-	# real file descriptors, and stdin/stdout here are neither), matching
-	# what the proven-safe `cat` control already does. `-S` keeps the
-	# sparse-file win `cp -r` had -- GNU tar's own hole detection, a
-	# different code path from cp's.
+	# cp -r, VERIFIED, with a slower fallback: a real >18G deploy image was
+	# once retrieved with the right size but WRONG content (full-file md5
+	# diverged deep in the file; a 1MB-prefix check missed it) -- while
+	# `cat`-streaming the same source, same volume, was correct. An isolated
+	# retest of plain `cp -r` against that same file afterwards did NOT
+	# reproduce it, so this looks conditional (likely concurrent
+	# volume/container activity at the time) rather than a deterministic
+	# property of `cp -r` -- the exact trigger is still unconfirmed. Giving
+	# up cp -r's speed unconditionally (a tar pipe measured ~7-16x slower on
+	# a real 10G file, live) is a worse trade than checking its work: cksum
+	# each retrieved file (POSIX CRC, ~5x faster than md5sum here, measured)
+	# and only pay tar's cost on the rare mismatch.
 	destsub="$sub${extra:+/$extra}"
 	run mkdir -p "$dest"
-	run container run --rm -u 0:0 \
+	# DRY_RUN, its own early branch, same shape volume_fsck_one()'s STEP E
+	# uses: the real path below captures container run's output via command
+	# substitution to compare it, which -- unlike a plain `run container
+	# run ...` -- does not go through run()'s own dry-run short-circuit, so
+	# it needs one of its own.
+	if [ "$DRY_RUN" -eq 1 ]; then
+		run container run --rm -u 0:0 \
+			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
+			sh -c "mkdir -p '/out/$destsub' && cp -r '$guest/.' '/out/$destsub/' && cd '$guest' && $(retrieve_verify_script)"
+		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
+		return 0
+	fi
+	local src_manifest dst_manifest
+	src_manifest="$(container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p '/out/$destsub' && tar -S -C '$guest' -cf - . | tar -S -C '/out/$destsub' -xf -"
+		sh -c "mkdir -p '/out/$destsub' && cp -r '$guest/.' '/out/$destsub/' && cd '$guest' && $(retrieve_verify_script)")"
+	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
+	if [ "$src_manifest" != "$dst_manifest" ]; then
+		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
+		run rm -rf "${dest:?}/${destsub:?}"
+		run mkdir -p "$dest/$destsub"
+		run container run --rm -u 0:0 \
+			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
+			sh -c "tar -S -C '$guest' -cf - . | tar -S -C '/out/$destsub' -xf -"
+		dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
+		[ "$src_manifest" = "$dst_manifest" ] || die "'$sub' still fails verification after the tar fallback" \
+			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
+		warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
+	fi
 	did "retrieved $sub -> $dest/$destsub"
 
 	[ "$sub" = "buildstats" ] && check_buildstats_accumulation "$dest/$destsub" "$guest"
