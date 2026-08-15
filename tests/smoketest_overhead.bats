@@ -50,6 +50,27 @@ EOF
 	touch "$ROOT/bin/kas-container"
 	chmod +x "$ROOT/bin/kas-container"
 
+	# Fake container: cmd_smoketest calls ensure_container_running() before
+	# ever reaching run_kas, and that was previously unmocked here -- passed
+	# locally only because a real, running `container` daemon happened to
+	# always be present on the dev Mac. GitHub Actions' macOS runners have no
+	# Apple `container` CLI installed at all, so every test in this file died
+	# on "container system did not start" in CI. Same fix as
+	# smoketest_ladder.bats.
+	mkdir -p "$TESTDIR/fakebin"
+	cat > "$TESTDIR/fakebin/container" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+	"system status") echo "status running"; exit 0 ;;
+	"volume ls")     echo "NAME"; exit 0 ;;
+	"container ls"|"ls "*|"ls") echo "ID"; exit 0 ;;
+esac
+exit 0
+EOF
+	chmod +x "$TESTDIR/fakebin/container"
+	PATH="$TESTDIR/fakebin:$PATH"
+	export PATH
+
 	# A fake sampler: production always invokes it as `/usr/bin/python3 <bin>`,
 	# so it must be valid Python. It installs its SIGTERM handler FIRST, records
 	# STARTED, prints the two headline lines the hook greps, then idles until
