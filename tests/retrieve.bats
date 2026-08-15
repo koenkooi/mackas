@@ -330,6 +330,16 @@ refute_call() {
 	diff -r "$FIXTURE/buildstats/20260717121723" "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723"
 }
 
+@test "retrieve: a checksum mismatch prints a manifest diff, not just the fact of a mismatch" {
+	# Diagnostic added after a report of an intermittent mismatch even with
+	# LC_ALL=C in place, still unexplained -- the diff is what turns the
+	# NEXT occurrence into evidence (same file set, different cksum vs.
+	# different file set entirely) instead of another guess.
+	MOCK_VERIFY_CORRUPT=1 mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE '^\s*[<>] '
+}
+
 @test "retrieve: no verification mismatch means no fallback and no warning" {
 	mk retrieve buildstats
 	[ "$status" -eq 0 ]
