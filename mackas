@@ -34,7 +34,7 @@ SCRIPT_NAME="$(basename "$0")"
 # SCRIPT_NAME stays the bare program label ("mackas: error: ...").
 SCRIPT_CMD="$0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
-SCRIPT_VERSION="0.1.2"
+SCRIPT_VERSION="0.1.3"
 
 # kas-container release we pin to, and its expected sha256.
 KAS_CONTAINER_VERSION="5.4"
