@@ -22,15 +22,17 @@
 
 name: CI
 
-# DISABLED: this workflow never runs on its own -- no push/pull_request
-# triggers, so it consumes no GitHub Actions minutes (macOS runners in
-# particular are billed at a premium). It can only be started by hand from the
-# Actions tab ("Run workflow"). To re-enable automatic runs, add back:
-#   push:
-#     branches: [main]
-#   pull_request:
-# The local `./run-tests.sh` runs exactly the same hermetic suite for free.
+# Runs on every push to main and every pull request. GitHub Actions usage on
+# standard hosted runners (including macOS) is unmetered on a public repo --
+# confirmed against GitHub's own billing docs, still true after the
+# 2026-01-01 Actions repricing (see TODO.md item 7 / issue #35) -- so this
+# costs nothing as long as koenkooi/mackas stays public. Re-check that before
+# ever making the repo private: a private repo bills macOS runners at a 10x
+# multiplier against the account's included-minutes quota.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
