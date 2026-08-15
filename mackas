@@ -6363,6 +6363,19 @@ fetch_tmp_subdir() {
 	# and only pay tar's cost on the rare mismatch.
 	destsub="$sub${extra:+/$extra}"
 	run mkdir -p "$dest"
+	# cp -r never deletes a destination file that is absent from the
+	# source -- a destination directory that accumulates across retrieves
+	# without being cleaned between builds (a real case: image-oci.bbclass's
+	# content-addressed blobs/sha256/ tree, which grows or changes shape
+	# build to build) keeps stale files the fresh source manifest no longer
+	# lists, and retrieve_verify_local()'s comparison correctly reports that
+	# as a mismatch -- not corruption, not a race, just an unswept
+	# destination. Clear it first so cp -r starts from empty, exactly like
+	# the fallback below already does; this stops the primary path from
+	# ever paying the slow fallback just because old content was left
+	# lying around.
+	run rm -rf "${dest:?}/${destsub:?}"
+	run mkdir -p "$dest/$destsub"
 	# DRY_RUN, its own early branch, same shape volume_fsck_one()'s STEP E
 	# uses: the real path below captures container run's output via command
 	# substitution to compare it, which -- unlike a plain `run container

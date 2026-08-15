@@ -344,7 +344,7 @@ refute_call() {
 	mk retrieve buildstats
 	[ "$status" -eq 0 ]
 	refute_call "tar -S -C"
-	! printf '%s\n' "$output" | grep -qi "falling back\|fallback"
+	assert_fails grep -qi "falling back\|fallback" <<< "$output"
 }
 
 @test "retrieve: a mismatch that survives the tar fallback too is a hard failure, not a silent bad copy" {
@@ -823,6 +823,27 @@ EOF
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
+@test "retrieve: a stale file already sitting in the destination is cleared, not left to fail verification" {
+	# Real report: cp -r never deletes a destination file absent from the
+	# source, so a destination that accumulates across retrieves without
+	# being cleaned between builds (image-oci.bbclass's content-addressed
+	# blobs/ tree was the real case) keeps stale entries the fresh source
+	# manifest no longer lists -- retrieve_verify_local() correctly flags
+	# that as a mismatch, which used to mean paying the slow tar fallback
+	# on every single retrieve of a directory that ever shrinks or changes
+	# shape between builds. Wiping destsub before cp -r (matching what the
+	# fallback already did) fixes this at the source: verification should
+	# now pass on the FIRST attempt even with stale cruft already present.
+	mkdir -p "$ROOT/artifacts/buildstats/$RETRIEVE_TS/an-old-buildname-from-last-week"
+	echo stale > "$ROOT/artifacts/buildstats/$RETRIEVE_TS/an-old-buildname-from-last-week/build_stats"
+
+	mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	assert_fails grep -qi "falling back\|fallback" <<< "$output"
+	[ ! -e "$ROOT/artifacts/buildstats/$RETRIEVE_TS/an-old-buildname-from-last-week" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+}
+
 # ---------------------------------------------------------------------------
 # BUILDNAME accumulation: buildstats.bbclass appends build_stats forever for a
 # project whose BUILDNAME does not vary per build (e.g. Angstrom's
@@ -1257,3 +1278,4 @@ EOF
 	grep -qF -- 'done | LC_ALL=C sort | xargs -P 8 -L 1' "$MACKAS"
 	grep -qF -- ') | LC_ALL=C sort' "$MACKAS"
 }
+
