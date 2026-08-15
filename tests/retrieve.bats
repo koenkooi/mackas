@@ -1203,3 +1203,47 @@ EOF
 	# ...and it is never invoked bare, which is what caused the reset.
 	assert_fails grep -qE 'shell [^-]' "$KASARGV_LOG"
 }
+
+@test "retrieve: verification is locale-independent -- same tree, different LC_ALL, identical manifest" {
+	# Real bug: the manifest's own `sort` used to collate under whatever
+	# locale the process happened to run under. The container's default
+	# (en_US.utf8) and this Mac's default shell locale (observed nl_NL.UTF-8)
+	# collate real deploy/images-shaped filenames (dots, hyphens, mixed
+	# case) into DIFFERENT orders for the exact SAME file set -- so a
+	# byte-identical cp -r of a multi-file directory read as a checksum
+	# mismatch on every retrieve, purely from manifest line reordering, and
+	# fell back to the slow tar copy for no real reason. Fixed by pinning
+	# LC_ALL=C on every sort in retrieve_verify_script()/retrieve_verify_local().
+	#
+	# en_US.UTF-8 is used here (not nl_NL.UTF-8) because it is present on
+	# every macOS install and every common CI image, so this test does not
+	# depend on a locale nobody but this Mac has installed.
+	if ! locale -a 2>/dev/null | grep -qi '^en_US\.UTF-8$'; then
+		skip "en_US.UTF-8 locale not installed on this machine"
+	fi
+
+	local tree="$TESTDIR/locale-tree"
+	mkdir -p "$tree"
+	# Same shape that provably reorders under en_US.UTF-8 vs C collation on
+	# both GNU and BSD sort (verified live against both before this fix).
+	for f in A-1.txt A_1.txt A.1.txt a-1.txt A-2.txt AB.txt A-10.txt A-B.txt; do
+		echo "$f" > "$tree/$f"
+	done
+
+	eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$MACKAS")"
+
+	local c_manifest en_manifest
+	c_manifest="$(LC_ALL=C retrieve_verify_local "$tree")"
+	en_manifest="$(LC_ALL=en_US.UTF-8 retrieve_verify_local "$tree")"
+	[ "$c_manifest" = "$en_manifest" ]
+}
+
+@test "retrieve: every verification sort is pinned to LC_ALL=C" {
+	# Direct source pin for the locale fix above -- catches a regression
+	# where a future edit adds or touches one of these sort calls without
+	# carrying the LC_ALL=C prefix along.
+	grep -qF -- 'LC_ALL=C sort /tmp/.mackas-verify-jobs' "$MACKAS"
+	grep -qF -- "' _ | LC_ALL=C sort" "$MACKAS"
+	grep -qF -- 'done | LC_ALL=C sort | xargs -P 8 -L 1' "$MACKAS"
+	grep -qF -- ') | LC_ALL=C sort' "$MACKAS"
+}
