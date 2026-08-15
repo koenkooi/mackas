@@ -6153,14 +6153,14 @@ find . -type f -printf '%s %p\n' | while read -r size path; do
 		printf '%s 0 %s - -\n' "$rel" "$path" >> /tmp/.mackas-verify-jobs
 	fi
 done
-sort /tmp/.mackas-verify-jobs | xargs -P 8 -L 1 sh -c '
+LC_ALL=C sort /tmp/.mackas-verify-jobs | xargs -P 8 -L 1 sh -c '
 	if [ "$5" = "-" ]; then
 		sum=$(cksum < "$3")
 	else
 		sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
 	fi
 	printf "%s#%s\t%s\n" "$1" "$2" "$sum"
-' _ | sort
+' _ | LC_ALL=C sort
 EOS
 }
 
@@ -6170,6 +6170,17 @@ EOS
 # all) -- stat -f%z instead of find -printf (BSD find has neither), sort/dd
 # invoked the same way BSD and GNU agree on. Verified live to produce
 # byte-identical output against the guest-side script for the same tree.
+# Every sort here and in retrieve_verify_script() is LC_ALL=C: without it,
+# GNU sort collates under whatever locale the kas image ships (en_US.utf8)
+# while BSD sort here follows the user's own shell locale (observed:
+# nl_NL.UTF-8) -- two different, non-C collation orders for the exact same
+# filename set. The final comparison is a literal string compare of the
+# whole manifest, so a same-content, different-ORDER pair of "identical"
+# sorted outputs reads as a mismatch and triggers the tar fallback on every
+# retrieve of a directory with more than one sort-order-sensitive filename,
+# with zero data actually wrong. Verified live: real deploy/images filenames
+# (dots, hyphens, mixed case) reorder under nl_NL.UTF-8 vs en_US.utf8, and
+# LC_ALL=C converges GNU and BSD sort on byte order regardless of locale.
 retrieve_verify_local() {
 	local root="$1"
 	# Job generation AND the xargs workers below run in ONE subshell so a
@@ -6196,7 +6207,7 @@ retrieve_verify_local() {
 			else
 				printf '%s 0 %s - -\n' "$rel" "$path"
 			fi
-		done | sort | xargs -P 8 -L 1 sh -c '
+		done | LC_ALL=C sort | xargs -P 8 -L 1 sh -c '
 			if [ "$5" = "-" ]; then
 				sum=$(cksum < "$3")
 			else
@@ -6204,7 +6215,7 @@ retrieve_verify_local() {
 			fi
 			printf "%s#%s\t%s\n" "$1" "$2" "$sum"
 		' _
-	) | sort
+	) | LC_ALL=C sort
 }
 
 fetch_tmp_subdir() {
