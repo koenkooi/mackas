@@ -6382,6 +6382,20 @@ fetch_tmp_subdir() {
 	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
 		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
+		# Diagnostic, not a fix: this mismatch has been seen both as a
+		# deterministic locale-collation artifact (fixed -- see LC_ALL=C
+		# above) and, separately, as a genuinely intermittent failure even
+		# with that fix in place -- still unexplained. Since the fallback
+		# already makes this run safe regardless of cause, spend a cheap
+		# `diff` on the two (small, text) manifests now rather than
+		# discarding the only evidence of what actually diverged: same file
+		# set with different cksums (real content difference, or a source
+		# file that changed between cp -r's read and the verify read) looks
+		# nothing like mismatched file sets (a file present on one side and
+		# not the other, e.g. a build still writing when retrieve started).
+		local mdiff_line
+		diff <(printf '%s' "$src_manifest") <(printf '%s' "$dst_manifest") 2>/dev/null | head -20 | \
+			while IFS= read -r mdiff_line; do warn "    $mdiff_line"; done
 		run rm -rf "${dest:?}/${destsub:?}"
 		run mkdir -p "$dest/$destsub"
 		run container run --rm -u 0:0 \
