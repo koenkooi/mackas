@@ -82,6 +82,7 @@
 
 import json
 import os
+import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -542,9 +543,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+class _FastBindHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer, minus the reverse-DNS lookup its server_bind()
+    does unconditionally. HTTPServer.server_bind() calls
+    socket.getfqdn(host) to set self.server_name -- nothing here ever reads
+    server_name (clients connect straight to 127.0.0.1:PORT), so that call
+    is pure cost. Usually a few ms, but getfqdn("0.0.0.0") triggers a real
+    reverse-DNS/NSS lookup whose latency depends entirely on the host's
+    network config -- measured 5+ seconds on a CI runner with unusual DNS,
+    against ~10ms on a normal Mac. Skip it: use the bind address itself."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 def main(server, eventHandler, params):
     _set_targets(params)
-    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), _Handler)
+    httpd = _FastBindHTTPServer(("0.0.0.0", PORT), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     linger = True
