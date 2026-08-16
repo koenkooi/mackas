@@ -94,6 +94,35 @@ CONF
 	[ ! -f "$HOME/.mackas.conf" ]
 }
 
+@test "set --dry-run reports 'would write', not 'written'" {
+	run "$MACKAS" --dry-run set MACKAS_USE_NFS_MIRRORS 1
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'would write MACKAS_USE_NFS_MIRRORS=1'
+	! printf '%s\n' "$output" | grep -qF 'MACKAS_USE_NFS_MIRRORS=1 written'
+}
+
+@test "set --dry-run leaves no mackas-conf.* tempfile behind in TMPDIR" {
+	# config_write_setting() always mktemp's a scratch file; the final mv onto
+	# the real config is run()-gated (never executes under --dry-run), so the
+	# function must clean the scratch file up itself or it leaks forever.
+	local scratch; scratch="$(make_tmpdir)"
+	local old_tmpdir="${TMPDIR:-}"
+	export TMPDIR="$scratch"
+	run "$MACKAS" --dry-run set MACKAS_USE_NFS_MIRRORS 1
+	if [ -n "$old_tmpdir" ]; then export TMPDIR="$old_tmpdir"; else unset TMPDIR; fi
+	[ "$status" -eq 0 ]
+	[ -z "$(find "$scratch" -name 'mackas-conf.*')" ]
+}
+
+@test "unset --dry-run reports 'would remove', not 'removed'" {
+	"$MACKAS" set MACKAS_USE_NFS_MIRRORS 1
+	run "$MACKAS" --dry-run unset MACKAS_USE_NFS_MIRRORS
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'would remove MACKAS_USE_NFS_MIRRORS'
+	assert_fails grep -qF 'MACKAS_USE_NFS_MIRRORS removed' <<< "$output"
+	conf | grep -qF "MACKAS_USE_NFS_MIRRORS='1'"
+}
+
 @test "set: wrong argument count is refused" {
 	run "$MACKAS" set MACKAS_USE_NFS_MIRRORS
 	[ "$status" -ne 0 ]
