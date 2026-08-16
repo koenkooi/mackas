@@ -214,7 +214,11 @@ refute_clog() {
 @test "exec: --dry-run BEFORE the command is still mackas's own flag" {
 	MACKAS_PROJECT_DIR=meta-angstrom mk exec --dry-run du -sh meta-angstrom
 	[ "$status" -eq 0 ]
-	printf '%s\n' "$output" | grep -qF -- '--skip setup_dir'
+	# Pinned against the actual KAS_SKIP_REPO_STEPS constant, not a
+	# hardcoded copy of it, so the dry-run print can never silently drift
+	# from what a real (non-dry-run) call sends.
+	skip_flags="$(MACKAS_LIB_ONLY=1 bash -c '. "$1" && printf %s "$KAS_SKIP_REPO_STEPS"' _ "$MACKAS")"
+	printf '%s\n' "$output" | grep -qF -- "$skip_flags"
 	[ ! -f "$KLOG" ]
 }
 

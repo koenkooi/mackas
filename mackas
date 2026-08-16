@@ -41,6 +41,13 @@ KAS_CONTAINER_VERSION="5.4"
 KAS_CONTAINER_URL="https://raw.githubusercontent.com/siemens/kas/${KAS_CONTAINER_VERSION}/kas-container"
 KAS_CONTAINER_SHA256="9707355d1eba19e334e663ab9fcf6881ac323aed16ff7f4fd7e217f879a3894c"
 
+# The four kas 'shell' setup steps that mutate a repo checkout (checkout,
+# patch application, writing local.conf/bblayers.conf) -- individually, and
+# never -k; see the kflag assignment in kas_shell_ro() for why. One constant
+# so kas_shell_ro()'s kflag, cmd_exec()'s dry-run print and exec_usage()'s
+# --help text can never drift apart the way the old conditional '-k' logic did.
+KAS_SKIP_REPO_STEPS="--skip setup_dir --skip finish_setup_repos --skip repos_checkout --skip repos_apply_patches"
+
 # The KAS_CONTAINER_ENGINE value every direct kas-container invocation in this
 # file forces, instead of relying on kas-container's own 'docker -v | grep
 # ^Docker' probe (see env.sh's matching export for the same reasoning, kept
@@ -1159,9 +1166,9 @@ compose_kas_files() {
 # typing or tab-completing one, or from a symlink recorded by an OLDER
 # mackas that predates this normalization -- comparing such a path against a
 # freshly-normalized one with plain string equality reads as "different"
-# even though they name the same directory. Used both to normalize
-# MACKAS_ROOT itself and to normalize a symlink's `readlink` target before
-# comparing it against MACKAS_ROOT (derive_paths, setup_short_link).
+# even though they name the same directory. Used to normalize MACKAS_ROOT
+# itself; resolve_path (below) calls this too, so same_dir's comparisons
+# get it for free.
 strip_trailing_slash() {
 	printf '%s' "$1" | sed 's:\(.\)/*$:\1:'
 }
@@ -1194,6 +1201,15 @@ resolve_path() {
 	else
 		printf '%s\n' "$p"
 	fi
+}
+
+# same_dir A B -- true if A and B name the same directory once symlinks are
+# fully resolved (see resolve_path's own comment for why a bare string
+# compare between a symlink and its target is not enough -- and, the same
+# way, why a bare readlink comparison misses a link that reaches its target
+# through ANOTHER symlink rather than directly).
+same_dir() {
+	[ "$(resolve_path "$1")" = "$(resolve_path "$2")" ]
 }
 
 # Values that depend on other values, resolved once everything else is final.
@@ -1254,13 +1270,11 @@ derive_paths() {
 	local link_target=""
 	MACKAS_BASE="$MACKAS_ROOT"
 	if [ -L "$MACKAS_SHORT_LINK" ]; then
-		# strip_trailing_slash: a link recorded by an older mackas (before
-		# MACKAS_ROOT normalization existed) can still carry a trailing slash
-		# baked into its target -- compare normalized, or a perfectly valid
-		# link reads as "does not resolve to MACKAS_ROOT" on a bare string
-		# mismatch.
-		link_target="$(strip_trailing_slash "$(readlink "$MACKAS_SHORT_LINK" 2>/dev/null || true)")"
-		if [ "$link_target" = "$MACKAS_ROOT" ] && [ -d "$MACKAS_SHORT_LINK" ]; then
+		link_target="$(readlink "$MACKAS_SHORT_LINK" 2>/dev/null || true)"
+		# same_dir, not a bare string compare: also catches a link recorded by
+		# an older mackas with a trailing slash baked in, or one that reaches
+		# MACKAS_ROOT through ANOTHER symlink rather than directly.
+		if same_dir "$MACKAS_SHORT_LINK" "$MACKAS_ROOT" && [ -d "$MACKAS_SHORT_LINK" ]; then
 			# -d follows the link, so this is also what rules out a dangling one.
 			MACKAS_BASE="$MACKAS_SHORT_LINK"
 		else
@@ -1907,6 +1921,20 @@ volume_in_use() {
 	return 1
 }
 
+# require_volumes_free CMDHINT -- one-VM rule: refuse if any of the three
+# volumes kas_shell_ro()/kas_runtime_args() attaches is already held by a
+# running container. CMDHINT is the "re-run '...'" command shown in the die
+# message, so each caller keeps its own wording.
+require_volumes_free() {
+	local cmd_hint="$1" v
+	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
+		if volume_in_use "$v"; then
+			die "volume '$v' is attached to a running container" \
+				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$cmd_hint'"
+		fi
+	done
+}
+
 host_ip() {
 	# Primary IPv4 on the default route's interface.
 	local iface
@@ -2409,11 +2437,10 @@ check_short_link() {
 
 	if [ -L "$MACKAS_SHORT_LINK" ]; then
 		local tgt
-		# strip_trailing_slash: see setup_short_link's own comment -- a link
-		# recorded by an older mackas can carry a trailing slash baked into
-		# its target.
-		tgt="$(strip_trailing_slash "$(readlink "$MACKAS_SHORT_LINK")")"
-		if [ "$tgt" = "$MACKAS_ROOT" ]; then
+		tgt="$(readlink "$MACKAS_SHORT_LINK")"
+		# same_dir, not a bare string compare: also passes a link that reaches
+		# MACKAS_ROOT through ANOTHER symlink rather than directly.
+		if same_dir "$MACKAS_SHORT_LINK" "$MACKAS_ROOT"; then
 			ck_pass "short link $MACKAS_SHORT_LINK -> $MACKAS_ROOT (${len_short} chars for the socket path)"
 		else
 			ck_fail "short link $MACKAS_SHORT_LINK points at '$tgt', not '$MACKAS_ROOT'" \
@@ -3302,12 +3329,11 @@ setup_short_link() {
 	step "Short symlink: $MACKAS_SHORT_LINK -> $MACKAS_ROOT"
 	if [ -L "$MACKAS_SHORT_LINK" ]; then
 		local tgt
-		# strip_trailing_slash: a link recorded by an older mackas can still
-		# carry a trailing slash baked into its target (MACKAS_ROOT wasn't
-		# normalized at the time it was created) -- compare normalized, or a
-		# perfectly correct link is misreported as pointing elsewhere.
-		tgt="$(strip_trailing_slash "$(readlink "$MACKAS_SHORT_LINK")")"
-		if [ "$tgt" = "$MACKAS_ROOT" ]; then
+		tgt="$(readlink "$MACKAS_SHORT_LINK")"
+		# same_dir, not a bare string compare: also passes a link recorded by
+		# an older mackas with a trailing slash baked in, or one that reaches
+		# MACKAS_ROOT through ANOTHER symlink rather than directly.
+		if same_dir "$MACKAS_SHORT_LINK" "$MACKAS_ROOT"; then
 			skip "$MACKAS_SHORT_LINK -> $MACKAS_ROOT"
 		else
 			# A DIFFERENT root than the one just configured -- almost always
@@ -5260,10 +5286,9 @@ run_kas() {
 # best-guess default rather than treating this as fatal, matching
 # 'retrieve's existing best-effort, per-object style.
 # kas_shell_ro CMDSTRING -- run CMDSTRING inside a kas shell for the project's
-# kas config, with kas's own repo-mutating setup steps always skipped. This is
-# the one place that literal --skip set lives; both callers below share it so
-# it can never drift between them the way the old conditional '-k' logic did
-# (see the data-loss history in the comment on the kflag line).
+# kas config, with kas's own repo-mutating setup steps always skipped, via the
+# shared KAS_SKIP_REPO_STEPS constant (rationale, including the data-loss
+# history, is on the kflag assignment below).
 #
 # Returns 1 (with a warn already printed) on a precondition failure -- no real
 # checkout, no readable/safe gitconfig -- rather than ever letting the
@@ -5359,7 +5384,7 @@ kas_shell_ro() {
 	# fresh checkout AND on a configured one, with no conditional at all.
 	# (kas/libkas.py's setup_parser_keep_config_unchanged_arg lists the five
 	# steps -k bundles; write_bbconfig is the one deliberately left in.)
-	local kflag="--skip setup_dir --skip finish_setup_repos --skip repos_checkout --skip repos_apply_patches"
+	local kflag="$KAS_SKIP_REPO_STEPS"
 
 	(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
@@ -5832,9 +5857,8 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD exec -- CMD [ARGS...]   (only needed if CMD itself starts with '-',
                                      or collides with one of exec's own flags)
 
-Runs \`kas-container shell <files> --skip setup_dir --skip finish_setup_repos
---skip repos_checkout --skip repos_apply_patches -c "CMD ARGS..."\` -- the
-exact skip set \`bitbake_getvar()\` already uses internally for retrieve/
+Runs \`kas-container shell <files> $KAS_SKIP_REPO_STEPS -c "CMD ARGS..."\` --
+the exact skip set \`bitbake_getvar()\` already uses internally for retrieve/
 buildstats/clean. No flag adds '-k' back or drops a skip: that is the entire
 point. See the '-k' explanation in docs/architecture.md for why dropping
 those steps by hand, even briefly, can reset a layer to its pinned revision
@@ -5909,13 +5933,7 @@ cmd_exec() {
 	# (retrieve/clean/sstate prune), nothing upstream of exec has already
 	# checked this -- so exec must, or a second attach fails with an opaque
 	# Virtualization.framework error instead of a clear refusal.
-	local v
-	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
-		if volume_in_use "$v"; then
-			die "volume '$v' is attached to a running container" \
-				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD exec'"
-		fi
-	done
+	require_volumes_free "$SCRIPT_CMD exec"
 
 	local joined w
 	joined=""
@@ -5926,8 +5944,7 @@ cmd_exec() {
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		info "${C_BLD}mackas exec${C_RST} -- would run (repo-mutating steps skipped):"
-		info "  $(quote_cmd kas-container shell --skip setup_dir --skip finish_setup_repos \
-			--skip repos_checkout --skip repos_apply_patches "$KAS_FILES_ARG" -c "$joined")"
+		info "  $(quote_cmd kas-container shell $KAS_SKIP_REPO_STEPS "$KAS_FILES_ARG" -c "$joined")"
 		return 0
 	fi
 
@@ -5956,7 +5973,7 @@ cmd_exec() {
 # $rt_args/$gitconfig for the caller (not local to this function -- callers
 # declare them and read them straight after calling this).
 kas_project_subcommand_preflight() {
-	local cmd_name="$1" v
+	local cmd_name="$1"
 	require_mackas_root
 	ensure_workspace_attached
 	ensure_kas_container_installed
@@ -5967,12 +5984,7 @@ kas_project_subcommand_preflight() {
 	# short-circuit in volume_in_use() itself.
 	ensure_container_running
 
-	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
-		if volume_in_use "$v"; then
-			die "volume '$v' is attached to a running container" \
-				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD $cmd_name'"
-		fi
-	done
+	require_volumes_free "$SCRIPT_CMD $cmd_name"
 
 	rt_args="$(kas_runtime_args)"
 	gitconfig="${GITCONFIG_FILE:-$MACKAS_GITCONFIG}"
@@ -6637,17 +6649,8 @@ cmd_retrieve() {
 
 	# One-VM rule: bitbake_getvar() goes through kas_shell_ro(), which attaches
 	# ALL THREE volumes via kas_runtime_args() -- not just TMPDIR -- so all
-	# three must be checked here, the same loop cmd_exec/
-	# kas_project_subcommand_preflight use, rather than let a concurrent
-	# holder of just the sstate or downloads volume slip past a TMPDIR-only
-	# guard and hit a raw Virtualization.framework error instead.
-	local v
-	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
-		if volume_in_use "$v"; then
-			die "volume '$v' is attached to a running container" \
-				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD retrieve'"
-		fi
-	done
+	# three must be checked, same as cmd_exec/kas_project_subcommand_preflight.
+	require_volumes_free "$SCRIPT_CMD retrieve"
 	# fetch_tmp_subdir's existence+size probe now always attaches the volume
 	# for real, dry-run or not (item 33) -- refuse before that if it does not
 	# exist yet at all, the same guard clean_tmp_deploy/sstate_prune already
@@ -7873,17 +7876,8 @@ refuse_unsafe_guest_path() {
 clean_tmp_deploy() {
 	# One-VM rule: bitbake_getvar() goes through kas_shell_ro(), which attaches
 	# ALL THREE volumes via kas_runtime_args() -- not just TMPDIR -- so all
-	# three must be checked here, the same loop cmd_exec/
-	# kas_project_subcommand_preflight use, rather than let a concurrent
-	# holder of just the sstate or downloads volume slip past a TMPDIR-only
-	# guard and hit a raw Virtualization.framework error instead.
-	local v
-	for v in "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE"; do
-		if volume_in_use "$v"; then
-			die "volume '$v' is attached to a running container" \
-				"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean tmp+deploy'"
-		fi
-	done
+	# three must be checked, same as cmd_exec/kas_project_subcommand_preflight.
+	require_volumes_free "$SCRIPT_CMD clean tmp+deploy"
 	if ! volume_exists "$MACKAS_VOL_TMP"; then
 		info "Nothing to clean -- '$MACKAS_VOL_TMP' does not exist yet ($SCRIPT_CMD setup)"
 		return 0
