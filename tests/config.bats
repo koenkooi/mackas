@@ -549,6 +549,12 @@ setting() {
 	! printf '%s\n' "$output" | grep -qi 'syntax error'
 }
 
+@test "setup --tmpdir-size 512K is refused (unrecognised unit)" {
+	run "$MACKAS" --dry-run -y setup --tmpdir-size 512K
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'not a size'
+}
+
 @test "smoketest falls back to \$PWD with a warning when MACKAS_ROOT is unset" {
 	run "$MACKAS" --dry-run -y smoketest
 	printf '%s\n' "$output" | grep -q 'MACKAS_ROOT is not set'
@@ -639,6 +645,43 @@ MOCK
 		run "$MACKAS" --set MACKAS_MEMORY=16g status
 	[ "$status" -eq 0 ]
 	[ "$(setting MACKAS_MEMORY)" = "16g" ]
+}
+
+@test "MACKAS_VOLUME_NAME with a space is refused, not smuggled" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_NAME=oe build' status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'MACKAS_VOLUME_NAME'
+}
+
+@test "MACKAS_VOLUME_NAME empty is refused" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_NAME=' status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'MACKAS_VOLUME_NAME'
+}
+
+@test "a garbage MACKAS_VOLUME_SIZE_TMP dies before reaching the container CLI" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set MACKAS_VOLUME_SIZE_TMP=lol status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'MACKAS_VOLUME_SIZE_TMP'
+}
+
+@test "an unrecognised size unit on MACKAS_VOLUME_SIZE_DL is refused" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set MACKAS_VOLUME_SIZE_DL=512K status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'MACKAS_VOLUME_SIZE_DL'
+}
+
+@test "valid MACKAS_VOLUME_SIZE_SSTATE shapes are all accepted" {
+	for v in 1T 200G 512M 42; do
+		MACKAS_ROOT="/tmp/mackas test dir" \
+			run "$MACKAS" --set "MACKAS_VOLUME_SIZE_SSTATE=$v" status
+		[ "$status" -eq 0 ]
+		[ "$(setting MACKAS_VOLUME_SIZE_SSTATE)" = "$v" ]
+	done
 }
 
 @test "defaults: auto-fstrim is ON" {

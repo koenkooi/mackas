@@ -476,7 +476,7 @@ validate_settings() {
 	# extra arguments: MACKAS_MEMORY='8g -v /Users:/host' would smuggle a bind
 	# mount past every other check. A plain space is not a control character, so
 	# the loop above lets it through; pin both to their expected shapes here, as
-	# setup_volumes already does for MACKAS_VOLUME_NAME and the mirror paths.
+	# derive_paths() already does for the mirror paths.
 	case "$MACKAS_CPUS" in
 		''|*[!0-9]*)
 			die "MACKAS_CPUS='$MACKAS_CPUS' is not a positive integer" \
@@ -497,6 +497,25 @@ validate_settings() {
 				"set MACKAS_MONITOR_PORT to a whole port number (no spaces) in $(config_hint)"
 			;;
 	esac
+	# MACKAS_VOLUME_NAME is word-split into --runtime-args the same way (it
+	# names the -v host source for each volume mount). setup_volumes() checks
+	# it again right before use, since bats exercises that function directly,
+	# but every other command reaches this check first.
+	case "$MACKAS_VOLUME_NAME" in
+		*[[:space:]]*|"")
+			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
+				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
+			;;
+	esac
+	# MACKAS_VOLUME_SIZE_* goes straight into `container volume create -s` and
+	# the resize/budgeting math (size_to_gb/size_to_bytes) -- pin it to what
+	# those actually parse so a typo or stray unit dies here with a clear
+	# message instead of reaching the container CLI as-is.
+	for n in MACKAS_VOLUME_SIZE_TMP MACKAS_VOLUME_SIZE_DL MACKAS_VOLUME_SIZE_SSTATE; do
+		eval "v=\"\${$n}\""
+		valid_size_shape "$v" || die "$n='$v' is not a size like 1T, 200G or 512M" \
+			"set $n to digits optionally followed by t, g or m (or tb/gb/mb, tib/gib/mib) in $(config_hint)"
+	done
 }
 
 host_mem_gb() {
@@ -1436,7 +1455,30 @@ kas_runtime_args() {
 	printf '%s' "$rt_str"
 }
 
-# Parse "200G" / "42g" / "1024M" -> whole GiB (rounded up).
+# valid_size_shape SIZE -- true when SIZE is digits optionally followed by a
+# unit size_to_gb/size_to_bytes both recognize (t/tb/tib, g/gb/gib, m/mb/mib,
+# case-insensitive) or no unit at all (bare digits = GiB). The single source
+# of truth for what a volume-size setting or --tmpdir-size/--sstate-size/
+# --downloads-size flag is allowed to look like -- validate_settings() and
+# validate_setup_size() both call this rather than keeping their own copy.
+valid_size_shape() {
+	local s="$1" num unit
+	num="$(printf '%s' "$s" | sed 's/[^0-9].*$//')"
+	unit="$(printf '%s' "$s" | sed 's/^[0-9]*//' | tr '[:upper:]' '[:lower:]')"
+	[ -n "$num" ] || return 1
+	case "$unit" in
+		''|t|tb|tib|g|gb|gib|m|mb|mib) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Parse "200G" / "42g" / "1024M" -> whole GiB (rounded up). Also fed real
+# `du -h` output by status_volume() (e.g. "8.0M") -- NOT covered by
+# valid_size_shape(), and its decimal point makes the unit match nothing
+# below, so it falls to the catch-all rather than the m|mb|mib case. Keep
+# that fallback reading as GiB (not 0): du's smallest unit is K, always
+# below the M/G/T this parses, so overestimating whatever slips through
+# still lands on the safe side of a near-cap warning.
 size_to_gb() {
 	local s="$1" num unit
 	num="$(printf '%s' "$s" | sed 's/[^0-9].*$//')"
@@ -3996,6 +4038,9 @@ setup_volumes() {
 
 	# kas-container word-splits --runtime-args, so a volume name with a space
 	# in it would silently become two arguments and mount something absurd.
+	# validate_settings() already checked this for every command; repeated
+	# here as a backstop for callers (tests included) that reach this
+	# function directly without going through main()'s validation first.
 	case "$MACKAS_VOLUME_NAME" in
 		*[[:space:]]*|"")
 			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
@@ -4508,17 +4553,13 @@ EOF
 
 # validate_setup_size FLAG VALUE -- keeps whitespace/garbage out of a size
 # given directly on setup's own command line or typed at its interactive
-# prompt, before it ever reaches MACKAS_VOLUME_SIZE_*. Not a check of unit
-# spelling -- size_to_gb() already tolerates an unrecognised unit letter by
-# treating it as GiB, and this accepts the same shape it does: digits,
-# optionally followed by letters.
+# prompt, before it ever reaches MACKAS_VOLUME_SIZE_*. Same shape
+# valid_size_shape()/size_to_gb()/size_to_bytes() all agree on: digits,
+# optionally followed by t/tb/tib, g/gb/gib or m/mb/mib -- so e.g. "512K"
+# is refused here rather than silently read as 512 GiB by the budgeting math.
 validate_setup_size() {
 	local flag="$1" val="$2"
-	case "$val" in
-		''|[!0-9]*|*[!0-9a-zA-Z]*)
-			die "$flag '$val' is not a size like 1T, 200G or 512M" "$SCRIPT_CMD setup --help"
-			;;
-	esac
+	valid_size_shape "$val" || die "$flag '$val' is not a size like 1T, 200G or 512M" "$SCRIPT_CMD setup --help"
 }
 
 # prompt_setup_settings -- ask for whichever of the root path / three volume

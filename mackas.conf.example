@@ -182,12 +182,14 @@
 # refuses a name with one rather than mounting something absurd.
 #MACKAS_VOLUME_NAME="oe-build"
 
-# The three caps. They total 200G, which is what the SSD can spare alongside
-# Time Machine (it has ~296 GiB free). Sparse, so this is a ceiling, not a
-# cost. Getting one wrong is not fatal -- `mackas volume resize` grows a
-# volume later by copying it into a new, larger one -- but that copy needs
-# roughly twice the used space free, which is the other reason TMPDIR is not
-# in the same volume as the caches.
+# The three caps. Digits, optionally followed by t/tb/tib, g/gb/gib or
+# m/mb/mib (case-insensitive) -- e.g. 1T, 200G, 512M; bare digits mean GiB.
+# Any other shape is refused rather than silently misread. They total 200G,
+# which is what the SSD can spare alongside Time Machine (it has ~296 GiB
+# free). Sparse, so this is a ceiling, not a cost. Getting one wrong is not
+# fatal -- `mackas volume resize` grows a volume later by copying it into a
+# new, larger one -- but that copy needs roughly twice the used space free,
+# which is the other reason TMPDIR is not in the same volume as the caches.
 #MACKAS_VOLUME_SIZE_TMP="120G"
 #MACKAS_VOLUME_SIZE_DL="40G"
 #MACKAS_VOLUME_SIZE_SSTATE="40G"
