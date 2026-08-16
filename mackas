@@ -1009,6 +1009,11 @@ config_write_setting() {
 	fi
 	chmod "$perm" "$tmp"
 	run mv "$tmp" "$file"
+	local rc=$?
+	# run() only PRINTS the mv under --dry-run, so $tmp is never actually
+	# moved onto $file -- clean it up here or it leaks in $TMPDIR forever.
+	[ "$DRY_RUN" -eq 1 ] && rm -f "$tmp"
+	return "$rc"
 }
 
 # Same shape as validate_settings()'s character check, applied unconditionally
@@ -1097,7 +1102,11 @@ cmd_set() {
 
 	local file; file="$(set_target_config_file)"
 	config_write_setting "$file" "$name" "$value"
-	did "$name=$value written to $file"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "  would write $name=$value to $file"
+	else
+		did "$name=$value written to $file"
+	fi
 }
 
 cmd_get() {
@@ -1157,7 +1166,11 @@ cmd_unset() {
 	# NAME was never persisted -- including "no config file at all" -- rather
 	# than 'unset' hand-rolling that same read/rewrite loop a second time.
 	if config_write_setting "$file" "$name" "" delete; then
-		did "$name removed from $file"
+		if [ "$DRY_RUN" -eq 1 ]; then
+			info "  would remove $name from $file"
+		else
+			did "$name removed from $file"
+		fi
 	else
 		info "$name is not persisted in $file -- nothing to do"
 	fi
@@ -1838,7 +1851,10 @@ refuse_if_stale_entity() {
 			"restart it yourself, then re-run: container system stop && container system start"
 	fi
 	restart_container_daemon
-	[ "$DRY_RUN" -eq 1 ] && return 1
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "      dry-run: assuming the restart would make '$name' visible"
+		return 1
+	fi
 	if volume_exists "$name"; then
 		did "container daemon restarted; '$name' is now recognized"
 		return 1
@@ -4034,6 +4050,8 @@ ensure_volume() {
 	elif refuse_if_stale_entity "$name"; then
 		run container volume create -s "$size" "$name"
 		did "created ext4 volume '$name' ($size, $role, sparse until used)"
+	elif [ "$DRY_RUN" -eq 1 ]; then
+		skip "volume '$name' exists ($role) -- dry-run, restart not actually performed"
 	else
 		skip "volume '$name' exists ($role) -- found after restarting the container daemon"
 	fi

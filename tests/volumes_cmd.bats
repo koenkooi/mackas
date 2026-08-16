@@ -248,6 +248,21 @@ refute_call() {
 	printf '%s\n' "$output" | grep -qi 'found after restarting'
 }
 
+@test "setup --dry-run: never claims a simulated restart found the stale entity" {
+	# run() only PRINTS 'container system stop/start' under --dry-run, so the
+	# daemon's index is never actually rescanned -- the volume is NOT really
+	# found afterward, and the report must not say it was.
+	mkdir -p "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp"
+	: > "$HOME/Library/Application Support/com.apple.container/volumes/oe-build-tmp/entity.json"
+	run "$MACKAS" -y --dry-run --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 setup
+	[ "$status" -eq 0 ]
+	refute_call "[system] [start]"
+	assert_fails grep -qi 'found after restarting' <<< "$output"
+	printf '%s\n' "$output" | grep -qi 'dry-run'
+}
+
 # ---------------------------------------------------------------------------
 # A7: attaching a busy volume is a SECOND attach. The runtime refuses it, and
 # under set -e that aborts the whole command. setup's chown and check's
