@@ -2586,10 +2586,14 @@ check_one_volume() {
 # container_running: this is the one check in this whole rung that still
 # works with the daemon down, so it runs unconditionally, before that gate.
 check_volume_dirty_bit() {
-	local name="$1" dbout dbrc=0
+	local name="$1" dbout dbrc=0 suffix=""
 	dbout="$(volume_dirty_bit "$name")" || dbrc=$?
 	[ "$dbrc" -eq 1 ] || return 0
-	ck_fail "volume '$name' has ext4 errors recorded on disk${dbout#*"$name/volume.img"}" \
+	case "$dbout" in
+		*"$name/volume.img"*) suffix="${dbout#*"$name/volume.img"}" ;;
+		*) suffix=": $dbout" ;;
+	esac
+	ck_fail "volume '$name' has ext4 errors recorded on disk$suffix" \
 		"$SCRIPT_CMD volume fsck $name"
 }
 
@@ -4632,6 +4636,15 @@ cmd_setup() {
 	info "${C_BLD}mackas setup${C_RST}  (config: ${CONFIG_FILE_USED:-none, using built-in defaults})"
 	if [ "$DRY_RUN" -eq 1 ]; then
 		warn "--dry-run: printing mutating commands, changing nothing."
+	fi
+
+	# Set STEP_TOTAL based on whether project steps are needed. When no
+	# project is configured, the setup_project and setup_kas_fragment steps
+	# are skipped, so only 9 of the 11 steps run.
+	if [ -n "$MACKAS_PROJECT_URL" ]; then
+		STEP_TOTAL=11
+	else
+		STEP_TOTAL=9
 	fi
 
 	setup_runtime
