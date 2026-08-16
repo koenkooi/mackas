@@ -194,27 +194,31 @@ esac
 last="${@: -1}"
 resolve_destsub_guestsub() {
 	# $1: the sh -c string, $2: the pattern marking where the guest path
-	# starts (e.g. "cp -r '"), $3: the pattern immediately after it (e.g.
-	# "/\\.'" -- cp -r's 'GUEST/.' trick). $3 disambiguates the fallback's
-	# tar command specifically: it has TWO "tar -S -C '" occurrences (its
-	# own source -C and destination -C), and a bare greedy sed match picks
-	# the LAST one -- the destination, wrongly -- without an anchor that
-	# only the source's trailing text (' -cf) satisfies. $4, if given, is
-	# an alternate destsub-extraction pattern for shapes with no "mkdir -p
-	# '/out/...'" of their own (the fallback's mkdir happens as a separate
+	# starts (e.g. "cp -r "), $3: the pattern immediately after it (e.g.
+	# "/\\. " -- cp -r's 'GUEST/.' trick). $3 disambiguates the fallback's
+	# tar command specifically: it has TWO "tar -S -C " occurrences (its own
+	# source -C and destination -C), and a bare greedy sed match picks the
+	# LAST one -- the destination, wrongly -- without an anchor that only
+	# the source's trailing text (-cf) satisfies. $4, if given, is an
+	# alternate destsub-extraction pattern for shapes with no "mkdir -p
+	# /out/..." of their own (the fallback's mkdir happens as a separate
 	# HOST-side `run mkdir -p` before the container, not embedded in this
-	# string) -- default "mkdir -p '/out/" for the primary path, which does
-	# embed it. Only the FIRST line of $1 matters (the mkdir -p/copy
-	# command) -- $1 can now be many lines long (the primary path embeds
-	# retrieve_verify_script's whole heredoc after it), and sed's default
-	# per-line pass-through would otherwise leak every OTHER line of that
-	# script straight into destsub/guestdir via the command substitutions
-	# below.
+	# string) -- default "mkdir -p /out/" for the primary path, which does
+	# embed it. Guest/destsub are now %q-quoted by mackas itself (fixed:
+	# they used to be embedded raw inside single quotes), so every fixture
+	# value used here -- plain names, no spaces or shell metacharacters --
+	# survives %q unquoted and unescaped; a capture group bounded by the
+	# next space is what a quote-delimited capture used to be. Only the
+	# FIRST line of $1 matters (the mkdir -p/copy command) -- $1 can now be
+	# many lines long (the primary path embeds retrieve_verify_script's
+	# whole heredoc after it), and sed's default per-line pass-through
+	# would otherwise leak every OTHER line of that script straight into
+	# destsub/guestdir via the command substitutions below.
 	local first_line destsub_pat="$4"
-	[ -n "$destsub_pat" ] || destsub_pat="mkdir -p '/out/"
+	[ -n "$destsub_pat" ] || destsub_pat="mkdir -p /out/"
 	first_line="$(printf '%s\n' "$1" | head -1)"
-	destsub="$(printf '%s\n' "$first_line" | sed -E "s#.*$destsub_pat([^']*)'.*#\1#")"
-	guestdir="$(printf '%s\n' "$first_line" | sed -E "s#.*$2([^']*)$3.*#\1#")"
+	destsub="$(printf '%s\n' "$first_line" | sed -E "s#.*$destsub_pat([^ ]*).*#\1#")"
+	guestdir="$(printf '%s\n' "$first_line" | sed -E "s#.*$2([^ ]*)$3.*#\1#")"
 	case "$guestdir" in
 		*/deploy/images|*/deploy/images/*)
 			guestsub="deploy/images${guestdir#*/deploy/images}"
@@ -228,7 +232,7 @@ case "$last" in
 	# (fetch_tmp_subdir's own retrieve_verify_script) -- .mackas-verify-jobs
 	# is a marker string unique to that script, safe to match on.
 	*".mackas-verify-jobs"*)
-		resolve_destsub_guestsub "$last" "cp -r '" "/\\.'"
+		resolve_destsub_guestsub "$last" "cp -r " "/\\. "
 		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
 			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
@@ -258,7 +262,7 @@ case "$last" in
 	# plain copy is fine for a test double); only the real retrieved shape
 	# has to match what fetch_tmp_subdir actually runs.
 	*"tar -S -C"*"-cf - . | tar -S -C"*)
-		resolve_destsub_guestsub "$last" "tar -S -C '" "' -cf" "-C '/out/"
+		resolve_destsub_guestsub "$last" "tar -S -C " " -cf" "-C /out/"
 		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
 			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
@@ -368,6 +372,18 @@ refute_call() {
 	grep -qF -- 'probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \' "$MACKAS"
 	grep -qF -- 'du -sk $(printf '"'"'%q'"'"' "$guest")' "$MACKAS"
 	grep -qF -- '-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE"' "$MACKAS"
+}
+
+@test "retrieve: the copy's cp -r and tar fallback %q-quote the guest path and destsub, not embed them raw in single quotes" {
+	# fetch_tmp_subdir's guest sh -c commands used to embed $guest and
+	# $destsub inside single quotes; a guest path or (pre-shape-check)
+	# MACHINE containing a single quote could break out of that quoting.
+	# Pin the fixed form, same idiom the existence+size probe above and
+	# clean_tmp_deploy already use -- a mock can't distinguish the two
+	# shapes (it never runs the string through a real shell), so this is a
+	# source-grep, not a runtime assertion.
+	grep -qF -- 'mkdir -p $(printf '"'"'%q'"'"' "/out/$destsub") && cp -r $(printf '"'"'%q'"'"' "$guest/.") $(printf '"'"'%q'"'"' "/out/$destsub/") && cd $(printf '"'"'%q'"'"' "$guest")' "$MACKAS"
+	grep -qF -- 'tar -S -C $(printf '"'"'%q'"'"' "$guest") -cf - . | tar -S -C $(printf '"'"'%q'"'"' "/out/$destsub") -xf -' "$MACKAS"
 }
 
 @test "retrieve: does NOT fetch logs or deploy unless asked" {
@@ -643,6 +659,23 @@ STUB
 	printf '%s\n' "$output" | grep -qi 'looks unsafe'
 }
 
+@test "retrieve: a MACHINE containing a space or a quote is refused, not just '/' and '..'" {
+	# The old check only excluded '/' and '..'; a MACHINE is now %q-quoted
+	# before reaching the guest shell (see fetch_tmp_subdir), so this is no
+	# longer an injection vector either way -- but a MACHINE is never a
+	# real board name shaped like this, so refusing it early is still the
+	# more useful failure than a guest path bitbake can never resolve.
+	mk retrieve deploy images "qemu arm"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'looks unsafe'
+	refute_call "-d "
+
+	mk retrieve deploy images "qemu'arm"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'looks unsafe'
+	refute_call "-d "
+}
+
 @test "retrieve: two different MACHINE overrides land in two different destinations" {
 	MOCK_TMP_HAS="boardA" mk retrieve deploy images boardA
 	[ "$status" -eq 0 ]
@@ -774,6 +807,19 @@ EOF
 	printf '%s\n' "$output" | grep -qF 'buildstats: 4.0M to transfer'
 	refute_call "cp -r"
 	refute_call ":/out]"
+}
+
+@test "retrieve: --dry-run deploy prints the correctly %q-quoted copy commands" {
+	# deploy has no dry-run coverage above (only buildstats/buildhistory/
+	# sbom do) -- exercise it here, and pin the pieces of the %q-quoted
+	# command (mkdir -p, cp -r, cd) that a dry-run preview is the only way
+	# to see without a real container run.
+	MOCK_TMP_HAS="deploy" mk --dry-run retrieve deploy
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'mkdir -p /out/deploy'
+	printf '%s\n' "$output" | grep -qF 'cp -r /build/tmp/deploy/.'
+	printf '%s\n' "$output" | grep -qF 'cd /build/tmp/deploy'
+	[ ! -d "$ROOT/artifacts" ]
 }
 
 # ---------------------------------------------------------------------------

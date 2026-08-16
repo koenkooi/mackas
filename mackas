@@ -6430,14 +6430,14 @@ fetch_tmp_subdir() {
 	if [ "$DRY_RUN" -eq 1 ]; then
 		run container run --rm -u 0:0 \
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "mkdir -p '/out/$destsub' && cp -r '$guest/.' '/out/$destsub/' && cd '$guest' && $(retrieve_verify_script)"
+			sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)"
 		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
 		return 0
 	fi
 	local src_manifest dst_manifest
 	src_manifest="$(container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p '/out/$destsub' && cp -r '$guest/.' '/out/$destsub/' && cd '$guest' && $(retrieve_verify_script)")"
+		sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)")"
 	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
 		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
@@ -6459,7 +6459,7 @@ fetch_tmp_subdir() {
 		run mkdir -p "$dest/$destsub"
 		run container run --rm -u 0:0 \
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "tar -S -C '$guest' -cf - . | tar -S -C '/out/$destsub' -xf -"
+			sh -c "tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
 		dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 		[ "$src_manifest" = "$dst_manifest" ] || die "'$sub' still fails verification after the tar fallback" \
 			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
@@ -6616,12 +6616,17 @@ cmd_retrieve() {
 						*)
 							# A MACHINE substitutes straight into the trailing
 							# path component of a resolved guest path (see
-							# fetch_tmp_subdir) -- refuse anything shaped like
-							# a path escape ('/', '..') rather than let a typo
-							# silently retrieve some other directory entirely.
+							# fetch_tmp_subdir), which is now %q-quoted for the
+							# guest sh -c -- but a shell metacharacter surviving
+							# that quoting intact (e.g. embedded in the printed
+							# --dry-run preview, or in warn/die/info messages)
+							# is still a typo trap, and '..' would still walk
+							# the resolved path up a directory. Pin the shape to
+							# what a real MACHINE looks like instead of trying
+							# to enumerate what's dangerous.
 							case "$1" in
-								*/*|*..*)
-									die "MACHINE '$1' looks unsafe (contains '/' or '..')" \
+								*[!A-Za-z0-9._-]*|*..*)
+									die "MACHINE '$1' looks unsafe (must be letters, digits, '.', '_', '-' only, no '..')" \
 										"a MACHINE is a plain name, e.g. 'qemuarm64', not a path" ;;
 							esac
 							objects[$idx]="deploy:images:$1"; shift ;;
