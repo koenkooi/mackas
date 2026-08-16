@@ -172,11 +172,14 @@ notifier_calls() {
 	printf '%s\n' "$output" | grep -qi 'bitbake progress'
 }
 
-@test "monitor --help documents MACKAS_MONITOR_POLL_INTERVAL and is honest that --dry-run/-v have no effect" {
+@test "monitor --help documents MACKAS_MONITOR_POLL_INTERVAL and is honest that -y/-v have no effect" {
 	run "$MACKAS" monitor --help
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qF 'MACKAS_MONITOR_POLL_INTERVAL'
 	printf '%s\n' "$output" | grep -qi 'have no effect'
+	# --dry-run DOES have an effect (prints the invocation, does not poll) --
+	# the doc must not lump it in with -y/-v's "no effect" any more.
+	printf '%s\n' "$output" | grep -qi -- '--dry-run prints'
 }
 
 @test "monitor: an unknown option is refused" {
@@ -195,6 +198,17 @@ notifier_calls() {
 	run "$MACKAS" monitor --port
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'needs a value'
+}
+
+@test "monitor: --dry-run prints the real invocation instead of polling" {
+	run "$MACKAS" monitor --dry-run --port 18801 --once
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'mackas-monitor'
+	printf '%s\n' "$output" | grep -qF -- '--port 18801'
+	printf '%s\n' "$output" | grep -qF -- '--once'
+	# Never actually polled -- no connection-refused diagnostic, no exit 2.
+	printf '%s\n' "$output" > "$TESTDIR/dryrun.out"
+	assert_fails grep -qi 'nothing is listening' "$TESTDIR/dryrun.out"
 }
 
 # ---------------------------------------------------------------------------
