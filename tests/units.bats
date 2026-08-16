@@ -277,6 +277,44 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# inspect_holds_volume -- the one matcher volume_in_use and
+# restart_container_daemon now share for `container inspect`'s mount-name
+# key. Both spacings Apple has actually shipped must match, a name that is
+# only a substring elsewhere in the JSON must not, and a name containing ERE
+# metacharacters must not false-match some other, similarly-spelled name.
+# ---------------------------------------------------------------------------
+
+@test "inspect_holds_volume: matches the historical ' : ' spacing" {
+	local detail='{ "mounts" : [ { "name" : "oe-build-tmp" } ] }'
+	inspect_holds_volume "$detail" oe-build-tmp
+}
+
+@test "inspect_holds_volume: matches a tight ':' spacing too" {
+	local detail='{"mounts":[{"name":"oe-build-tmp"}]}'
+	inspect_holds_volume "$detail" oe-build-tmp
+}
+
+@test "inspect_holds_volume: does not false-match a substring in the image field" {
+	# The historical kas-image false positive: a volume named "kas" must not
+	# read as held just because it appears inside the image reference.
+	local detail='{ "configuration" : { "image" : { "reference" : "ghcr.io/siemens/kas/kas:5.4" } }, "mounts" : [ { "name" : "oe-build-tmp" } ] }'
+	assert_fails inspect_holds_volume "$detail" kas
+}
+
+@test "inspect_holds_volume: a dot in the name is not a wildcard" {
+	# Unescaped, "." in an ERE matches any character, so "a.b" would also
+	# match a mount literally named "aXb". It must not.
+	local detail='{ "mounts" : [ { "name" : "aXb" } ] }'
+	assert_fails inspect_holds_volume "$detail" "a.b"
+}
+
+@test "inspect_holds_volume: a name with ERE metacharacters matches only itself" {
+	local detail='{ "mounts" : [ { "name" : "vol[1].b" } ] }'
+	inspect_holds_volume "$detail" "vol[1].b"
+	assert_fails inspect_holds_volume "$detail" "volX1Xb"
+}
+
+# ---------------------------------------------------------------------------
 # No maintainer-private identifiers ship in the tool.
 #
 # The tool must be generic: no encoding of one person's disks, host, uid or

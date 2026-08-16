@@ -1715,9 +1715,9 @@ restart_container_daemon() {
 			die "cannot inspect running container '$id', so refusing to restart the daemon" \
 				"a restart would stop it; investigate with 'container inspect $id'"
 		fi
-		if printf '%s\n' "$detail" | grep -qF "\"name\" : \"$MACKAS_VOL_TMP\"" ||
-		   printf '%s\n' "$detail" | grep -qF "\"name\" : \"$MACKAS_VOL_DL\"" ||
-		   printf '%s\n' "$detail" | grep -qF "\"name\" : \"$MACKAS_VOL_SSTATE\""; then
+		if inspect_holds_volume "$detail" "$MACKAS_VOL_TMP" ||
+		   inspect_holds_volume "$detail" "$MACKAS_VOL_DL" ||
+		   inspect_holds_volume "$detail" "$MACKAS_VOL_SSTATE"; then
 			holders="${holders:+$holders }$id"
 		else
 			others=$((others + 1))
@@ -1856,6 +1856,24 @@ delete_volume() {
 	return 1
 }
 
+# inspect_holds_volume DETAIL NAME -- true if `container inspect` output
+# DETAIL (one container's JSON) has NAME as the mount block's  "name" : "..."
+# key, NOT a bare substring of the whole JSON. A plain grep -qF "$name" over
+# the entire inspect output false-positived on the IMAGE field: a volume
+# named "kas" "matched" ghcr.io/siemens/kas/kas:5.4 in every running
+# container, reporting a free volume as in use. Anchoring to the mount name
+# key still fails CLOSED on a malformed inspect (nothing matches -> the
+# caller's loop moves on), which is fine, but stops the false positive.
+#
+# NAME is regex-escaped before going into the ERE, so a volume name that
+# happens to contain metacharacters (a dot, brackets, ...) cannot make the
+# pattern match some other, similarly-spelled name.
+inspect_holds_volume() {
+	local detail="$1" name="$2" escaped
+	escaped="$(printf '%s' "$name" | sed 's/[][\.^$*+?(){}|/]/\\&/g')"
+	printf '%s\n' "$detail" | grep -qE "\"name\"[[:space:]]*:[[:space:]]*\"$escaped\""
+}
+
 # volume_in_use NAME -- true if a running container currently has volume NAME
 # attached.
 #
@@ -1866,9 +1884,8 @@ delete_volume() {
 #
 # There is no single `container` query for "who holds this volume", so this
 # lists the RUNNING containers (`container ls` shows only those; the first
-# column is the container ID) and inspects each: `container inspect`'s JSON
-# carries  "name" : "<volume>"  in the mount block, so a fixed-string match on
-# the volume name is correct. If the runtime is not up, nothing can hold it.
+# column is the container ID) and inspects each with inspect_holds_volume().
+# If the runtime is not up, nothing can hold it.
 #
 # The guard is UX, not the safety backstop. Virtualization.framework itself
 # REFUSES a second attach of the same ext4 image outright --
@@ -1892,17 +1909,7 @@ volume_in_use() {
 			warn "could not inspect container '$id'; assuming volume '$name' is in use"
 			return 0
 		fi
-		# Match the mount block's  "name" : "<volume>"  key, NOT a bare
-		# substring of the whole JSON. A plain grep -qF "$name" over the entire
-		# inspect output false-positived on the IMAGE field: a volume named
-		# "kas" "matched" ghcr.io/siemens/kas/kas:5.4 in every running
-		# container, reporting a free volume as in use. Anchoring to the mount
-		# name key still fails CLOSED on a malformed inspect (nothing matches ->
-		# the loop moves on), which is fine, but stops the false positive.
-		if printf '%s\n' "$detail" \
-			| grep -qE "\"name\"[[:space:]]*:[[:space:]]*\"$name\""; then
-			return 0
-		fi
+		inspect_holds_volume "$detail" "$name" && return 0
 	done
 	return 1
 }
