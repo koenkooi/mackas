@@ -511,6 +511,61 @@ EOF
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 }
 
+@test "retrieve: bitbake_getvar's warning names bitbake-getvar's REAL stderr reason" {
+	# bitbake_getvar()'s stderr redirect used to sit outside its command
+	# substitution ('out="$(...)" 2>"$errfile"'), a no-op -- errfile stayed
+	# empty and the mock's own stderr line leaked straight past mackas. This
+	# pins the redirect to the substitution: the exact text the mock writes
+	# to stderr must show up, verbatim, in the "bitbake-getvar failed for"
+	# warning below, not just some generic fallback notice.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q DEPLOY_DIR "*)
+		echo "ParseError: some real bitbake-getvar failure" >&2
+		exit 1
+		;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+
+	MOCK_TMP_HAS="deploy" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy
+	[ "$status" -eq 0 ]
+	grep -qF 'bitbake-getvar failed for DEPLOY_DIR: ParseError: some real bitbake-getvar failure' <<< "$output"
+}
+
+@test "retrieve: bitbake_getvar's captured stderr text actually reaches quiet_undefined's match" {
+	# Same captured-stderr mechanism as the test above, but for the
+	# QUIET_UNDEFINED opt-in (buildhistory/sbom): the captured bytes must
+	# actually MATCH "The variable 'X' is not defined" to swallow the two
+	# generic warnings below. A bare `!` here would pass vacuously even if
+	# they leaked (bash's `set -e` never aborts on a `!`-negated command,
+	# see assert_fails's own comment) -- assert_fails is what actually fails
+	# the test on that wrong-success case.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q BUILDHISTORY_DIR "*)
+		echo "The variable 'BUILDHISTORY_DIR' is not defined" >&2
+		exit 1
+		;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+
+	MOCK_TMP_HAS="" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve buildhistory
+	[ "$status" -ne 0 ]
+	grep -qi 'does not INHERIT buildhistory' <<< "$output"
+	assert_fails grep -qF 'bitbake-getvar failed for BUILDHISTORY_DIR' <<< "$output"
+	assert_fails grep -qF 'could not resolve BUILDHISTORY_DIR' <<< "$output"
+}
+
 @test "retrieve: reports the real measured size to transfer, not a fixed guess" {
 	# Item 33: replaces the old hardcoded "deploy can be large" line -- every
 	# object gets a REAL, measured figure now, not just deploy.
