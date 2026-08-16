@@ -238,3 +238,22 @@ EXPECT_FILES="kas/base.yml:kas/macos-local.yml"
 	[ "$status" -eq 0 ]
 	[ ! -e "$ROOT" ]
 }
+
+@test "setup with no project configured ends at [9/9], not [11/11]" {
+	# Unset the project settings that mk() normally sets, forcing the no-project path.
+	run "$MACKAS" -y \
+		--set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$SHORT" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		--set MACKAS_OVERHEAD=0 \
+		--set MACKAS_CPUS=6 \
+		--set MACKAS_MEMORY=12g \
+		--set MACKAS_PROJECT_URL="" \
+		--dry-run \
+		setup
+	[ "$status" -eq 0 ]
+	# The output should show [9/9] for the final step, not [11/11].
+	printf '%s\n' "$output" | grep -qF '[9/9]'
+	# And it should NOT show [11/11].
+	! printf '%s\n' "$output" | grep -qF '[11/11]'
+}
