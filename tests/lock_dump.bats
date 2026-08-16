@@ -164,6 +164,18 @@ refute_klog() {
 	refute_klog "[lock]"
 }
 
+@test "lock: --dry-run prints the real, pasteable invocation (env prefix + runtime-args + kas-files)" {
+	MACKAS_PROJECT_DIR=meta-angstrom mk --dry-run lock
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--runtime-args'
+	printf '%s\n' "$output" | grep -qF -- '-v\ oe-build-tmp:/build'
+	printf '%s\n' "$output" | grep -qF -- 'GITCONFIG_FILE='
+	printf '%s\n' "$output" | grep -qF -- 'kas-container.real'
+	printf '%s\n' "$output" | grep -qF -- 'lock kas/macos-local.yml'
+	# lock never runs bitbake -- BB_NUMBER_THREADS/PARALLEL_MAKE would be a lie.
+	! printf '%s\n' "$output" | grep -qF -- 'BB_NUMBER_THREADS'
+}
+
 @test "lock --help prints usage and does nothing" {
 	mk lock --help
 	[ "$status" -eq 0 ]
@@ -215,6 +227,19 @@ refute_klog() {
 	[ "$status" -eq 0 ]
 	refute_klog "[dump]"
 	[ ! -f "$ROOT/logs/dump-20260803000002.yml" ]
+}
+
+@test "dump: --dry-run prints the real, pasteable invocation (env prefix + runtime-args + kas-files)" {
+	MACKAS_PROJECT_DIR=meta-angstrom mk --dry-run dump
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--runtime-args'
+	printf '%s\n' "$output" | grep -qF -- '-v\ oe-build-tmp:/build'
+	printf '%s\n' "$output" | grep -qF -- 'GITCONFIG_FILE='
+	printf '%s\n' "$output" | grep -qF -- 'kas-container.real'
+	printf '%s\n' "$output" | grep -qF -- 'dump --resolve-env --resolve-local --resolve-refs kas/macos-local.yml'
+	printf '%s\n' "$output" | grep -qF -- 'writing resolved config to:'
+	# dump never runs bitbake -- BB_NUMBER_THREADS/PARALLEL_MAKE would be a lie.
+	! printf '%s\n' "$output" | grep -qF -- 'BB_NUMBER_THREADS'
 }
 
 @test "dump --help prints usage and does nothing" {

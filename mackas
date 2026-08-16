@@ -4964,19 +4964,33 @@ cmd_adopt() {
 # smoketest
 # ---------------------------------------------------------------------------
 
+# kas_env_vars WANT_BUILD_VARS -- the VAR=value words kas_invoke_env exports
+# ahead of the real kas-container binary (PATH/engine/work-dir/gitconfig/
+# image, plus BB_NUMBER_THREADS/PARALLEL_MAKE when WANT_BUILD_VARS=1), with
+# no command word or --runtime-args after them. Shared by kas_env_prefix()
+# below (the log-header shape, documentation text rather than a runnable
+# line -- there is no command word between its VARs and --runtime-args) and
+# by any dry-run preview that needs the same VARs immediately before the
+# real binary name, to stay a genuinely pasteable command line.
+# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are deliberately blanked, not set: see
+# kas_runtime_args().
+# shellcheck disable=SC2016  # literal text: $PATH must appear verbatim in
+# the printed command line, to be expanded by the user's shell, not ours.
+kas_env_vars() {
+	local want_build_vars="$1"
+	printf 'PATH=%s:/opt/homebrew/bin:$PATH KAS_CONTAINER_ENGINE=%s KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s KAS_CONTAINER_IMAGE=%s' \
+		"$SHIM_DIR" "$MACKAS_KAS_ENGINE" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$KAS_IMAGE"
+	[ "$want_build_vars" = "1" ] && printf ' BB_NUMBER_THREADS=%s PARALLEL_MAKE=%s' "$MACKAS_CPUS" "-j $MACKAS_CPUS"
+}
+
 kas_env_prefix() {
 	# Emitted for the log header so a failure is reproducible by hand. Must
 	# mirror run_kas()'s own _kas_exec invocation (via kas_invoke_env(),
 	# below) variable for variable -- it used to omit KAS_CONTAINER_ENGINE,
 	# KAS_CONTAINER_IMAGE, BB_NUMBER_THREADS and PARALLEL_MAKE, so pasting the
 	# printed header back verbatim did not actually reproduce a real build.
-	# KAS_BUILD_DIR/DL_DIR/SSTATE_DIR are deliberately blanked, not set: see
-	# kas_runtime_args().
-	# shellcheck disable=SC2016  # literal text: $PATH must appear verbatim in
-	# the printed command line, to be expanded by the user's shell, not ours.
-	printf 'PATH=%s:/opt/homebrew/bin:$PATH KAS_CONTAINER_ENGINE=%s KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s KAS_CONTAINER_IMAGE=%s BB_NUMBER_THREADS=%s PARALLEL_MAKE=%s --runtime-args %s' \
-		"$SHIM_DIR" "$MACKAS_KAS_ENGINE" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$KAS_IMAGE" \
-		"$MACKAS_CPUS" "-j $MACKAS_CPUS" "$(printf '%q' "$(kas_runtime_args)")"
+	# Always the build-vars shape: every caller here is a real build/shell rung.
+	printf '%s --runtime-args %s' "$(kas_env_vars 1)" "$(printf '%q' "$(kas_runtime_args)")"
 }
 
 # kas_invoke_env RT_ARGS GITCONFIG WANT_BUILD_VARS CMD... -- exec
@@ -6006,7 +6020,10 @@ cmd_lock() {
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		info "${C_BLD}mackas lock${C_RST} -- would run:"
-		info "  $(quote_cmd kas-container lock "$KAS_FILES_ARG")"
+		printf '%s+ (cd %s && %s %s --runtime-args %s %s)%s\n' \
+			"$C_DIM" "$(printf '%q' "$MACKAS_PROJECT")" \
+			"$(kas_env_vars 0)" "$(printf '%q' "$KAS_CONTAINER_REAL")" \
+			"$(printf '%q' "$rt_args")" "$(quote_cmd lock "$KAS_FILES_ARG")" "$C_RST"
 		return 0
 	fi
 
@@ -6056,7 +6073,11 @@ cmd_dump() {
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		info "${C_BLD}mackas dump${C_RST} -- would run:"
-		info "  $(quote_cmd kas-container dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")"
+		printf '%s+ (cd %s && %s %s --runtime-args %s %s)%s\n' \
+			"$C_DIM" "$(printf '%q' "$MACKAS_PROJECT")" \
+			"$(kas_env_vars 0)" "$(printf '%q' "$KAS_CONTAINER_REAL")" \
+			"$(printf '%q' "$rt_args")" \
+			"$(quote_cmd dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")" "$C_RST"
 		info "  writing resolved config to: $out"
 		return 0
 	fi
@@ -7218,9 +7239,10 @@ through System Settings > Notifications that no CLI can do for you.
 Installing terminal-notifier (brew install terminal-notifier) sidesteps it
 by carrying its own bundle identity, and is preferred automatically.
 
---dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted here for
-consistency with every other command, but have no effect: monitor only
-polls and prints, it never mutates anything or asks for confirmation.
+-y/--yes (or -f/--force) and -v/--verbose are accepted here for consistency
+with every other command, but have no effect: monitor never mutates
+anything or asks for confirmation. --dry-run prints the mackas-monitor
+invocation it would run instead of polling.
 EOF
 }
 
@@ -7271,7 +7293,9 @@ cmd_monitor() {
 	[ "$once" -eq 1 ] && args+=(--once)
 	[ "$notify" = "1" ] && args+=(--notify)
 	[ "$wait_for_start" != "0" ] && args+=(--wait-for-start "$wait_for_start")
-	/usr/bin/python3 "$tool" "${args[@]}"
+	# run(): prints the invocation and returns 0 under --dry-run instead of
+	# actually polling, same as every other real command in this file.
+	run /usr/bin/python3 "$tool" "${args[@]}"
 }
 
 show() { printf '  %-24s %s\n' "$1" "$2"; }
