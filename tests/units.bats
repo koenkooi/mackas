@@ -237,6 +237,21 @@ teardown() {
 	[ "$MACKAS_BASE" = "$MACKAS_ROOT" ]
 }
 
+@test "derive_paths adopts a short link that reaches MACKAS_ROOT through ANOTHER symlink" {
+	# same_dir compares fully-resolved paths, not a bare readlink() string --
+	# so a link one hop removed (short-link -> alias -> root) must still be
+	# adopted, the same as a direct short-link -> root link is.
+	set_defaults
+	MACKAS_ROOT="$TESTDIR/root"
+	mkdir -p "$MACKAS_ROOT"
+	ln -sfn "$MACKAS_ROOT" "$TESTDIR/root-alias"
+	MACKAS_SHORT_LINK="$TESTDIR/oe"
+	ln -sfn "$TESTDIR/root-alias" "$MACKAS_SHORT_LINK"
+	derive_paths
+	[ "$MACKAS_BASE" = "$MACKAS_SHORT_LINK" ]
+	[ "$MACKAS_WORK" = "$MACKAS_SHORT_LINK/work" ]
+}
+
 # ---------------------------------------------------------------------------
 # kas_env_prefix -- the "paste this back to reproduce it by hand" log header
 # ---------------------------------------------------------------------------
