@@ -1,7 +1,7 @@
 # mackas CI.
 #
-# Started by hand only (workflow_dispatch -- see the DISABLED note below).
-# The two main gates:
+# Runs on every push to main and every pull request (see the `on:` block
+# below), plus manual dispatch. The two main gates:
 #
 #   macos  -- the full ./run-tests.sh (shellcheck, bash 3.2 syntax, the bats
 #             suite, and the Python unittest suite). The bats suite is macOS-

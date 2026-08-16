@@ -130,10 +130,16 @@ a partial run.
 
 ## Workflow conventions
 
-- **CI is intentionally disabled.** `.github/workflows/ci.yml` is
-  `workflow_dispatch`-only because GitHub Actions minutes cost money (macOS
-  runners at a premium). **Do not add `push`/`pull_request` triggers or run the
-  workflow.** `./run-tests.sh` covers the same hermetic suite for free.
+- **CI runs on every push to main and every pull request.**
+  `.github/workflows/ci.yml` triggers on `push`/`pull_request`/
+  `workflow_dispatch`. This is free: public-repo standard GitHub-hosted
+  runners, including macOS, are unmetered — confirmed against GitHub's own
+  billing docs, still true after the 2026-01-01 Actions repricing. Keep it
+  that way: re-confirm `koenkooi/mackas` is still public
+  (`gh repo view --json visibility`) before ever touching the `on:` block,
+  since a private repo bills macOS runners at a 10x multiplier against the
+  account's included-minutes quota. `./run-tests.sh` runs the identical
+  hermetic suite locally for free either way.
 - **Keep docs current in the same commit that makes them stale.** `docs/` and
   `README.md` are part of the change, not a follow-up.
 - **Versioning:** SemVer-ish, but pre-1.0 (`0.y.z`), so nothing is promised
