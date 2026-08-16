@@ -52,8 +52,35 @@ teardown() {
 	[ "$(size_to_gb "abc")" = "0" ]
 }
 
+@test "size_to_gb: real 'du -h' output with a decimal point still parses (near-cap depends on it)" {
+	# status_volume() feeds size_to_gb() real `du -h` output like "8.0M" --
+	# the decimal point means the unit match below fails (".0m" is not "m"),
+	# same as any other unrecognised-unit input, so it falls to the
+	# catch-all. That fallback deliberately still reads as GiB, not 0: it
+	# overestimates whatever slips through, which errs on the side of a
+	# near-cap warning firing rather than a full volume going unreported.
+	[ "$(size_to_gb "8.0M")" = "8" ]
+}
+
 @test "size_to_gb: the real default volume size parses to 200" {
 	[ "$(size_to_gb 200G)" = "200" ]
+}
+
+# ---------------------------------------------------------------------------
+# valid_size_shape -- the single shape validate_settings()/validate_setup_size()
+# both pin MACKAS_VOLUME_SIZE_*/--tmpdir-size et al to.
+# ---------------------------------------------------------------------------
+
+@test "valid_size_shape: accepts every unit size_to_gb/size_to_bytes parse" {
+	for v in 1T 200G 512M 42 1t 200g 512m 1TB 1TiB 200GB 200GiB 512MB 512MiB; do
+		valid_size_shape "$v" || { echo "expected '$v' to be valid" >&2; return 1; }
+	done
+}
+
+@test "valid_size_shape: refuses an unrecognised unit, garbage or empty" {
+	for v in 512K lol "" abc "1t2" "1 T"; do
+		! valid_size_shape "$v" || { echo "expected '$v' to be refused" >&2; return 1; }
+	done
 }
 
 # ---------------------------------------------------------------------------
