@@ -5470,7 +5470,7 @@ bitbake_getvar() {
 	# not discarded -- a bare "could not resolve" with no reason was hard to
 	# debug live.
 	errfile="$(mktemp "${TMPDIR:-/tmp}/mackas-getvar.XXXXXX" 2>/dev/null)" || errfile=/dev/null
-	out="$(kas_shell_ro "bitbake-getvar --value -q $(printf '%q' "$var")")" 2>"$errfile"
+	out="$(kas_shell_ro "bitbake-getvar --value -q $(printf '%q' "$var")" 2>"$errfile")"
 	rc=$?
 	if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
 		errmsg="$(tail -1 "$errfile" 2>/dev/null)"
