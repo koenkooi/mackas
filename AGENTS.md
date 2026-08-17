@@ -8,24 +8,25 @@ break by accident.
 
 ## What this repo is
 
-- `mackas` — the whole tool, one ~9700-line **bash 3.2** script. Subcommands:
+- `mackas` — the whole tool, one ~10,500-line **bash 3.2** script. Subcommands:
   `check`, `setup`, `adopt`, `smoketest`, `status`, `shell`, `exec`,
-  `retrieve`, `buildstats`, `sstate`, `monitor`, `clean`, `destroy`, `volume`,
-  `set`, `get`, `unset`, `runtime-args`, `lock`, `dump`.
+  `retrieve`, `buildstats`, `buildhistory`, `sstate`, `monitor`, `clean`,
+  `destroy`, `volume`, `set`, `get`, `unset`, `runtime-args`, `lock`, `dump`.
 - `bin/docker` — a shim that translates the `docker` CLI calls kas-container v5.4
   makes into Apple `container` calls. Nothing more.
 - `mirror-server/mackas-mirrord` — optional HTTP mirror server. **Python 3.7+,
   stdlib only.**
-- `tools/` — Python, stdlib only: `mackas-buildstats-analyze` and
-  `mackas-overhead` (build profiling), `mackas-monitor` (renders the live
-  progress bridge in a terminal), `mackas-ext4-dirty-bit` (reads a volume
-  image's ext4 dirty/error state without mounting it).
+- `tools/` — Python, stdlib only: `mackas-buildstats-analyze`,
+  `mackas-buildhistory-analyze` and `mackas-overhead` (build profiling),
+  `mackas-monitor` (renders the live progress bridge in a terminal),
+  `mackas-ext4-dirty-bit` (reads a volume image's ext4 dirty/error state
+  without mounting it).
 - `mackas-uibridge/` — the live build-progress bridge behind `MACKAS_MONITOR=1`.
   `mackasjson.py` is a bitbake UI module (`bb.ui.mackasjson`) that serves
   progress as JSON over HTTP; `bitbake` is a wrapper bind-mounted directly over
   the checkout's own `bin/bitbake` for the lifetime of one container run (a
   PATH shadow does not work — see the file's own header for why).
-- `tests/` — 37 `*.bats` files + 6 `test_*.py` files.
+- `tests/` — 38 `*.bats` files + 7 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security, monitor-app.
 - `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to

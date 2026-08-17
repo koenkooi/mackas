@@ -333,16 +333,35 @@ either of those derived for you.
 
 ### Buildhistory (what changed in package/image content)
 
-For browsing history or diffing several commits, **`mackas retrieve
-buildhistory` copies the whole thing to `$MACKAS_BASE/artifacts/buildhistory`**
-— a real host-side directory (a git checkout when `BUILDHISTORY_COMMIT` is on)
-you can `git log`/`git diff`/`git show` directly on macOS, no container
-round-trip per query. It resolves `BUILDHISTORY_DIR` via bitbake, and says so
-specifically when the project does not inherit the class instead of reporting a
-missing directory. It is a full copy each time, so for one quick lookup the
-in-container query is cheaper.
+**`mackas buildhistory analyze`** answers "what did the last build change"
+directly: recipes added/removed/upgraded, the biggest `PKGSIZE` movers
+(listed past >1% or >64 KiB; smaller ones still counted into the net
+total), and per-image `IMAGESIZE`/installed-package deltas — read via host
+`git` plumbing, no container. `mackas retrieve buildhistory` **copies the
+whole tree to `$MACKAS_BASE/artifacts/buildhistory`** (a real host-side
+directory, a git checkout when `BUILDHISTORY_COMMIT` is on) and then runs
+this summary automatically on what it just copied, so a routine retrieve
+already answers the question. Re-run it later without re-copying:
 
-For a single value, query inside the container:
+```sh
+mackas buildhistory analyze                              # $MACKAS_BASE/artifacts/buildhistory, build-minus-1..HEAD
+mackas buildhistory analyze --from HEAD~5 --to HEAD       # a wider comparison
+mackas buildhistory analyze --detail                      # + upstream buildhistory-diff's per-field output
+mackas buildhistory analyze --json                        # for scripting/piping
+```
+
+`--detail` additionally runs openembedded-core's own
+`scripts/buildhistory-diff` in a throwaway kas-image container for
+per-field semantics (`RDEPENDS` version-constraint comparisons, unified
+diffs of `pkg_postinst`) the summary deliberately does not reimplement —
+best-effort, needs a checkout under `$MACKAS_ROOT/work`. It resolves
+`BUILDHISTORY_DIR` via bitbake, and says so specifically when the project
+does not inherit the class instead of reporting a missing directory. With
+`BUILDHISTORY_COMMIT` off there is no history to diff, so it reports the
+CURRENT state instead (counts and sizes, no comparison).
+
+`retrieve buildhistory` is a full copy each time, so for one quick lookup
+without copying the tree, query inside the container instead:
 
 ```sh
 mackas exec sh -c "cd /build/buildhistory && git log --oneline $PRE..HEAD && git diff --stat $PRE..HEAD"

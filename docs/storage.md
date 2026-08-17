@@ -1041,7 +1041,7 @@ keep accumulating across builds and will manage it yourself.
 
 ## Buildhistory, and the volume it lives in
 
-`meta/classes-global/buildhistory.bbclass` records what each build actually
+`meta/classes/buildhistory.bbclass` records what each build actually
 produced — package and image contents, sizes, runtime dependencies, sysroot
 listings — under `BUILDHISTORY_DIR`, which it defaults to
 `${TOPDIR}/buildhistory`. Two consequences follow from that default on this
@@ -1085,6 +1085,29 @@ everyone building it sees the same thing.
 The retrieved copy is a plain directory on the Mac, and a git repository when
 `BUILDHISTORY_COMMIT` is on — one commit per build, readable with ordinary
 `git -C $MACKAS_BASE/artifacts/buildhistory log`, no container needed.
+
+**`mackas buildhistory analyze`** turns that git history into a digest
+instead of a manual `git log`/`git diff` session: recipes
+added/removed/upgraded, the biggest `PKGSIZE` movers, and per-image
+`IMAGESIZE`/installed-package deltas, read via host `git` plumbing (`git
+diff --name-status` plus one `git cat-file --batch` — no container, no
+bitbake, cost proportional to what changed rather than the size of the
+tree). `PKGSIZE` and `IMAGESIZE` are both already recorded in KiB
+(buildhistory.bbclass's own convention — `IMAGESIZE` comes from `du -ks`),
+not bytes. A package-size change is listed only past >1% or >64 KiB;
+smaller changes are still counted into the net total. `--detail`
+additionally runs openembedded-core's own `scripts/buildhistory-diff`
+inside a throwaway kas-image container for the per-field semantics
+(`RDEPENDS` version-constraint comparisons, unified diffs of
+`pkg_postinst`, ...) that the summary deliberately does not reimplement;
+best-effort, since it needs a checkout under `$MACKAS_ROOT/work` with
+bitbake and `scripts/buildhistory-diff` reachable under it. `retrieve
+buildhistory` runs the summary layer automatically on what it just
+copied — never `--detail`, and never affecting `retrieve`'s own exit
+code — so a routine `mackas retrieve buildhistory` already answers "what
+did this build change" without a separate step. With `BUILDHISTORY_COMMIT`
+off there is no per-build history to diff, so this reports the CURRENT
+state instead (recipe/package/image counts and sizes, no comparison).
 
 ## SPDX/SBOM output — `DEPLOY_DIR_SPDX`
 

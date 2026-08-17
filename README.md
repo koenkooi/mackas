@@ -114,6 +114,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `exec` | `exec CMD` runs a one-off read-only command against the checkout with kas's repo-mutating setup steps always skipped — see [below](#driving-kas-directly). `mackas exec --help`. |
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
+| `buildhistory` | `buildhistory analyze [PATH] [--from REV] [--to REV] [--detail] [--json]` summarises what changed between two builds — recipes added/removed/upgraded, the biggest PKGSIZE movers, per-image size/content deltas. `mackas buildhistory --help`. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. Exits 0 on a build that succeeded, 1 on one that failed, 2 when no bridge is reachable — a usable scripted probe. |
 | `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
@@ -155,6 +156,7 @@ from macOS. `mackas retrieve` copies them out with a throwaway container:
 ./mackas retrieve buildhistory              # what each build produced, if the project inherits it
 ./mackas retrieve buildstats --dest ~/out   # elsewhere
 ./mackas buildstats analyze [PATH]          # summarise what was fetched
+./mackas buildhistory analyze [PATH]        # what changed between two builds
 ```
 
 Every object resolves its real guest path from bitbake itself
@@ -170,6 +172,21 @@ the same volume bare `mackas clean` drops wholesale, retrieve it before
 cleaning, point `BUILDHISTORY_DIR` somewhere that survives, or use
 `mackas clean tmp+deploy` instead of bare `clean` — it keeps buildhistory
 (and conf/) intact, clearing only TMPDIR and DEPLOY_DIR.
+
+`buildhistory analyze` reads the retrieved tree with host `git` (`git diff
+--name-status` plus one `git cat-file --batch`, no container) and prints a
+rollup: recipes added/removed/upgraded, the biggest PKGSIZE movers (listed
+past >1% or >64 KiB, everything smaller still counted into the net total),
+and per-image IMAGESIZE/installed-package deltas. `--detail` additionally
+runs openembedded-core's own `scripts/buildhistory-diff` in a throwaway
+kas-image container for the per-field detail (`RDEPENDS` version-constraint
+changes, unified diffs of `pkg_postinst`, ...) — best-effort, needs a
+checkout under `$MACKAS_ROOT/work`. `--json` emits the summary as JSON
+instead (refuses `--detail`). `retrieve buildhistory` runs the summary layer
+automatically on what it just copied; re-run it later without re-copying
+with `mackas buildhistory analyze`. Needs `BUILDHISTORY_COMMIT = "1"` (most
+projects' default) for there to be build-to-build history to diff — with it
+off, this shows the current state instead (no comparison).
 
 `buildstats analyze` runs
 [`tools/mackas-buildstats-analyze`](tools/mackas-buildstats-analyze) over
@@ -402,7 +419,7 @@ volume-relocation symlink already belongs to a different live project,
 | `mirror-server/mackas-mirrord.service` | Hardened systemd unit for it (Debian 13). |
 | `mirror-server/mackas-mirrord.conf.example` | Annotated config for it. |
 | `mackas-uibridge/` | The live-progress bridge (`MACKAS_MONITOR=1`): a bitbake UI module (`mackasjson.py`) and the `bitbake` wrapper mounted over the checkout's own. **Optional.** |
-| `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller), `mackas-ext4-dirty-bit` (the superblock dirty-bit probe `check` runs). |
+| `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-buildhistory-analyze` (`buildhistory analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller), `mackas-ext4-dirty-bit` (the superblock dirty-bit probe `check` runs). |
 | `tests/`, `run-tests.sh`, `Makefile` | bats test suite and its entry points (`./run-tests.sh` or `make test`). See [testing.md](docs/testing.md). |
 | `COPYING` | GPLv3. |
 | `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`. |
