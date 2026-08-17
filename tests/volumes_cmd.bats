@@ -109,6 +109,33 @@ esac
 exit 0
 EOF
 	chmod +x "$TESTDIR/fakebin/container"
+
+	# Fake curl + shasum: `mackas setup` fetches kas-container for real on any
+	# root where $KAS_CONTAINER_REAL does not already exist (mackas:4153-4155)
+	# -- a genuine network call to raw.githubusercontent.com with no mock here
+	# previously, unlike setup_e2e.bats/setup_kas_container.bats, which both
+	# already fake this exact path. Every test in this file that runs a real
+	# (non-dry-run) `mackas setup` from a fresh root was silently depending on
+	# that call succeeding fast against the real network; a live 429 from
+	# raw.githubusercontent.com reproduced this failing outright, confirmed
+	# against unmodified main, unrelated to any particular change here.
+	PINNED_SHA="$(grep '^KAS_CONTAINER_SHA256=' "$MACKAS" | cut -d'"' -f2)"
+	cat > "$TESTDIR/fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
+[ -n "$out" ] || exit 1
+printf '#!/usr/bin/env bash\nexit 0\n' > "$out"
+exit 0
+EOF
+	chmod +x "$TESTDIR/fakebin/curl"
+	cat > "$TESTDIR/fakebin/shasum" <<EOF
+#!/usr/bin/env bash
+f="\${@: -1}"
+printf '%s  %s\n' "$PINNED_SHA" "\$f"
+EOF
+	chmod +x "$TESTDIR/fakebin/shasum"
+
 	PATH="$TESTDIR/fakebin:$PATH"
 	export PATH
 }
