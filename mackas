@@ -6859,7 +6859,7 @@ ${C_BLD}$SCRIPT_CMD buildstats${C_RST} -- work with buildstats already retrieved
 from the TMPDIR volume ('$SCRIPT_CMD retrieve buildstats').
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD buildstats analyze [PATH]
+  $SCRIPT_CMD buildstats analyze [PATH] [--json] [--top N] [-o FILE] [--chart|--no-chart]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
   analyze [PATH]   Summarise the NEWEST build in a buildstats directory (wall
@@ -6870,11 +6870,21 @@ ${C_BLD}SUBCOMMANDS${C_RST}
                    to \$MACKAS_BASE/artifacts/buildstats -- the default
                    '$SCRIPT_CMD retrieve buildstats' destination.
 
+    --json         Machine-readable JSON instead of the text digest.
+    --top N        How many entries per top-N table (default 25).
+    -o FILE        Write the summary to FILE instead of stdout.
+    --chart        Render the bootchart SVG and fail the command if that
+                   render fails (the default silently tolerates a chart
+                   failure -- it is a bonus, not something you asked for).
+    --no-chart     Skip the SVG render entirely -- no throwaway container.
+
 The SVG needs pycairo, which this Mac's own Python does not have, so it runs
-INSIDE a throwaway kas-image container instead -- best-effort: silently
-skipped (not an error) with no checkout yet, or if pybootchartgui.py cannot
-be found under it. A build with a chart already on disk is skipped, so
-re-running 'analyze' after one more build only charts the new one.
+INSIDE a throwaway kas-image container instead -- best-effort by default:
+silently skipped (not an error) with no checkout yet, or if
+pybootchartgui.py cannot be found under it, or on any other render failure,
+unless --chart asked for it explicitly. A build with a chart already on disk
+is skipped, so re-running 'analyze' after one more build only charts the new
+one.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after the subcommand.
@@ -7004,14 +7014,35 @@ buildstats_render_svg() {
 	return "$rc"
 }
 
-# buildstats analyze [PATH] -- summarise a buildstats dir already on disk
-# (see cmd_retrieve). Non-fatal on a missing analyzer or a failed run: this is
-# a read-only summary, never worth taking the process down over.
+# buildstats analyze [PATH] [--json] [--top N] [-o FILE] [--chart|--no-chart]
+# -- summarise a buildstats dir already on disk (see cmd_retrieve). Non-fatal
+# on a missing analyzer or a failed summary run: this is a read-only summary,
+# never worth taking the process down over. The chart step's own exit code is
+# only ever allowed to fail the command when --chart was passed explicitly --
+# see the case below for why.
 buildstats_analyze() {
-	[ "$#" -le 1 ] || die "'buildstats analyze' takes at most one PATH" \
-		"$SCRIPT_CMD buildstats analyze [PATH]"
-
-	local path="${1:-$MACKAS_BASE/artifacts/buildstats}"
+	local path="" json=0 topn="" outfile="" chart="default"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--json)        json=1; shift ;;
+			--top)         topn="${2:-}"
+				[ -n "$topn" ] || die "--top needs a value" "$SCRIPT_CMD buildstats --help"
+				shift 2 ;;
+			--top=*)       topn="${1#*=}"; shift ;;
+			-o|--output)   outfile="${2:-}"
+				[ -n "$outfile" ] || die "-o/--output needs a value" "$SCRIPT_CMD buildstats --help"
+				shift 2 ;;
+			-o=*|--output=*) outfile="${1#*=}"; shift ;;
+			--chart)       chart="on"; shift ;;
+			--no-chart)    chart="off"; shift ;;
+			-*) die "unknown option for 'buildstats analyze': $1" "$SCRIPT_CMD buildstats --help" ;;
+			*) if [ -z "$path" ]; then path="$1"; else
+				die "'buildstats analyze' takes at most one PATH" \
+					"$SCRIPT_CMD buildstats analyze [PATH]"
+			fi; shift ;;
+		esac
+	done
+	path="${path:-$MACKAS_BASE/artifacts/buildstats}"
 
 	# A relative PATH would be read as a NAMED VOLUME source, not a host
 	# directory, the moment buildstats_render_svg bind-mounts it -- same
@@ -7031,12 +7062,35 @@ buildstats_analyze() {
 		rc=1
 	else
 		hdr "buildstats summary"
-		/usr/bin/python3 "$analyzer" "$path" --summary \
+		local pyargs
+		pyargs=("$path")
+		if [ "$json" -eq 1 ]; then pyargs+=(--json); else pyargs+=(--summary); fi
+		[ -n "$topn" ] && pyargs+=(--top "$topn")
+		[ -n "$outfile" ] && pyargs+=(-o "$outfile")
+		/usr/bin/python3 "$analyzer" "${pyargs[@]}" \
 			|| { warn "analyze failed (non-fatal); check $path"; rc=1; }
 	fi
 
-	hdr "bootchart SVG"
-	buildstats_render_svg "$path" || true
+	# Charting boots a throwaway container per uncharted build dir -- on by
+	# default (existing behaviour), but its own failure only turns into a
+	# command failure when the user explicitly asked for it with --chart.
+	# Left at the default, or explicitly skipped with --no-chart, a chart
+	# problem stays a silent skip -- the same "unrequested bonus, never
+	# fatal" reasoning buildhistory_detail_diff's exit-code propagation
+	# already applies to something the user DID ask for.
+	case "$chart" in
+		off) : ;;
+		on)
+			hdr "bootchart SVG"
+			# buildstats_render_svg already warns per build on its own
+			# failures; no need to add a second, generic warning on top.
+			buildstats_render_svg "$path" || rc=1
+			;;
+		default)
+			hdr "bootchart SVG"
+			buildstats_render_svg "$path" || true
+			;;
+	esac
 
 	return "$rc"
 }

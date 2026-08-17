@@ -139,6 +139,65 @@ assert_call() {
 	[ "$status" -ne 0 ]
 }
 
+@test "buildstats analyze: an unknown flag is refused, not swallowed as a second PATH" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mk buildstats analyze --bogus
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'unknown option'
+}
+
+# ---------------------------------------------------------------------------
+# --json / --top / -o -- previously unreachable: buildstats_analyze() only
+# ever accepted a single positional PATH and hardcoded --summary, so every
+# flag tools/mackas-buildstats-analyze itself supports was dead from the CLI.
+# ---------------------------------------------------------------------------
+
+@test "buildstats analyze: default output is the text summary, not JSON" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mk buildstats analyze
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'task CPU'
+	assert_fails grep -qF '"n_tasks"' <<< "$output"
+}
+
+@test "buildstats analyze: --json emits JSON instead of the text summary" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mk buildstats analyze --json
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF '"n_tasks"'
+	assert_fails grep -qF 'task CPU' <<< "$output"
+}
+
+@test "buildstats analyze: --top N is forwarded to the analyzer" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mk buildstats analyze --top 3
+	[ "$status" -eq 0 ]
+}
+
+@test "buildstats analyze: --top with no value is a usage error" {
+	mk buildstats analyze --top
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi -- '--top needs a value'
+}
+
+@test "buildstats analyze: -o FILE writes the summary to FILE, not stdout" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	local out="$TESTDIR/summary.txt"
+	mk buildstats analyze -o "$out"
+	[ "$status" -eq 0 ]
+	[ -s "$out" ]
+	grep -qF 'task CPU' "$out"
+	assert_fails grep -qF 'task CPU' <<< "$output"
+}
+
+@test "buildstats analyze: --json and -o compose" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	local out="$TESTDIR/summary.json"
+	mk buildstats analyze --json -o "$out"
+	[ "$status" -eq 0 ]
+	grep -qF '"n_tasks"' "$out"
+}
+
 # ---------------------------------------------------------------------------
 # Bootchart SVG -- runs pybootchartgui inside a throwaway container
 # ---------------------------------------------------------------------------
@@ -295,6 +354,58 @@ EOF
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'pybootchartgui failed'
 	[ ! -f "$ROOT/artifacts/buildstats/20260717121723.svg" ]
+}
+
+# ---------------------------------------------------------------------------
+# --chart / --no-chart -- the chart step is on by default, but its own
+# failure only turns into a command failure when the user explicitly asked
+# for it with --chart. Left at the default, a chart problem is a silent
+# skip; --no-chart skips the step (and its container) entirely.
+# ---------------------------------------------------------------------------
+
+@test "buildstats analyze: --no-chart skips the SVG step entirely -- no container call" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mkdir -p "$ROOT/work/openembedded-core/scripts/pybootchartgui"
+	touch "$ROOT/work/openembedded-core/scripts/pybootchartgui/pybootchartgui.py"
+
+	CLOG="$TESTDIR/container.log"
+	export CLOG
+	svg_container_mock
+
+	mk buildstats analyze --no-chart
+	[ "$status" -eq 0 ]
+	assert_fails grep -q . "$CLOG"
+	[ ! -f "$ROOT/artifacts/buildstats/20260717121723.svg" ]
+}
+
+@test "buildstats analyze: --chart propagates a chart failure into the command's own exit code" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mkdir -p "$ROOT/work/openembedded-core/scripts/pybootchartgui"
+	touch "$ROOT/work/openembedded-core/scripts/pybootchartgui/pybootchartgui.py"
+
+	CLOG="$TESTDIR/container.log"
+	export CLOG
+	MOCK_SVG_FAIL=1
+	export MOCK_SVG_FAIL
+	svg_container_mock
+
+	mk buildstats analyze --chart
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'pybootchartgui failed'
+}
+
+@test "buildstats analyze: --chart succeeds normally when the chart itself succeeds" {
+	buildstats_fixture "$ROOT/artifacts/buildstats"
+	mkdir -p "$ROOT/work/openembedded-core/scripts/pybootchartgui"
+	touch "$ROOT/work/openembedded-core/scripts/pybootchartgui/pybootchartgui.py"
+
+	CLOG="$TESTDIR/container.log"
+	export CLOG
+	svg_container_mock
+
+	mk buildstats analyze --chart
+	[ "$status" -eq 0 ]
+	[ -f "$ROOT/artifacts/buildstats/20260717121723.svg" ]
 }
 
 @test "buildstats analyze: an explicit relative PATH is absolutised before it reaches the container mount" {
