@@ -146,7 +146,7 @@ teardown() {
 	# Verified missing in the Fable review: 'mackas volume --version' used
 	# to die as "unknown 'volume' subcommand: --version" instead of doing
 	# what --version does everywhere else.
-	for cmd in volume retrieve buildstats set get unset clean; do
+	for cmd in volume retrieve buildstats buildhistory set get unset clean; do
 		run "$MACKAS" "$cmd" --version
 		[ "$status" -eq 0 ]
 		printf '%s\n' "$output" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+'

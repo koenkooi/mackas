@@ -152,3 +152,135 @@ teardown() {
 	}
 	[ "$(volume_size oe-build-tmp)" = "800M" ]
 }
+
+# ---------------------------------------------------------------------------
+# buildhistory_repo_state -- the buildhistory-analyze preflight's git-state
+# classifier. Never called via `$(...)` (that would run it in a subshell and
+# discard every global it sets, see the function's own comment) -- called
+# plainly, then the globals are read directly, exactly as
+# buildhistory_analyze() itself does.
+# ---------------------------------------------------------------------------
+
+bh_git_repo() {
+	local dir="$1"
+	mkdir -p "$dir"
+	git init -q "$dir"
+	git -C "$dir" config user.email test@example.com
+	git -C "$dir" config user.name test
+}
+
+bh_commit() {
+	local dir="$1" msg="$2" tag="${3:-}"
+	git -C "$dir" add -A
+	git -C "$dir" commit -q -m "$msg" --allow-empty
+	[ -z "$tag" ] || git -C "$dir" tag "$tag"
+}
+
+@test "buildhistory_repo_state: a directory that does not exist is 'missing'" {
+	buildhistory_repo_state "$TESTDIR/nope" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "missing" ]
+}
+
+@test "buildhistory_repo_state: an existing dir with no packages/images/sdk is 'notree'" {
+	mkdir -p "$TESTDIR/empty-dir"
+	buildhistory_repo_state "$TESTDIR/empty-dir" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "notree" ]
+}
+
+@test "buildhistory_repo_state: a buildhistory tree with no .git is 'nogit' (snapshot mode)" {
+	mkdir -p "$TESTDIR/nogit/packages"
+	buildhistory_repo_state "$TESTDIR/nogit" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "nogit" ]
+}
+
+@test "buildhistory_repo_state: a git repo with zero commits is 'empty'" {
+	mkdir -p "$TESTDIR/emptygit/packages"
+	bh_git_repo "$TESTDIR/emptygit"
+	buildhistory_repo_state "$TESTDIR/emptygit" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "empty" ]
+}
+
+@test "buildhistory_repo_state: exactly one commit is 'single' -- nothing to diff yet" {
+	mkdir -p "$TESTDIR/single/packages"
+	echo x > "$TESTDIR/single/packages/f"
+	bh_git_repo "$TESTDIR/single"
+	bh_commit "$TESTDIR/single" "Build 1"
+	buildhistory_repo_state "$TESTDIR/single" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "single" ]
+}
+
+@test "buildhistory_repo_state: two commits with a build-minus-1 tag resolve directly to 'ok'" {
+	mkdir -p "$TESTDIR/ok/packages"
+	bh_git_repo "$TESTDIR/ok"
+	echo one > "$TESTDIR/ok/packages/f"
+	bh_commit "$TESTDIR/ok" "Build 1" build-minus-1
+	echo two > "$TESTDIR/ok/packages/f"
+	bh_commit "$TESTDIR/ok" "Build 2"
+
+	buildhistory_repo_state "$TESTDIR/ok" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "ok" ]
+	[ "$BH_FROM_FELL_BACK" -eq 0 ]
+	[ -n "$BH_FROM" ]
+	[ -n "$BH_TO" ]
+	[ "$BH_FROM" != "$BH_TO" ]
+}
+
+@test "buildhistory_repo_state: no build-minus-1 tag falls back to HEAD~1 for the DEFAULT from" {
+	mkdir -p "$TESTDIR/notag/packages"
+	bh_git_repo "$TESTDIR/notag"
+	echo one > "$TESTDIR/notag/packages/f"
+	bh_commit "$TESTDIR/notag" "Build 1"
+	echo two > "$TESTDIR/notag/packages/f"
+	bh_commit "$TESTDIR/notag" "Build 2"
+
+	buildhistory_repo_state "$TESTDIR/notag" build-minus-1 HEAD 0
+	[ "$BH_STATE" = "ok" ]
+	[ "$BH_FROM_FELL_BACK" -eq 1 ]
+	[ "$BH_FROM_REV" = "HEAD~1" ]
+}
+
+@test "buildhistory_repo_state: an EXPLICIT --from that fails to resolve is 'badrev', no fallback" {
+	mkdir -p "$TESTDIR/notag2/packages"
+	bh_git_repo "$TESTDIR/notag2"
+	echo one > "$TESTDIR/notag2/packages/f"
+	bh_commit "$TESTDIR/notag2" "Build 1"
+	echo two > "$TESTDIR/notag2/packages/f"
+	bh_commit "$TESTDIR/notag2" "Build 2"
+
+	# from_explicit=1: even though this IS the string "build-minus-1", the
+	# caller asked for it by name, so a failed resolution must not silently
+	# fall back to HEAD~1 the way the default does above.
+	buildhistory_repo_state "$TESTDIR/notag2" build-minus-1 HEAD 1
+	[ "$BH_STATE" = "badrev" ]
+}
+
+@test "buildhistory_repo_state: a bogus user-supplied --to is 'badrev'" {
+	mkdir -p "$TESTDIR/badto/packages"
+	bh_git_repo "$TESTDIR/badto"
+	echo one > "$TESTDIR/badto/packages/f"
+	bh_commit "$TESTDIR/badto" "Build 1" build-minus-1
+	echo two > "$TESTDIR/badto/packages/f"
+	bh_commit "$TESTDIR/badto" "Build 2"
+
+	buildhistory_repo_state "$TESTDIR/badto" build-minus-1 no-such-rev 0
+	[ "$BH_STATE" = "badrev" ]
+}
+
+@test "buildhistory_repo_state: a .git dir but no git binary on PATH is 'nogitbin'" {
+	mkdir -p "$TESTDIR/hasgit/packages" "$TESTDIR/hasgit/.git" "$TESTDIR/emptybin"
+	local savepath="$PATH"
+	PATH="$TESTDIR/emptybin"
+	buildhistory_repo_state "$TESTDIR/hasgit" build-minus-1 HEAD 0
+	PATH="$savepath"
+	[ "$BH_STATE" = "nogitbin" ]
+}
+
+@test "buildhistory_repo_state: no git binary but ALSO no .git dir still classifies as 'nogit'" {
+	# Snapshot mode never needs the git binary at all -- only diff mode does.
+	mkdir -p "$TESTDIR/nogit2/packages" "$TESTDIR/emptybin"
+	local savepath="$PATH"
+	PATH="$TESTDIR/emptybin"
+	buildhistory_repo_state "$TESTDIR/nogit2" build-minus-1 HEAD 0
+	PATH="$savepath"
+	[ "$BH_STATE" = "nogit" ]
+}

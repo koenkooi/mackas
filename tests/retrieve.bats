@@ -83,8 +83,24 @@ EOF
 	# buildhistory is NOT under tmp/ in the guest -- it is ${TOPDIR}/buildhistory,
 	# i.e. /build/buildhistory, a sibling of /build/tmp. The fixture is flat, so
 	# it sits alongside the others here; the probe path is what the tests pin.
-	mkdir -p "$FIXTURE/buildhistory/packages" "$FIXTURE/buildhistory/images"
-	echo 'PV = 1.36.1' > "$FIXTURE/buildhistory/packages/latest"
+	#
+	# A REAL two-commit git repo, tagged build-minus-1 on the first commit --
+	# the shape buildhistory.bbclass itself produces with BUILDHISTORY_COMMIT
+	# on. This is what makes 'retrieve buildhistory''s own auto-run of
+	# buildhistory_analyze() below produce a real diff instead of snapshot
+	# mode, and is also what pins that the copy preserves dotfiles (.git) --
+	# see the "cp -r preserves .git" test below.
+	mkdir -p "$FIXTURE/buildhistory/packages/cortexa57/busybox/busybox" "$FIXTURE/buildhistory/images"
+	echo 'PV = 1.36.1' > "$FIXTURE/buildhistory/packages/cortexa57/busybox/latest"
+	git init -q "$FIXTURE/buildhistory"
+	git -C "$FIXTURE/buildhistory" config user.email test@example.com
+	git -C "$FIXTURE/buildhistory" config user.name test
+	git -C "$FIXTURE/buildhistory" add -A
+	git -C "$FIXTURE/buildhistory" commit -q -m "Build 1"
+	git -C "$FIXTURE/buildhistory" tag build-minus-1
+	echo 'PV = 1.37.0' > "$FIXTURE/buildhistory/packages/cortexa57/busybox/latest"
+	git -C "$FIXTURE/buildhistory" add -A
+	git -C "$FIXTURE/buildhistory" commit -q -m "Build 2"
 	# sbom is the SPDX/SBOM tree under DEPLOY_DIR, with arch subdirs. The
 	# fixture mirrors the real layout: flat with arch-specific subdirs.
 	mkdir -p "$FIXTURE/spdx/x86_64/packages" "$FIXTURE/spdx/x86_64/builds"
@@ -1001,8 +1017,18 @@ EOF
 	MOCK_TMP_HAS="buildhistory" mk retrieve buildhistory
 	[ "$status" -eq 0 ]
 	[ -d "$ROOT/artifacts/buildhistory/packages" ]
-	[ -f "$ROOT/artifacts/buildhistory/packages/latest" ]
+	[ -f "$ROOT/artifacts/buildhistory/packages/cortexa57/busybox/latest" ]
 	printf '%s\n' "$output" | grep -qF "Retrieved to $ROOT/artifacts"
+}
+
+@test "retrieve: buildhistory's cp -r preserves dotfiles (.git) -- the whole feature rests on this" {
+	# Mutation-tested: reverting the fixture in setup() to a non-git tree
+	# makes this fail (no .git to find), proving it is not vacuous.
+	MOCK_TMP_HAS="buildhistory" mk retrieve buildhistory
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/buildhistory/.git" ]
+	run git -C "$ROOT/artifacts/buildhistory" rev-parse --verify -q build-minus-1
+	[ "$status" -eq 0 ]
 }
 
 @test "retrieve: buildhistory is probed at /build/buildhistory, NOT under tmp/" {
@@ -1123,6 +1149,50 @@ EOF
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	printf '%s\n' "$output" | grep -qi 'does not INHERIT buildhistory'
 	[ ! -d "$ROOT/artifacts/buildhistory" ]
+}
+
+# ---------------------------------------------------------------------------
+# buildhistory_analyze() auto-runs at the tail of 'retrieve buildhistory' --
+# see the design's item 47 (TODO, local-only): 'retrieve' used to only hint
+# at how to inspect buildhistory, never actually summarising it.
+# ---------------------------------------------------------------------------
+
+@test "retrieve buildhistory: auto-runs the summary layer and never calls container for it" {
+	MOCK_TMP_HAS="buildhistory" mk retrieve buildhistory
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'buildhistory changes'
+	printf '%s\n' "$output" | grep -qF 'busybox'
+	printf '%s\n' "$output" | grep -qF 'Re-run without re-copying'
+	# The summary layer is host git plus python3 -- it must not be the
+	# reason ANY container call appears in this run (the fixture has no
+	# build-minus-1..HEAD size/image data, so this also incidentally checks
+	# --detail was never invoked, which retrieve never asks for).
+	refute_call "buildhistory-diff"
+}
+
+@test "retrieve buildstats: does NOT auto-run the buildhistory summary" {
+	MOCK_TMP_HAS="buildstats" mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qF 'buildhistory changes'
+}
+
+@test "retrieve buildhistory: still exits 0 when the auto-run summary itself fails" {
+	# Copy $MACKAS to a directory with no sibling tools/ (same trick
+	# buildstats_analyze.bats uses for its own missing-analyzer test), so
+	# buildhistory_analyze()'s python invocation fails -- retrieve's own
+	# exit code must not follow it down, since the auto-run is a bonus on
+	# top of a copy that already succeeded.
+	local nodir="$TESTDIR/no-tools"
+	mkdir -p "$nodir"
+	cp "$MACKAS" "$nodir/mackas"
+	chmod +x "$nodir/mackas"
+
+	MOCK_TMP_HAS="buildhistory" run "$nodir/mackas" --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 retrieve buildhistory
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'analyzer not found'
+	printf '%s\n' "$output" | grep -qF "Retrieved to $ROOT/artifacts"
 }
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+#
+# mackas-buildhistory-analyze -- summarise what changed in a Yocto/OE
+# buildhistory tree between two builds.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Summarise a Yocto/OE buildhistory tree as text or JSON. Stdlib only.
+
+`mackas buildhistory analyze` runs this over what `mackas retrieve
+buildhistory` fetched (see `mackas`'s `buildhistory_analyze()`): a rollup of
+what changed between two builds -- recipes added/removed/upgraded, the
+biggest package-size movers, and per-image size/content deltas.
+
+Two modes:
+
+  DIFF mode (the normal case) reads two git revisions of the tree via host
+  `git` plumbing -- `git diff --name-status -M` to enumerate what changed
+  (the only full walk), then one `git cat-file --batch` process to read every
+  blob that enumeration named, from both sides, in one subprocess. Cost is
+  proportional to what changed, not to the size of the tree.
+
+  SNAPSHOT mode reads the working tree directly (`os.walk`) and reports what
+  is currently recorded, with no comparison. Used when there is no usable
+  git history to diff (BUILDHISTORY_COMMIT off, or only one build so far);
+  the caller (mackas's `buildhistory_analyze()`) decides which mode applies
+  and passes `--snapshot` explicitly -- this module does not itself decide
+  whether a `.git` directory is "usable", only how to read one.
+
+Buildhistory's own directory shape (`meta/classes/buildhistory.bbclass`,
+`scripts/lib/buildhistory_analysis.py` upstream) is classified by path:
+
+    packages/<arch>/<recipe>/latest                -> PE, PV, PR, DEPENDS,
+                                                       PACKAGES
+    packages/<arch>/<recipe>/<pkg>/latest           -> PKGE, PKGV, PKGR,
+                                                       PKGSIZE
+    images/<machine>/<libc>/<image>/image-info.txt  -> IMAGESIZE, DISTRO,
+                                                       IMAGE_FEATURES
+    images/.../installed-package-names.txt          -> one package per line
+    images/.../files-in-image.txt                   -> counted, not diffed
+                                                       line by line (that is
+                                                       `--detail`'s job, via
+                                                       upstream's own
+                                                       buildhistory-diff)
+    sdk/...                                         -> counted only; the
+                                                       exact per-field SDK
+                                                       shape is not parsed
+                                                       here
+    anything else (sysroot, pkg_postinst, ...)      -> counted as "N paths
+                                                       changed", never
+                                                       rendered individually
+
+A package's PKGSIZE change is *listed* only if it exceeds 1% or 64 KiB
+(whichever it hits first); everything smaller is still counted into the net
+total and rolled into one "N smaller changes not shown" line. `--all`
+disables the threshold. This deliberately differs from upstream
+buildhistory-diff's 10%-and-drop filter -- see docs/storage.md and the
+buildhistory-analyze design notes for why.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+# PKGSIZE and IMAGESIZE are both already in KiB -- buildhistory.bbclass
+# writes PKGSIZE straight from bitbake's own PKGSIZE variable (Kbytes, by OE
+# convention: see e.g. IMAGE_ROOTFS_EXTRA_SPACE's identical "Kbytes"
+# convention in bitbake.conf), and IMAGESIZE via `du -ks` (buildhistory.bbclass's
+# buildhistory_get_imageinfo). Neither is bytes -- do not divide by 1024 again.
+THRESHOLD_PCT = 1.0
+THRESHOLD_KIB = 64
+
+RECIPE_LATEST_RE = re.compile(r'^packages/([^/]+)/([^/]+)/latest$')
+PKG_LATEST_RE = re.compile(r'^packages/([^/]+)/([^/]+)/([^/]+)/latest$')
+IMAGE_INFO_RE = re.compile(r'^images/([^/]+)/([^/]+)/([^/]+)/image-info\.txt$')
+IMAGE_INSTALLED_RE = re.compile(
+    r'^images/([^/]+)/([^/]+)/([^/]+)/installed-package-names\.txt$')
+IMAGE_FILES_RE = re.compile(
+    r'^images/([^/]+)/([^/]+)/([^/]+)/files-in-image\.txt$')
+SDK_RE = re.compile(r'^sdk/')
+
+KV_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
+
+
+class GitError(Exception):
+    """Anything wrong with the git plumbing this tool depends on."""
+
+
+def parse_kv(text):
+    """Parse a buildhistory 'latest'/'image-info.txt' style file: one
+    'KEY = value' assignment per line. Unrecognised or malformed lines are
+    ignored -- a truncated or hand-edited file must not crash the report."""
+    out = {}
+    if text is None:
+        return out
+    for line in text.splitlines():
+        m = KV_RE.match(line)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def parse_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_wordset(v):
+    """A space-separated value (PACKAGES, DEPENDS, ...) -> set of words."""
+    return set(v.split()) if v else set()
+
+
+def parse_lineset(text):
+    """One item per line (installed-package-names.txt) -> set, blanks
+    dropped."""
+    if not text:
+        return set()
+    return {ln.strip() for ln in text.splitlines() if ln.strip()}
+
+
+# ---------------------------------------------------------------------------
+# git plumbing
+# ---------------------------------------------------------------------------
+
+def run_git(path, args, input_bytes=None):
+    try:
+        r = subprocess.run(
+            ["git", "-C", path] + args,
+            input=input_bytes,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise GitError("git not found on PATH")
+    return r
+
+
+def resolve_commit(path, rev):
+    r = run_git(path, ["rev-parse", "--verify", "-q", rev + "^{commit}"])
+    if r.returncode != 0:
+        raise GitError("revision %r does not resolve in %s" % (rev, path))
+    return r.stdout.decode().strip()
+
+
+def commit_info(path, sha):
+    """(date ISO-8601, subject) for one commit."""
+    r = run_git(path, ["log", "-1", "--format=%cI%x00%s", sha])
+    if r.returncode != 0:
+        raise GitError("could not read commit %s" % sha)
+    out = r.stdout.decode(errors="replace").rstrip("\n")
+    date, _, subject = out.partition("\x00")
+    return date, subject
+
+
+def diff_name_status(path, from_sha, to_sha):
+    """Enumerate what changed between two revisions -- the only full walk
+    this tool does; everything after is bounded by this list's size, not the
+    tree's. Returns a list of (status, path) for plain changes, and
+    (status, old_path, new_path) for detected renames (git diff -M)."""
+    r = run_git(path, ["diff", "--name-status", "-M",
+                        "-z", from_sha, to_sha])
+    if r.returncode != 0:
+        raise GitError("git diff --name-status failed between %s and %s"
+                        % (from_sha, to_sha))
+    fields = r.stdout.decode(errors="replace").split("\x00")
+    # -z NUL-terminates every field; the final split leaves a trailing "".
+    entries = []
+    i = 0
+    while i < len(fields) and fields[i]:
+        status = fields[i]
+        if status.startswith("R") or status.startswith("C"):
+            old_path, new_path = fields[i + 1], fields[i + 2]
+            entries.append((status, old_path, new_path))
+            i += 3
+        else:
+            entries.append((status, fields[i + 1]))
+            i += 2
+    return entries
+
+
+def batch_cat_file(path, refs):
+    """One `git cat-file --batch` process for every '<sha>:<path>' in REFS
+    (a list, order preserved). Returns {ref: text or None (missing)}. This is
+    the one place many-file reads happen, and it is one subprocess total --
+    not one per file, which matters when a kernel bump touches hundreds of
+    files-in-image.txt entries."""
+    if not refs:
+        return {}
+    input_bytes = ("\n".join(refs) + "\n").encode()
+    r = run_git(path, ["cat-file", "--batch"], input_bytes=input_bytes)
+    if r.returncode != 0:
+        raise GitError("git cat-file --batch failed")
+    data = r.stdout
+    out = {}
+    idx = 0
+    n = len(data)
+    for ref in refs:
+        nl = data.index(b"\n", idx)
+        header = data[idx:nl].decode(errors="replace")
+        idx = nl + 1
+        parts = header.split()
+        if len(parts) >= 2 and parts[-1] == "missing":
+            out[ref] = None
+            continue
+        size = int(parts[2])
+        content = data[idx:idx + size]
+        idx += size + 1  # +1: cat-file --batch always appends one \n
+        out[ref] = content.decode(errors="replace")
+    if idx != n:
+        # Tolerate trailing noise rather than crash a report over it.
+        pass
+    return out
+
+
+def ls_tree_paths(path, rev, prefix):
+    """Fast (metadata-only, no blob reads) listing of every path under
+    PREFIX at REV -- used only to compute "N unchanged" totals, never to
+    read content. Bounded by tree size, unlike the diff-driven blob reads
+    above, but git's own tree-entry listing is cheap even for a
+    several-thousand-recipe distro."""
+    r = run_git(path, ["ls-tree", "-r", "--name-only", "-z", rev, "--",
+                        prefix])
+    if r.returncode != 0:
+        return []
+    out = r.stdout.decode(errors="replace").split("\x00")
+    return [p for p in out if p]
+
+
+def read_worktree_file(path, rel):
+    full = os.path.join(path, rel)
+    try:
+        with open(full, errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# classification
+# ---------------------------------------------------------------------------
+
+def classify(entries):
+    """Bucket diff entries by the path shapes buildhistory writes. Each
+    bucket maps a key tuple to (old_rel_path_or_None, new_rel_path_or_None,
+    status). A pure arch-directory rename of an otherwise-identical
+    recipe/package (a machine switch, caught by git's own -M rename
+    detection) is folded into a single 'moved' entry instead of looking like
+    one removal plus one addition."""
+    recipes = {}
+    pkgs = {}
+    images_info = {}
+    images_installed = {}
+    images_files = {}
+    sdk_paths = []
+    other_paths = []
+    moved_recipes = set()
+    moved_pkgs = set()
+
+    def handle(status, old, new):
+        o_m = RECIPE_LATEST_RE.match(old) if old else None
+        n_m = RECIPE_LATEST_RE.match(new) if new else None
+        if (o_m or n_m) and status[0] in "RC" and o_m and n_m \
+                and o_m.group(2) == n_m.group(2) and o_m.group(1) != n_m.group(1):
+            # Same recipe name, different arch, detected as a rename ->
+            # content is (near-)identical -- a machine/arch move, not a
+            # real content change. Record it so it is excluded from both
+            # added/removed AND the ls-tree "total" reconciliation.
+            moved_recipes.add((o_m.group(1), o_m.group(2)))
+            moved_recipes.add((n_m.group(1), n_m.group(2)))
+            return
+        o_m = PKG_LATEST_RE.match(old) if old else None
+        n_m = PKG_LATEST_RE.match(new) if new else None
+        if (o_m or n_m) and status[0] in "RC" and o_m and n_m \
+                and (o_m.group(2), o_m.group(3)) == (n_m.group(2), n_m.group(3)) \
+                and o_m.group(1) != n_m.group(1):
+            moved_pkgs.add((o_m.group(1), o_m.group(2), o_m.group(3)))
+            moved_pkgs.add((n_m.group(1), n_m.group(2), n_m.group(3)))
+            return
+
+        for p, is_new in ((old, False), (new, True)):
+            if not p:
+                continue
+            m = RECIPE_LATEST_RE.match(p)
+            if m:
+                key = (m.group(1), m.group(2))
+                recipes.setdefault(key, {})["new" if is_new else "old"] = p
+                continue
+            m = PKG_LATEST_RE.match(p)
+            if m:
+                key = (m.group(1), m.group(2), m.group(3))
+                pkgs.setdefault(key, {})["new" if is_new else "old"] = p
+                continue
+            m = IMAGE_INFO_RE.match(p)
+            if m:
+                key = (m.group(1), m.group(2), m.group(3))
+                images_info.setdefault(key, {})["new" if is_new else "old"] = p
+                continue
+            m = IMAGE_INSTALLED_RE.match(p)
+            if m:
+                key = (m.group(1), m.group(2), m.group(3))
+                images_installed.setdefault(key, {})["new" if is_new else "old"] = p
+                continue
+            m = IMAGE_FILES_RE.match(p)
+            if m:
+                key = (m.group(1), m.group(2), m.group(3))
+                images_files.setdefault(key, {})["new" if is_new else "old"] = p
+                continue
+            if SDK_RE.match(p):
+                sdk_paths.append(p)
+                continue
+            other_paths.append(p)
+
+    for e in entries:
+        if len(e) == 3:
+            status, old, new = e
+            handle(status, old, new)
+        else:
+            status, p = e
+            if status == "A":
+                handle(status, None, p)
+            elif status == "D":
+                handle(status, p, None)
+            else:
+                handle(status, p, p)
+
+    return {
+        "recipes": recipes, "pkgs": pkgs,
+        "images_info": images_info, "images_installed": images_installed,
+        "images_files": images_files,
+        "sdk_paths": sdk_paths, "other_paths": other_paths,
+        "moved_recipes": moved_recipes, "moved_pkgs": moved_pkgs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# diff mode
+# ---------------------------------------------------------------------------
+
+def build_refs(path_map, from_sha, to_sha):
+    """path_map: {key: {"old": path_or_None, "new": path_or_None}}.
+    Returns the list of '<sha>:<path>' refs to fetch, in a stable order."""
+    refs = []
+    for key in sorted(path_map):
+        d = path_map[key]
+        if d.get("old"):
+            refs.append("%s:%s" % (from_sha, d["old"]))
+        if d.get("new"):
+            refs.append("%s:%s" % (to_sha, d["new"]))
+    return refs
+
+
+def analyze_diff(path, from_rev, to_rev, top, show_all):
+    from_sha = resolve_commit(path, from_rev)
+    to_sha = resolve_commit(path, to_rev)
+    from_date, _ = commit_info(path, from_sha)
+    to_date, to_subject = commit_info(path, to_sha)
+
+    entries = diff_name_status(path, from_sha, to_sha)
+    c = classify(entries)
+
+    refs = []
+    refs += build_refs(c["recipes"], from_sha, to_sha)
+    refs += build_refs(c["pkgs"], from_sha, to_sha)
+    refs += build_refs(c["images_info"], from_sha, to_sha)
+    refs += build_refs(c["images_installed"], from_sha, to_sha)
+    blobs = batch_cat_file(path, refs)
+
+    def blob_for(d, sha, side):
+        p = d.get(side)
+        if not p:
+            return None
+        ref = "%s:%s" % (sha, p)
+        return blobs.get(ref)
+
+    # --- recipes ---
+    recipes_added, recipes_removed, recipes_changed = [], [], []
+    for (arch, recipe), d in sorted(c["recipes"].items()):
+        old_kv = parse_kv(blob_for(d, from_sha, "old"))
+        new_kv = parse_kv(blob_for(d, to_sha, "new"))
+        if d.get("old") and not d.get("new"):
+            recipes_removed.append({"name": recipe, "arch": arch,
+                                     "pv": old_kv.get("PV"), "pr": old_kv.get("PR")})
+            continue
+        if d.get("new") and not d.get("old"):
+            n_pkgs = len(parse_wordset(new_kv.get("PACKAGES")))
+            recipes_added.append({"name": recipe, "arch": arch,
+                                   "pv": new_kv.get("PV"), "pr": new_kv.get("PR"),
+                                   "n_packages": n_pkgs})
+            continue
+        old_pkgs = parse_wordset(old_kv.get("PACKAGES"))
+        new_pkgs = parse_wordset(new_kv.get("PACKAGES"))
+        pkgs_added = sorted(new_pkgs - old_pkgs)
+        pkgs_removed = sorted(old_pkgs - new_pkgs)
+        pv_changed = old_kv.get("PV") != new_kv.get("PV")
+        pr_changed = old_kv.get("PR") != new_kv.get("PR")
+        if pv_changed or pr_changed or pkgs_added or pkgs_removed:
+            recipes_changed.append({
+                "name": recipe, "arch": arch,
+                "pv": [old_kv.get("PV"), new_kv.get("PV")],
+                "pr": [old_kv.get("PR"), new_kv.get("PR")],
+                "packages_added": pkgs_added, "packages_removed": pkgs_removed,
+            })
+
+    total_recipes_to = len({
+        (m.group(1), m.group(2)) for m in (
+            RECIPE_LATEST_RE.match(p) for p in ls_tree_paths(path, to_sha, "packages/"))
+        if m})
+    recipes_unchanged = max(
+        0, total_recipes_to - len(recipes_added) - len(recipes_changed))
+
+    # --- packages (size movers) ---
+    pkg_changes = []
+    size_delta_total = 0
+    for (arch, recipe, pkg), d in sorted(c["pkgs"].items()):
+        old_kv = parse_kv(blob_for(d, from_sha, "old"))
+        new_kv = parse_kv(blob_for(d, to_sha, "new"))
+        old_size = parse_int(old_kv.get("PKGSIZE")) if d.get("old") else None
+        new_size = parse_int(new_kv.get("PKGSIZE")) if d.get("new") else None
+        if old_size is None and new_size is None:
+            continue
+        delta = (new_size or 0) - (old_size or 0)
+        size_delta_total += delta
+        pct = None
+        if old_size:
+            pct = round(delta * 100.0 / old_size, 1)
+        pkg_changes.append({
+            "name": pkg, "arch": arch, "recipe": recipe,
+            "pkgsize": [old_size, new_size], "delta": delta, "pct": pct,
+            "new": old_size is None, "removed": new_size is None,
+        })
+
+    def significant(pc):
+        if pc["new"] or pc["removed"]:
+            return True
+        if show_all:
+            return True
+        if abs(pc["delta"]) >= THRESHOLD_KIB:
+            return True
+        if pc["pct"] is not None and abs(pc["pct"]) >= THRESHOLD_PCT:
+            return True
+        return False
+
+    shown = sorted((pc for pc in pkg_changes if significant(pc)),
+                   key=lambda pc: -abs(pc["delta"]))[:top]
+    hidden = [pc for pc in pkg_changes if pc not in shown]
+
+    # --- images ---
+    image_keys = sorted(set(c["images_info"]) | set(c["images_installed"])
+                         | set(c["images_files"]))
+    images = []
+    for key in image_keys:
+        machine, libc, image = key
+        info_d = c["images_info"].get(key, {})
+        old_kv = parse_kv(blob_for(info_d, from_sha, "old"))
+        new_kv = parse_kv(blob_for(info_d, to_sha, "new"))
+        old_size = parse_int(old_kv.get("IMAGESIZE")) if info_d.get("old") else None
+        new_size = parse_int(new_kv.get("IMAGESIZE")) if info_d.get("new") else None
+
+        inst_d = c["images_installed"].get(key, {})
+        old_installed = parse_lineset(blob_for(inst_d, from_sha, "old"))
+        new_installed = parse_lineset(blob_for(inst_d, to_sha, "new"))
+        pkgs_added = sorted(new_installed - old_installed)
+        pkgs_removed = sorted(old_installed - new_installed)
+
+        files_d = c["images_files"].get(key, {})
+        # files-in-image.txt content is only fetched for images that
+        # actually changed there -- same batch already ran above would be
+        # wasteful for images with no files-in-image.txt diff at all, so
+        # this is a second, small batch of just the changed ones.
+        files_added = files_removed = 0
+        if files_d.get("old") or files_d.get("new"):
+            refs2 = []
+            if files_d.get("old"):
+                refs2.append("%s:%s" % (from_sha, files_d["old"]))
+            if files_d.get("new"):
+                refs2.append("%s:%s" % (to_sha, files_d["new"]))
+            blobs2 = batch_cat_file(path, refs2)
+            old_lines = parse_lineset(
+                blobs2.get("%s:%s" % (from_sha, files_d.get("old", ""))))
+            new_lines = parse_lineset(
+                blobs2.get("%s:%s" % (to_sha, files_d.get("new", ""))))
+            files_added = len(new_lines - old_lines)
+            files_removed = len(old_lines - new_lines)
+
+        images.append({
+            "machine": machine, "libc": libc, "image": image,
+            "imagesize": [old_size, new_size],
+            "delta": (new_size or 0) - (old_size or 0) if old_size and new_size else None,
+            "packages_added": pkgs_added, "packages_removed": pkgs_removed,
+            "files_added": files_added, "files_removed": files_removed,
+        })
+
+    return {
+        "path": path, "mode": "diff",
+        "from": {"rev": from_rev, "sha": from_sha, "date": from_date},
+        "to": {"rev": to_rev, "sha": to_sha, "date": to_date},
+        "no_changes": to_subject.startswith("No changes:"),
+        "recipes": {
+            "added": recipes_added, "removed": recipes_removed,
+            "changed": recipes_changed, "unchanged": recipes_unchanged,
+        },
+        "packages": {
+            "size_delta_total": size_delta_total,
+            "changed": shown,
+            "n_hidden": len(hidden),
+            "hidden_delta_total": sum(pc["delta"] for pc in hidden),
+            "n_total_changed": len(pkg_changes),
+        },
+        "images": images,
+        "sdk": ({"changed_paths": len(c["sdk_paths"])}
+                if c["sdk_paths"] else None),
+        "other_changed_paths": len(c["other_paths"]),
+        "top": top, "all": show_all,
+    }
+
+
+# ---------------------------------------------------------------------------
+# snapshot mode
+# ---------------------------------------------------------------------------
+
+def analyze_snapshot(path, top):
+    recipes = 0
+    packages = 0
+    total_pkgsize = 0
+    images = {}
+
+    for root, _dirs, files in os.walk(os.path.join(path, "packages")):
+        if "latest" not in files:
+            continue
+        rel = os.path.relpath(os.path.join(root, "latest"), path)
+        rel = rel.replace(os.sep, "/")
+        if RECIPE_LATEST_RE.match(rel):
+            recipes += 1
+        elif PKG_LATEST_RE.match(rel):
+            packages += 1
+            kv = parse_kv(read_worktree_file(path, rel))
+            total_pkgsize += parse_int(kv.get("PKGSIZE"))
+
+    images_root = os.path.join(path, "images")
+    for root, _dirs, files in os.walk(images_root):
+        if "image-info.txt" not in files:
+            continue
+        rel = os.path.relpath(os.path.join(root, "image-info.txt"), path)
+        rel = rel.replace(os.sep, "/")
+        m = IMAGE_INFO_RE.match(rel)
+        if not m:
+            continue
+        kv = parse_kv(read_worktree_file(path, rel))
+        n_pkgs = 0
+        inst_rel = rel.replace("image-info.txt", "installed-package-names.txt")
+        installed = read_worktree_file(path, inst_rel)
+        if installed is not None:
+            n_pkgs = len(parse_lineset(installed))
+        images[(m.group(1), m.group(2), m.group(3))] = {
+            "machine": m.group(1), "libc": m.group(2), "image": m.group(3),
+            "imagesize": parse_int(kv.get("IMAGESIZE")), "n_packages": n_pkgs,
+        }
+
+    return {
+        "path": path, "mode": "snapshot",
+        "recipes": {"count": recipes},
+        "packages": {"count": packages, "total_size": total_pkgsize},
+        "images": [images[k] for k in sorted(images)],
+        "top": top,
+    }
+
+
+# ---------------------------------------------------------------------------
+# formatting
+# ---------------------------------------------------------------------------
+
+def fmt_kib_delta(n):
+    """N is already in KiB -- PKGSIZE/IMAGESIZE's own native unit (see the
+    module docstring) -- so the ladder starts there, not at bytes."""
+    if n is None:
+        return "--"
+    sign = "-" if n < 0 else "+" if n > 0 else ""
+    n = abs(float(n))
+    if n < 1024:
+        return "%s%.1f KiB" % (sign, n)
+    n /= 1024.0
+    if n < 1024:
+        return "%s%.2f MiB" % (sign, n)
+    n /= 1024.0
+    return "%s%.2f GiB" % (sign, n)
+
+
+def fmt_kib(n):
+    """N is already in KiB -- see fmt_kib_delta."""
+    if n is None:
+        return "--"
+    n = float(n)
+    if n < 1024:
+        return "%.1f KiB" % n
+    n /= 1024.0
+    if n < 1024:
+        return "%.1f MiB" % n
+    n /= 1024.0
+    return "%.1f GiB" % n
+
+
+def format_summary_diff(rep):
+    out = []
+    out.append("== buildhistory summary")
+    out.append("  %s" % rep["path"])
+    out.append("  %s..%s" % (rep["from"]["rev"], rep["to"]["rev"]))
+    out.append("  %s  ->  %s" % (rep["from"]["date"] or "?", rep["to"]["date"] or "?"))
+    if rep["no_changes"]:
+        out.append("  last build changed nothing (commit subject: \"No changes: ...\")")
+
+    r = rep["recipes"]
+    out.append("")
+    out.append("  recipes    %d changed   %d added   %d removed   %d unchanged"
+                % (len(r["changed"]), len(r["added"]), len(r["removed"]),
+                   r["unchanged"]))
+    for a in r["added"]:
+        out.append("    + %-18s %s-%s   (new, %d packages)"
+                    % (a["name"][:18], a.get("pv") or "?", a.get("pr") or "?",
+                       a["n_packages"]))
+    for rm in r["removed"]:
+        out.append("    - %-18s %s-%s"
+                    % (rm["name"][:18], rm.get("pv") or "?", rm.get("pr") or "?"))
+    for ch in r["changed"]:
+        line = "    ~ %-18s %s-%s  ->  %s-%s" % (
+            ch["name"][:18], ch["pv"][0] or "?", ch["pr"][0] or "?",
+            ch["pv"][1] or "?", ch["pr"][1] or "?")
+        extra = []
+        if ch["packages_added"]:
+            extra.append("PACKAGES +%d (%s)" % (
+                len(ch["packages_added"]), ", ".join(ch["packages_added"])))
+        if ch["packages_removed"]:
+            extra.append("PACKAGES -%d (%s)" % (
+                len(ch["packages_removed"]), ", ".join(ch["packages_removed"])))
+        if extra:
+            line += "   " + "  ".join(extra)
+        out.append(line)
+
+    p = rep["packages"]
+    out.append("")
+    out.append("  size movers (PKGSIZE, top %d of %d changed packages, net %s)"
+                % (len(p["changed"]), p["n_total_changed"],
+                   fmt_kib_delta(p["size_delta_total"])))
+    for pc in p["changed"]:
+        state = "new" if pc["new"] else "removed" if pc["removed"] else (
+            "%+.1f%%" % pc["pct"] if pc["pct"] is not None else "")
+        out.append("    %-20s %10s   %8s -> %8s   %s"
+                    % (pc["name"][:20], fmt_kib_delta(pc["delta"]),
+                       fmt_kib(pc["pkgsize"][0]), fmt_kib(pc["pkgsize"][1]),
+                       state))
+    if p["n_hidden"]:
+        out.append("    %d smaller changes not shown (under 1%% and under 64 KiB)"
+                    " -- --all shows them" % p["n_hidden"])
+
+    out.append("")
+    if rep["images"]:
+        out.append("  images")
+        for im in rep["images"]:
+            name = "%s/%s/%s" % (im["machine"], im["libc"], im["image"])
+            if (im["imagesize"][0] == im["imagesize"][1]
+                    and not im["packages_added"] and not im["packages_removed"]
+                    and not im["files_added"] and not im["files_removed"]):
+                out.append("    %-40s unchanged" % name)
+                continue
+            out.append("    %s" % name)
+            out.append("      IMAGESIZE   %s   %s -> %s"
+                        % (fmt_kib_delta(im["delta"]), fmt_kib(im["imagesize"][0]),
+                           fmt_kib(im["imagesize"][1])))
+            if im["packages_added"] or im["packages_removed"]:
+                out.append("      packages    +%d -%d     added: %s  removed: %s"
+                            % (len(im["packages_added"]), len(im["packages_removed"]),
+                               ", ".join(im["packages_added"]) or "--",
+                               ", ".join(im["packages_removed"]) or "--"))
+            if im["files_added"] or im["files_removed"]:
+                out.append("      files       +%d -%d     (--detail shows the file-level diff)"
+                            % (im["files_added"], im["files_removed"]))
+    else:
+        out.append("  images     none recorded")
+
+    out.append("")
+    if rep["sdk"]:
+        out.append("  sdk        %d paths changed" % rep["sdk"]["changed_paths"])
+    else:
+        out.append("  sdk        no sdk recorded")
+    if rep["other_changed_paths"]:
+        out.append("  other      %d paths changed (sysroot, pkg_postinst, ...)"
+                    % rep["other_changed_paths"])
+
+    out.append("")
+    out.append("  Per-field detail (upstream buildhistory-diff):"
+                "  mackas buildhistory analyze --detail")
+    return "\n".join(out)
+
+
+def format_summary_snapshot(rep):
+    out = []
+    out.append("== buildhistory summary")
+    out.append("  %s" % rep["path"])
+    out.append("  not a git repository -- BUILDHISTORY_COMMIT is off, so no per-build history")
+    out.append("  is recorded and there is nothing to compare. Showing the CURRENT state instead.")
+    out.append("  Turn history on in your kas config's local_conf_header (or conf/local.conf):")
+    out.append('    BUILDHISTORY_COMMIT = "1"')
+    out.append("")
+    out.append("  recipes    %d recorded          packages   %d recorded (total PKGSIZE %s)"
+                % (rep["recipes"]["count"], rep["packages"]["count"],
+                   fmt_kib(rep["packages"]["total_size"])))
+    for im in rep["images"]:
+        out.append("  images     %s/%s/%s   IMAGESIZE %s, %d packages"
+                    % (im["machine"], im["libc"], im["image"],
+                       fmt_kib(im["imagesize"]), im["n_packages"]))
+    if not rep["images"]:
+        out.append("  images     none recorded")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="mackas-buildhistory-analyze",
+        description="Summarise a buildhistory tree between two builds (stdlib only).")
+    p.add_argument("path", help="a retrieved buildhistory directory")
+    p.add_argument("--from", dest="from_rev", default="build-minus-1", metavar="REV")
+    p.add_argument("--to", dest="to_rev", default="HEAD", metavar="REV")
+    p.add_argument("--snapshot", action="store_true",
+                    help="read the working tree directly, no git diff")
+    p.add_argument("--json", action="store_true",
+                    help="emit JSON instead of the text digest")
+    p.add_argument("--top", type=int, default=10, metavar="N",
+                    help="how many size movers to list (default 10)")
+    p.add_argument("--all", dest="show_all", action="store_true",
+                    help="disable the small-change threshold")
+    args = p.parse_args(argv)
+
+    if not os.path.isdir(args.path):
+        sys.stderr.write(
+            "mackas-buildhistory-analyze: error: not a directory: %s\n" % args.path)
+        return 1
+
+    try:
+        if args.snapshot or not os.path.isdir(os.path.join(args.path, ".git")):
+            rep = analyze_snapshot(args.path, args.top)
+        else:
+            rep = analyze_diff(args.path, args.from_rev, args.to_rev,
+                                args.top, args.show_all)
+    except GitError as exc:
+        sys.stderr.write("mackas-buildhistory-analyze: error: %s\n" % exc)
+        return 1
+
+    if args.json:
+        sys.stdout.write(json.dumps(rep, indent=1) + "\n")
+    elif rep["mode"] == "snapshot":
+        sys.stdout.write(format_summary_snapshot(rep) + "\n")
+    else:
+        sys.stdout.write(format_summary_diff(rep) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

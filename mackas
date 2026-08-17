@@ -155,6 +155,7 @@ OVERHEAD_OUT=""
 VOLUME_ARGS=()
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
+BUILDHISTORY_ARGS=()
 SSTATE_ARGS=()
 MONITOR_ARGS=()
 ADOPT_ARGS=()
@@ -6838,6 +6839,16 @@ cmd_retrieve() {
 		# that setting is a project decision, not something mackas asserts:
 		# with it off the directory is still there, just without the history.
 		info "  Inspect with: git -C $(printf '%q' "$dest/buildhistory") log --oneline   (when BUILDHISTORY_COMMIT is on)"
+
+		# Auto-run the summary layer (never --detail -- that boots a
+		# container per call, which retrieve itself never does) on what was
+		# JUST copied, since it is warm in cache and a handful of host `git`
+		# reads costs a fraction of the copy it follows. Never lets a failure
+		# here affect retrieve's own exit code -- this is a bonus, not part
+		# of what retrieve promised to do.
+		hdr "buildhistory changes"
+		buildhistory_analyze "$dest/buildhistory" || true
+		info "  Re-run without re-copying: $SCRIPT_CMD buildhistory analyze"
 	fi
 	return 0
 }
@@ -7054,6 +7065,398 @@ cmd_buildstats() {
 		help)     buildstats_usage ;;
 		*) die "unknown 'buildstats' subcommand: $sub" \
 			"$SCRIPT_CMD buildstats --help  (analyze)" ;;
+	esac
+}
+
+# buildhistory_repo_state PATH FROM TO FROM_EXPLICIT -- classify PATH's
+# usability for a build-to-build diff, and (when usable) resolve FROM/TO into
+# concrete SHAs. Bash 3.2 has no `local -n` or associative arrays, so instead
+# of returning a value this sets a fixed set of globals every call (reset at
+# the top, so a stale value from an earlier call never survives an early
+# return); BH_STATE is the one word the caller switches on:
+#   missing   PATH does not exist
+#   notree    PATH exists but has neither packages/, images/ nor sdk/
+#   nogitbin  PATH has a .git dir but no `git` binary is on PATH
+#   nogit     no .git dir -- BUILDHISTORY_COMMIT is off (snapshot mode)
+#   empty     .git exists but has zero commits (a bare `git init`)
+#   single    only one commit so far -- nothing to diff against yet
+#   badrev    FROM or TO (as given) does not resolve
+#   ok        >= 2 commits and FROM/TO both resolve -- diff mode
+# BH_FROM / BH_TO are the resolved SHAs (state ok only). BH_FROM_REV is the
+# revision name actually used -- FROM itself, or "HEAD~1" if FROM was left at
+# its default ("build-minus-1") and did not resolve (a non-default
+# BUILDHISTORY_TAG, or a copy that lost its tags): FROM_EXPLICIT=1 means the
+# caller typed --from themselves, so no silent fallback happens for them -- an
+# unresolvable USER-SUPPLIED revision is 'badrev', not a quiet substitution.
+# BH_FROM_FELL_BACK flags that substitution for the caller's own info line.
+# BH_N_COMMITS/BH_LAST_SUBJECT are read once here so the caller does not need
+# a second git invocation for the "No changes:" check.
+#
+# A command substitution `$(buildhistory_repo_state ...)` would run this
+# function in a SUBSHELL, discarding every global it sets -- so, unlike a
+# function that only prints its result, this one is always called PLAINLY
+# (never wrapped in `$()`) and communicates entirely through BH_STATE and
+# friends.
+buildhistory_repo_state() {
+	local path="$1" from="${2:-build-minus-1}" to="${3:-HEAD}" from_explicit="${4:-0}"
+	BH_STATE="" BH_FROM="" BH_TO="" BH_FROM_REV="$from" BH_FROM_FELL_BACK=0
+	BH_N_COMMITS=0 BH_LAST_SUBJECT=""
+
+	if [ ! -d "$path" ]; then
+		BH_STATE="missing"; return 0
+	fi
+	if [ ! -d "$path/packages" ] && [ ! -d "$path/images" ] && [ ! -d "$path/sdk" ]; then
+		BH_STATE="notree"; return 0
+	fi
+	if [ ! -d "$path/.git" ]; then
+		BH_STATE="nogit"; return 0
+	fi
+	if ! command -v git >/dev/null 2>&1; then
+		BH_STATE="nogitbin"; return 0
+	fi
+	if ! git -C "$path" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+		BH_STATE="empty"; return 0
+	fi
+
+	BH_N_COMMITS="$(git -C "$path" rev-list --count HEAD 2>/dev/null || echo 0)"
+	BH_LAST_SUBJECT="$(git -C "$path" log -1 --format=%s HEAD 2>/dev/null || true)"
+
+	if [ "$BH_N_COMMITS" -le 1 ]; then
+		BH_STATE="single"; return 0
+	fi
+
+	BH_TO="$(git -C "$path" rev-parse --verify -q "${to}^{commit}" 2>/dev/null || true)"
+	if [ -z "$BH_TO" ]; then
+		BH_STATE="badrev"; return 0
+	fi
+
+	BH_FROM="$(git -C "$path" rev-parse --verify -q "${from}^{commit}" 2>/dev/null || true)"
+	if [ -z "$BH_FROM" ] && [ "$from_explicit" -eq 0 ] && [ "$from" = "build-minus-1" ]; then
+		# Our own default didn't resolve -- a non-default BUILDHISTORY_TAG, or
+		# a copy that lost its tags. Fall back to the last two builds rather
+		# than fail outright; a USER-supplied --from never falls back (see
+		# the from_explicit guard above).
+		BH_FROM="$(git -C "$path" rev-parse --verify -q "HEAD~1^{commit}" 2>/dev/null || true)"
+		if [ -n "$BH_FROM" ]; then
+			BH_FROM_REV="HEAD~1"
+			BH_FROM_FELL_BACK=1
+		fi
+	fi
+	if [ -z "$BH_FROM" ]; then
+		BH_STATE="badrev"; return 0
+	fi
+
+	BH_STATE="ok"
+}
+
+# buildhistory_detail_diff PATH FROM TO -- run openembedded-core's own
+# scripts/buildhistory-diff against the retrieved tree, inside a throwaway
+# kas-image container, and print its per-field output. Best-effort, modelled
+# on buildstats_render_svg()'s skip-vs-warn discipline (mackas:6918): `info`
+# for an ordinary absence (no checkout yet), `warn` for tried-and-failed,
+# never fatal to the caller by itself -- buildhistory_analyze() decides
+# whether its own exit code reflects this one's failure.
+buildhistory_detail_diff() {
+	local path="$1" from="$2" to="$3" bhd oecore bbroot out
+
+	if [ ! -d "$MACKAS_WORK" ]; then
+		info "  no checkout under $MACKAS_WORK yet; skipping buildhistory-diff"
+		return 0
+	fi
+
+	bhd="$(find "$MACKAS_WORK" -maxdepth 4 -type f -name buildhistory-diff 2>/dev/null | head -1)"
+	if [ -z "$bhd" ]; then
+		warn "  scripts/buildhistory-diff not found under $MACKAS_WORK; skipping"
+		return 1
+	fi
+	# buildhistory-diff lives at <oe-core>/scripts/buildhistory-diff --
+	# scriptpath's add_oe_lib_path() needs <oe-core>/meta/lib, so the OE-CORE
+	# ROOT must be mounted, not just scripts/.
+	oecore="$(dirname "$(dirname "$bhd")")"
+
+	bbroot="$(find "$MACKAS_WORK" -maxdepth 5 -type d -path '*/bitbake/lib/bb' 2>/dev/null | head -1)"
+	if [ -z "$bbroot" ]; then
+		warn "  bitbake not found under $MACKAS_WORK; skipping buildhistory-diff"
+		return 1
+	fi
+	# In a kas checkout, bitbake is a SIBLING of oe-core, so scriptpath's own
+	# nested <oe-core>/bitbake/lib/bb probe fails and its $PATH-walk fallback
+	# is what actually fires -- the container command below prepends
+	# /bitbake/bin to PATH, or buildhistory-diff exits 1 with "Unable to find
+	# bitbake". .../bitbake/lib/bb -> the bitbake root, two levels up.
+	bbroot="$(dirname "$(dirname "$bbroot")")"
+
+	# run()'s dry-run branch prints "+ <cmd>" to STDOUT and returns 0 --
+	# out="$(run container run ...)" would capture that banner and print it
+	# as if it were diff output. Branch on DRY_RUN and return before any
+	# output capture, rather than fall into the capturing path below.
+	if [ "$DRY_RUN" -eq 1 ]; then
+		run container run --rm \
+			-v "$oecore:/oe-core:ro" -v "$bbroot:/bitbake:ro" -v "$path:/bh:ro" \
+			-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+			"$KAS_IMAGE" \
+			sh -c 'PATH=/bitbake/bin:$PATH exec python3 /oe-core/scripts/buildhistory-diff -p /bh -c no "$1" "$2"' \
+			sh "$from" "$to"
+		return 0
+	fi
+
+	# Three host bind-mounts, no named volume, no one-VM check (same
+	# reasoning as buildstats_render_svg's comment at mackas:6966-6970): this
+	# never touches oe-build-tmp. Revisions go through 'sh -c "..." sh "$1"
+	# "$2"' positionals rather than string interpolation, since they are
+	# user-supplied.
+	vrb "+ $(quote_cmd container run --rm -v "$oecore:/oe-core:ro" \
+		-v "$bbroot:/bitbake:ro" -v "$path:/bh:ro" "$KAS_IMAGE" \
+		sh -c 'PATH=/bitbake/bin:$PATH buildhistory-diff -p /bh -c no' "$from" "$to")"
+	if ! out="$(container run --rm \
+		-v "$oecore:/oe-core:ro" -v "$bbroot:/bitbake:ro" -v "$path:/bh:ro" \
+		-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+		"$KAS_IMAGE" \
+		sh -c 'PATH=/bitbake/bin:$PATH exec python3 /oe-core/scripts/buildhistory-diff -p /bh -c no "$1" "$2"' \
+		sh "$from" "$to")"
+	then
+		warn "  buildhistory-diff failed (non-fatal); the kas image may be missing GitPython"
+		warn "  host-side fallback:"
+		git -C "$path" log --oneline "$from..$to" 2>/dev/null || true
+		git -C "$path" diff --stat "$from" "$to" 2>/dev/null | tail -1 || true
+		return 1
+	fi
+
+	if [ -z "$out" ]; then
+		info "  no significant changes between $from and $to (buildhistory-diff's own"
+		info "  filters; the summary above counts everything)"
+	else
+		printf '%s\n' "$out"
+	fi
+	return 0
+}
+
+# buildhistory_usage() -- buildstats_usage()'s shape (mackas:6845), naming
+# the two layers, the defaults, and the BUILDHISTORY_COMMIT requirement.
+buildhistory_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD buildhistory${C_RST} -- work with a buildhistory tree already retrieved
+from the TMPDIR volume ('$SCRIPT_CMD retrieve buildhistory').
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD buildhistory analyze [PATH] [--from REV] [--to REV] [--detail]
+                          [--json] [--top N] [--all]
+
+${C_BLD}SUBCOMMANDS${C_RST}
+  analyze [PATH]   Summarise what changed between two builds -- recipes
+                   added/removed/upgraded, the biggest PKGSIZE movers, and
+                   per-image size/content deltas -- via
+                   tools/mackas-buildhistory-analyze, a stdlib-only host
+                   Python tool that reads the retrieved git repo directly
+                   (no container, no bitbake). PATH defaults to
+                   \$MACKAS_BASE/artifacts/buildhistory -- the default
+                   '$SCRIPT_CMD retrieve buildhistory' destination.
+
+Options:
+  --from REV   left side of the comparison (default: build-minus-1, the tag
+               buildhistory.bbclass rotates before each commit)
+  --to REV     right side of the comparison (default: HEAD)
+  --detail     also run upstream openembedded-core's own buildhistory-diff,
+               INSIDE a throwaway kas-image container, and print its
+               per-field output underneath the summary -- best-effort: needs
+               a checkout under \$MACKAS_WORK with bitbake and
+               scripts/buildhistory-diff under it.
+  --json       emit the summary as JSON instead of the text digest. Refuses
+               --detail (its output would corrupt the JSON stream).
+  --top N      how many size movers to list (default 10)
+  --all        disable the summary's own small-change threshold (>1% or
+               >64 KiB) -- every changed package is listed
+
+BUILDHISTORY_COMMIT must be "1" (in the project's kas config's
+local_conf_header, or conf/local.conf) for there to be any build-to-build
+history to compare -- otherwise this shows the CURRENT state instead
+(snapshot mode), which is still useful but is not a diff.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after the subcommand.
+EOF
+}
+
+# buildhistory_analyze [PATH] [FLAGS...] -- the buildstats_analyze()
+# analogue (mackas:6999) for a retrieved buildhistory tree. Never die()s from
+# inside the analysis itself -- die is reserved for argument-shape errors
+# (too many positionals, a PATH containing ':', --detail combined with
+# --json); everything the analysis can find wrong about the TREE (missing,
+# not a git repo, only one build, an unresolvable revision, ...) is an
+# ordinary degraded state, reported with info/warn and a non-zero return,
+# never a hard exit.
+buildhistory_analyze() {
+	local args=() from="" to="" from_explicit=0 top="10"
+	local want_json=0 want_detail=0 want_all=0 named_path=0 path rc=0 state
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--from)   from="${2:-}"; from_explicit=1; shift 2 ;;
+			--from=*) from="${1#--from=}"; from_explicit=1; shift ;;
+			--to)     to="${2:-}"; shift 2 ;;
+			--to=*)   to="${1#--to=}"; shift ;;
+			--top)    top="${2:-}"; shift 2 ;;
+			--top=*)  top="${1#--top=}"; shift ;;
+			--json)   want_json=1; shift ;;
+			--detail) want_detail=1; shift ;;
+			--all)    want_all=1; shift ;;
+			*)        args+=("$1"); shift ;;
+		esac
+	done
+
+	[ "${#args[@]}" -le 1 ] || die "'buildhistory analyze' takes at most one PATH" \
+		"$SCRIPT_CMD buildhistory analyze [PATH]"
+	if [ "$want_detail" -eq 1 ] && [ "$want_json" -eq 1 ]; then
+		die "'--detail' and '--json' cannot be combined" \
+			"detail output would corrupt the JSON stream -- run them separately"
+	fi
+
+	if [ "${#args[@]}" -eq 1 ]; then
+		path="${args[0]}"
+		named_path=1
+	else
+		path="$MACKAS_BASE/artifacts/buildhistory"
+	fi
+	[ -n "$from" ] || from="build-minus-1"
+	[ -n "$to" ] || to="HEAD"
+
+	# A relative PATH would be read as a NAMED VOLUME source, not a host
+	# directory, the moment --detail bind-mounts it -- same footgun
+	# buildstats_analyze() guards against (mackas:7008). Absolutise against
+	# $PWD, and reject ':' UNCONDITIONALLY (not just under --detail) so the
+	# error is identical regardless of which flags are given.
+	case "$path" in
+		/*) ;;
+		*)  path="$PWD/$path" ;;
+	esac
+	case "$path" in
+		*:*) die "buildhistory analyze PATH must not contain ':' (it becomes a bind-mount path)" \
+			"choose a path without a colon" ;;
+	esac
+
+	buildhistory_repo_state "$path" "$from" "$to" "$from_explicit"
+	state="$BH_STATE"
+
+	# --json means the caller wants a clean, parseable stdout stream (the
+	# same reasoning --detail+--json is refused above) -- info() writes to
+	# stdout, so every informational line below is suppressed under --json.
+	# warn() writes to stderr already, so those stay unconditional.
+	case "$state" in
+		missing)
+			if [ "$named_path" -eq 1 ]; then
+				warn "buildhistory analyze: no such directory: $path"
+				return 1
+			fi
+			if [ "$want_json" -eq 0 ]; then
+				info "  $path does not exist yet -- nothing has been retrieved."
+				info "  If the project inherits buildhistory: $SCRIPT_CMD retrieve buildhistory"
+				info "  If not: add INHERIT += \"buildhistory\" to local_conf_header (or"
+				info "  conf/local.conf), build, then retrieve again."
+			fi
+			return 0
+			;;
+		notree)
+			if [ "$named_path" -eq 1 ]; then
+				warn "buildhistory analyze: $path does not look like a buildhistory tree"
+				return 1
+			fi
+			[ "$want_json" -eq 1 ] || \
+				info "  $path does not look like a buildhistory tree (no packages/, images/ or sdk/)"
+			return 0
+			;;
+		nogitbin)
+			warn "buildhistory analyze: host git not found -- install it (e.g. 'xcode-select --install')"
+			return 1
+			;;
+		badrev)
+			warn "buildhistory analyze: revision '$from'..'$to' did not resolve in $path"
+			return 1
+			;;
+		empty)
+			[ "$want_json" -eq 1 ] || info "  no builds recorded yet in $path"
+			return 0
+			;;
+		nogit)
+			if [ "$want_json" -eq 0 ]; then
+				info "  not a git repository -- BUILDHISTORY_COMMIT is off, so no per-build history"
+				info "  is recorded and there is nothing to compare. Showing the CURRENT state instead."
+				info "  Turn history on in your kas config's local_conf_header (or conf/local.conf):"
+				info "    BUILDHISTORY_COMMIT = \"1\""
+			fi
+			;;
+		single)
+			[ "$want_json" -eq 1 ] || \
+				info "  only one build recorded so far; nothing to compare against yet"
+			;;
+		ok)
+			if [ "$want_json" -eq 0 ]; then
+				[ "$BH_FROM_FELL_BACK" -eq 0 ] || \
+					info "  '$from' not found; comparing the last two builds instead ($BH_FROM_REV..$to)"
+				case "$BH_LAST_SUBJECT" in
+					"No changes:"*) info "  the last build changed nothing (\"$BH_LAST_SUBJECT\")" ;;
+				esac
+			fi
+			;;
+	esac
+
+	[ "$want_json" -eq 1 ] || hdr "buildhistory summary"
+	local analyzer="$SCRIPT_DIR/tools/mackas-buildhistory-analyze"
+	if [ ! -f "$analyzer" ] || [ ! -x /usr/bin/python3 ]; then
+		warn "analyzer not found at $analyzer; skipping"
+		rc=1
+	else
+		local pyargs=("$path" --top "$top")
+		case "$state" in
+			# Pass the REVISION NAME, not the already-resolved SHA -- the
+			# python tool re-resolves it itself (cheap: one more rev-parse in
+			# the same repo), which is what lets its report's "rev" field
+			# show "build-minus-1"/"HEAD" (or the HEAD~1 fallback) instead of
+			# a bare hash.
+			ok) pyargs+=(--from "$BH_FROM_REV" --to "$to") ;;
+			*)  pyargs+=(--snapshot) ;;
+		esac
+		[ "$want_json" -eq 0 ] || pyargs+=(--json)
+		[ "$want_all" -eq 0 ] || pyargs+=(--all)
+		/usr/bin/python3 "$analyzer" "${pyargs[@]}" \
+			|| { warn "analyze failed (non-fatal); check $path"; rc=1; }
+	fi
+
+	if [ "$want_detail" -eq 1 ]; then
+		if [ "$state" = "ok" ]; then
+			hdr "buildhistory-diff"
+			buildhistory_detail_diff "$path" "$BH_FROM" "$BH_TO" || rc=1
+		else
+			info "  --detail skipped: no build-to-build history to diff yet"
+		fi
+	fi
+
+	return "$rc"
+}
+
+cmd_buildhistory() {
+	local sub="" rest=() a want_help=0
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildhistory ;;
+			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		buildhistory_usage
+		return 0
+	fi
+
+	case "${sub:-help}" in
+		analyze)  buildhistory_analyze ${rest+"${rest[@]}"} ;;
+		help)     buildhistory_usage ;;
+		*) die "unknown 'buildhistory' subcommand: $sub" \
+			"$SCRIPT_CMD buildhistory --help  (analyze)" ;;
 	esac
 }
 
@@ -9825,6 +10228,8 @@ ${C_BLD}COMMANDS${C_RST}
              '$SCRIPT_CMD retrieve --help'.
   buildstats Work with buildstats already retrieved (currently: analyze).
              '$SCRIPT_CMD buildstats --help'.
+  buildhistory  Work with a buildhistory tree already retrieved: analyze
+             what changed between two builds. '$SCRIPT_CMD buildhistory --help'.
   sstate     Prune sstate objects bitbake hasn't reused in a while.
              '$SCRIPT_CMD sstate --help'.
   monitor    Show live bitbake progress from a build started with
@@ -9982,6 +10387,13 @@ main() {
 				cmd="buildstats"; shift
 				if [ "$want_help" -eq 1 ]; then BUILDSTATS_ARGS=("$@" "--help"); else BUILDSTATS_ARGS=("$@"); fi
 				break ;;
+			buildhistory)
+				# Same shape again: buildhistory owns everything after it (its
+				# subcommand, e.g. 'analyze', and that subcommand's own args).
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="buildhistory"; shift
+				if [ "$want_help" -eq 1 ]; then BUILDHISTORY_ARGS=("$@" "--help"); else BUILDHISTORY_ARGS=("$@"); fi
+				break ;;
 			sstate)
 				# Same shape again: sstate owns everything after it (its
 				# subcommand, e.g. 'prune', and that subcommand's own args).
@@ -10112,6 +10524,7 @@ main() {
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
 		retrieve)   cmd_retrieve ${RETRIEVE_ARGS+"${RETRIEVE_ARGS[@]}"} ;;
 		buildstats) cmd_buildstats ${BUILDSTATS_ARGS+"${BUILDSTATS_ARGS[@]}"} ;;
+		buildhistory) cmd_buildhistory ${BUILDHISTORY_ARGS+"${BUILDHISTORY_ARGS[@]}"} ;;
 		sstate)     cmd_sstate ${SSTATE_ARGS+"${SSTATE_ARGS[@]}"} ;;
 		monitor)    cmd_monitor ${MONITOR_ARGS+"${MONITOR_ARGS[@]}"} ;;
 		set)        cmd_set ${SET_ARGS+"${SET_ARGS[@]}"} ;;
