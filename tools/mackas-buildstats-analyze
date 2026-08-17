@@ -341,8 +341,13 @@ def main(argv=None):
         prog="mackas-buildstats-analyze",
         description="Summarise a Yocto buildstats directory (stdlib only).")
     p.add_argument("dir", help="a buildstats dir, or one BUILDNAME dir in it")
-    p.add_argument("--summary", action="store_true",
-                   help="human-readable digest instead of JSON")
+    fmt = p.add_mutually_exclusive_group()
+    fmt.add_argument("--summary", action="store_true",
+                      help="human-readable digest instead of JSON")
+    fmt.add_argument("--json", action="store_true",
+                      help="JSON output -- the default; accepted explicitly so "
+                           "a caller can name its choice instead of relying on "
+                           "the absence of --summary")
     p.add_argument("--top", type=int, default=25, metavar="N",
                    help="how many entries per top-N table (default 25)")
     p.add_argument("-o", "--output", metavar="FILE",
