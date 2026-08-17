@@ -341,7 +341,13 @@ total), and per-image `IMAGESIZE`/installed-package deltas — read via host
 whole tree to `$MACKAS_BASE/artifacts/buildhistory`** (a real host-side
 directory, a git checkout when `BUILDHISTORY_COMMIT` is on) and then runs
 this summary automatically on what it just copied, so a routine retrieve
-already answers the question. Re-run it later without re-copying:
+already answers the question. That local path is **not distro/config-scoped**
+— it resolves whatever `BUILDHISTORY_DIR` the currently active
+`MACKAS_KAS_CONFIG` points at (correctly, per-config), but always lands at
+the same fixed local directory, so retrieving two different DISTROs/configs
+out of one project without `--dest` silently overwrites the previous one's
+local copy. Pass `--dest` per config when you need both kept side by side.
+Re-run it later without re-copying:
 
 ```sh
 mackas buildhistory analyze                              # $MACKAS_BASE/artifacts/buildhistory, build-minus-1..HEAD
