@@ -19,6 +19,7 @@ setup() {
 	# Likewise, make sure the caller's environment cannot leak in.
 	unset MACKAS_CONF MACKAS_MEMORY MACKAS_CPUS MACKAS_ROOT MACKAS_KAS_CONFIG
 	unset MACKAS_VOLUME_SIZE_TMP MACKAS_OVERHEAD MACKAS_OVERHEAD_INTERVAL
+	unset MACKAS_VOLUME_NAME MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME
 	unset MACKAS_PROJECT_URL MACKAS_PROJECT_BRANCH MACKAS_PROJECT_DIR MACKAS_SMOKETEST_TARGETS
 	# Point HOME at the throwaway dir so ~/.config/mackas/config and
 	# ~/.mackas.conf cannot be picked up from the real home directory.
@@ -53,6 +54,13 @@ teardown() {
 # Read one setting out of `mackas status` output.
 setting() {
 	printf '%s\n' "$output" | awk -v k="$1" '$1 == k { $1=""; sub(/^ +/,""); print; exit }'
+}
+
+# The volume names `status` reports in its "ext4 volumes" section, in order.
+# The fake `container` above answers "running" with an empty volume list, so
+# every line is the "[ no]" form; both forms are matched anyway.
+ext4_volume_names() {
+	printf '%s\n' "$output" | sed -n 's/^  \[[ a-z]*\] \([^ ]*\) .*/\1/p'
 }
 
 # ---------------------------------------------------------------------------
@@ -659,6 +667,64 @@ MOCK
 		run "$MACKAS" --set 'MACKAS_VOLUME_NAME=' status
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'MACKAS_VOLUME_NAME'
+}
+
+@test "MACKAS_VOLUME_DL_NAME with a space is refused, not word-split" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_DL_NAME=shared dl' status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_DL_NAME'
+	printf '%s\n' "$output" | grep -qi 'whitespace'
+}
+
+@test "MACKAS_VOLUME_SSTATE_NAME with a space is refused, not word-split" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_SSTATE_NAME=shared sstate' status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_SSTATE_NAME'
+	printf '%s\n' "$output" | grep -qi 'whitespace'
+}
+
+@test "an empty MACKAS_VOLUME_DL_NAME is accepted -- empty is how you say 'derive it'" {
+	# The stem refuses empty; these two must not, or the documented default
+	# would be un-settable.
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_DL_NAME=' status
+	[ "$status" -eq 0 ]
+	[ -z "$(setting MACKAS_VOLUME_DL_NAME)" ]
+}
+
+@test "both volume-name overrides are listed in the resolved configuration, empty by default" {
+	MACKAS_ROOT="/tmp/mackas test dir" run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_DL_NAME'
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_SSTATE_NAME'
+	[ -z "$(setting MACKAS_VOLUME_DL_NAME)" ]
+	[ -z "$(setting MACKAS_VOLUME_SSTATE_NAME)" ]
+}
+
+@test "the overrides reach status with the same names whether MACKAS_ROOT is set or not" {
+	# derive_paths() has TWO branches -- an early return for an unset
+	# MACKAS_ROOT, and the main one. `status`, `help` and `volume list` on a
+	# machine with no root configured go through the FIRST, so deriving in
+	# only one makes mackas PRINT one set of names and OPERATE on another.
+	run "$MACKAS" --set MACKAS_VOLUME_DL_NAME=shared-dl \
+		--set MACKAS_VOLUME_SSTATE_NAME=shared-sstate status
+	[ "$status" -eq 0 ]
+	# Prove this really was the no-root branch, not a $PWD fallback.
+	printf '%s\n' "$output" | grep -qF 'MACKAS_ROOT is not set'
+	local noroot; noroot="$(ext4_volume_names)"
+
+	MACKAS_ROOT="$TESTDIR/oe" run "$MACKAS" --set MACKAS_VOLUME_DL_NAME=shared-dl \
+		--set MACKAS_VOLUME_SSTATE_NAME=shared-sstate status
+	[ "$status" -eq 0 ]
+	local withroot; withroot="$(ext4_volume_names)"
+
+	[ -n "$noroot" ]
+	[ "$noroot" = "$withroot" ]
+	[ "$noroot" = "oe-build-tmp
+shared-dl
+shared-sstate" ]
 }
 
 @test "a garbage MACKAS_VOLUME_SIZE_TMP dies before reaching the container CLI" {
