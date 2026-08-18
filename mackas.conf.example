@@ -182,6 +182,30 @@
 # refuses a name with one rather than mounting something absurd.
 #MACKAS_VOLUME_NAME="oe-build"
 
+# The downloads and sstate volumes can be named outright instead of derived
+# from the stem. Empty (the default) derives them, which is what every mackas
+# install does unless told otherwise.
+#
+# What this makes possible: two mackas configs naming the SAME volume here
+# share that cache. Both caches are safe to share -- downloads are checksum-
+# verified upstream tarballs, sstate is keyed by task-input hash -- but safe
+# is not the same as worthwhile: an ext4 image may be mounted by exactly ONE
+# VM at a time (see docs/architecture.md), so a shared volume means whoever
+# names it queues on each other's builds. That trade is yours to make, per
+# config; nothing here recommends it, and nothing shares by default.
+#
+# A shared volume has to exist before it can be mounted, and seeding it from
+# an existing cache is what `mackas volume duplicate` is for. There is no
+# equivalent knob for TMPDIR: two builds in one /build is corruption, not
+# contention.
+#
+# Same whitespace rule as the stem, for the same reason. The three volumes
+# must also resolve to three DIFFERENT names: they are all attached to one
+# container, so naming two of them alike would mount a single ext4 image twice
+# into the same VM. That is refused outright, not warned about.
+#MACKAS_VOLUME_DL_NAME="mackas-shared-dl"
+#MACKAS_VOLUME_SSTATE_NAME="mackas-shared-sstate"
+
 # The three caps. Digits, optionally followed by t/tb/tib, g/gb/gib or
 # m/mb/mib (case-insensitive) -- e.g. 1T, 200G, 512M; bare digits mean GiB.
 # Any other shape is refused rather than silently misread. They total 200G,

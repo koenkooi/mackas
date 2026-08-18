@@ -131,6 +131,13 @@ ext4 volume does; hardlinks work inside it.
 | `${MACKAS_VOLUME_NAME}-dl` | `/downloads` | `DL_DIR` | `MACKAS_VOLUME_SIZE_DL=40G` |
 | `${MACKAS_VOLUME_NAME}-sstate` | `/sstate` | `SSTATE_DIR` | `MACKAS_VOLUME_SIZE_SSTATE=40G` |
 
+The two cache volumes can also be named outright, with
+`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME`, instead of being
+derived from the stem — which is what lets two configs point at one shared
+cache. Empty is the default and derives the names above. See
+[storage.md](storage.md#naming-the-cache-volumes-outright) for the trade.
+There is no such knob for TMPDIR: it is per build tree by construction.
+
 200G total, the budget this SSD can spare. All three are sparse — ~1.2 MB
 each until used — and independently capped, so a runaway build cannot eat
 the free space Time Machine needs.
@@ -173,8 +180,9 @@ The corollary: a build that reaches kas-container with **no `-e` at all** — on
 
 `mackas` word-splits nothing itself, but kas-container expands
 `${KAS_EXTRA_RUNTIME_ARGS}` unquoted, so no value inside that string may
-contain a space. That is why `MACKAS_VOLUME_NAME` must be space-free, and
-why `setup` refuses a name that isn't.
+contain a space. That is why `MACKAS_VOLUME_NAME` — and
+`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME` with it — must be
+space-free, and why `setup` refuses a name that isn't.
 
 ### The chown — a fresh volume is `root:root`
 
