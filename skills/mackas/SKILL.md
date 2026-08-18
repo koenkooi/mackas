@@ -786,9 +786,10 @@ branch the config does not reference, not just the working-tree state.
 
 ## Notes and gotchas
 
-- Only **one VM** may hold an ext4 volume at a time. `retrieve`, `clean`,
-  `exec`, `sstate prune` and every `volume` operation refuse while a build or
-  `mackas shell` still has it attached. Stop the build first.
+- Only **one VM** may hold an ext4 volume at a time. Every mackas command that
+  touches a volume refuses while another one holds it — `smoketest` and `shell`
+  included, so a second build is a clear refusal naming the volume rather than
+  a VZError. Stop the first one first.
 - `DL_DIR`/`SSTATE_DIR` are shared across every machine's build under the same
   two volumes — never point them at anything machine- or layer-specific.
 - kas printing "Repo <x> is dirty - no checkout" is **expected and harmless**
