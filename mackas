@@ -33,6 +33,11 @@ SCRIPT_NAME="$(basename "$0")"
 # from a checkout, "mackas" if on PATH, an absolute path if run that way.
 # SCRIPT_NAME stays the bare program label ("mackas: error: ...").
 SCRIPT_CMD="$0"
+# The subcommand main() settled on, for hints that must name it back to the
+# user from code shared by several: run_kas() serves both 'shell' and
+# 'smoketest' and cannot tell them apart otherwise. Empty when this file is
+# sourced as a library (MACKAS_LIB_ONLY=1), which never reaches those hints.
+SCRIPT_SUBCOMMAND=""
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 SCRIPT_VERSION="0.1.4"
 
@@ -5330,6 +5335,13 @@ run_kas() {
 		return 0
 	fi
 
+	# One-VM rule, for the last entrypoint that lacked it: 'shell' and every
+	# smoketest rung land here. It sits AFTER ensure_container_running above,
+	# because volume_in_use() short-circuits to "not in use" with the daemon
+	# down (see kas_project_subcommand_preflight for the same ordering), and
+	# after the --dry-run return, so --dry-run queries no volume state.
+	require_volumes_free "$SCRIPT_CMD $SCRIPT_SUBCOMMAND"
+
 	# The one place a user finds out MACKAS_MONITOR=1 actually took effect.
 	# monitor_runtime_args() already warns on every path that skips the
 	# bridge, so silence here means it is genuinely in rt_args -- checking
@@ -5715,6 +5727,11 @@ removed again (checkout + generated kas fragment) once the ladder finishes.
 Declining exits smoketest without running anything.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. smoketest refuses while
+  another build ($SCRIPT_CMD shell, a second smoketest, or a raw
+  kas-container) still holds any of the three volumes -- stop it first.
 EOF
 }
 
@@ -5943,6 +5960,11 @@ is what an interactive session should get.
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
 though shell has nothing to confirm and nothing --dry-run would print instead
 of doing.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. shell refuses while a
+  running build ($SCRIPT_CMD smoketest, another shell, or a raw
+  kas-container) still holds any of the three volumes -- stop it first.
 EOF
 }
 
@@ -10599,6 +10621,8 @@ main() {
 			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args lock dump help)" ;;
 		esac
 	done
+
+	SCRIPT_SUBCOMMAND="${cmd:-check}"
 
 	snapshot_env
 	set_defaults
