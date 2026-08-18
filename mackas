@@ -102,6 +102,8 @@ SETTING_NAMES="
 MACKAS_ROOT
 MACKAS_SHORT_LINK
 MACKAS_VOLUME_NAME
+MACKAS_VOLUME_DL_NAME
+MACKAS_VOLUME_SSTATE_NAME
 MACKAS_VOLUME_SIZE_TMP
 MACKAS_VOLUME_SIZE_DL
 MACKAS_VOLUME_SIZE_SSTATE
@@ -421,6 +423,8 @@ SETTINGS_INTERPOLATED="
 MACKAS_ROOT
 MACKAS_SHORT_LINK
 MACKAS_VOLUME_NAME
+MACKAS_VOLUME_DL_NAME
+MACKAS_VOLUME_SSTATE_NAME
 KAS_IMAGE
 MACKAS_CPUS
 MACKAS_MEMORY
@@ -510,16 +514,7 @@ validate_settings() {
 				"set MACKAS_MONITOR_PORT to a whole port number (no spaces) in $(config_hint)"
 			;;
 	esac
-	# MACKAS_VOLUME_NAME is word-split into --runtime-args the same way (it
-	# names the -v host source for each volume mount). setup_volumes() checks
-	# it again right before use, since bats exercises that function directly,
-	# but every other command reaches this check first.
-	case "$MACKAS_VOLUME_NAME" in
-		*[[:space:]]*|"")
-			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
-				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
-			;;
-	esac
+	validate_volume_names
 	# MACKAS_VOLUME_SIZE_* goes straight into `container volume create -s` and
 	# the resize/budgeting math (size_to_gb/size_to_bytes) -- pin it to what
 	# those actually parse so a typo or stray unit dies here with a clear
@@ -528,6 +523,32 @@ validate_settings() {
 		eval "v=\"\${$n}\""
 		valid_size_shape "$v" || die "$n='$v' is not a size like 1T, 200G or 512M" \
 			"set $n to digits optionally followed by t, g or m (or tb/gb/mb, tib/gib/mib) in $(config_hint)"
+	done
+}
+
+# Every volume name lands unquoted in the --runtime-args string kas-container
+# word-splits, as the -v source of a mount, so whitespace in one silently
+# becomes two arguments and mounts something absurd. validate_settings() calls
+# this for every command; setup_volumes() calls it again right before use,
+# since bats exercises that function directly. The stem is also required to be
+# non-empty; the two per-volume overrides mean "derive from the stem" when
+# empty, so for those only whitespace is a problem.
+validate_volume_names() {
+	local n v
+	case "$MACKAS_VOLUME_NAME" in
+		*[[:space:]]*|"")
+			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
+				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
+			;;
+	esac
+	for n in MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
+		eval "v=\"\${$n}\""
+		case "$v" in
+			*[[:space:]]*)
+				die "$n='$v' contains whitespace" \
+					"set $n to a space-free volume name in $(config_hint), or leave it empty to derive the name from MACKAS_VOLUME_NAME"
+				;;
+		esac
 	done
 }
 
@@ -615,6 +636,17 @@ set_defaults() {
 	# kas-container word-splits --runtime-args, so the stem must not contain
 	# whitespace; setup refuses one that does.
 	MACKAS_VOLUME_NAME="oe-build"
+
+	# Per-volume overrides of the stem, for downloads and sstate only. Empty
+	# means derive from MACKAS_VOLUME_NAME, which is what every existing
+	# install does. Naming one explicitly is what makes two mackas configs
+	# able to point at the SAME cache volume -- possible, deliberately not a
+	# default and not advice: an ext4 image takes exactly one VM at a time,
+	# so a shared volume is a serialization point between whoever names it.
+	# There is no equivalent for TMPDIR: two builds sharing one /build is
+	# corruption, not contention.
+	MACKAS_VOLUME_DL_NAME=""       # derived from MACKAS_VOLUME_NAME if empty
+	MACKAS_VOLUME_SSTATE_NAME=""   # derived from MACKAS_VOLUME_NAME if empty
 
 	# Three separately-sized volumes, not one. TMPDIR is the churny, throwaway
 	# one -- `clean` drops it -- while downloads and sstate are the expensive
@@ -1271,10 +1303,7 @@ derive_paths() {
 		KAS_CONTAINER_BIN=""; KAS_CONTAINER_REAL=""; SHIM_DIR=""
 		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
 		KAS_FILES_ARG="$(compose_kas_files)"
-		MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
-		MACKAS_VOL_DL="${MACKAS_VOLUME_NAME}-dl"
-		MACKAS_VOL_SSTATE="${MACKAS_VOLUME_NAME}-sstate"
-		MACKAS_VOL_LEGACY="$MACKAS_VOLUME_NAME"
+		derive_volume_names
 		return 0
 	fi
 
@@ -1343,18 +1372,56 @@ derive_paths() {
 	MACKAS_KAS_FRAGMENT_REPO="$MACKAS_PROJECT/kas/macos-local.yml"
 	KAS_FILES_ARG="$(compose_kas_files)"
 
-	# The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
-	# filesystem semantics, and none of them may be a host (APFS) directory --
-	# see kas_runtime_args() for why they are volumes rather than bind mounts.
+	derive_volume_names
+
+	validate_nfs_mirror_paths
+}
+
+# The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
+# filesystem semantics, and none of them may be a host (APFS) directory -- see
+# kas_runtime_args() for why they are volumes rather than bind mounts.
+#
+# Called from BOTH of derive_paths()' branches. `status`, `help` and `volume
+# list` on a machine with no MACKAS_ROOT go through the early-return one, so
+# deriving in only one branch makes mackas PRINT one set of names and OPERATE
+# on another.
+#
+# The overrides are read here rather than written back into
+# MACKAS_VOLUME_DL_NAME/_SSTATE_NAME: derive_paths() runs more than once per
+# invocation (adopt re-derives after picking a new stem), and backfilling
+# would pin the caches to the stem that was current the first time round.
+derive_volume_names() {
 	MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
-	MACKAS_VOL_DL="${MACKAS_VOLUME_NAME}-dl"
-	MACKAS_VOL_SSTATE="${MACKAS_VOLUME_NAME}-sstate"
+	MACKAS_VOL_DL="${MACKAS_VOLUME_DL_NAME:-${MACKAS_VOLUME_NAME}-dl}"
+	MACKAS_VOL_SSTATE="${MACKAS_VOLUME_SSTATE_NAME:-${MACKAS_VOLUME_NAME}-sstate}"
 	# The single volume mackas used to create, before the split into three.
 	# Nothing uses it any more; `check` and `status` report it so it does not
 	# sit there silently eating disk.
 	MACKAS_VOL_LEGACY="$MACKAS_VOLUME_NAME"
 
-	validate_nfs_mirror_paths
+	# Two of the three resolving to one name is invariant 3 violated from
+	# INSIDE a single container: kas_runtime_args() would emit `-v x:/downloads
+	# -v x:/sstate`, attaching one ext4 image twice to the same VM. Nothing
+	# downstream catches it -- require_volumes_free() only asks what OTHER
+	# running containers hold, and setup_volumes() would create the name twice
+	# at two different sizes and report success -- so the first sign would be a
+	# corrupt filesystem mid-build. Before these two knobs existed the three
+	# names were one stem plus three fixed suffixes and could not collide;
+	# refuse here, where every caller resolves them.
+	if [ "$MACKAS_VOL_DL" = "$MACKAS_VOL_TMP" ]; then
+		die_volume_collision "$MACKAS_VOL_DL" "the build volume and the downloads volume"
+	fi
+	if [ "$MACKAS_VOL_SSTATE" = "$MACKAS_VOL_TMP" ]; then
+		die_volume_collision "$MACKAS_VOL_SSTATE" "the build volume and the sstate volume"
+	fi
+	if [ "$MACKAS_VOL_DL" = "$MACKAS_VOL_SSTATE" ]; then
+		die_volume_collision "$MACKAS_VOL_DL" "the downloads volume and the sstate volume"
+	fi
+}
+
+die_volume_collision() {
+	die "$2 both resolve to '$1'" \
+		"the three volumes are attached to one container, so they must have three distinct names; set MACKAS_VOLUME_DL_NAME / MACKAS_VOLUME_SSTATE_NAME to differ from each other and from \${MACKAS_VOLUME_NAME}-tmp in $(config_hint)"
 }
 
 # kas-container WORD-SPLITS the string it gets from --runtime-args, so every
@@ -4095,19 +4162,11 @@ ensure_volume() {
 }
 
 setup_volumes() {
-	step "ext4 volumes: ${MACKAS_VOLUME_NAME}-{tmp,dl,sstate} ($(total_volume_gb) GiB total)"
+	step "ext4 volumes: $MACKAS_VOL_TMP, $MACKAS_VOL_DL, $MACKAS_VOL_SSTATE ($(total_volume_gb) GiB total)"
 
-	# kas-container word-splits --runtime-args, so a volume name with a space
-	# in it would silently become two arguments and mount something absurd.
-	# validate_settings() already checked this for every command; repeated
-	# here as a backstop for callers (tests included) that reach this
-	# function directly without going through main()'s validation first.
-	case "$MACKAS_VOLUME_NAME" in
-		*[[:space:]]*|"")
-			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
-				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
-			;;
-	esac
+	# Backstop for callers (tests included) that reach this function directly
+	# without going through main()'s validate_settings first.
+	validate_volume_names
 
 	ensure_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
 	ensure_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
