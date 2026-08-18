@@ -121,6 +121,99 @@ teardown() {
 	printf '%s\n' "$out" | grep -qi 'whitespace'
 }
 
+# ---------------------------------------------------------------------------
+# MACKAS_VOLUME_DL_NAME / MACKAS_VOLUME_SSTATE_NAME -- naming a cache volume
+# outright instead of deriving it from the stem. Both are empty by default:
+# these knobs make it POSSIBLE for two configs to name one cache volume, they
+# never turn anything on. There is no TMPDIR equivalent on purpose.
+# ---------------------------------------------------------------------------
+
+@test "volume names: with both overrides unset, the derived names are exactly today's" {
+	# The backward-compatibility guard for the whole feature: every install
+	# that has never heard of these settings must keep byte-identical volume
+	# names, or it silently starts building against empty caches.
+	[ "$MACKAS_VOL_TMP" = "oe-build-tmp" ]
+	[ "$MACKAS_VOL_DL" = "oe-build-dl" ]
+	[ "$MACKAS_VOL_SSTATE" = "oe-build-sstate" ]
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-v oe-build-dl:/downloads -e DL_DIR=/downloads"
+	printf '%s\n' "$args" | grep -qF -- "-v oe-build-sstate:/sstate -e SSTATE_DIR=/sstate"
+}
+
+@test "volume names: MACKAS_VOLUME_DL_NAME moves only the downloads volume" {
+	MACKAS_VOLUME_DL_NAME="shared-dl"
+	derive_paths
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-v shared-dl:/downloads -e DL_DIR=/downloads"
+	assert_fails grep -qF -- "oe-build-dl" <<< "$args"
+	# tmp and sstate stay on the stem -- an override is per volume, not a
+	# second stem.
+	[ "$MACKAS_VOL_TMP" = "oe-build-tmp" ]
+	[ "$MACKAS_VOL_SSTATE" = "oe-build-sstate" ]
+}
+
+@test "volume names: MACKAS_VOLUME_SSTATE_NAME moves only the sstate volume" {
+	MACKAS_VOLUME_SSTATE_NAME="shared-sstate"
+	derive_paths
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-v shared-sstate:/sstate -e SSTATE_DIR=/sstate"
+	assert_fails grep -qF -- "oe-build-sstate" <<< "$args"
+	[ "$MACKAS_VOL_TMP" = "oe-build-tmp" ]
+	[ "$MACKAS_VOL_DL" = "oe-build-dl" ]
+}
+
+@test "volume names: an override with whitespace is refused, not word-split" {
+	# Same hazard as the stem: these land unquoted in --runtime-args as the
+	# -v source, so 'shared dl:/downloads' would arrive as two arguments.
+	MACKAS_VOLUME_DL_NAME="shared dl"
+	derive_paths
+	out="$( (setup_volumes) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'whitespace'
+	printf '%s\n' "$out" | grep -qF 'MACKAS_VOLUME_DL_NAME'
+}
+
+@test "volume names: a whitespace MACKAS_VOLUME_SSTATE_NAME is refused too" {
+	MACKAS_VOLUME_SSTATE_NAME="shared sstate"
+	derive_paths
+	out="$( (setup_volumes) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'whitespace'
+	printf '%s\n' "$out" | grep -qF 'MACKAS_VOLUME_SSTATE_NAME'
+}
+
+@test "volume names: two overrides resolving to one name are refused" {
+	# All three volumes are attached to ONE container, so this would emit
+	# `-v shared:/downloads -v shared:/sstate` and mount a single ext4 image
+	# twice into the same VM -- invariant 3 from the inside, which
+	# require_volumes_free() cannot see because it only asks what OTHER
+	# containers hold.
+	MACKAS_VOLUME_DL_NAME="shared"
+	MACKAS_VOLUME_SSTATE_NAME="shared"
+	out="$( (derive_paths) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qF "'shared'"
+	printf '%s\n' "$out" | grep -qi 'downloads volume and the sstate volume'
+}
+
+@test "volume names: an override colliding with the build volume is refused" {
+	MACKAS_VOLUME_DL_NAME="oe-build-tmp"
+	out="$( (derive_paths) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'build volume and the downloads volume'
+}
+
+@test "volume names: three distinct names are accepted" {
+	# The negative control for the two above: the collision guard must refuse
+	# collisions WITHOUT refusing the ordinary case the knobs exist for.
+	MACKAS_VOLUME_DL_NAME="my-dl"
+	MACKAS_VOLUME_SSTATE_NAME="my-sstate"
+	derive_paths
+	[ "$MACKAS_VOL_DL" = "my-dl" ]
+	[ "$MACKAS_VOL_SSTATE" = "my-sstate" ]
+	[ "$MACKAS_VOL_TMP" = "oe-build-tmp" ]
+}
+
 @test "runtime-args: the NFS mirror mounts ride along when enabled" {
 	MACKAS_USE_NFS_MIRRORS=1
 	args="$(kas_runtime_args)"
@@ -549,6 +642,28 @@ write_env_sh() {
 	[ "$rc" -ne 0 ]
 	printf '%s\n' "$out" | grep -qi 'MACKAS_ROOT'
 	# It has to say what to do about it, like every other failure here.
+	printf '%s\n' "$out" | grep -q 'next:'
+}
+
+@test "settings: a double quote in a volume-name override is refused" {
+	# Registering these two in SETTINGS_INTERPOLATED is what subjects them to
+	# this check at all, and nothing else in the suite exercises that
+	# registration -- deleting the two lines leaves everything else green
+	# while the refusal silently disappears. They reach the generated env.sh
+	# and the kas fragment, so an unescaped quote is the same injection
+	# hazard MACKAS_ROOT is guarded against above.
+	MACKAS_VOLUME_DL_NAME='dl";echo>&2;"x'
+	out="$( (validate_settings) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qF 'MACKAS_VOLUME_DL_NAME'
+	printf '%s\n' "$out" | grep -q 'next:'
+}
+
+@test "settings: a backtick in MACKAS_VOLUME_SSTATE_NAME is refused" {
+	MACKAS_VOLUME_SSTATE_NAME='sstate`id`'
+	out="$( (validate_settings) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qF 'MACKAS_VOLUME_SSTATE_NAME'
 	printf '%s\n' "$out" | grep -q 'next:'
 }
 
