@@ -16,6 +16,7 @@ setup() {
 	unset MACKAS_CONF MACKAS_MEMORY MACKAS_CPUS MACKAS_ROOT MACKAS_KAS_CONFIG
 	unset MACKAS_PROJECT_URL MACKAS_PROJECT_BRANCH MACKAS_PROJECT_DIR MACKAS_SMOKETEST_TARGETS
 	unset MACKAS_USE_NFS_MIRRORS MACKAS_SSTATE_MIRROR_PATH MACKAS_DL_MIRROR_PATH
+	unset MACKAS_VOLUME_NAME MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME
 	# HOME, not a real one: ~/.mackas.conf is the default target when nothing
 	# was already loaded, and the real home directory's own config (if any)
 	# must never leak into these tests either way.
@@ -171,6 +172,45 @@ CONF
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qF 'nothing to do'
 	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set/get/unset: MACKAS_VOLUME_DL_NAME round-trips and unsets back to the derived default" {
+	# Registering a setting is a four-place operation; missing SETTING_NAMES
+	# is what makes set/get/unset reject it outright.
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME mackas-shared-dl
+	[ "$status" -eq 0 ]
+	conf | grep -qF "MACKAS_VOLUME_DL_NAME='mackas-shared-dl'"
+
+	run "$MACKAS" get MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "mackas-shared-dl" ]
+
+	run "$MACKAS" unset MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	assert_fails grep -qF 'MACKAS_VOLUME_DL_NAME' "$HOME/.mackas.conf"
+
+	# Empty again: the default is "derive from MACKAS_VOLUME_NAME".
+	run "$MACKAS" get MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "" ]
+}
+
+@test "set/get/unset: MACKAS_VOLUME_SSTATE_NAME round-trips and unsets back to the derived default" {
+	run "$MACKAS" set MACKAS_VOLUME_SSTATE_NAME mackas-shared-sstate
+	[ "$status" -eq 0 ]
+	conf | grep -qF "MACKAS_VOLUME_SSTATE_NAME='mackas-shared-sstate'"
+
+	run "$MACKAS" get MACKAS_VOLUME_SSTATE_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "mackas-shared-sstate" ]
+
+	run "$MACKAS" unset MACKAS_VOLUME_SSTATE_NAME
+	[ "$status" -eq 0 ]
+	assert_fails grep -qF 'MACKAS_VOLUME_SSTATE_NAME' "$HOME/.mackas.conf"
+
+	run "$MACKAS" get MACKAS_VOLUME_SSTATE_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "" ]
 }
 
 @test "unset: does not remove a DIFFERENT setting whose name shares a suffix" {
