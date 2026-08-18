@@ -83,9 +83,56 @@ Quick index:
   [`mackas volume resize`](#growing-a-volume-mackas-volume-resize).
 - Re-attach an image you moved by hand:
   [`mackas volume recover`](#relocating-a-volume-and-recovering-a-hand-moved-one).
+- Name a cache volume yourself instead of deriving it from the stem:
+  [`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME`](#naming-the-cache-volumes-outright).
 
 Every one of these obeys the **one-VM rule**: a volume a running build holds
 is refused rather than attached to, or moved under, a second VM.
+
+### Naming the cache volumes outright
+
+The downloads and sstate volumes are `${MACKAS_VOLUME_NAME}-dl` and
+`${MACKAS_VOLUME_NAME}-sstate` unless `MACKAS_VOLUME_DL_NAME` /
+`MACKAS_VOLUME_SSTATE_NAME` name them directly. Both default to empty, which
+derives those names; a mackas that has never been told otherwise behaves
+exactly as it always did.
+
+Naming them is what makes it **possible** for two configs — two adopted
+roots, say — to point at one cache volume. Both caches are safe to share:
+downloads are upstream tarballs and git mirrors keyed by name and checksum,
+so a bad one fails verification at fetch time no matter who wrote it, and
+sstate is keyed by task-input hash. `BB_HASHSERVE_DB_DIR` lives in the sstate
+volume (see above), so its hash-equivalence database travels with the cache
+rather than being left behind.
+
+Safe to share is not the same as worth sharing, and mackas neither shares by
+default nor suggests you start. An ext4 image may be mounted by **one VM at a
+time**, so a shared volume is a point where the builds that name it queue on
+each other — a cost that does not exist on a Linux host, where concurrent
+builds against one cache are ordinary. What you buy is disk and warm-cache
+hit rate; what you pay is serialization. An [HTTP mirror](#http-mirrors--optional-and-not-just-an-nfs-bridge)
+buys the hit rate without the queueing, and is the better answer whenever it
+is available.
+
+Two practical notes: the shared volume has to exist before anything can mount
+it, and `mackas volume duplicate <existing> <newname>` is how to seed it from
+a cache you already have; and the names land unquoted in the word-split
+`--runtime-args` string, so like the stem they must be space-free — mackas
+refuses one that isn't rather than mounting the fragments.
+
+The three volumes must also resolve to three **distinct** names. Sharing a
+cache between two *configs* is the supported thing these knobs make possible;
+naming two volumes of the *same* config alike is not, because all three are
+attached to one container — `-v shared:/downloads -v shared:/sstate` would
+mount a single ext4 image twice into one VM, which is the one-VM rule broken
+from the inside rather than between two builds. mackas refuses a collision
+when it resolves the names, since nothing downstream would catch it: the
+held-volume check only asks what *other* running containers hold, and `setup`
+would otherwise create the name twice at two different sizes and report
+success.
+
+TMPDIR has no such knob on purpose. Two builds sharing one `/build` is not
+contention, it is corruption.
 
 ### Reclaiming disk from a grown volume (`mackas volume fstrim`)
 
