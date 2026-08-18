@@ -13,6 +13,11 @@ REPRODUCE-*.md
 # Draft GitHub issue bodies staged for inspection before `gh issue create`.
 github-issues/
 
+# Local design/scratch planning notes. Never committed, never referenced by
+# path from a GitHub issue/PR/comment (those must be self-contained or
+# inline the content directly) -- see AGENTS.md.
+plans/
+
 # Reference checkout of upstream kas, for reading and debugging only.
 #
 # Deliberately NOT a submodule and NOT vendored. mackas' central design goal
