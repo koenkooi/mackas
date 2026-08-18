@@ -1,7 +1,7 @@
 # mackas CI.
 #
-# Runs on every push to main and every pull request (see the `on:` block
-# below), plus manual dispatch. The two main gates:
+# Runs on every push to main or multi-project and every pull request (see the
+# `on:` block below), plus manual dispatch. The two main gates:
 #
 #   macos  -- the full ./run-tests.sh (shellcheck, bash 3.2 syntax, the bats
 #             suite, and the Python unittest suite). The bats suite is macOS-
@@ -31,7 +31,13 @@ name: CI
 # multiplier against the account's included-minutes quota.
 on:
   push:
-    branches: [main]
+    # multi-project is the integration branch for the multi-project epic
+    # (issue #72): sub-milestones PR into it, not into main, until it is
+    # ready. Without it here the branch would get pre-merge CI (pull_request
+    # is unfiltered, so it fires whatever the base) but no POST-merge run,
+    # so a bad interaction between two merged milestones would stay hidden
+    # until the branch finally PRs into main.
+    branches: [main, multi-project]
   pull_request:
   workflow_dispatch:
 
