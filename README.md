@@ -141,7 +141,10 @@ fallback if your kas config has no sensible bare default.
 out, as a worked example (smallest native recipe → same recipe
 cross-compiled → the real targets, **hours** cold). Each rung streams to
 `$MACKAS_ROOT/logs/` and stops the ladder on failure. See
-[testing.md](docs/testing.md#the-smoketest-ladder).
+[testing.md](docs/testing.md#the-smoketest-ladder). `smoketest` and `shell`
+obey the **one-VM rule** like everything else: if another build already holds
+one of the three volumes, they refuse by name up front instead of letting
+Virtualization.framework reject the second attach mid-run.
 
 ### Getting build outputs off the volume
 
