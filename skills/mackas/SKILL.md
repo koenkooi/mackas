@@ -43,7 +43,9 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
   - `oe-build-dl` → `/downloads` (`DL_DIR`)
   - `oe-build-sstate` → `/sstate` (`SSTATE_DIR`)
 
-  Details: [architecture.md](../../docs/architecture.md#the-ext4-volumes),
+  The last two can be named outright with `MACKAS_VOLUME_DL_NAME` /
+  `MACKAS_VOLUME_SSTATE_NAME`, so check `mackas status` rather than assuming
+  the stem. Details: [architecture.md](../../docs/architecture.md#the-ext4-volumes),
   [storage.md](../../docs/storage.md).
 
 ## Preflight (every session)
