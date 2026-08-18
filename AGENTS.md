@@ -26,7 +26,7 @@ break by accident.
   progress as JSON over HTTP; `bitbake` is a wrapper bind-mounted directly over
   the checkout's own `bin/bitbake` for the lifetime of one container run (a
   PATH shadow does not work — see the file's own header for why).
-- `tests/` — 38 `*.bats` files + 7 `test_*.py` files.
+- `tests/` — 39 `*.bats` files + 7 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security, monitor-app.
 - `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to
