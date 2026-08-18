@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -50,7 +51,13 @@ def _float_env(name, default):
 
 
 POLL_INTERVAL = _float_env("MACKAS_MONITOR_POLL_INTERVAL", 2.0)
-REQUEST_TIMEOUT = 2.0
+
+# 2.0 used to be hardcoded here and was too tight: a real build under load
+# (bitbake busy, the bridge single-threaded) has been observed taking close
+# to 2s to answer a live, healthy bridge -- right at the edge of the old
+# value, so it read as "unreachable" when it was just slow. Widened, and
+# made overridable for a machine that is consistently slower still.
+REQUEST_TIMEOUT = _float_env("MACKAS_MONITOR_REQUEST_TIMEOUT", 5.0)
 
 # Where the bridge is published on the host, and where it is polled until
 # something proves that address unusable.
@@ -269,7 +276,9 @@ def connection_error_message(port, exc, host=LOOPBACK):
             f"reached bitbake yet, or the progress bridge did not come up "
             f"inside the container; try again in a few seconds"
         )
-    if isinstance(real, TimeoutError) or isinstance(exc, TimeoutError):
+    if isinstance(real, (TimeoutError, socket.timeout)) or isinstance(
+        exc, (TimeoutError, socket.timeout)
+    ):
         return f"{host}:{port} did not respond within {REQUEST_TIMEOUT}s -- try again"
     return f"could not reach the bridge at {host}:{port}: {exc}"
 
@@ -665,7 +674,14 @@ def main(argv=None):
         while True:
             try:
                 state = fetch(port, host)
-            except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            # socket.timeout is only an alias of TimeoutError from Python
+            # 3.10 on; mackas's stdlib-only floor is 3.7, and a bare timeout
+            # can propagate unwrapped (see _underlying_os_error's docstring),
+            # so it must be listed explicitly or it reaches the user as an
+            # unhandled traceback on older interpreters instead of the
+            # message connection_error_message() already has for it.
+            except (urllib.error.URLError, ConnectionError, TimeoutError,
+                    socket.timeout) as exc:
                 direct = None
                 if not asked_runtime and isinstance(
                     _underlying_os_error(exc), ConnectionResetError
