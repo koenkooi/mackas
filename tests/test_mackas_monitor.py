@@ -41,6 +41,7 @@ import io
 import itertools
 import json
 import os
+import socket
 import unittest
 import urllib.error
 from unittest import mock
@@ -91,6 +92,14 @@ class ConnectionErrorMessageTest(unittest.TestCase):
 
     def test_timeout(self):
         msg = mon.connection_error_message(8801, TimeoutError("timed out"))
+        self.assertIn("did not respond within", msg)
+
+    def test_timeout_bare_socket_timeout(self):
+        # socket.timeout: its own OSError subclass pre-3.10, only an alias
+        # of TimeoutError from 3.10 on -- must be told apart from the
+        # generic OSError fallback on the older interpreters this repo's
+        # 3.7+ floor still has to support.
+        msg = mon.connection_error_message(8801, socket.timeout("timed out"))
         self.assertIn("did not respond within", msg)
 
     def test_unknown_falls_back_to_generic_message(self):
@@ -754,6 +763,20 @@ class PollLoopFallbackTest(unittest.TestCase):
         rc, _, err, run = self._main(urlopen)
         self.assertEqual(rc, mon.EXIT_UNREACHABLE)
         self.assertIn("did not respond within", err)
+
+    def test_bare_socket_timeout_is_caught_not_an_unhandled_traceback(self):
+        # The real-world crash this pins: socket.timeout is only an alias of
+        # TimeoutError from Python 3.10 on. Before that it is its own OSError
+        # subclass, and urlopen() has been observed to let it propagate bare
+        # (see _underlying_os_error's docstring) rather than wrapping it in a
+        # URLError -- so on the 3.7-3.9 floor this repo targets, a plain
+        # `except TimeoutError` misses it entirely and it reaches the user as
+        # an unhandled traceback instead of "did not respond within Ns".
+        urlopen = mock.Mock(side_effect=socket.timeout("timed out"))
+        rc, _, err, run = self._main(urlopen)
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        self.assertIn("did not respond within", err)
+        run.assert_not_called()
         run.assert_not_called()
 
     def test_a_reset_wrapped_in_urlerror_is_still_retried(self):
