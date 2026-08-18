@@ -42,6 +42,12 @@ break by accident.
   finished item is annotated in place, never renumbered away). New items go at
   the end. Never cite a TODO item number in anything public — commits, `--help`
   text, GitHub issues.
+- `plans/` — scratch design/research notes. **Local-only and gitignored, never
+  committed, under any circumstance** (this is not a convention to work around
+  with a "deliberate exception" force-add — it has bitten twice already: once
+  citing a TODO item number, once actually pushing `plans/` content to a PR on
+  a public repo). A GitHub issue/PR/comment must never reference a `plans/`
+  path — inline the relevant content directly, or don't reference it.
 - `kas-upstream/` — a reference clone of kas, for reading. **Gitignored**:
   deliberately neither vendored nor a submodule, so clone it yourself
   (`git clone https://github.com/siemens/kas.git kas-upstream`). **The design
