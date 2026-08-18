@@ -158,12 +158,17 @@ a partial run.
 
 ## Workflow conventions
 
-- **CI runs on every push to main and every pull request.**
-  `.github/workflows/ci.yml` triggers on `push`/`pull_request`/
-  `workflow_dispatch`. This is free: public-repo standard GitHub-hosted
-  runners, including macOS, are unmetered — confirmed against GitHub's own
-  billing docs, still true after the 2026-01-01 Actions repricing. Keep it
-  that way: re-confirm `koenkooi/mackas` is still public
+- **CI runs on every push to `main` or `multi-project`, and every pull
+  request.** `.github/workflows/ci.yml` triggers on `push`/`pull_request`/
+  `workflow_dispatch`. `pull_request` is deliberately unfiltered, so a PR is
+  gated whatever its base — which is what lets the multi-project epic take
+  PRs against its own integration branch. `push` is filtered, so an
+  integration branch must be listed there too or it gets no post-merge run;
+  note that for `push` events GitHub reads the workflow from the pushed ref,
+  so that listing has to exist **on** the branch. This is free: public-repo
+  standard GitHub-hosted runners, including macOS, are unmetered — confirmed
+  against GitHub's own billing docs, still true after the 2026-01-01 Actions
+  repricing. Keep it that way: re-confirm `koenkooi/mackas` is still public
   (`gh repo view --json visibility`) before ever touching the `on:` block,
   since a private repo bills macOS runners at a 10x multiplier against the
   account's included-minutes quota. `./run-tests.sh` runs the identical
