@@ -1525,6 +1525,10 @@ clear_buildstats_doubles() {
 	auto_fstrim() { echo "$1" >> "$PHASES"; }
 	kas_runtime_args() { echo "-c 2"; }
 	ensure_container_running() { return 0; }
+	# run_kas's one-VM guard would otherwise reach the REAL `container` CLI on
+	# a dev Mac -- and fail closed on whatever it found there. tests/
+	# one_vm_build.bats covers the guard itself, against a fake runtime.
+	volume_in_use() { return 1; }
 	rc=0; run_kas "" build foo >/dev/null 2>&1 || rc=$?
 	[ "$rc" -eq 0 ]
 	[ "$(tr '\n' ' ' < "$PHASES")" = "before after " ]
