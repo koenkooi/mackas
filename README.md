@@ -460,6 +460,8 @@ The settings a new user actually needs:
 | `MACKAS_ROOT` | *(none; falls back to `$PWD` with a warning)* | Where everything lives. Must be a dir on a case-sensitive volume — `setup` refuses otherwise; see below. |
 | `MACKAS_SHORT_LINK` | `$HOME/oe` | Short, space-free symlink to `MACKAS_ROOT`. |
 | `MACKAS_VOLUME_NAME` | `oe-build` | Stem for the three ext4 volumes (`-tmp`, `-dl`, `-sstate`). Must be space-free. |
+| `MACKAS_VOLUME_DL_NAME` | *(empty: `${MACKAS_VOLUME_NAME}-dl`)* | Names the downloads volume outright instead of deriving it. Must be space-free. |
+| `MACKAS_VOLUME_SSTATE_NAME` | *(empty: `${MACKAS_VOLUME_NAME}-sstate`)* | Names the sstate volume outright instead of deriving it. Must be space-free. |
 | `MACKAS_VOLUME_SIZE_TMP` | `120G` | Cap on the TMPDIR volume. |
 | `MACKAS_VOLUME_SIZE_DL` | `40G` | Cap on the downloads volume. |
 | `MACKAS_VOLUME_SIZE_SSTATE` | `40G` | Cap on the sstate volume. |
