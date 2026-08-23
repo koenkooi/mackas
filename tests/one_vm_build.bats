@@ -237,3 +237,71 @@ refute_volume_state_query() {
 	[ "$status" -eq 0 ]
 	refute_volume_state_query
 }
+
+# ---------------------------------------------------------------------------
+# The hand-typed wrapper path (issue #96)
+#
+# The generated bin/kas-container asks `mackas runtime-args
+# --require-volumes-free` for the string it is about to attach, so the one-VM
+# rule reaches that entrypoint through the same require_volumes_free() the
+# tests above drive through `shell`/`smoketest` -- not a second copy of
+# volume_in_use() written in POSIX sh. These drive the mackas side of that
+# contract; tests/kas_wrapper.bats drives the generated script's side.
+# ---------------------------------------------------------------------------
+
+@test "runtime-args --require-volumes-free: refuses when the TMPDIR volume is held" {
+	MOCK_BUSY_VOLUME=oe-build-tmp mk runtime-args --require-volumes-free
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "volume 'oe-build-tmp' is attached to a running container"
+	# Nothing usable on stdout: a caller that refuses must not also hand back
+	# an args string it could go on to use.
+	refute_output ':/build'
+}
+
+@test "runtime-args --require-volumes-free: refuses when the downloads volume is held, naming IT" {
+	MOCK_BUSY_VOLUME=oe-build-dl mk runtime-args --require-volumes-free
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "volume 'oe-build-dl' is attached to a running container"
+	refute_output 'oe-build-tmp'
+}
+
+@test "runtime-args --require-volumes-free: the refusal points back at kas-container" {
+	MOCK_BUSY_VOLUME=oe-build-tmp mk runtime-args --require-volumes-free
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "then re-run 'kas-container"
+}
+
+@test "runtime-args --require-volumes-free: nothing held prints the full args string" {
+	mk runtime-args --require-volumes-free
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '-v oe-build-tmp:/build'
+	printf '%s\n' "$output" | grep -qF -- '-v oe-build-dl:/downloads'
+	printf '%s\n' "$output" | grep -qF -- '-v oe-build-sstate:/sstate'
+}
+
+@test "runtime-args: without the flag it stays a pure query -- no volume-state query, no refusal" {
+	# The flag is what the wrapper passes; `mackas runtime-args` typed by hand
+	# is still just "print what a build would use", printable while a build is
+	# running. Adding the check unconditionally would have been the simpler
+	# edit and the wrong one.
+	MOCK_BUSY_VOLUME=oe-build-tmp mk runtime-args
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '-v oe-build-tmp:/build'
+	refute_volume_state_query
+}
+
+@test "runtime-args: an unknown flag is refused, not silently ignored" {
+	# runtime-args grew a tail-capturing parser to take --require-volumes-free
+	# at all; a typo'd flag reaching the wrapper must fail loudly there rather
+	# than be dropped on the floor and let the build proceed unchecked.
+	mk runtime-args --require-volumes-fre
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "unknown option for 'runtime-args'"
+}
+
+@test "runtime-args --help: still prints its own usage, and mentions the flag" {
+	mk runtime-args --help
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--require-volumes-free'
+	refute_volume_state_query
+}
