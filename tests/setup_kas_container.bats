@@ -235,13 +235,15 @@ fake_shasum() {
 
 	(setup_kas_container)
 	[ -x "$KAS_CONTAINER_BIN" ]
-	first_frozen="$(grep 'MACKAS_FROZEN_RUNTIME_ARGS=' "$KAS_CONTAINER_BIN")"
+	first_image="$(grep '^KAS_IMAGE=' "$KAS_CONTAINER_BIN")"
 
-	# Change something kas_runtime_args() bakes into the wrapper's fallback,
-	# so a regenerated wrapper is provably different from the first one
-	# rather than merely "still present" (which a stale copy would also be).
-	MACKAS_VOLUME_NAME="othervolname"
-	derive_paths
+	# Change something the wrapper bakes in, so a regenerated wrapper is
+	# provably different from the first one rather than merely "still
+	# present" (which a stale copy would also be). The volume names are NOT
+	# such a thing any more -- the wrapper asks mackas for them live on every
+	# call and refuses if that fails (issue #96), so nothing about them is in
+	# this file to compare.
+	KAS_IMAGE="ghcr.io/siemens/kas/kas:9.9.9"
 
 	rm -f "$CURL_MARKER"
 	out="$( (setup_kas_container) 2>&1 )" && rc=0 || rc=$?
@@ -249,8 +251,8 @@ fake_shasum() {
 	printf '%s\n' "$out" | grep -qi 'verified'
 	[ ! -f "$CURL_MARKER" ]                     # the download was skipped
 	[ -x "$KAS_CONTAINER_BIN" ]                  # but the wrapper is still there
-	second_frozen="$(grep 'MACKAS_FROZEN_RUNTIME_ARGS=' "$KAS_CONTAINER_BIN")"
-	[ "$first_frozen" != "$second_frozen" ]      # ...and was actually rewritten
+	second_image="$(grep '^KAS_IMAGE=' "$KAS_CONTAINER_BIN")"
+	[ "$first_image" != "$second_image" ]        # ...and was actually rewritten
 }
 
 # ---------------------------------------------------------------------------
