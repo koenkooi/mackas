@@ -168,11 +168,12 @@ ASSUME_YES=0
 OVERHEAD_PID=""
 OVERHEAD_OUT=""
 
-# The `volume`/`retrieve`/`buildstats`/`sstate`/`monitor` subcommands' tails (everything after
-# the command word), captured verbatim by main()'s flag loop and handed to the
-# matching cmd_*(). Declared empty here so `${FOO_ARGS+...}` is safe under
-# `set -u` when that command never ran.
+# The `volume`/`retrieve`/`buildstats`/`sstate`/`monitor`/`runtime-args`
+# subcommands' tails (everything after the command word), captured verbatim by
+# main()'s flag loop and handed to the matching cmd_*(). Declared empty here so
+# `${FOO_ARGS+...}` is safe under `set -u` when that command never ran.
 VOLUME_ARGS=()
+RUNTIME_ARGS_ARGS=()
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
 BUILDHISTORY_ARGS=()
@@ -3718,15 +3719,14 @@ fi
 # derive MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG and append the macos-local.yml
 # fragment, both before handing off to that wrapper.
 #
-# This is the value at the moment 'setup' generated this file -- conceptually
-# the same FROZEN FALLBACK the $KAS_CONTAINER_BIN wrapper script bakes into
-# its own MACKAS_FROZEN_RUNTIME_ARGS (see write_kas_wrapper()), computed
-# independently there rather than read from this export. The kas-container()
-# function below no longer consults this variable at all -- it delegates
-# --runtime-args (live value AND fallback) entirely to the wrapper now.
-# Kept exported anyway, unchanged, so a shell that already sourced an older
-# env.sh keeps seeing the name it had -- removing it out from under an
-# already-sourced shell is the breaking change, not keeping an unread export.
+# This is the value at the moment 'setup' generated this file, and nothing
+# reads it: the kas-container() function below delegates --runtime-args
+# entirely to the wrapper, which recomputes it live on every call and
+# REFUSES rather than fall back if that fails (issue #96). Kept exported
+# anyway, unchanged, so a shell that already sourced an older env.sh keeps
+# seeing the name it had -- removing it out from under an already-sourced
+# shell is the breaking change, not keeping an unread export. Never treat it
+# as a fallback: a stale copy of these values is exactly what #96 removed.
 export MACKAS_RUNTIME_ARGS=$q_runtime_args
 
 # Absolute path to the generated fragment (empty project -> a path that
@@ -3898,8 +3898,8 @@ kas-container() {
 	# Hand off to $KAS_CONTAINER_BIN, the protection wrapper SCRIPT
 	# write_kas_wrapper() generates in $SCRIPT_NAME (see q_kasbin's own
 	# assignment above for why this must stay the wrapper, never .real). IT
-	# now computes --runtime-args live (falling back to a frozen copy the same
-	# way this function used to), blanks KAS_BUILD_DIR/DL_DIR/SSTATE_DIR,
+	# computes --runtime-args live and refuses to launch if that fails,
+	# applies the one-VM rule, blanks KAS_BUILD_DIR/DL_DIR/SSTATE_DIR,
 	# prepends the shim dir to PATH, and sets up the container
 	# engine/image/gitconfig -- none of that belongs here anymore.
 	# MACKAS_KAS_FRAGMENT_DONE=1 tells it the fragment-append above already
@@ -4294,8 +4294,9 @@ write_kas_wrapper() {
 	# spelled out in setup_shim_and_env(): the raw form was an injection.
 	# BREW_BIN is on this list because it used to be a hardcoded literal --
 	# turning it into a variable put it straight back inside a raw "..." until
-	# this line existed.
-	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_rtargs q_scriptname
+	# this line existed. No q_rtargs: the frozen --runtime-args string is gone
+	# from the generated file entirely (issue #96) -- there is nothing to quote.
+	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_scriptname
 	q_real="$(shq "$KAS_CONTAINER_REAL")"
 	q_shim="$(shq "$SHIM_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -4303,7 +4304,6 @@ write_kas_wrapper() {
 	q_work="$(shq "$MACKAS_WORK")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
-	q_rtargs="$(shq "$(kas_runtime_args)")"
 	q_scriptname="$(shq "$SCRIPT_NAME")"
 
 	run mkdir -p "$MACKAS_BIN"
@@ -4333,11 +4333,12 @@ MACKAS_WORK=$q_work
 KAS_IMAGE=$q_image
 MACKAS_GITCONFIG=$q_gitconfig
 SCRIPT_NAME=$q_scriptname
-# The --runtime-args string in effect when '$SCRIPT_NAME setup' generated
-# this file -- the FALLBACK used only if live recomputation below fails (a
-# stale/incompatible $SCRIPT_NAME binary, or a setting this shell has since
-# broken). Normal calls never use this frozen copy.
-MACKAS_FROZEN_RUNTIME_ARGS=$q_rtargs
+
+# There is deliberately NO frozen copy of --runtime-args in this file any
+# more (issue #96). It used to be the fallback for a failed live recompute,
+# which made every guard $SCRIPT_NAME applies while computing that string --
+# a volume-name collision, a held volume, an ambiguous project -- degrade to
+# a warning plus a build on setup-time values through this path alone.
 
 # Re-entry guard. KAS_CONTAINER_REAL must never lead back to this wrapper --
 # a symlink loop, or .real somehow replaced by a copy of this file -- would
@@ -4390,23 +4391,47 @@ done
 # the same way it already reaches '$SCRIPT_NAME smoketest'/'shell', not just
 # after the next '$SCRIPT_NAME setup'.
 #
-# '|| true' matters here for the same reason it matters in env.sh's own
-# _mackas_runtime_args(): under 'set -e', a failing command substitution
-# would abort before the fallback below ever runs, handing kas-container an
-# EMPTY --runtime-args -- no volumes, no limits, no warning -- instead of
-# degrading to the frozen copy above.
-rt="\$("\$MACKAS_SELF" runtime-args 2>/dev/null)" || true
+# --require-volumes-free asks that same call for run_kas()'s one-VM check
+# too: a hand-typed 'kas-container build' is a second, independent way into
+# the very hazard that guard exists to close, and only \$SCRIPT_NAME can
+# answer it (see cmd_runtime_args() for why the check rides on this call
+# rather than being reimplemented here or asked for separately). It runs
+# after the daemon start above on purpose -- the query reads "nothing holds
+# it" with the runtime down.
+#
+# stderr is NOT redirected: whatever \$SCRIPT_NAME says -- a die() naming the
+# held volume or the colliding names, a warning that MACKAS_MONITOR=1 could
+# not be wired up -- is the diagnosis, and it belongs in front of the person
+# who typed the command, verbatim and in order.
+#
+# '|| _mackas_rt_rc=\$?' rather than a bare assignment: under 'set -e' a
+# failing command substitution would abort this script before the refusal
+# below could explain itself, and it also keeps the exit status, which a
+# bare assignment discards.
+_mackas_rt_rc=0
+rt="\$("\$MACKAS_SELF" runtime-args --require-volumes-free)" || _mackas_rt_rc=\$?
 
-if [ -z "\$rt" ]; then
-	echo "\$SCRIPT_NAME: could not recompute --runtime-args live; using the value baked in at setup time (re-run: \$SCRIPT_NAME setup)" >&2
-	rt="\$MACKAS_FROZEN_RUNTIME_ARGS"
+# FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
+# computing this string is a safety guard -- a held volume, two volume names
+# resolving to one, a project that cannot be derived unambiguously -- and
+# each of them means the setup-time values are no longer known to be right,
+# which is exactly when quietly reusing them does the damage. Failing here
+# is the same outcome the equivalent '\$SCRIPT_NAME shell' would produce; a
+# wrapper that is more permissive than the command it wraps is a bypass, not
+# a convenience.
+if [ "\$_mackas_rt_rc" -ne 0 ]; then
+	echo "\$SCRIPT_NAME: refusing to launch kas-container -- '\$SCRIPT_NAME runtime-args' exited \$_mackas_rt_rc (its message is above)" >&2
+	echo "\$SCRIPT_NAME: not falling back to the values baked in at setup time: they may name volumes this build must not touch" >&2
+	exit 1
 fi
 
-# Validate whichever string is about to be used, live or fallback: it must
-# be non-empty and name all three ext4 volumes kas_runtime_args() always
-# emits. Refusing here, rather than exec'ing anyway, is deliberate -- a
-# multi-hour build with no protected storage attached is strictly worse
-# than failing fast before it ever starts.
+# Validate the string that is about to be used: it must be non-empty and
+# name all three ext4 volumes kas_runtime_args() always emits. This catches
+# what a zero exit status cannot -- a truncated or empty answer from a
+# stale/incompatible \$SCRIPT_NAME that still returns success. Refusing here,
+# rather than exec'ing anyway, is deliberate -- a multi-hour build with no
+# protected storage attached is strictly worse than failing fast before it
+# ever starts.
 _mackas_kas_ok=1
 case "\$rt" in
 	*":/build"*) ;;
@@ -4422,6 +4447,7 @@ case "\$rt" in
 esac
 if [ -z "\$rt" ] || [ "\$_mackas_kas_ok" != "1" ]; then
 	echo "\$SCRIPT_NAME: refusing to launch kas-container -- --runtime-args is empty or missing an ext4 volume (/build, /downloads, /sstate); this would build with NO protected storage attached" >&2
+	echo "\$SCRIPT_NAME: next: \$SCRIPT_NAME setup   # reinstalls the wrapper against this \$SCRIPT_NAME" >&2
 	exit 1
 fi
 
@@ -8351,15 +8377,21 @@ mounts, mirror mounts if enabled, the live-progress-bridge args if
 MACKAS_MONITOR=1) and nothing else.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD runtime-args
+  $SCRIPT_CMD runtime-args [--require-volumes-free]
 
-Not something you normally run directly: the \`kas-container\` wrapper
-env.sh generates calls this itself, once per invocation, so a setting that
+Not something you normally run directly: the generated \`kas-container\`
+wrapper calls this itself, once per invocation, so a setting that
 affects the build (MACKAS_MONITOR, a volume-name override, ...) takes
 effect on a hand-typed \`kas-container build/shell <files>\` the same way it
 already does for '$SCRIPT_CMD smoketest'/'shell' -- not just after the next
 '$SCRIPT_CMD setup'. Exists so that fact has one implementation instead of
-being copied into the generated env.sh.
+being copied into the generated wrapper.
+
+${C_BLD}--require-volumes-free${C_RST} applies the one-VM rule first and prints nothing
+if it fails: refuse, naming the volume, when a running container already
+holds one of the three ext4 volumes this string attaches. The wrapper
+passes it on every call, so a hand-typed \`kas-container build\` while a
+build is running is refused exactly as '$SCRIPT_CMD shell' would be.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted
 but change nothing here -- there is nothing to confirm and nothing dry-run
@@ -8392,14 +8424,49 @@ EOF
 }
 
 # cmd_runtime_args -- print kas_runtime_args()'s current value, stdout only,
-# nothing else. The env.sh wrapper shells out to this per call (see
-# setup_shim_and_env) instead of freezing the string at 'setup' time, so a
-# setting kas_runtime_args() reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a
-# volume-name override) reaches a hand-typed kas-container call the same way
+# nothing else. The generated kas-container wrapper shells out to this per
+# call (see write_kas_wrapper) instead of freezing the string at 'setup' time,
+# so a setting kas_runtime_args() reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS,
+# a volume-name override) reaches a hand-typed kas-container call the same way
 # it already reaches run_kas() -- one implementation, not two copies that can
 # drift (see issue #25: the frozen copy is exactly how MACKAS_MONITOR=1
 # silently never took effect for a hand-typed build).
+#
+# --require-volumes-free adds run_kas()'s one-VM guard to that same call
+# (issue #96). It lives HERE, rather than being reimplemented in POSIX sh
+# inside the generated wrapper, for the reason above -- one implementation of
+# volume_in_use() -- and it rides on the runtime-args call rather than a
+# second subprocess so the names checked are, by construction, exactly the
+# names that call is about to hand kas-container. Ordering matches run_kas():
+# the wrapper starts the container runtime before it gets here, because
+# volume_in_use() short-circuits to "not in use" with the daemon down.
 cmd_runtime_args() {
+	local want_help=0 require_free=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help|help) want_help=1; shift ;;
+			--require-volumes-free) require_free=1; shift ;;
+			--dry-run) DRY_RUN=1; shift ;;
+			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
+			-v|--verbose) VERBOSE=1; shift ;;
+			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" runtime-args ;;
+			-*) die "unknown option for 'runtime-args': $1" "$SCRIPT_CMD runtime-args --help" ;;
+			*) die "unexpected argument for 'runtime-args': $1" "$SCRIPT_CMD runtime-args --help" ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		runtime_args_usage
+		return 0
+	fi
+
+	# Before printing, never after: a caller that refuses on a held volume must
+	# get nothing on stdout to accidentally use.
+	if [ "$require_free" -eq 1 ]; then
+		require_volumes_free "kas-container ..."
+	fi
+
 	printf '%s\n' "$(kas_runtime_args)"
 }
 
@@ -10674,7 +10741,15 @@ main() {
 				cmd="adopt"; shift
 				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|destroy|runtime-args|lock|dump)
+			runtime-args)
+				# Same shape again: runtime-args owns everything after it
+				# (--require-volumes-free), captured verbatim for
+				# cmd_runtime_args.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="runtime-args"; shift
+				if [ "$want_help" -eq 1 ]; then RUNTIME_ARGS_ARGS=("$@" "--help"); else RUNTIME_ARGS_ARGS=("$@"); fi
+				break ;;
+			check|smoketest|status|shell|destroy|lock|dump)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
 			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args lock dump help)" ;;
@@ -10709,7 +10784,7 @@ main() {
 	derive_paths
 
 	# A bare 'help'/'-h' (no command named at all) shows the general usage.
-	# volume/retrieve/buildstats/sstate/monitor/set/get/unset handle their OWN --help
+	# volume/retrieve/buildstats/sstate/monitor/runtime-args/set/get/unset handle their OWN --help
 	# internally (via the "--help" appended to their *_ARGS above), so they
 	# are dispatched normally either way, below.
 	if [ "$want_help" -eq 1 ] && [ -z "$cmd" ]; then
@@ -10725,7 +10800,7 @@ main() {
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
 		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
-		runtime-args) if [ "$want_help" -eq 1 ]; then runtime_args_usage; else cmd_runtime_args; fi ;;
+		runtime-args) cmd_runtime_args ${RUNTIME_ARGS_ARGS+"${RUNTIME_ARGS_ARGS[@]}"} ;;
 		lock)      if [ "$want_help" -eq 1 ]; then lock_usage;      else cmd_lock;      fi ;;
 		dump)      if [ "$want_help" -eq 1 ]; then dump_usage;      else cmd_dump;      fi ;;
 		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;

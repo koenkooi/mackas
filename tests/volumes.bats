@@ -594,8 +594,9 @@ write_env_sh() {
 	write_env_sh
 	grep -qF "export MACKAS_RUNTIME_ARGS='-c 6 -m 12g" "$MACKAS_ENV_SH"
 	grep -qF 'kas-container() {' "$MACKAS_ENV_SH"
-	# --runtime-args (live, with fallback), the dir-var blanking and the PATH
-	# prepend are ALL the wrapper's job now (issue #25 lives on there) -- this
+	# --runtime-args (live, and fatal if that fails -- issue #96), the dir-var
+	# blanking and the PATH prepend are ALL the wrapper's job now (issue #25
+	# lives on there) -- this
 	# function only marks that its own fragment-append already ran and hands
 	# off \$@ unmodified.
 	grep -qF 'MACKAS_KAS_FRAGMENT_DONE=1' "$MACKAS_ENV_SH"
