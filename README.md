@@ -121,7 +121,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
-| `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The `env.sh` wrapper calls it itself on every hand-typed `kas-container`; you rarely type it, except to check what a setting did. |
+| `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
 | `dump` | `kas dump --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. |
 
@@ -332,8 +332,10 @@ hands off to `$MACKAS_BIN/kas-container`, the generated protection wrapper
 script, and that wrapper — not the function — is what supplies
 `--runtime-args` (the ext4 volumes, CPU/memory limits, and the
 live-progress-bridge args when `MACKAS_MONITOR=1`, recomputed live per call
-via `mackas runtime-args`, not frozen at `setup` time, so exporting a setting
-takes effect on the very next hand-typed build), points `GITCONFIG_FILE` at
+via `mackas runtime-args --require-volumes-free`, never frozen at `setup`
+time, so exporting a setting takes effect on the very next hand-typed build,
+and a build that mackas refuses — a held volume, colliding volume names —
+is refused here too rather than run on stale values), points `GITCONFIG_FILE` at
 the generated `safe.directory` config, and blanks
 `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`.
 `MACKAS_KAS_AUTO_FRAGMENT=0` / `MACKAS_KAS_AUTO_PROJECT=0` disable the two
