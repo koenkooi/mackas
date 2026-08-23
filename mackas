@@ -6239,41 +6239,46 @@ cmd_dump() {
 # 256M (keep in sync with retrieve_verify_local()'s own threshold) is split
 # into up to 8 whole-MiB byte-range chunks so one huge deploy image
 # checksums in parallel instead of serially; everything else is checksummed
-# whole. `dd bs=1M skip=N count=M` chunk boundaries are deliberately
+# in BATCHES, many files per cksum invocation (see retrieve_verify_local()'s
+# own comment for why -- issue #94, a process-per-file spawn was the
+# dominant cost against a real 650k-file deploy dir, not the checksumming
+# itself). `dd bs=1M skip=N count=M` chunk boundaries are deliberately
 # whole-MiB so the identical invocation shape works against both GNU dd
 # (here) and BSD dd (retrieve_verify_local, the host side) -- verified live
 # to produce byte-identical output for the same tree, sub-file chunks
 # included. cksum (POSIX CRC) over md5sum/sha*sum: measured ~5x faster than
 # md5sum on a real 10G file on this runtime, and ARM64's SHA hardware
-# extensions only help the sha*sum tools it has no equivalent for.
+# extensions only help the sha*sum tools it has no equivalent for; cksum
+# also has the property the batching below depends on -- given multiple
+# paths on one invocation, it labels each line with the exact path it was
+# given, so a batch's own internal ordering is never load-bearing.
 retrieve_verify_script() {
 	cat <<'EOS'
 : > /tmp/.mackas-verify-jobs
-find . -type f -printf '%s %p\n' | while read -r size path; do
+mkdir -p /tmp/.mackas-verify-batches
+find . -type f -size +268435456c -printf '%s %p\n' | while read -r size path; do
 	rel="${path#./}"
-	if [ "$size" -gt 268435456 ]; then
-		size_mb=$(( (size + 1048575) / 1048576 ))
-		chunk_mb=$(( (size_mb + 7) / 8 ))
-		i=0
-		while [ "$i" -lt 8 ]; do
-			skip_mb=$(( i * chunk_mb ))
-			if [ "$skip_mb" -lt "$size_mb" ]; then
-				printf '%s %s %s %s %s\n' "$rel" "$i" "$path" "$skip_mb" "$chunk_mb" >> /tmp/.mackas-verify-jobs
-			fi
-			i=$((i+1))
-		done
-	else
-		printf '%s 0 %s - -\n' "$rel" "$path" >> /tmp/.mackas-verify-jobs
-	fi
+	size_mb=$(( (size + 1048575) / 1048576 ))
+	chunk_mb=$(( (size_mb + 7) / 8 ))
+	i=0
+	while [ "$i" -lt 8 ]; do
+		skip_mb=$(( i * chunk_mb ))
+		if [ "$skip_mb" -lt "$size_mb" ]; then
+			printf '%s %s %s %s %s\n' "$rel" "$i" "$path" "$skip_mb" "$chunk_mb" >> /tmp/.mackas-verify-jobs
+		fi
+		i=$((i+1))
+	done
 done
-LC_ALL=C sort /tmp/.mackas-verify-jobs | xargs -P 8 -L 1 sh -c '
-	if [ "$5" = "-" ]; then
-		sum=$(cksum < "$3")
-	else
+{
+	LC_ALL=C sort /tmp/.mackas-verify-jobs | xargs -r -P 8 -L 1 sh -c '
 		sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
-	fi
-	printf "%s#%s\t%s\n" "$1" "$2" "$sum"
-' _ | LC_ALL=C sort
+		printf "%s#%s\t%s\n" "$1" "$2" "$sum"
+	' _
+	find . -type f ! -size +268435456c -print0 | \
+		xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' /tmp/.mackas-verify-batches
+	find /tmp/.mackas-verify-batches -type f -exec cat {} + | \
+		LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
+} | LC_ALL=C sort
 EOS
 }
 
@@ -6294,8 +6299,38 @@ EOS
 # with zero data actually wrong. Verified live: real deploy/images filenames
 # (dots, hyphens, mixed case) reorder under nl_NL.UTF-8 vs en_US.utf8, and
 # LC_ALL=C converges GNU and BSD sort on byte order regardless of locale.
+# The same LC_ALL=C pinning now also covers the awk below, for the same
+# reason: sub() against a non-UTF-8 filename byte sequence is exactly the
+# kind of thing that diverges between the container's locale and this
+# Mac's own (verified identical under LC_ALL=C, en_US.UTF-8, nl_NL.UTF-8).
+#
+# The <=256M files below are batched, many per cksum invocation, instead of
+# one process per file (issue #94: a real ~650k-file deploy dir, mostly
+# per-recipe SPDX/SBOM json, took 35+ minutes to verify -- profiling showed
+# well under 1 of the 8 parallel slots ever busy, i.e. dominated by
+# fork/exec overhead, not real checksum work; a prototype of this exact
+# batching measured 89x on a 30k-file tree, byte-identical manifests).
+# `xargs -P 8 -n 256 cksum | awk` (piping every worker's output through one
+# shared pipe) looks like the obvious form but silently corrupts the
+# manifest: concurrent workers' multi-line output can interleave at stdio
+# flush boundaries, reproduced 3/3 runs on a tree with long paths. Each
+# xargs worker instead appends to a file named for its OWN pid
+# ("$0/c.$$" -- $0 is the batch directory, passed as xargs' fixed initial
+# argument); pids are unique among live processes, so two concurrent
+# workers never share a file, and a later, reused pid just appends after
+# the previous holder already exited. `-r` on every xargs here and in
+# retrieve_verify_script() (both the batched one and the existing chunk
+# one): without it, an empty directory hits GNU xargs' "run once even on
+# empty input" behavior on the guest side while BSD xargs does not, so an
+# empty directory's guest and host manifests disagreed and fell back to
+# tar before failing outright.
 retrieve_verify_local() {
 	local root="$1"
+	local batchdir rc=0
+	# A plain host tmpdir, not under $root -- it must never end up inside
+	# the tree being verified and checksum itself. Created before the cd
+	# below for that same reason.
+	batchdir="$(mktemp -d "${TMPDIR:-/tmp}/mackas-verify.XXXXXX")" || return 1
 	# Job generation AND the xargs workers below run in ONE subshell so a
 	# relative $path resolves the same way throughout -- splitting these
 	# across two subshells (an earlier version of this function did) loses
@@ -6304,31 +6339,29 @@ retrieve_verify_local() {
 	# instead of erroring, which is worse than not verifying at all.
 	(
 		cd "$root" || exit 1
-		find . -type f | while IFS= read -r path; do
+		find . -type f -size +268435456c | while IFS= read -r path; do
 			local size rel size_mb chunk_mb i skip_mb
 			size="$(stat -f%z "$path")"
 			rel="${path#./}"
-			if [ "$size" -gt 268435456 ]; then
-				size_mb=$(( (size + 1048575) / 1048576 ))
-				chunk_mb=$(( (size_mb + 7) / 8 ))
-				i=0
-				while [ "$i" -lt 8 ]; do
-					skip_mb=$(( i * chunk_mb ))
-					[ "$skip_mb" -lt "$size_mb" ] && printf '%s %s %s %s %s\n' "$rel" "$i" "$path" "$skip_mb" "$chunk_mb"
-					i=$((i+1))
-				done
-			else
-				printf '%s 0 %s - -\n' "$rel" "$path"
-			fi
-		done | LC_ALL=C sort | xargs -P 8 -L 1 sh -c '
-			if [ "$5" = "-" ]; then
-				sum=$(cksum < "$3")
-			else
-				sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
-			fi
+			size_mb=$(( (size + 1048575) / 1048576 ))
+			chunk_mb=$(( (size_mb + 7) / 8 ))
+			i=0
+			while [ "$i" -lt 8 ]; do
+				skip_mb=$(( i * chunk_mb ))
+				[ "$skip_mb" -lt "$size_mb" ] && printf '%s %s %s %s %s\n' "$rel" "$i" "$path" "$skip_mb" "$chunk_mb"
+				i=$((i+1))
+			done
+		done | LC_ALL=C sort | xargs -r -P 8 -L 1 sh -c '
+			sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
 			printf "%s#%s\t%s\n" "$1" "$2" "$sum"
 		' _
-	) | LC_ALL=C sort
+		find . -type f ! -size +268435456c -print0 | \
+			xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' "$batchdir"
+		find "$batchdir" -type f -exec cat {} + | \
+			LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
+	) | LC_ALL=C sort || rc=$?
+	rm -rf "$batchdir"
+	return $rc
 }
 
 fetch_tmp_subdir() {
