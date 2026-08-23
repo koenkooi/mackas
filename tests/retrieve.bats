@@ -1443,10 +1443,160 @@ EOF
 @test "retrieve: every verification sort is pinned to LC_ALL=C" {
 	# Direct source pin for the locale fix above -- catches a regression
 	# where a future edit adds or touches one of these sort calls without
-	# carrying the LC_ALL=C prefix along.
-	grep -qF -- 'LC_ALL=C sort /tmp/.mackas-verify-jobs' "$MACKAS"
-	grep -qF -- "' _ | LC_ALL=C sort" "$MACKAS"
-	grep -qF -- 'done | LC_ALL=C sort | xargs -P 8 -L 1' "$MACKAS"
-	grep -qF -- ') | LC_ALL=C sort' "$MACKAS"
+	# carrying the LC_ALL=C prefix along. The batched small-file path (issue
+	# #94) added its own LC_ALL=C awk, pinned separately below.
+	grep -qF -- 'LC_ALL=C sort /tmp/.mackas-verify-jobs | xargs -r -P 8 -L 1' "$MACKAS"
+	grep -qF -- 'done | LC_ALL=C sort | xargs -r -P 8 -L 1' "$MACKAS"
+	grep -qF -- '} | LC_ALL=C sort' "$MACKAS"
+	grep -qF -- ') | LC_ALL=C sort || rc=$?' "$MACKAS"
+}
+
+@test "retrieve: verify's small-file batching stays in sync between host and guest" {
+	# Issue #94's fix (batched cksum instead of one spawn per file) has two
+	# implementations of the exact same idea -- guest (retrieve_verify_script,
+	# POSIX sh) and host (retrieve_verify_local, bash) -- that must agree on
+	# the size threshold and the awk program that turns cksum's own output
+	# back into the manifest format, or the two sides' manifests silently
+	# stop meaning the same thing. Each fragment is expected exactly twice --
+	# one per side -- so a future edit that changes only one side, or that
+	# "simplifies" +268435456c to +262144k/+256M (a rounding a GNU/BSD find
+	# pair would have to be trusted to agree on), fails this test instead of
+	# shipping a mismatch that only shows up as an intermittent-looking
+	# checksum failure.
+	local n
+	n="$(grep -cF -- '-size +268435456c' "$MACKAS")"
+	[ "$n" -eq 4 ] # 2 finds (large-file, small-file) x 2 sides
+	n="$(grep -cF -- 'sub(/^[0-9]+ [0-9]+ \.\//, "")' "$MACKAS")"
+	[ "$n" -eq 2 ]
+	n="$(grep -cF -- "xargs -0 -r -P 8 -n 256 sh -c 'cksum" "$MACKAS")"
+	[ "$n" -eq 2 ]
+}
+
+@test "retrieve: verify's batched manifest matches a naive per-file cksum" {
+	# Format-preservation pin for issue #94's fix: batching many files
+	# through one cksum invocation must produce the exact same
+	# "<relpath>#<chunk>\t<cksum-line>" manifest a plain per-file loop would.
+	local tree f rel expected actual
+	tree="$TESTDIR/naive-tree"
+	mkdir -p "$tree/sub"
+	for f in one.txt two.txt three.txt sub/four.txt; do
+		echo "content-$f" > "$tree/$f"
+	done
+
+	expected=""
+	for f in one.txt two.txt sub/four.txt three.txt; do
+		expected="$expected$(printf '%s#0\t%s\n' "$f" "$(cksum < "$tree/$f")")"$'\n'
+	done
+	expected="$(printf '%s' "$expected" | LC_ALL=C sort)"
+
+	eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$MACKAS")"
+	actual="$(retrieve_verify_local "$tree")"
+	[ "$expected" = "$actual" ]
+}
+
+@test "retrieve: verify handles filenames with spaces, quotes and glob characters" {
+	# Latent bug closed by issue #94's fix: the old xargs -L 1 job list
+	# word-split on whitespace, so a file with a space in its name silently
+	# took the dd/chunk branch with a garbage offset instead of being
+	# checksummed for real -- same file set on both sides, so no mismatch
+	# ever fired and the file just went unverified. -print0/xargs -0 fixes
+	# this as a side effect of switching to batching.
+	local tree name
+	tree="$TESTDIR/hostile-tree"
+	mkdir -p "$tree"
+	for name in "with space.txt" "quote'.txt" 'dq".txt' "star*.txt" "semi;amp&.txt"; do
+		echo "content" > "$tree/$name"
+	done
+
+	eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$MACKAS")"
+	local actual
+	actual="$(retrieve_verify_local "$tree")"
+	local name expected_sum actual_line
+	for name in "with space.txt" "quote'.txt" 'dq".txt' "star*.txt" "semi;amp&.txt"; do
+		expected_sum="$(cksum < "$tree/$name")"
+		actual_line="$(printf '%s\n' "$actual" | grep -F "$name#0	")"
+		[ -n "$actual_line" ]
+		[ "$actual_line" = "$(printf '%s#0\t%s' "$name" "$expected_sum")" ]
+	done
+}
+
+@test "retrieve: verify of an empty directory produces an empty manifest" {
+	# Latent bug closed by issue #94's fix: GNU xargs runs its command once
+	# even on empty input (BSD xargs does not), so an empty guest directory
+	# would checksum nothing (empty pipe -> cksum's own "no input" line) while
+	# the host side produced truly nothing -- a guaranteed mismatch on any
+	# empty directory. -r on every xargs here fixes it.
+	local tree
+	tree="$TESTDIR/empty-tree"
+	mkdir -p "$tree"
+
+	eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$MACKAS")"
+	local actual
+	actual="$(retrieve_verify_local "$tree")"
+	[ -z "$actual" ]
+}
+
+@test "retrieve: the 256M chunking threshold is exact" {
+	# Pins the +268435456c boundary against being "simplified" to a rounded
+	# unit suffix: a file of EXACTLY 268435456 bytes must stay in the
+	# single-checksum (small-file) path, one byte over must chunk into 8.
+	local tree
+	tree="$TESTDIR/threshold-tree"
+	mkdir -p "$tree"
+	dd if=/dev/zero of="$tree/exact.bin" bs=1 count=1 seek=268435455 2>/dev/null
+	dd if=/dev/zero of="$tree/over.bin" bs=1 count=1 seek=268435456 2>/dev/null
+
+	eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$MACKAS")"
+	local actual
+	actual="$(retrieve_verify_local "$tree")"
+	local exact_lines over_lines
+	exact_lines="$(printf '%s\n' "$actual" | grep -cF 'exact.bin#')"
+	over_lines="$(printf '%s\n' "$actual" | grep -cF 'over.bin#')"
+	[ "$exact_lines" -eq 1 ]
+	[ "$over_lines" -eq 8 ]
+	printf '%s\n' "$actual" | grep -qF 'exact.bin#0	'
+	printf '%s\n' "$actual" | grep -qF 'over.bin#7	'
+}
+
+@test "retrieve: verify's batched output is never interleaved under load" {
+	# Regression test for the corruption hazard batching introduces: eight
+	# concurrent cksum workers writing multi-line output through one SHARED
+	# pipe interleave at stdio flush boundaries on long enough lines (3/3
+	# reproductions during development, ~30 corrupted lines each, on a tree
+	# shaped like this one). The fix (each worker appends to its own
+	# pid-named file) must produce exactly one well-formed line per file,
+	# every time.
+	local tree deep i
+	tree="$TESTDIR/interleave-tree"
+	deep="$tree/$(printf 'x%.0s' $(seq 1 60))/$(printf 'x%.0s' $(seq 1 60))"
+	mkdir -p "$deep"
+	for i in $(seq 1 1500); do
+		echo "data-$i" > "$deep/f$i.json"
+	done
+
+	eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$MACKAS")"
+	local actual nlines badlines
+	actual="$(retrieve_verify_local "$tree")"
+	nlines="$(printf '%s\n' "$actual" | wc -l | tr -d ' ')"
+	badlines="$(printf '%s\n' "$actual" | grep -cvE $'^.+#0\t[0-9]+ [0-9]+$' || true)"
+	[ "$nlines" -eq 1500 ]
+	[ "$badlines" -eq 0 ]
+}
+
+@test "retrieve: verify leaves no scratch directory behind" {
+	local tree
+	tree="$TESTDIR/scratch-cleanup-tree"
+	mkdir -p "$tree"
+	echo hi > "$tree/f.txt"
+
+	local tmpdir_before
+	tmpdir_before="$TESTDIR/verify-tmp"
+	mkdir -p "$tmpdir_before"
+	TMPDIR="$tmpdir_before" \
+		bash -c "eval \"\$(awk '/^retrieve_verify_local\\(\\) \\{/,/^}/' '$MACKAS')\"; retrieve_verify_local '$tree'" >/dev/null
+
+	local leftover
+	leftover="$(find "$tmpdir_before" -maxdepth 1 -name 'mackas-verify.*')"
+	[ -z "$leftover" ]
 }
 
