@@ -33,12 +33,12 @@
 # unprotected".
 #
 # The wrapper's LIVE --runtime-args recompute (MACKAS_SELF, "mackas
-# runtime-args") and its GENERATION-TIME frozen fallback (kas_runtime_args(),
-# called directly by write_kas_wrapper() to bake MACKAS_FROZEN_RUNTIME_ARGS)
-# are controlled INDEPENDENTLY of each other here: a fake MACKAS_SELF stub
-# answers the former; overriding the kas_runtime_args shell function itself
-# (before calling the real write_kas_wrapper()) controls the latter. Both
-# default to a real, valid string; individual tests force one or both bad.
+# runtime-args --require-volumes-free") is the wrapper's ONLY source for that
+# string since issue #96 -- there is no frozen fallback baked into the
+# generated file any more, so a fake MACKAS_SELF stub is the only knob these
+# tests need. It defaults to a real, valid string and a zero exit; individual
+# tests make it fail the way a real 'mackas' would when a guard refuses
+# (message on stderr, non-zero exit, nothing on stdout).
 #
 # NOTE: bats' own `run` must not be used here -- mackas defines its own run()
 # and sourcing it shadows bats' version. Explicit subshells with manually
@@ -90,6 +90,13 @@ lib_setup() {
 	KREC="$TESTDIR/kas.rec"
 	export KREC
 
+	# The MACKAS_SELF stub's own argv log -- unlike KREC this one IS
+	# pre-created, since tests read it for the flags the wrapper passed rather
+	# than asserting it never came into existence.
+	SELF_REC="$TESTDIR/self.rec"
+	export SELF_REC
+	: > "$SELF_REC"
+
 	write_self_stub "$(kas_runtime_args)" 0
 	write_recorder
 	write_container_mock
@@ -108,33 +115,27 @@ teardown() {
 # Harness helpers
 # ---------------------------------------------------------------------------
 
-# write_self_stub OUTPUT EXITCODE -- (re)write the fake MACKAS_SELF binary:
-# answers "runtime-args" with OUTPUT and exits EXITCODE, refuses anything
-# else. This controls the wrapper's LIVE recompute independently of the
-# FROZEN fallback (force_frozen_fallback, below). Does NOT regenerate the
-# wrapper -- MACKAS_SELF is a fixed path baked in once; only its CONTENT
-# changes here.
+# write_self_stub OUTPUT EXITCODE [STDERR] -- (re)write the fake MACKAS_SELF
+# binary: answers "runtime-args" with OUTPUT on stdout, STDERR (if given) on
+# stderr, and exits EXITCODE; refuses anything else. Every call's argv is
+# appended to $SELF_REC, so a test can assert WHICH flags the wrapper passed.
+# Does NOT regenerate the wrapper -- MACKAS_SELF is a fixed path baked in
+# once; only its CONTENT changes here.
 write_self_stub() {
-	local output="$1" exitcode="${2:-0}"
+	local output="$1" exitcode="${2:-0}" errmsg="${3:-}"
 	{
 		printf '#!/usr/bin/env bash\n'
+		printf 'printf "ARGV:%%s\\n" "$*" >> "$SELF_REC"\n'
 		printf 'if [ "$1" = "runtime-args" ]; then\n'
+		if [ -n "$errmsg" ]; then
+			printf '\tprintf "%%s\\n" %s >&2\n' "$(printf '%q' "$errmsg")"
+		fi
 		printf '\tprintf %%s %s\n' "$(printf '%q' "$output")"
 		printf '\texit %s\n' "$exitcode"
 		printf 'fi\n'
 		printf 'exit 1\n'
 	} > "$SELF_STUB"
 	chmod +x "$SELF_STUB"
-}
-
-# force_frozen_fallback OUTPUT -- override kas_runtime_args() itself, the
-# function write_kas_wrapper() calls DIRECTLY (never through MACKAS_SELF) to
-# bake MACKAS_FROZEN_RUNTIME_ARGS at generation time. The caller must re-run
-# (the real) write_kas_wrapper after this for it to take effect.
-force_frozen_fallback() {
-	FROZEN_FAKE="$1"
-	# shellcheck disable=SC2317  # invoked indirectly by write_kas_wrapper()
-	kas_runtime_args() { printf '%s' "$FROZEN_FAKE"; }
 }
 
 # write_container_mock -- a fake `container` on $PATH answering "system
@@ -287,15 +288,46 @@ rec_runtime_args_value() {
 }
 
 # ---------------------------------------------------------------------------
-# 6-7: refusal on empty/unusable computed args. A multi-hour build with no
-# protected storage attached is strictly worse than failing fast before it
-# ever starts -- the recorder must NEVER be created in either case.
+# 6-7: refusal on a failed or unusable live recompute. A multi-hour build
+# with no protected storage attached -- or with SOMEONE ELSE'S storage
+# attached, which is what reusing setup-time values can mean once volume
+# names are configurable (M1) or derived (M3) -- is strictly worse than
+# failing fast before it ever starts. The recorder must NEVER be created.
 # ---------------------------------------------------------------------------
 
-@test "refusal: empty live recompute AND empty frozen fallback refuses to launch, recorder never created" {
-	write_self_stub "" 1
-	force_frozen_fallback ""
-	write_kas_wrapper
+@test "refusal: a failed live recompute is FATAL, not a fallback -- recorder never created (issue #96)" {
+	# Exactly how a real 'mackas' refuses: its die() message on stderr, a
+	# non-zero exit, nothing on stdout. The wrapper used to warn and build on
+	# the frozen copy; there is no frozen copy any more, and this is the test
+	# that keeps one from coming back.
+	write_self_stub "" 1 "mackas: error: volume 'oe-build-dl' is attached to a running container"
+	[ ! -e "$KREC" ]
+
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	# mackas's own message reaches the terminal verbatim -- the wrapper adds
+	# context, it never swallows or paraphrases the diagnosis.
+	printf '%s\n' "$out" | grep -qF "volume 'oe-build-dl' is attached to a running container"
+	printf '%s\n' "$out" | grep -qi 'refusing to launch'
+	printf '%s\n' "$out" | grep -qi 'not falling back'
+	[ ! -e "$KREC" ]
+}
+
+@test "refusal: the live recompute is asked for the one-VM check, not just the args string (issue #96)" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'ARGV:runtime-args --require-volumes-free' "$SELF_REC"
+}
+
+@test "refusal: a partial args string (limits present, no volume mounts) refuses to launch, recorder never created" {
+	# A live recompute that SUCCEEDS but answers something plausible-but-
+	# incomplete: cpu/memory limits present, none of the three ext4 mounts --
+	# a stale/incompatible mackas, which a non-zero exit status cannot catch.
+	# This exercises the substring-validation case statements specifically; a
+	# totally-empty answer would already be caught by the plain "-z" check.
+	write_self_stub "-c 4 -m 8g" 0
 	[ ! -e "$KREC" ]
 
 	cd "$TESTDIR"
@@ -306,23 +338,23 @@ rec_runtime_args_value() {
 	[ ! -e "$KREC" ]
 }
 
-@test "refusal: a partial args string (limits present, no volume mounts) refuses to launch, recorder never created" {
-	# Live fails (forcing the fallback to be consulted at all), and the
-	# fallback itself is plausible-but-incomplete: cpu/memory limits present,
-	# none of the three ext4 mounts. This exercises the substring-validation
-	# case statements specifically -- a totally-empty $rt (test 6, above)
-	# would already be caught by the plain "-z" check alone.
-	write_self_stub "" 1
-	force_frozen_fallback "-c 4 -m 8g"
-	write_kas_wrapper
+@test "refusal: an empty answer with a ZERO exit status still refuses, recorder never created" {
+	write_self_stub "" 0
 	[ ! -e "$KREC" ]
 
 	cd "$TESTDIR"
 	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
 	[ "$rc" -ne 0 ]
 	printf '%s\n' "$out" | grep -qi 'refusing to launch'
-	printf '%s\n' "$out" | grep -qF 'mackas setup'
 	[ ! -e "$KREC" ]
+}
+
+@test "no frozen fallback: the generated wrapper bakes in no --runtime-args string at all (issue #96)" {
+	# A source-level pin, not a behavioural one: as long as the setup-time
+	# string is not IN the file, no future edit can quietly start using it
+	# again. The volume names are the part that must not be frozen.
+	assert_fails grep -q 'MACKAS_FROZEN_RUNTIME_ARGS' "$KAS_CONTAINER_BIN"
+	assert_fails grep -qF -- "-v $MACKAS_VOL_TMP:/build" "$KAS_CONTAINER_BIN"
 }
 
 # ---------------------------------------------------------------------------
