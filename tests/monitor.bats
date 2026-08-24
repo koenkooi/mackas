@@ -306,7 +306,7 @@ EOF
 #!/bin/sh
 case "\$1" in
 	ls)      printf 'ID  IMAGE  STATE\n'
-	         printf 'deadbeef-0000-0000-0000-000000000000  ghcr.io/siemens/kas/kas:5.4  running\n' ;;
+	         printf 'deadbeef-0000-0000-0000-000000000000  ghcr.io/siemens/kas/kas:5.5  running\n' ;;
 	inspect) /bin/cat "$TESTDIR/inspect.json" ;;
 	*)       exit 1 ;;
 esac

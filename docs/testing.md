@@ -94,7 +94,7 @@ make that possible:
 | File | Covers |
 |---|---|
 | `tests/shim.bats` | Flag translation: drops, hard-fails, the IMAGE boundary, spaces, subcommand renames, exit-code propagation. |
-| `tests/kas_argv_replay.bats` | The *kas half* of the shim contract: the real `docker` argv kas-container 5.4 issues (recorded in `tests/fixtures/kas-container-5.4.argv`) replayed through the shim, asserting no dropped flag reaches `container`, no hard-fail fires, the IMAGE boundary forwards verbatim, and every `-v`/`-e` value survives. A guard test fails if the pinned `KAS_CONTAINER_VERSION` has no matching fixture. |
+| `tests/kas_argv_replay.bats` | The *kas half* of the shim contract: the real `docker` argv kas-container 5.5 issues (recorded in `tests/fixtures/kas-container-5.5.argv`) replayed through the shim, asserting no dropped flag reaches `container`, no hard-fail fires, the IMAGE boundary forwards verbatim, and every `-v`/`-e` value survives. A guard test fails if the pinned `KAS_CONTAINER_VERSION` has no matching fixture. |
 | `tests/config.bats` | Precedence: defaults < config file < env < `--set`. Search order, spaces in values. |
 | `tests/cli.bats` | `--help`, `--version`, unknown command/option exit codes, flag placement, `--dry-run` mutating nothing. |
 | `tests/units.bats` | Pure helpers (`size_to_gb`, `nearest_existing_dir`, `derive_paths`, …), sourced via `MACKAS_LIB_ONLY=1`. |

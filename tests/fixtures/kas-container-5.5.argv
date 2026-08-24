@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # WHAT THIS IS
-#   The exact `docker` argv that the real kas-container 5.4 issues for the
+#   The exact `docker` argv that the real kas-container 5.5 issues for the
 #   four invocations mackas drives: `checkout`, `shell ... -c "bitbake -p"`,
 #   `build ... --target X`, and a plain `shell`. This pins the *kas half* of the
 #   bin/docker shim contract: previously "verified by reading upstream", now
@@ -21,7 +21,7 @@
 #   paths (/repo, /work, /build, ...) and every flag/value SHAPE are verbatim.
 #
 # FILENAME <-> VERSION
-#   The "5.4" in the name is mackas's pinned KAS_CONTAINER_VERSION. tests/
+#   The "5.5" in the name is mackas's pinned KAS_CONTAINER_VERSION. tests/
 #   kas_argv_replay.bats fails loudly if that pin has no matching fixture, so a
 #   version bump without re-recording cannot pass silently.
 #
@@ -39,7 +39,7 @@ run
 KAS_WORK_DIR=/work
 --workdir=/repo
 -e
-KAS_CONTAINER_SCRIPT_VERSION=5.4
+KAS_CONTAINER_SCRIPT_VERSION=5.5
 -e
 USER_ID=1000
 -e
@@ -76,7 +76,7 @@ DL_DIR=/downloads
 oe-build-sstate:/sstate
 -e
 SSTATE_DIR=/sstate
-ghcr.io/siemens/kas/kas:5.4
+ghcr.io/siemens/kas/kas:5.5
 checkout
 /repo/base.yml:/repo/macos-local.yml
 === END
@@ -90,7 +90,7 @@ run
 KAS_WORK_DIR=/work
 --workdir=/repo
 -e
-KAS_CONTAINER_SCRIPT_VERSION=5.4
+KAS_CONTAINER_SCRIPT_VERSION=5.5
 -e
 USER_ID=1000
 -e
@@ -127,7 +127,7 @@ DL_DIR=/downloads
 oe-build-sstate:/sstate
 -e
 SSTATE_DIR=/sstate
-ghcr.io/siemens/kas/kas:5.4
+ghcr.io/siemens/kas/kas:5.5
 shell
 -c
 bitbake -p
@@ -143,7 +143,7 @@ run
 KAS_WORK_DIR=/work
 --workdir=/repo
 -e
-KAS_CONTAINER_SCRIPT_VERSION=5.4
+KAS_CONTAINER_SCRIPT_VERSION=5.5
 -e
 USER_ID=1000
 -e
@@ -180,7 +180,7 @@ DL_DIR=/downloads
 oe-build-sstate:/sstate
 -e
 SSTATE_DIR=/sstate
-ghcr.io/siemens/kas/kas:5.4
+ghcr.io/siemens/kas/kas:5.5
 build
 --target
 core-image-minimal
@@ -196,7 +196,7 @@ run
 KAS_WORK_DIR=/work
 --workdir=/repo
 -e
-KAS_CONTAINER_SCRIPT_VERSION=5.4
+KAS_CONTAINER_SCRIPT_VERSION=5.5
 -e
 USER_ID=1000
 -e
@@ -233,7 +233,7 @@ DL_DIR=/downloads
 oe-build-sstate:/sstate
 -e
 SSTATE_DIR=/sstate
-ghcr.io/siemens/kas/kas:5.4
+ghcr.io/siemens/kas/kas:5.5
 shell
 /repo/base.yml:/repo/macos-local.yml
 === END

@@ -202,7 +202,7 @@
 
 # --- kas / image -------------------------------------------------------------
 
-#KAS_IMAGE="ghcr.io/siemens/kas/kas:5.4"
+#KAS_IMAGE="ghcr.io/siemens/kas/kas:5.5"
 
 
 # --- Project (which layers to build) -----------------------------------------
