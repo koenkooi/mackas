@@ -15,7 +15,7 @@
 # whatever actually landed in --dest), falling back to a piped `tar -S` copy
 # on a mismatch. A real >18G deploy image once came back from `cp -r` with
 # the right size but wrong content, which is what this whole verify/fallback
-# dance exists for; see fetch_tmp_subdir's own comment for the fuller story.
+# dance exists for; see fetch_volume_subdir's own comment for the fuller story.
 # The mock extracts retrieve_verify_local() fresh from $REAL_MACKAS to
 # generate the "source" side of that comparison, rather than a hand-rolled
 # stand-in -- the real function must agree with itself against identical
@@ -53,7 +53,7 @@ setup() {
 	export REAL_MACKAS="$MACKAS"
 
 	# retrieve buildstats nests each retrieval under its own timestamp
-	# (fetch_tmp_subdir's EXTRA param -- see cmd_retrieve) so successive
+	# (fetch_volume_subdir's EXTRA param -- see cmd_retrieve) so successive
 	# retrievals never merge into the same host path. MACKAS_RETRIEVE_TS is
 	# an undocumented test seam (cf. MACKAS_OVERHEAD_BIN) for a deterministic
 	# value here instead of the real `date +%Y%m%d%H%M%S`.
@@ -134,7 +134,7 @@ case "$1 $2" in
 		exit 0 ;;
 	"volume ls")
 		# volume_exists() gates cmd_retrieve's whole run (item 33 follow-up:
-		# fetch_tmp_subdir's probe always attaches the volume for real, so
+		# fetch_volume_subdir's probe always attaches the volume for real, so
 		# retrieve refuses up front rather than bind-mount a name that was
 		# never created) -- report the TMPDIR volume present, matching a
 		# project that has actually run a build.
@@ -245,7 +245,7 @@ resolve_destsub_guestsub() {
 
 case "$last" in
 	# The primary path: cp -r, then a checksum manifest of the guest tree
-	# (fetch_tmp_subdir's own retrieve_verify_script) -- .mackas-verify-jobs
+	# (fetch_volume_subdir's own retrieve_verify_script) -- .mackas-verify-jobs
 	# is a marker string unique to that script, safe to match on.
 	*".mackas-verify-jobs"*)
 		resolve_destsub_guestsub "$last" "cp -r " "/\\. "
@@ -257,7 +257,7 @@ case "$last" in
 				# the DESTINATION after the copy, so retrieve_verify_local()
 				# (run for real, below and again unmocked by mackas itself)
 				# disagrees with the source manifest this handler prints,
-				# and fetch_tmp_subdir's fallback path actually runs.
+				# and fetch_volume_subdir's fallback path actually runs.
 				f="$(find "$outdir/$destsub" -type f | head -1)"
 				[ -n "$f" ] && printf 'X' | dd of="$f" bs=1 seek=0 count=1 conv=notrunc 2>/dev/null
 			fi
@@ -276,7 +276,7 @@ case "$last" in
 	# The fallback path, only reached after a verification mismatch: piped
 	# `tar -S`. The mock still uses `cp -r` to populate the fixture data (a
 	# plain copy is fine for a test double); only the real retrieved shape
-	# has to match what fetch_tmp_subdir actually runs.
+	# has to match what fetch_volume_subdir actually runs.
 	*"tar -S -C"*"-cf - . | tar -S -C"*)
 		resolve_destsub_guestsub "$last" "tar -S -C " " -cf" "-C /out/"
 		if [ -n "$outdir" ]; then
@@ -385,20 +385,24 @@ refute_call() {
 	# This machine's uid is not 0, so an argv match alone could pass against a
 	# hardcoded literal on the wrong command. Pin the source form: both the probe
 	# and the copy run as -u 0:0.
-	grep -qF -- 'probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \' "$MACKAS"
+	grep -qF -- 'probe="$(container run --rm -u 0:0 -v "$vol:$mount" "$KAS_IMAGE" \' "$MACKAS"
 	grep -qF -- 'du -sk $(printf '"'"'%q'"'"' "$guest")' "$MACKAS"
-	grep -qF -- '-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE"' "$MACKAS"
+	grep -qF -- '-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE"' "$MACKAS"
+	# ...and that retrieve is what passes the TMPDIR volume at /build, since
+	# $vol/$mount are now parameters shared with 'sstate push'.
+	grep -qF -- 'fetch_volume_subdir "$MACKAS_VOL_TMP" /build \' "$MACKAS"
 }
 
 @test "retrieve: the copy's cp -r and tar fallback %q-quote the guest path and destsub, not embed them raw in single quotes" {
-	# fetch_tmp_subdir's guest sh -c commands used to embed $guest and
+	# fetch_volume_subdir's guest sh -c commands used to embed $guest and
 	# $destsub inside single quotes; a guest path or (pre-shape-check)
 	# MACHINE containing a single quote could break out of that quoting.
 	# Pin the fixed form, same idiom the existence+size probe above and
 	# clean_tmp_deploy already use -- a mock can't distinguish the two
 	# shapes (it never runs the string through a real shell), so this is a
 	# source-grep, not a runtime assertion.
-	grep -qF -- 'mkdir -p $(printf '"'"'%q'"'"' "/out/$destsub") && cp -r $(printf '"'"'%q'"'"' "$guest/.") $(printf '"'"'%q'"'"' "/out/$destsub/") && cd $(printf '"'"'%q'"'"' "$guest")' "$MACKAS"
+	grep -qF -- 'mkdir -p $(printf '"'"'%q'"'"' "/out/$destsub") && cp -r $(printf '"'"'%q'"'"' "$guest/.") $(printf '"'"'%q'"'"' "/out/$destsub/")' "$MACKAS"
+	grep -qF -- '$copy_cmd && cd $(printf '"'"'%q'"'"' "$guest") && $(retrieve_verify_script "$find_newer")' "$MACKAS"
 	grep -qF -- 'tar -S -C $(printf '"'"'%q'"'"' "$guest") -cf - . | tar -S -C $(printf '"'"'%q'"'"' "/out/$destsub") -xf -' "$MACKAS"
 }
 
@@ -732,7 +736,7 @@ STUB
 
 @test "retrieve: a MACHINE containing a space or a quote is refused, not just '/' and '..'" {
 	# The old check only excluded '/' and '..'; a MACHINE is now %q-quoted
-	# before reaching the guest shell (see fetch_tmp_subdir), so this is no
+	# before reaching the guest shell (see fetch_volume_subdir), so this is no
 	# longer an injection vector either way -- but a MACHINE is never a
 	# real board name shaped like this, so refusing it early is still the
 	# more useful failure than a guest path bitbake can never resolve.
@@ -1091,7 +1095,7 @@ EOF
 	# exact wording on every retrieve -- a real, expected outcome, not the
 	# generic bitbake-getvar failure the OTHER "does not INHERIT" test above
 	# models via an empty stub. Both generic warnings (bitbake_getvar's own,
-	# and fetch_tmp_subdir's "assuming the default") must stay silent here:
+	# and fetch_volume_subdir's "assuming the default") must stay silent here:
 	# the buildhistory-specific message already says everything there is to
 	# say, and printing both would read like two things went wrong instead
 	# of one expected thing.
