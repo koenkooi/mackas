@@ -47,13 +47,20 @@ fetches. mackas orchestrates these; it does not vouch for them.
   (it is dropped before the call reaches Apple `container`), and hard-refuses
   `--device` and `--network host` rather than guessing a translation.
 - **Input/config safety.** A config file is *sourced as shell*, so one mackas
-  finds on its own (`~/.config/mackas/config`, `~/.mackas.conf`) is executed
-  only if it is owned by you (or root) and not group/world-writable — file and
-  directory both (`config_file_is_safe`); one you name yourself with
+  finds or derives on its own — the search path (`~/.config/mackas/config`,
+  `~/.mackas.conf`) and the `--project NAME` /`$MACKAS_PROJECT_SELECT`
+  selector, which resolves to `~/.config/mackas/projects/NAME.conf` — is
+  executed only if it is owned by you (or root) and not group/world-writable,
+  file and directory both (`config_file_is_safe`); one you name yourself with
   `--config` or `$MACKAS_CONF` is deliberately exempt, being a request rather
-  than an ambush. `./mackas.conf` is *not* in the search path at all, for the
-  same reason: a cwd-relative config any untrusted tree could drop in was code
-  execution needing no exploit. Every value written into a generated
+  than an ambush. A project name is validated before it becomes a path (no
+  path separator, no `..`, no leading `-`, a restricted character class), and
+  an unsafe project file is *refused*, never quietly replaced by the next
+  search-path candidate. `mackas projects` lists the pinned configs by
+  **grepping** them, never sourcing — listing a directory of shell files must
+  not run any of them. `./mackas.conf` is *not* in the search path at all, for
+  the same reason: a cwd-relative config any untrusted tree could drop in was
+  code execution needing no exploit. Every value written into a generated
   file is validated first (`validate_settings` rejects `"`, backticks and control
   characters) so a value cannot break out of the shell or YAML it lands in —
   including the undocumented `MACKAS_BREW_BIN` test seam, which is not a
