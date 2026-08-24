@@ -797,6 +797,69 @@ Caveat: a `DL_DIR` populated without `BB_GENERATE_MIRROR_TARBALLS = "1"`
 lacks tarballs for scm checkouts, which makes the downloads mirror much less
 useful than it looks. Check how the mirror's cache was built.
 
+### Publishing sstate: `mackas sstate push`
+
+Everything above is the *read* direction. `mackas sstate push` is the write
+one, and it is the only part of mackas that talks to another host.
+
+```sh
+mackas set MACKAS_SSTATE_PUSH_DEST mirror@linux-computer.local:/srv/mackas/sstate
+mackas sstate push            # incremental
+mackas sstate push --full     # ignore the stamp, offer everything again
+```
+
+One push, in the order the steps have to happen in:
+
+1. **Refuse a held volume.** One VM per ext4 image; a running build wins.
+2. **Stage.** A throwaway container mounts the sstate volume **read-only**
+   plus a host staging directory (`MACKAS_SSTATE_PUSH_STAGE`, default
+   `$MACKAS_BASE/sstate-push`) and copies only the objects newer than this
+   volume+destination's stamp. sstate objects are written once and never
+   modified, so mtime is a trustworthy newness signal.
+3. **Verify.** The same chunked-`cksum` manifest `retrieve` uses runs
+   in-container over the source subset and on the host over the staged copy;
+   a mismatch retries the copy once and then dies. This exists because a real
+   >18 GB artifact was once copied with the right size and the wrong content.
+4. **Release the volume**, then transfer. The staging container has exited, so
+   a long network transfer never sits inside the window where the volume is
+   held — and the container itself stays network-free and credential-free,
+   because the push credentials never leave the host.
+5. **Two `rsync --ignore-existing` passes**, payload then `*.siginfo`. bitbake
+   decides an object is available by finding its signature, so the ordering is
+   what stops a consumer reading the mirror mid-push from seeing a `.siginfo`
+   whose object has not landed. **Never `--inplace`**: rsync's default
+   temp-file-then-rename is what makes each object appear atomically, the same
+   pattern `sstate.bbclass` itself uses.
+6. **Stamp**, only once rsync has exited clean.
+
+`--ignore-existing` is what makes the whole thing safe to repeat: a published
+object is immutable and the first writer wins, so two pushers racing on the
+same hash-derived path need no lock (they are pushing identical bytes), an
+interrupted push re-offers the same objects next time, and a lost stamp costs
+a full rescan — slow, never wrong.
+
+The stamp lives at `$MACKAS_BASE/state/sstate-push/<volume+destination>.stamp`
+and holds the epoch at which the scan *started*, as file content rather than
+as the file's own mtime: copying or restoring the state directory rewrites
+mtimes, and a stamp that silently jumped forward would skip objects the mirror
+never received. One stamp per volume+destination pair, so pushing one volume
+to two mirrors keeps two independent positions.
+
+**Transport: rsync over ssh, deliberately not an HTTP PUT.** Adding a write
+path to `mackas-mirrord` is rejected outright — its read-only-ness is the
+security property being asked for. The split *is* the design: read path
+anonymous and read-only, write path authenticated out of band over ssh.
+
+**Push before you prune.** Prune-then-push buys nothing (`--ignore-existing`
+plus stamp-based staging already keeps pushes incremental) and costs the
+mirror the objects it would have archived. Once an object is on the mirror,
+pruning it locally costs an HTTP refetch instead of a rebuild.
+
+Staging doubles the transient footprint of the new objects — point
+`MACKAS_SSTATE_PUSH_STAGE` at a roomier filesystem if the first push of a
+warm cache does not fit next to `$MACKAS_BASE`. A failed push leaves its
+staging directory behind for inspection; a successful one removes it.
+
 ### Serving local files instead of bind-mounting them
 
 The motivation is virtiofs, not the network. A bind-mounted

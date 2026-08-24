@@ -159,13 +159,20 @@ seams that make it work:
 The table is the highlights, not the whole suite; the remaining hermetic
 files (`adopt`, `case_sensitivity`, `check_discard_support`, `lock_dump`,
 `purefns`, `require_root`, `set_get_unset`, `setup_e2e`,
-`smoketest_example_project`, `smoketest_ladder`, `sstate`, `volume_mgmt`,
+`smoketest_example_project`, `smoketest_ladder`, `sstate`, `sstate_push`,
+`volume_mgmt`,
 `workspace_attach`) follow the same patterns, and each file's own header says
 exactly what it pins. `adopt` covers `adopt`'s foreign-root introspection and
 collision-free volume/link derivation; `lock_dump` covers `lock`/`dump` as
 kas-container's own top-level subcommands (never `kas_shell_ro()`'s
 `shell -c` shape), sharing one runtime-args/gitconfig/one-VM preflight;
-`sstate` covers `sstate prune`'s age-based scan and one-VM refusal;
+`sstate` covers `sstate prune`'s age-based scan and one-VM refusal, and
+`sstate_push` covers `sstate push` against a fake `container` **and** a fake
+`rsync`: the one-VM refusal, the read-only staging mount, the stamp being
+honoured as `find`'s cutoff and advanced only after a clean transfer, the
+two-pass ordering (`.siginfo` second), `--ignore-existing` on every pass with
+`--inplace` on none, and a verification failure aborting before anything
+reaches the network;
 `workspace_attach` covers the fail-closed workspace-image attach guard's
 whole decision table against a stubbed `hdiutil`. The `*_real` files are the opt-in suites described below.
 

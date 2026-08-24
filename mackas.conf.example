@@ -446,6 +446,30 @@
 #   export NETRC_FILE=~/.netrc
 
 
+# --- Publishing sstate to a mirror (opt-in) ----------------------------------
+
+# Everything above is the READ direction. `mackas sstate push` is the write
+# one: it publishes new sstate objects to the directory a mirror server
+# serves, over rsync/ssh.
+#
+# The destination is an rsync/ssh target, never an HTTP URL -- mackas-mirrord
+# serves read-only on purpose, so the write path is authenticated out of band
+# over ssh instead. Empty by default: push does nothing until you name one,
+# and --dest overrides it for a single run.
+#MACKAS_SSTATE_PUSH_DEST="mirror@linux-computer.local:/srv/mackas/sstate"
+
+# Where the objects are staged and VERIFIED on the host before anything is
+# transferred (the manifest check only exists on a host-side copy, and it
+# exists because a real >18G artifact was once copied with the right size and
+# the wrong content). Empty means $MACKAS_BASE/sstate-push. Point it at a
+# roomier filesystem if the first push of a warm cache would not fit next to
+# $MACKAS_BASE: staging costs a second copy of every NEW object, transiently.
+#MACKAS_SSTATE_PUSH_STAGE="$MACKAS_BASE/sstate-push"
+#
+# Push before you prune: once an object is on the mirror, pruning it locally
+# costs an HTTP refetch instead of a rebuild. See docs/storage.md.
+
+
 # --- NFS mirrors (opt-in) ----------------------------------------------------
 
 # A mirror host that exports e.g. /build/<build>/build/{downloads,sstate-cache}

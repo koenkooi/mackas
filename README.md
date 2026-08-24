@@ -115,7 +115,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `buildhistory` | `buildhistory analyze [PATH] [--from REV] [--to REV] [--detail] [--json]` summarises what changed between two builds — recipes added/removed/upgraded, the biggest PKGSIZE movers, per-image size/content deltas. `mackas buildhistory --help`. |
-| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
+| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days; `sstate push` publishes new ones to a mirror over rsync/ssh. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. Exits 0 on a build that succeeded, 1 on one that failed, 2 when no bridge is reachable — a usable scripted probe. |
 | `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
@@ -260,6 +260,41 @@ stamps still reference — use openembedded-core's own
 "nothing has touched this in months" case. For a full wipe instead of
 age-based pruning, `mackas clean sstate` deletes and recreates the whole
 volume.
+
+### Publishing sstate to a mirror
+
+`mackas sstate push` is the write half of the mirror story: the read half
+(`MACKAS_USE_HTTP_MIRRORS`, `mackas-mirrord`) has always been there, but
+nothing put objects *on* a mirror. Set `MACKAS_SSTATE_PUSH_DEST` to an
+rsync/ssh target — `mirror@host:/srv/mackas/sstate`, the directory
+`mackas-mirrord` serves — and run it after a build:
+
+```sh
+mackas set MACKAS_SSTATE_PUSH_DEST mirror@linux-computer.local:/srv/mackas/sstate
+mackas sstate push
+```
+
+Objects newer than this volume+destination's own stamp are copied out of the
+ext4 volume into a host staging directory and **verified there** with the
+same checksum manifest `mackas retrieve` uses — a real >18 GB artifact was
+once copied with the right size and the wrong content, and a shared mirror is
+the last place to skip that check. Only then is the volume released and the
+transfer made, as two `rsync --ignore-existing` passes: every object first,
+the `.siginfo` files second, so a consumer reading the mirror mid-push never
+finds a signature whose object is missing. Nothing is ever sent with
+`--inplace`; published objects are immutable and the first writer wins, which
+is also why two machines pushing at once need no locking. The stamp advances
+only after rsync exits clean, so an interrupted push simply re-offers the same
+objects next time, and a lost stamp costs a full rescan rather than a wrong
+result.
+
+**Push before you prune.** Once an object is on the mirror, pruning it locally
+downgrades from "forced rebuild" to "HTTP refetch".
+
+The destination is an ssh target rather than an HTTP upload on purpose:
+`mackas-mirrord` is read-only, and that is a security property worth keeping.
+`--full` ignores the stamp; `--dry-run` shows the shape without transferring.
+Details: [storage.md](docs/storage.md#publishing-sstate-mackas-sstate-push).
 
 ### Watching a build live
 
