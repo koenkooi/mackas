@@ -11,6 +11,32 @@
 #
 # Or point at one directly:  mackas --config /path/to/conf
 #
+# ...or select a PINNED PROJECT by name, which resolves to
+# ~/.config/mackas/projects/<name>.conf -- the standalone config `mackas
+# adopt` writes there:
+#
+#   mackas --project meta-ai status      # one command
+#   export MACKAS_PROJECT_SELECT=meta-ai # a whole shell
+#   mackas projects                      # what is pinned
+#
+# That is a SELECTOR, not a fifth precedence rung: it decides which single
+# file is sourced, never a value inside one, so the order below is unchanged.
+# MACKAS_PROJECT_SELECT is for that reason not a setting -- it does not appear
+# below, `mackas set` refuses it, and writing it into a config file selects
+# nothing (a selector inside the file it selects is circular).
+#
+# Naming a path (--config/$MACKAS_CONF) and selecting a project
+# (--project/$MACKAS_PROJECT_SELECT) are mutually exclusive. mackas refuses
+# the combination rather than ranking it: quietly ignoring either one is how
+# a build ends up pointed at a project nobody asked for.
+#
+# A --project file gets the ownership check the searched paths get (below),
+# and is refused outright when it fails. --config stays exempt. The asymmetry
+# is the point: mackas builds the --project path itself out of a bare name, in
+# a fixed and entirely guessable place, which is the ambush shape -- a path
+# you typed is a request. Project names are checked before they become a path:
+# letters, digits, '.', '_' and '-' only, no '/', no '..', no leading '-'.
+#
 # This file is SOURCED AS SHELL. You can compute values, but anything you
 # execute here runs with your privileges -- keep it to assignments.
 #

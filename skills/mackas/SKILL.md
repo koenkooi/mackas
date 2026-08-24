@@ -803,10 +803,16 @@ branch the config does not reference, not just the working-tree state.
   `--version`) are always safe **before** the subcommand, and that placement
   is recommended; every subcommand, including `setup` and `adopt`, also
   accepts them after its own command word (e.g. `mackas setup <root>
-  --dry-run` works the same as `mackas --dry-run setup <root>`). `--config`
-  and `--set` are the exception: they are resolved before any subcommand
-  runs, so they only work **before** the subcommand word — placed after,
-  they die with a redirect to the correct order.
+  --dry-run` works the same as `mackas --dry-run setup <root>`). `--config`,
+  `--project` and `--set` are the exception: they are resolved before any
+  subcommand runs, so they only work **before** the subcommand word — placed
+  after, they die with a redirect to the correct order.
+- `--project <name>` (or `$MACKAS_PROJECT_SELECT`) sources
+  `~/.config/mackas/projects/<name>.conf` — the standalone config `mackas
+  adopt` writes — instead of searching. `mackas projects` lists what is
+  pinned; `mackas status` names the one in effect. It cannot be combined with
+  `--config`/`$MACKAS_CONF`: naming a path and selecting a project are two
+  answers to the same question and mackas refuses rather than ranks them.
 - Most destructive commands are two-phase: they scan for real (even under
   `--dry-run`), report what they would reclaim, and only act after confirmation
   or `-y`.
