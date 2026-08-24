@@ -339,7 +339,7 @@ teardown() {
 @test "inspect_holds_volume: does not false-match a substring in the image field" {
 	# The historical kas-image false positive: a volume named "kas" must not
 	# read as held just because it appears inside the image reference.
-	local detail='{ "configuration" : { "image" : { "reference" : "ghcr.io/siemens/kas/kas:5.4" } }, "mounts" : [ { "name" : "oe-build-tmp" } ] }'
+	local detail='{ "configuration" : { "image" : { "reference" : "ghcr.io/siemens/kas/kas:5.5" } }, "mounts" : [ { "name" : "oe-build-tmp" } ] }'
 	assert_fails inspect_holds_volume "$detail" kas
 }
 

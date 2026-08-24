@@ -77,7 +77,7 @@ case "$1 $2" in
 			printf '[ { "mounts" : [ { "name" : "%s" } ] } ]\n' "$MOCK_BUSY_VOLUME"
 		exit 0 ;;
 	"system status") echo "status running"; exit 0 ;;
-	"image ls") echo "NAME TAG"; echo "ghcr.io/siemens/kas/kas 5.4"; exit 0 ;;
+	"image ls") echo "NAME TAG"; echo "ghcr.io/siemens/kas/kas 5.5"; exit 0 ;;
 esac
 
 # Fall through: 'container run ...'. Two shapes matter here: the combined

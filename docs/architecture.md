@@ -15,7 +15,7 @@ correctly between those two transports.
 
 ## The `docker` shim
 
-kas-container v5.4 cannot run against Apple `container` unmodified, for two
+kas-container v5.5 cannot run against Apple `container` unmodified, for two
 reasons. First, engine detection: it picks its engine with, essentially,
 
 ```sh
@@ -73,7 +73,7 @@ repository whose top-level directory it does not own, and `/repo` trips
 exactly that.
 
 **Why the failure mode misleads**: kas's `Repo.get_root_path()`
-(`kas/repos.py`, ~line 354, called at ~line 322) runs
+(`kas/repos.py`, ~line 350, called at ~line 322) runs
 `git rev-parse --show-toplevel` to resolve a url-less repository — meta-ai's
 own local `kas:` entry is one — and **silently falls back to the input
 path** when git exits non-zero. The refusal therefore quietly mis-resolves
@@ -88,7 +88,7 @@ file /build/../repo/kas/conf/layer.conf not found
 already has the hook: if the host variable `GITCONFIG_FILE` names an
 existing file, it mounts that file read-only at
 `/var/kas/userdata/.gitconfig` and exports `GITCONFIG_FILE` inside the
-container too (v5.4, line 728). `mackas setup` generates
+container too (v5.5, line 743). `mackas setup` generates
 `$MACKAS_BASE/gitconfig`:
 
 ```gitconfig
@@ -145,7 +145,7 @@ kas-container's `forward_dir()` **bind-mounts the host directory** that
 `KAS_BUILD_DIR` / `DL_DIR` / `SSTATE_DIR` name:
 
 ```sh
-# kas-container v5.4, line 632 (forward_dir() at line 287)
+# kas-container v5.5, line 639 (forward_dir() at line 289)
 forward_dir KAS_BUILD_DIR "/build" "rw"     # -v $KAS_BUILD_DIR:/build:rw -e KAS_BUILD_DIR=/build
 ```
 
@@ -165,8 +165,8 @@ That `-e` reaches the **guest** as an ordinary environment variable, re-establis
 The corollary: a build that reaches kas-container with **no `-e` at all** — one that bypassed the protection wrapper entirely, so no `--runtime-args` ever reached it — has `KAS_BUILD_DIR` genuinely unset inside the guest, not merely blank. kas then falls back to `KAS_WORK_DIR/build`, which lives on the virtiofs-backed host bind mount, not on any ext4 volume. This is narrower than "every mackas build puts `TOPDIR` on virtiofs": only a **bypassed** build does; a **correctly-invoked** one never does. See [issue #27](https://github.com/koenkooi/mackas/issues/27).
 
 > **`KAS_EXTRA_RUNTIME_ARGS` is not an environment variable.** kas-container
-> sets it to `""` unconditionally *before* parsing arguments (v5.4, line
-> 332). Exporting it does nothing — the value is discarded and every
+> sets it to `""` unconditionally *before* parsing arguments (v5.5, line
+> 334). Exporting it does nothing — the value is discarded and every
 > container silently runs at Apple's defaults of **cpus=4, memory=1gb**,
 > which bitbake will thrash or OOM on. The `--runtime-args` flag is the only
 > way in.
@@ -193,7 +193,7 @@ chown would otherwise leave a `root:root` volume forever), as `-u 0:0`
 because the kas image's default user is uid 30000 and cannot chown:
 
 ```sh
-container run --rm -u 0:0 -v oe-build-tmp:/mnt ghcr.io/siemens/kas/kas:5.4 \
+container run --rm -u 0:0 -v oe-build-tmp:/mnt ghcr.io/siemens/kas/kas:5.5 \
     chown "$(id -u):$(id -g)" /mnt
 ```
 

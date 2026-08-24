@@ -92,7 +92,7 @@ case "$1 $2" in
 		# MOCK_NO_IMAGE simulates a fresh machine where the kas image has not
 		# been pulled yet, so `check` must not boot-probe (which auto-fetches).
 		echo "NAME TAG"
-		[ -n "${MOCK_NO_IMAGE:-}" ] || echo "ghcr.io/siemens/kas/kas 5.4"
+		[ -n "${MOCK_NO_IMAGE:-}" ] || echo "ghcr.io/siemens/kas/kas 5.5"
 		;;
 	"--version "*|"--version") echo "container CLI version 1.1.0" ;;
 	"ls "*|"ls")
@@ -193,9 +193,9 @@ refute_call() {
 	# container run must add -u 0:0 or it dies with "Operation not permitted".
 	want="$(id -u):$(id -g)"
 	mackas_setup setup
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
 }
 
 @test "setup: chowns volumes that ALREADY existed too, not only ones it just created (bug 4)" {
@@ -209,9 +209,9 @@ refute_call() {
 	want="$(id -u):$(id -g)"
 	mackas_setup setup
 	refute_call "[volume] [create]"
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
 }
 
 @test "setup: the chown is computed, never a hardcoded uid:gid" {
@@ -303,10 +303,10 @@ refute_call() {
 	MOCK_INUSE=oe-build-tmp mackas_setup setup
 	[ "$status" -eq 0 ]
 	# The held volume must NOT be attached for a chown...
-	refute_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
+	refute_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
 	# ...but the other two still are.
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.5] [chown] [$want] [/mnt]"
 	printf '%s\n' "$output" | grep -qi "attached to a running build; skipping the chown"
 }
 
@@ -317,7 +317,7 @@ refute_call() {
 		--set MACKAS_RELOCATE_VOLUMES=0 check
 	# The held volume is called out, not attached...
 	printf '%s\n' "$output" | grep -qi "oe-build-tmp.*attached to a running build; skipping the ownership probe"
-	refute_call "[run] [--rm] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [stat]"
+	refute_call "[run] [--rm] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [stat]"
 	# ...and it must NOT emit the old misleading warning for it.
 	if printf '%s\n' "$output" | grep -qi "could not read the ownership of volume 'oe-build-tmp'"; then
 		printf 'check warned about ownership of a busy volume instead of skipping:\n%s\n' "$output" >&2
@@ -635,7 +635,7 @@ mackas_check() {
 @test "check: does not boot-probe (auto-pull) a missing image (A3)" {
 	MOCK_NO_IMAGE=1 mackas_check
 	# The boot probe would fetch the image; with it absent, it must be skipped.
-	refute_call "[run] [--rm] [ghcr.io/siemens/kas/kas:5.4] [true]"
+	refute_call "[run] [--rm] [ghcr.io/siemens/kas/kas:5.5] [true]"
 	printf '%s\n' "$output" | grep -qi 'kernel not probed'
 }
 
@@ -643,7 +643,7 @@ mackas_check() {
 	# The gate must not suppress the probe when the image is there -- that is
 	# the case it exists to check.
 	mackas_check
-	assert_call "[run] [--rm] [ghcr.io/siemens/kas/kas:5.4] [true]"
+	assert_call "[run] [--rm] [ghcr.io/siemens/kas/kas:5.5] [true]"
 }
 
 # ---------------------------------------------------------------------------
@@ -738,7 +738,7 @@ EOF
 	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
 		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
 		--set MACKAS_RELOCATE_VOLUMES=0 shell
-	grep -qxF 'ENV:KAS_CONTAINER_IMAGE=[ghcr.io/siemens/kas/kas:5.4]' "$KLOG"
+	grep -qxF 'ENV:KAS_CONTAINER_IMAGE=[ghcr.io/siemens/kas/kas:5.5]' "$KLOG"
 }
 
 @test "shell: forwards GITCONFIG_FILE pointing at the generated gitconfig (bug 5: dubious ownership)" {

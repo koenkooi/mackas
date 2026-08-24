@@ -215,8 +215,8 @@ refute_call() {
 
 @test "sstate prune: -u 0:0 is used for both the scan and the delete" {
 	MOCK_SSTATE_SIZES="1048576" mk -y sstate prune --older-than 90d
-	assert_call "run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/sstate] [ghcr.io/siemens/kas/kas:5.4] [find] [/sstate] [-type] [f] [-mtime] [+90] [-printf]"
-	assert_call "run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/sstate] [ghcr.io/siemens/kas/kas:5.4] [find] [/sstate] [-type] [f] [-mtime] [+90] [-delete]"
+	assert_call "run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/sstate] [ghcr.io/siemens/kas/kas:5.5] [find] [/sstate] [-type] [f] [-mtime] [+90] [-printf]"
+	assert_call "run] [--rm] [-u] [0:0] [-v] [oe-build-sstate:/sstate] [ghcr.io/siemens/kas/kas:5.5] [find] [/sstate] [-type] [f] [-mtime] [+90] [-delete]"
 }
 
 # ---------------------------------------------------------------------------
@@ -226,7 +226,7 @@ refute_call() {
 @test "sstate prune: fstrims the volume afterward by default" {
 	MOCK_SSTATE_SIZES="1048576" mk -y sstate prune --older-than 90d
 	[ "$status" -eq 0 ]
-	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim] [-v] [/mnt]"
+	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim] [-v] [/mnt]"
 	printf '%s\n' "$output" | grep -qF "pruned 1 sstate object(s)"
 }
 

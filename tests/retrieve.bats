@@ -142,7 +142,7 @@ case "$1 $2" in
 		echo "oe-build-tmp named local size=120G"
 		exit 0
 		;;
-	"image ls") echo "NAME TAG"; echo "ghcr.io/siemens/kas/kas 5.4"; exit 0 ;;
+	"image ls") echo "NAME TAG"; echo "ghcr.io/siemens/kas/kas 5.5"; exit 0 ;;
 	"container ls"|"ls ")
 		echo "ID  IMAGE  STATE"
 		[ -n "${MOCK_BUSY_VOLUME:-}" ] && echo "buildbox  kas  running"
@@ -378,7 +378,7 @@ refute_call() {
 	# Pinned to the exact invocation, not just "-u 0:0 appears somewhere":
 	# both the probe and the copy must run as root.
 	mk retrieve buildstats
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/build] [-v] [$ROOT/artifacts:/out] [ghcr.io/siemens/kas/kas:5.4] [sh] [-c]"
+	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/build] [-v] [$ROOT/artifacts:/out] [ghcr.io/siemens/kas/kas:5.5] [sh] [-c]"
 }
 
 @test "retrieve: the -u 0:0 in the copy is asserted against the source too" {
