@@ -37,9 +37,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 SCRIPT_VERSION="0.1.4"
 
 # kas-container release we pin to, and its expected sha256.
-KAS_CONTAINER_VERSION="5.4"
+KAS_CONTAINER_VERSION="5.5"
 KAS_CONTAINER_URL="https://raw.githubusercontent.com/siemens/kas/${KAS_CONTAINER_VERSION}/kas-container"
-KAS_CONTAINER_SHA256="9707355d1eba19e334e663ab9fcf6881ac323aed16ff7f4fd7e217f879a3894c"
+KAS_CONTAINER_SHA256="7a8186f18d14ec6bec3f8d5188eba7a60f1ef4b5587af15917527588cc7d738a"
 
 # The four kas 'shell' setup steps that mutate a repo checkout (checkout,
 # patch application, writing local.conf/bblayers.conf) -- individually, and
@@ -1933,7 +1933,7 @@ delete_volume() {
 # DETAIL (one container's JSON) has NAME as the mount block's  "name" : "..."
 # key, NOT a bare substring of the whole JSON. A plain grep -qF "$name" over
 # the entire inspect output false-positived on the IMAGE field: a volume
-# named "kas" "matched" ghcr.io/siemens/kas/kas:5.4 in every running
+# named "kas" "matched" ghcr.io/siemens/kas/kas:5.5 in every running
 # container, reporting a free volume as in use. Anchoring to the mount name
 # key still fails CLOSED on a malformed inspect (nothing matches -> the
 # caller's loop moves on), which is fine, but stops the false positive.
@@ -2269,7 +2269,7 @@ check_docker_shim() {
 	fi
 
 	if [ -z "$d" ]; then
-		ck_fail "no 'docker' on PATH -- kas-container v5.4 selects its engine by finding one" \
+		ck_fail "no 'docker' on PATH -- kas-container v5.5 selects its engine by finding one" \
 			"source $(printf '%q' "$MACKAS_ENV_SH")   (run '$SCRIPT_CMD setup' first if it doesn't exist)"
 		return
 	fi
@@ -3733,7 +3733,7 @@ kas-container() {
 	#
 	# The file-list argument is NOT always \$2: kas's own config argument is
 	# \`nargs='?'\` (kas/libkas.py setup_parser_config_arg, confirmed against
-	# real kas 5.4 source) and every subcommand accepts options before it --
+	# real kas 5.5 source) and every subcommand accepts options before it --
 	# 'shell -k <files>' is exactly what bitbake_getvar() itself passes, and
 	# '--skip STEP' (repeatable) is the surgical, repo-state-preserving
 	# alternative to -k this project's own docs now recommend. Scan past a
@@ -3821,7 +3821,7 @@ EOF
 }
 
 # A gitconfig forwarded into the container via kas-container's own
-# GITCONFIG_FILE mechanism (kas-container v5.4 ~line 728: it -v mounts the
+# GITCONFIG_FILE mechanism (kas-container v5.5 ~line 743: it -v mounts the
 # file at /var/kas/userdata/.gitconfig:ro and exports GITCONFIG_FILE inside
 # the container when the host env var names a file that exists).
 #
@@ -4522,13 +4522,17 @@ $diskmon_dirs
     # instead of just TMPDIR. Put the database in the same volume as the
     # sstate it indexes so it survives exactly as long as the cache does.
     #
-    # NOT the same fix as the BB_HASHSERVE_DB_DIR forward already built into
-    # kas-container (around line 636 of kas-container v5.4, which -v
-    # bind-mounts a HOST directory at /bb-hashserve-db): using that would put
-    # this database back on APFS over virtiofs, which is the exact bug the
-    # ext4 volumes exist to avoid. Setting it here, in local.conf, keeps it
-    # inside the /sstate volume instead -- no env var, no bind mount, no
-    # virtiofs.
+    # NOT the same fix as the BB_HASHSERVE_DB_DIR forward built into
+    # kas-container as of v5.5 (line 642, forward_dir BB_HASHSERVE_DB_DIR
+    # "/bb-hashserve-db" "rw" -- absent in 5.4, confirmed against both
+    # versions' source directly): it only activates if the HOST shell has
+    # BB_HASHSERVE_DB_DIR set, which mackas deliberately never does (see
+    # tests/volumes.bats' env.sh assertion), so it stays inert either way --
+    # but using it on purpose would -v bind-mount a HOST directory at
+    # /bb-hashserve-db, putting this database back on APFS over virtiofs,
+    # which is the exact bug the ext4 volumes exist to avoid. Setting it
+    # here, in local.conf, keeps it inside the /sstate volume instead -- no
+    # env var, no bind mount, no virtiofs.
     BB_HASHSERVE_DB_DIR = "\${SSTATE_DIR}"
 $mirrors_block
 EOF
@@ -6199,7 +6203,7 @@ cmd_dump() {
 # bind-mounts a host directory as /out. The recipe is the one proven by hand:
 #
 #   container run --rm -u 0:0 -v oe-build-tmp:/build -v <dest>:/out \
-#       ghcr.io/siemens/kas/kas:5.4 sh -c 'cp -r /build/tmp/buildstats /out/'
+#       ghcr.io/siemens/kas/kas:5.5 sh -c 'cp -r /build/tmp/buildstats /out/'
 #
 # -u 0:0 is required: the kas image's default user (uid 30000) cannot read the
 # root-owned build tree cleanly, and it matches ensure_volume()'s reasoning. No
@@ -9552,7 +9556,7 @@ fsck_guest_script() {
 set -e
 img=/vol/volume.img
 # e2fsprogs only if this image does not already have it. The pinned kas
-# image (ghcr.io/siemens/kas/kas:5.4) has NO e2fsprogs at all -- no e2fsck,
+# image (ghcr.io/siemens/kas/kas:5.5) has NO e2fsprogs at all -- no e2fsck,
 # fsck.ext4, dumpe2fs or debugfs, only a generic /usr/sbin/fsck dispatcher
 # with nothing to dispatch to (verified live). It IS Debian 13 trixie with a
 # working apt, and a build already needs network, so installing into the
