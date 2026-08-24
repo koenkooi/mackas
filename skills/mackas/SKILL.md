@@ -1,6 +1,6 @@
 ---
 name: mackas
-description: Drive OpenEmbedded builds on macOS through mackas (the kas-container wrapper for Apple's `container` runtime), and inspect what a build produced. Use when asked to build a recipe, image or machine for any OE layer set from a Mac; to look at buildhistory, deploy, logs or buildstats from a mackas build; or to manage the ext4 build volumes (fstrim, resize, clean, sstate prune). Covers the safe way to run one-off queries (`mackas exec`), the repo-reset and patch-skipping footguns of hand-typed `kas-container` calls, and the one-VM rule.
+description: Drive OpenEmbedded builds on macOS through mackas (the kas-container wrapper for Apple's `container` runtime), and inspect what a build produced. Use when asked to build a recipe, image or machine for any OE layer set from a Mac; to look at buildhistory, deploy, logs or buildstats from a mackas build; or to manage the ext4 build volumes (fstrim, resize, clean, sstate prune/push). Covers the safe way to run one-off queries (`mackas exec`), the repo-reset and patch-skipping footguns of hand-typed `kas-container` calls, and the one-VM rule.
 ---
 
 # Building and inspecting OpenEmbedded projects with mackas
@@ -621,6 +621,33 @@ separate manual step. For surgical pruning — keep only what one checkout's
 stamps still reference — use openembedded-core's own
 `scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
 "nothing has touched this in months" case.
+
+### Publishing sstate to a mirror
+
+`mackas sstate push` uploads sstate objects to the directory a mirror server
+serves, over rsync/ssh. It needs a destination — `MACKAS_SSTATE_PUSH_DEST`, or
+`--dest` for one run — and nothing else:
+
+```sh
+mackas sstate push                # only what is newer than the last push
+mackas sstate push --full         # ignore the stamp, offer everything again
+mackas --dry-run sstate push      # show the shape, transfer nothing
+```
+
+What to know when driving it:
+
+- **Push before you prune.** Once an object is on the mirror, pruning it
+  locally costs an HTTP refetch instead of a rebuild.
+- It refuses while a build holds the sstate volume, like every other volume
+  operation here.
+- Objects are staged to a host directory and checksum-verified there before
+  anything is transferred, so the first push of a warm cache needs transient
+  room for the new objects (`MACKAS_SSTATE_PUSH_STAGE` moves that elsewhere).
+- Re-running is always safe: everything is sent `--ignore-existing`, and the
+  stamp only advances after a clean transfer. An interrupted push just
+  re-offers the same objects.
+- The destination is an ssh target, not a URL. The mirror's HTTP side is
+  read-only by design.
 
 ## The `--skip` flag family
 
