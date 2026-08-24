@@ -121,12 +121,13 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
+| `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. |
 | `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
 | `dump` | `kas dump --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. |
 
-Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes` (or
-`-f/--force`), `-v/--verbose`, `--version`, `--help`.
+Options: `--config FILE`, `--project NAME`, `--set NAME=VALUE`, `--dry-run`,
+`-y/--yes` (or `-f/--force`), `-v/--verbose`, `--version`, `--help`.
 
 ### The smoketest ladder
 
@@ -404,7 +405,9 @@ outright** if the path is already this Mac's own root (that is
 `~/.config/mackas/projects/<name>.conf`, or wherever `--write-config FILE`
 says (note: `--write-config`, not the global `--config`, which loads an
 *existing* file); from then on, drive that project with
-`mackas --config <that file> ...`. adopt then runs `volume recover` (so a
+`mackas --project <name> ...` — the default location is what makes the short
+form work, and `mackas --config <that file> ...` always does too. adopt then
+runs `volume recover` (so a
 relocated volume Spotlight can find is re-pointed before `setup` would
 create a fresh empty one over it), checks for `work/` files owned by the
 other Mac's account and offers a recursive `chown` if the drive isn't
@@ -438,22 +441,48 @@ Precedence, lowest to highest:
 built-in defaults  ->  config file  ->  environment  ->  command-line flags
 ```
 
-Config file, first match wins: `$MACKAS_CONF`, then
-`~/.config/mackas/config`, then `~/.mackas.conf`. `./mackas.conf` is
-deliberately **not** searched: the config is sourced as shell, so a cwd
-config would let any untrusted tree you `cd` into (an unpacked tarball, a
-cloned repo) run code the moment you invoke `mackas`. To use a per-project
-config, name it out loud — `mackas --config ./mackas.conf ...` — and keep
-the file to assignments.
+Which file gets sourced, first match wins:
+
+| | |
+|---|---|
+| `--config FILE` / `$MACKAS_CONF` | a path, named outright |
+| `--project NAME` / `$MACKAS_PROJECT_SELECT` | `~/.config/mackas/projects/NAME.conf` |
+| `~/.config/mackas/config` | |
+| `~/.mackas.conf` | |
+
+`./mackas.conf` is deliberately **not** searched: the config is sourced as
+shell, so a cwd config would let any untrusted tree you `cd` into (an
+unpacked tarball, a cloned repo) run code the moment you invoke `mackas`. To
+use a per-project config, name it out loud — `mackas --config ./mackas.conf
+...` — and keep the file to assignments.
+
+`--project NAME` selects a *pinned* project: the standalone config `mackas
+adopt` writes under `~/.config/mackas/projects/`. `mackas projects` lists
+them. It is a **selector, not a fifth precedence rung** — it decides which
+single file is sourced, never a value in one, so the chain above is
+unchanged. `MACKAS_PROJECT_SELECT` is therefore not a setting: `mackas set`
+will not write it, and it takes no part in the config file's own
+resolution. Naming a path and selecting a project are mutually exclusive;
+combining them is refused rather than ranked, because silently ignoring
+either one is how you build against a project you did not mean.
+
+A `--project` file is held to the same ownership check a *searched* config
+is (yours or root's, not group/world-writable, file and directory both), and
+refused outright if it fails — deliberately stricter than `--config`, which
+is exempt. mackas derives the `--project` path itself from a bare name in a
+fixed, guessable place; a path you typed is a request, a path mackas guessed
+is an ambush surface. Names are validated before they become a path: no path
+separators, no `..`, no leading `-`, letters/digits/`.`/`_`/`-` only.
 
 Every setting is also an environment variable of the same name, and
 `--set NAME=VALUE` overrides both for the one command it rides along with.
 For a *persistent* override use `mackas set MACKAS_MEMORY 48g` / `get`
 (resolved through the full precedence chain) / `unset`. These operate on
 whatever config file the invocation is pointed at, including one that does
-not exist yet — `mackas --config ~/other-project.conf set ...` is how you
-bootstrap a new per-project config. `./mackas status` prints what is in
-effect and which config file (if any) was used.
+not exist yet — `mackas --config ~/other-project.conf set ...`, or
+`mackas --project newthing set ...`, is how you bootstrap a new per-project
+config. `./mackas status` prints what is in effect, which config file (if
+any) was used, and which project was selected.
 
 The settings a new user actually needs:
 
@@ -477,6 +506,11 @@ The settings a new user actually needs:
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty: one build rung with no `--target`. |
 | `MACKAS_MONITOR` | `0` | Opt builds into the live progress bridge ([above](#watching-a-build-live)). |
 | `MACKAS_WORKSPACE_IMAGE` | *(empty)* | The workspace image mounted at `work/`, once one exists. Written by `setup`, not by you: it is the record that gets `work/` reattached after a reboot. |
+
+`MACKAS_PROJECT_SELECT` is deliberately **absent** from that table and from
+every other list of settings: it chooses which file is read, so it cannot be
+one of the things read out of it. `mackas set`/`get`/`unset` refuse it, and
+it never participates in the precedence chain.
 
 [mackas.conf.example](mackas.conf.example) is the authoritative, annotated
 full list — mirrors, the host-overhead sampler, auto-`fstrim`, buildstats

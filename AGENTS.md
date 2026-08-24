@@ -8,10 +8,11 @@ break by accident.
 
 ## What this repo is
 
-- `mackas` — the whole tool, one ~10,500-line **bash 3.2** script. Subcommands:
+- `mackas` — the whole tool, one ~10,900-line **bash 3.2** script. Subcommands:
   `check`, `setup`, `adopt`, `smoketest`, `status`, `shell`, `exec`,
   `retrieve`, `buildstats`, `buildhistory`, `sstate`, `monitor`, `clean`,
-  `destroy`, `volume`, `set`, `get`, `unset`, `runtime-args`, `lock`, `dump`.
+  `destroy`, `volume`, `set`, `get`, `unset`, `projects`, `runtime-args`, `lock`,
+  `dump`.
 - `bin/docker` — a shim that translates the `docker` CLI calls kas-container v5.4
   makes into Apple `container` calls. Nothing more.
 - `mirror-server/mackas-mirrord` — optional HTTP mirror server. **Python 3.7+,

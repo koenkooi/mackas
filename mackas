@@ -402,13 +402,13 @@ is_setting_name() {
 # die_on_misplaced_global_flag ARG CMD -- every verb-object command
 # (volume/retrieve/buildstats/sstate/monitor/set/get/unset) owns everything after its own
 # command word, captured verbatim by main() before cmd_CMD ever runs -- so
-# --config/--set typed AFTER the command word are silently never seen by the
+# --config/--project/--set typed AFTER the command word are silently never seen by the
 # code that would act on them (main()'s own arg loop, and load_config/
 # apply_cli_overrides, already ran). Falling through to a generic "unknown
 # option" would leave that invisible; this redirects to the fix instead.
 die_on_misplaced_global_flag() {
 	case "$1" in
-		--config|--config=*|--set|--set=*)
+		--config|--config=*|--project|--project=*|--set|--set=*)
 			die "'$1' must come BEFORE '$2', not after -- it is resolved before '$2' runs" \
 				"$SCRIPT_CMD $1 ... $2 ..."
 			;;
@@ -888,6 +888,58 @@ set_defaults() {
 
 CONFIG_FILE_USED=""
 
+# The pinned project `--project NAME` / $MACKAS_PROJECT_SELECT settled on, for
+# `status` to report back. Deliberately NOT in SETTING_NAMES: a selector
+# written into the file it selects is circular, and it must not ride the
+# snapshot/restore machinery -- it picks WHICH file is sourced, never a value
+# in one, so the four-rung precedence chain is untouched by it.
+PROJECT_SELECTED=""
+
+# Where a project's pinned, standalone config lives. `adopt` already writes one
+# here; `--project NAME` reads exactly this path back.
+projects_dir() { printf '%s/.config/mackas/projects' "$HOME"; }
+
+# Refuse a project name before it is ever pasted into a path. The name becomes
+# <projects_dir>/<name>.conf, so a '/' or a '..' inside it aims that path
+# somewhere else entirely, and a leading '-' makes the value read as a flag to
+# whatever later passes it along. The allowed class is the one `adopt` already
+# produces (it tr's a checkout name down to [A-Za-z0-9-]), widened by '.' and
+# '_' only.
+validate_project_select() {
+	local name="$1" src="$2" hint
+	hint="$SCRIPT_CMD projects  (lists the pinned ones)"
+	case "$name" in
+		"") die "$src needs a project name" "$hint" ;;
+		-*) die "$src: a project name cannot start with '-': $name" "$hint" ;;
+		.|..|*..*) die "$src: a project name cannot be '.' or contain '..': $name" "$hint" ;;
+		*[!A-Za-z0-9._-]*)
+			die "$src: a project name may only contain letters, digits, '.', '_' and '-': $name" \
+				"$hint" ;;
+	esac
+}
+
+# Print FILE's value for setting NAME by GREPPING it, never sourcing it.
+# `projects` reads every pinned config in the directory at once, and sourcing a
+# directory's worth of them is exactly the code execution the search-path
+# restriction exists to prevent -- an unsafe one would have run before anything
+# could grade it.
+#
+# Understands the shq() single-quoted form config_write_setting emits plus a
+# hand-written double-quoted or bare value. Anything cleverer -- a $-expansion,
+# a command substitution -- is printed raw rather than resolved, because
+# resolving it means running it. Returns 1 when NAME is not in the file.
+config_grep_setting() {
+	local file="$1" name="$2" line v
+	line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$name=" "$file" 2>/dev/null | tail -1 || true)"
+	[ -n "$line" ] || return 1
+	v="${line#*=}"
+	case "$v" in
+		"'"*"'") v="${v#\'}"; v="${v%\'}" ;;
+		'"'*'"') v="${v#\"}"; v="${v%\"}" ;;
+	esac
+	printf '%s\n' "$v"
+}
+
 # Is $1 safe to source without being asked to?
 #
 # A config file is SHELL, not data: sourcing one runs whatever is in it with
@@ -924,11 +976,69 @@ path_is_owned_and_unwritable_by_others() {
 }
 
 load_config() {
-	local explicit="${1:-}" allow_missing="${2:-0}"
-	local candidates f
+	local explicit="${1:-}" allow_missing="${2:-0}" select="${3:-}"
+	local f
+	local sel="" sel_src="" path="" path_src="" path_hint=""
 
+	# Two ways to name a file outright, two ways to select a pinned project by
+	# name. The flag beats the environment WITHIN each pair, exactly as
+	# --config has always beaten $MACKAS_CONF. Mixing the pairs is refused
+	# rather than ranked: a name and a path are two different answers to "which
+	# file", and quietly preferring one hides the other in precisely the
+	# invocation that meant it.
+	if [ -n "$select" ]; then
+		sel="$select"; sel_src="--project"
+	elif [ -n "${MACKAS_PROJECT_SELECT:-}" ]; then
+		sel="$MACKAS_PROJECT_SELECT"; sel_src="\$MACKAS_PROJECT_SELECT"
+	fi
 	if [ -n "$explicit" ]; then
-		if [ ! -r "$explicit" ]; then
+		path="$explicit"; path_src="--config"
+		path_hint="check the path passed to --config"
+	elif [ -n "${MACKAS_CONF:-}" ]; then
+		path="${MACKAS_CONF}"; path_src="\$MACKAS_CONF"
+		# Same readability check as --config gets. Without it this lands on
+		# the `.` below and prints a raw, localized "No such file or
+		# directory" with no hint about which knob caused it.
+		path_hint="check \$MACKAS_CONF, or unset it to use the default search path"
+	fi
+	if [ -n "$sel" ] && [ -n "$path" ]; then
+		die "$sel_src and $path_src both choose a config file: '$sel' and '$path'" \
+			"drop one -- $sel_src picks a pinned project, $path_src names a path outright"
+	fi
+
+	if [ -n "$sel" ]; then
+		validate_project_select "$sel" "$sel_src"
+		f="$(projects_dir)/$sel.conf"
+		if [ ! -r "$f" ]; then
+			# Same allowance the typed paths get below: `set` on a project
+			# nobody has pinned yet is how its config gets written.
+			if [ "$allow_missing" -eq 1 ] && [ ! -e "$f" ]; then
+				PROJECT_SELECTED="$sel"
+				CONFIG_FILE_USED="$f"
+				return 0
+			fi
+			die "no pinned project '$sel': $f is not readable" \
+				"$SCRIPT_CMD projects  (lists the pinned ones)"
+		fi
+		# STRICTER than the typed paths below, deliberately. mackas built this
+		# path itself out of a bare name, in a fixed and entirely guessable
+		# place -- that is the ambush shape the search path is guarded against,
+		# not the request shape --config is. Refuse rather than fall through to
+		# the search path: the caller asked for THIS project, and silently
+		# loading a different one is worse than stopping.
+		if ! config_file_is_safe "$f"; then
+			die "refusing to source $f: it (or its directory) is owned by someone else or writable by group/other" \
+				"chmod go-w $(printf '%q' "$f") $(printf '%q' "$(projects_dir)")"
+		fi
+		# shellcheck disable=SC1090
+		. "$f"
+		PROJECT_SELECTED="$sel"
+		CONFIG_FILE_USED="$f"
+		return 0
+	fi
+
+	if [ -n "$path" ]; then
+		if [ ! -r "$path" ]; then
 			# set/get/unset (allow_missing=1, passed by main only for those
 			# three) may legitimately target a config file that does not
 			# exist yet -- 'set' is exactly the command that creates one,
@@ -939,37 +1049,15 @@ load_config() {
 			# fresh start. A file that exists but is unreadable (permissions,
 			# not absence) is refused either way -- 'set' writing there would
 			# only fail the same way moments later with a worse message.
-			if [ "$allow_missing" -eq 1 ] && [ ! -e "$explicit" ]; then
-				CONFIG_FILE_USED="$explicit"
+			if [ "$allow_missing" -eq 1 ] && [ ! -e "$path" ]; then
+				CONFIG_FILE_USED="$path"
 				return 0
 			fi
-			die "config file not readable: $explicit" \
-				"check the path passed to --config"
+			die "config file not readable: $path" "$path_hint"
 		fi
-		candidates="$explicit"
-	else
-		candidates=""
-		if [ -n "${MACKAS_CONF:-}" ]; then
-			candidates="${MACKAS_CONF}"
-			# Same readability check as --config gets. Without it this lands on
-			# the `.` below and prints a raw, localized "No such file or
-			# directory" with no hint about which knob caused it.
-			if [ ! -r "$candidates" ]; then
-				if [ "$allow_missing" -eq 1 ] && [ ! -e "$candidates" ]; then
-					CONFIG_FILE_USED="$candidates"
-					return 0
-				fi
-				die "config file not readable: $candidates" \
-					"check \$MACKAS_CONF, or unset it to use the default search path"
-			fi
-		fi
-	fi
-
-	if [ -n "$candidates" ]; then
-		f="$candidates"
 		# shellcheck disable=SC1090  # user-supplied config, path known at runtime only
-		. "$f"
-		CONFIG_FILE_USED="$f"
+		. "$path"
+		CONFIG_FILE_USED="$path"
 		return 0
 	fi
 
@@ -1015,9 +1103,10 @@ load_config() {
 # so they get the verb-object shape everything else here uses (see `volume`).
 
 # The file `set`/`unset` write to: whatever config file THIS invocation
-# actually loaded (--config, $MACKAS_CONF, or the first match of the normal
-# search path), or -- nothing loaded yet, the common first-use case -- the
-# same default `load_config` would have picked had one existed.
+# actually loaded (--config, $MACKAS_CONF, --project/$MACKAS_PROJECT_SELECT,
+# or the first match of the normal search path), or -- nothing loaded yet, the
+# common first-use case -- the same default `load_config` would have picked
+# had one existed.
 set_target_config_file() {
 	if [ -n "$CONFIG_FILE_USED" ]; then
 		printf '%s' "$CONFIG_FILE_USED"
@@ -1145,7 +1234,7 @@ cmd_set() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" set ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" set ;;
 			# Bare 'help' means "show usage" only in NAME's position -- 'set'
 			# is the one command here with a free-text positional (VALUE), and
 			# VALUE may legitimately BE the literal string "help" (a target
@@ -1165,6 +1254,11 @@ cmd_set() {
 	refuse_unwritable_setting_value "$value"
 
 	local file; file="$(set_target_config_file)"
+	# The target may sit in a directory that does not exist yet -- writing the
+	# first pinned project's config under ~/.config/mackas/projects/ is exactly
+	# that case, and config_write_setting's mv would fail on it.
+	local dir; dir="$(dirname "$file")"
+	[ -d "$dir" ] || run mkdir -p "$dir"
 	config_write_setting "$file" "$name" "$value"
 	if [ "$DRY_RUN" -eq 1 ]; then
 		info "  would write $name=$value to $file"
@@ -1187,7 +1281,7 @@ cmd_get() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help|help) want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" get ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" get ;;
 			*)              args+=("$a") ;;
 		esac
 	done
@@ -1210,7 +1304,7 @@ cmd_unset() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help|help) want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" unset ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" unset ;;
 			*)             args+=("$a") ;;
 		esac
 	done
@@ -1237,6 +1331,74 @@ cmd_unset() {
 		fi
 	else
 		info "$name is not persisted in $file -- nothing to do"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# projects -- list the pinned per-project configs, without running any of them
+# ---------------------------------------------------------------------------
+
+projects_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD projects${C_RST} -- list the pinned per-project configs.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD projects
+
+Lists $(projects_dir)/*.conf -- the standalone
+configs '$SCRIPT_CMD adopt' writes -- and, for each, the settings that say
+where that project's build lives. Select one for a single command with
+'$SCRIPT_CMD --project NAME ...', or for a whole shell with
+\$MACKAS_PROJECT_SELECT=NAME.
+
+Read-only, and it reads by GREPPING each file rather than sourcing it: a
+config is shell, and listing a directory of them must not run any of them.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
+though this reads only and never prompts.
+EOF
+}
+
+cmd_projects() {
+	local dir name f v s root found=0
+	dir="$(projects_dir)"
+	hdr "Pinned projects"
+	show "directory" "$dir"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		found=1
+		name="$(basename "$f" .conf)"
+		info ""
+		if [ "$f" = "$CONFIG_FILE_USED" ]; then
+			printf '  %s%s%s  (selected for this command)\n' "$C_BLD" "$name" "$C_RST"
+		else
+			printf '  %s%s%s\n' "$C_BLD" "$name" "$C_RST"
+		fi
+		root=""
+		for s in MACKAS_ROOT MACKAS_PROJECT_DIR MACKAS_VOLUME_NAME \
+		         MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
+			v="$(config_grep_setting "$f" "$s")" || v=""
+			if [ "$s" = "MACKAS_ROOT" ]; then root="$v"; fi
+			if [ -n "$v" ]; then
+				printf '    %-26s %s\n' "$s" "$v"
+			fi
+		done
+		if [ -n "$root" ] && [ ! -d "$root" ]; then
+			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
+				"its MACKAS_ROOT does not exist -- moved, or on an unmounted disk" "$C_RST"
+		fi
+		# The same test --project applies before sourcing, reported here
+		# instead of at the moment it would refuse.
+		if ! config_file_is_safe "$f"; then
+			printf '    %s%-26s %s%s\n' "$C_YEL" "unsafe" \
+				"owned by someone else or group/other-writable -- --project refuses it" "$C_RST"
+		fi
+		printf '    %-26s %s --project %s ...\n' "select with" "$SCRIPT_CMD" "$name"
+	done
+	if [ "$found" -eq 0 ]; then
+		info ""
+		info "  none pinned yet."
+		info "  '$SCRIPT_CMD adopt <root>' writes a standalone config here."
 	fi
 }
 
@@ -4810,7 +4972,7 @@ cmd_setup() {
 			-y|-f|--yes|--force)  ASSUME_YES=1; shift; continue ;;
 			-v|--verbose)  VERBOSE=1; shift; continue ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" setup ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" setup ;;
 			--tmpdir-size|--sstate-size|--downloads-size)
 				a="$1"; val="${2:-}"
 				[ -n "$val" ] || die "$a needs a value" "$SCRIPT_CMD setup --help"
@@ -4930,7 +5092,9 @@ ${C_BLD}OPTIONS${C_RST}
                        than one exists (or none can be found automatically).
   --write-config FILE  Where to persist the new, per-project config (NOT
                        the global --config, which loads an EXISTING one).
-                       Default: derived under ~/.config/mackas/projects/.
+                       Default: derived under ~/.config/mackas/projects/,
+                       which is what makes it reachable later as
+                       '$SCRIPT_CMD --project <name>' ('$SCRIPT_CMD projects').
 
 Ends by handing off to '$SCRIPT_CMD setup', with the new config in scope, for
 everything setup already does correctly on its own (project checkout,
@@ -5083,7 +5247,7 @@ cmd_adopt() {
 				[ -n "$config_opt" ] || die "--write-config needs a value" "$SCRIPT_CMD adopt --help"
 				shift 2 ;;
 			--write-config=*) config_opt="${1#*=}"; shift ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" adopt ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" adopt ;;
 			-*) die "unknown option for 'adopt': $1" "$SCRIPT_CMD adopt --help" ;;
 			*)
 				[ -z "$path" ] || die "'adopt' takes one path" "$SCRIPT_CMD adopt --help"
@@ -5143,7 +5307,7 @@ cmd_adopt() {
 	info "  volume name: $derived_name"
 	info "  short link : $derived_link"
 
-	local config_file="${config_opt:-$HOME/.config/mackas/projects/$base_name.conf}"
+	local config_file="${config_opt:-$(projects_dir)/$base_name.conf}"
 	if [ -f "$config_file" ]; then
 		confirm "  $config_file already exists -- overwrite its settings with this adoption?" \
 			|| die "declined -- nothing written" \
@@ -5193,6 +5357,9 @@ cmd_adopt() {
 	hdr "Adopted"
 	info "  config file : $config_file"
 	info "  from now on : $SCRIPT_CMD --config $(printf '%q' "$config_file") ..."
+	if [ "$config_file" = "$(projects_dir)/$base_name.conf" ]; then
+		info "                or, pinned as it is: $SCRIPT_CMD --project $base_name ..."
+	fi
 }
 
 # ---------------------------------------------------------------------------
@@ -6135,7 +6302,7 @@ cmd_exec() {
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" exec ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" exec ;;
 			--)            started=1; shift ;;
 			-*) die "unknown option for 'exec': $a" "$SCRIPT_CMD exec --help" ;;
 			*)  started=1; cmd_words+=("$a"); shift ;;
@@ -6838,7 +7005,7 @@ cmd_retrieve() {
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
 			--dest)        dest="${2:-}"; [ -n "$dest" ] || die "--dest needs a DIR"; shift 2 ;;
 			--dest=*)      dest="${1#*=}"; shift ;;
 			deploy)
@@ -7283,7 +7450,7 @@ cmd_buildstats() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildstats ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildstats ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -7675,7 +7842,7 @@ cmd_buildhistory() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildhistory ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildhistory ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -7839,7 +8006,7 @@ cmd_sstate() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" sstate ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" sstate ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -7989,7 +8156,7 @@ cmd_monitor() {
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
 			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
 			-*) die "unknown option for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
 			*) die "unexpected argument for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
 		esac
@@ -8137,6 +8304,11 @@ EOF
 cmd_status() {
 	hdr "Configuration"
 	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
+	# Only when one was selected: the selector is not a setting (it chooses
+	# the file, it is not read out of one), so the loop below never shows it.
+	if [ -n "$PROJECT_SELECTED" ]; then
+		show "project selected"   "$PROJECT_SELECTED"
+	fi
 	local n
 	for n in $SETTING_NAMES; do
 		# The three volume sizes: show the REAL cap once a volume already
@@ -8755,7 +8927,7 @@ cmd_clean() {
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" clean ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" clean ;;
 			tmp+deploy|downloads|sstate) targets+=("$1"); shift ;;
 			-*) die "unknown option for 'clean': $1" "$SCRIPT_CMD clean --help" ;;
 			*) die "unknown target for 'clean': $1" \
@@ -10443,7 +10615,7 @@ cmd_volume() {
 			# option".
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" volume ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" volume ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -10521,6 +10693,8 @@ ${C_BLD}COMMANDS${C_RST}
   set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
   get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.
   unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
+  projects   List the pinned per-project configs --project selects between.
+             '$SCRIPT_CMD projects --help'.
   runtime-args  Plumbing: prints the effective --runtime-args string. The
              env.sh wrapper calls this itself; you don't normally need to.
   lock       Pin every declared repo to its exact current commit
@@ -10531,6 +10705,9 @@ ${C_BLD}COMMANDS${C_RST}
 
 ${C_BLD}OPTIONS${C_RST}
   --config FILE   Use this config file instead of searching.
+  --project NAME  Use the pinned project NAME's config instead of searching:
+                  ~/.config/mackas/projects/NAME.conf. Mutually exclusive
+                  with --config/\$MACKAS_CONF. '$SCRIPT_CMD projects' lists them.
   --set NAME=VAL  Override one setting for THIS command only; beats config
                   file and environment. Repeatable. For a PERSISTENT
                   override, use '$SCRIPT_CMD set NAME VALUE' instead.
@@ -10546,15 +10723,23 @@ ${C_BLD}CONFIGURATION${C_RST}
   Precedence, lowest to highest:
     built-in defaults  ->  config file  ->  environment  ->  command-line flags
 
-  Config file, first match wins:
-    \$MACKAS_CONF
+  Which file, first match wins:
+    --config FILE  /  \$MACKAS_CONF            (a path, named outright)
+    --project NAME /  \$MACKAS_PROJECT_SELECT  (~/.config/mackas/projects/)
     ~/.config/mackas/config
     ~/.mackas.conf
 
+  Naming a path and selecting a project are mutually exclusive -- they are two
+  answers to the same question, so mackas refuses rather than ranks them. The
+  selector picks WHICH file is sourced; it is not a fifth precedence rung.
+
   It is sourced as shell, so it is only looked for in places that are yours:
-  a searched file is skipped unless you (or root) own it and its directory,
-  and neither is writable by group or other. ./mackas.conf is NOT searched --
-  name a per-project config out loud with --config ./mackas.conf.
+  a searched file, and a --project one, are refused unless you (or root) own
+  the file and its directory and neither is writable by group or other. A
+  --config path is exempt: mackas derives every other candidate itself, and a
+  derived path in a guessable place is an ambush, while a typed one is a
+  request. ./mackas.conf is NOT searched -- name it out loud with
+  --config ./mackas.conf.
 
   Every setting is also an environment variable of the same name, and can be
   overridden with --set NAME=VALUE. See mackas.conf.example for the full
@@ -10588,6 +10773,11 @@ ${C_BLD}EXAMPLES${C_RST}
   # Build somewhere else entirely.
   $SCRIPT_CMD --config ~/other.conf setup
 
+  # Or, for a project already pinned by 'adopt':
+  $SCRIPT_CMD projects
+  $SCRIPT_CMD --project meta-ai status
+  export MACKAS_PROJECT_SELECT=meta-ai   # for a whole shell
+
   # Start over.
   $SCRIPT_CMD destroy
 EOF
@@ -10614,7 +10804,7 @@ parse_set() {
 main() {
 	setup_colors
 
-	local cmd="" config_flag="" want_help=0
+	local cmd="" config_flag="" project_flag="" want_help=0
 	# Flags may appear before or after the subcommand. want_help is tracked
 	# SEPARATELY from cmd (rather than cmd="help" as a sentinel) so that
 	# 'mackas setup --help'/'mackas setup help'/'mackas help setup' all still
@@ -10624,6 +10814,13 @@ main() {
 		case "$1" in
 			--config) config_flag="${2:-}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift 2 ;;
 			--config=*) config_flag="${1#*=}"; shift ;;
+			# Only the flag's arity is checked here. The NAME itself is
+			# validated in load_config, the one place that turns it into a
+			# path, so nothing can ever reach that path unchecked -- and so
+			# --help stays typeable from anywhere, exactly as it is with an
+			# unreadable --config.
+			--project) project_flag="${2:-}"; [ -n "$project_flag" ] || die "--project needs a NAME" "$SCRIPT_CMD projects"; shift 2 ;;
+			--project=*) project_flag="${1#*=}"; shift ;;
 			--set) parse_set "${2:-}"; shift 2 ;;
 			--set=*) parse_set "${1#*=}"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
@@ -10749,10 +10946,10 @@ main() {
 				cmd="runtime-args"; shift
 				if [ "$want_help" -eq 1 ]; then RUNTIME_ARGS_ARGS=("$@" "--help"); else RUNTIME_ARGS_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|destroy|lock|dump)
+			check|smoketest|status|shell|destroy|lock|dump|projects)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args lock dump help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset projects runtime-args lock dump help)" ;;
 		esac
 	done
 
@@ -10772,9 +10969,10 @@ main() {
 	if [ "$want_help" -ne 1 ]; then
 		case "${cmd:-check}" in
 			# See load_config's comment: only these three may target a
-			# --config/MACKAS_CONF path that does not exist yet.
-			set|get|unset) load_config "$config_flag" 1 ;;
-			*)              load_config "$config_flag" ;;
+			# --config/$MACKAS_CONF path, or a --project name, that does not
+			# exist yet.
+			set|get|unset) load_config "$config_flag" 1 "$project_flag" ;;
+			*)              load_config "$config_flag" 0 "$project_flag" ;;
 		esac
 		mark_explicit_from_config
 	fi
@@ -10803,6 +11001,7 @@ main() {
 		runtime-args) cmd_runtime_args ${RUNTIME_ARGS_ARGS+"${RUNTIME_ARGS_ARGS[@]}"} ;;
 		lock)      if [ "$want_help" -eq 1 ]; then lock_usage;      else cmd_lock;      fi ;;
 		dump)      if [ "$want_help" -eq 1 ]; then dump_usage;      else cmd_dump;      fi ;;
+		projects)  if [ "$want_help" -eq 1 ]; then projects_usage;  else cmd_projects;  fi ;;
 		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;
 		exec)       cmd_exec ${EXEC_ARGS+"${EXEC_ARGS[@]}"} ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;
