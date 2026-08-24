@@ -516,7 +516,7 @@ write_env_sh() {
 	# KAS_CONTAINER_IMAGE is set, so KAS_IMAGE_VERSION beside it is ignored and
 	# a tagless name silently runs :latest instead of the pinned tag.
 	write_env_sh
-	grep -qF "export KAS_CONTAINER_IMAGE='ghcr.io/siemens/kas/kas:5.4'" "$MACKAS_ENV_SH"
+	grep -qF "export KAS_CONTAINER_IMAGE='ghcr.io/siemens/kas/kas:5.5'" "$MACKAS_ENV_SH"
 	! grep -qE '^[[:space:]]*export[[:space:]]+KAS_IMAGE_VERSION=' "$MACKAS_ENV_SH"
 }
 
@@ -650,7 +650,8 @@ write_env_sh() {
 
 @test "env.sh: does NOT export BB_HASHSERVE_DB_DIR (would re-bind-mount a host path via forward_dir)" {
 	# kas-container has its OWN BB_HASHSERVE_DB_DIR forward that BIND-MOUNTS a
-	# host directory (~line 636 of kas-container v5.4, same forward_dir()
+	# host directory (~line 642 of kas-container v5.5 -- absent in 5.4,
+	# confirmed against both versions' source directly -- same forward_dir()
 	# mechanism as KAS_BUILD_DIR/DL_DIR/SSTATE_DIR). Exporting it here would
 	# put the hash-equivalence database back on APFS over virtiofs -- the
 	# exact bug the ext4 volumes exist to avoid. It is set inside the
@@ -805,7 +806,7 @@ with_project_fragment() {
 	# Reported live: 'kas-container shell -k <files>' -- exactly what
 	# bitbake_getvar() itself passes -- put <files> at \$3, not \$2. kas's own
 	# config argument is nargs='?' with options allowed before it (confirmed
-	# against kas 5.4 source), so this is a real, common shape, not an edge
+	# against kas 5.5 source), so this is a real, common shape, not an edge
 	# case.
 	with_project_fragment
 	write_env_sh
@@ -1358,7 +1359,7 @@ write_gitconfig() {
 # It used to `grep -qF "$name"` over the whole `container inspect` output, so a
 # volume whose name appeared ANYWHERE -- most damningly inside the running
 # container's image reference -- read as "in use". A volume literally named
-# "kas" matched ghcr.io/siemens/kas/kas:5.4 in every running kas container, so
+# "kas" matched ghcr.io/siemens/kas/kas:5.5 in every running kas container, so
 # `buildstats` refused to attach a volume nothing actually held. The query is
 # now anchored to the mount block's  "name" : "<volume>"  key.
 # ---------------------------------------------------------------------------
@@ -1374,7 +1375,7 @@ in_use_inspect_double() {
 				cat <<'JSON'
 {
   "configuration" : {
-    "image" : { "reference" : "ghcr.io/siemens/kas/kas:5.4" }
+    "image" : { "reference" : "ghcr.io/siemens/kas/kas:5.5" }
   },
   "mounts" : [
     { "type" : "volume", "source" : "oe-build-tmp", "name" : "oe-build-tmp", "destination" : "/build" }

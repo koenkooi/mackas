@@ -442,7 +442,7 @@ refute_call() {
 	# Pinned to the whole invocation -- both privileges together, in order, on
 	# the right command. Neither -u 0:0 nor --cap-add alone works on a real
 	# guest (both give EPERM on the FITRIM ioctl), so both must be present.
-	assert_call "[run] [--rm] [-u] [0:0] [--cap-add] [CAP_SYS_ADMIN] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim] [-v] [/mnt]"
+	assert_call "[run] [--rm] [-u] [0:0] [--cap-add] [CAP_SYS_ADMIN] [-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim] [-v] [/mnt]"
 }
 
 @test "volume fstrim: the exact flags are asserted against the source too" {
@@ -516,8 +516,8 @@ refute_call() {
 	printf '%s\n' "$output" | grep -qi "oe-build-tmp.*skipping"
 	refute_call "[-v] [oe-build-tmp:/mnt]"
 	# ...but the other two are trimmed.
-	assert_call "[-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
-	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+	assert_call "[-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim]"
+	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim]"
 }
 
 @test "volume fstrim: --all is accepted as a synonym for the positional 'all'" {
@@ -526,9 +526,9 @@ refute_call() {
 	have_volume oe-build-sstate 40G  8192
 	vol fstrim --all
 	[ "$status" -eq 0 ]
-	assert_call "[-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
-	assert_call "[-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
-	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+	assert_call "[-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim]"
+	assert_call "[-v] [oe-build-dl:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim]"
+	assert_call "[-v] [oe-build-sstate:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim]"
 }
 
 @test "volume fstrim: -a is accepted as a synonym for the positional 'all'" {
@@ -537,7 +537,7 @@ refute_call() {
 	have_volume oe-build-sstate 40G  8192
 	vol fstrim -a
 	[ "$status" -eq 0 ]
-	assert_call "[-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.4] [fstrim]"
+	assert_call "[-v] [oe-build-tmp:/mnt] [ghcr.io/siemens/kas/kas:5.5] [fstrim]"
 }
 
 @test "volume fstrim: --all takes no volume name" {

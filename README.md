@@ -29,7 +29,7 @@ kas.
 ### Zero patches to kas — the central design goal
 
 **mackas does not patch, fork, or vendor kas. Not one line.** It downloads a
-pinned, sha256-verified `kas-container` release (currently v5.4) and runs it
+pinned, sha256-verified `kas-container` release (currently v5.5) and runs it
 unmodified. All adaptation lives in two places: `bin/docker` (the
 compatibility shim) and the environment plus kas fragment that `mackas setup`
 generates. The payoff: upstream kas releases are tracked for free, and the
@@ -358,7 +358,7 @@ shell-function-only conveniences (see
 [architecture.md](docs/architecture.md#running-kas-container-by-hand)).
 The separate, still-real concern is a pipx/pip kas earlier on `PATH` than
 `$MACKAS_BIN`: it resolves to a *different* kas-container release entirely,
-not the 5.4 mackas pins. `check` does not inspect that ordering — it reports
+not the 5.5 mackas pins. `check` does not inspect that ordering — it reports
 the resolution order for `docker`, not for `kas-container` — so confirm it
 yourself with `type -a kas-container`
 ([architecture.md](docs/architecture.md#running-kas-container-by-hand)).
@@ -460,7 +460,7 @@ The settings a new user actually needs:
 | `MACKAS_VOLUME_SIZE_TMP` | `120G` | Cap on the TMPDIR volume. |
 | `MACKAS_VOLUME_SIZE_DL` | `40G` | Cap on the downloads volume. |
 | `MACKAS_VOLUME_SIZE_SSTATE` | `40G` | Cap on the sstate volume. |
-| `KAS_IMAGE` | `ghcr.io/siemens/kas/kas:5.4` | kas container image. |
+| `KAS_IMAGE` | `ghcr.io/siemens/kas/kas:5.5` | kas container image. |
 | `MACKAS_CPUS` | physical cores − 2 | Passed as `-c`. |
 | `MACKAS_MEMORY` | ⅔ of host RAM | Passed as `-m`. |
 | `MACKAS_PROJECT_URL` | *(empty)* | Repo `setup` clones. Empty: `setup` skips the checkout step; `smoketest` offers meta-ai for one ephemeral run. |

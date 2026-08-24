@@ -529,7 +529,7 @@ class SstateRenderTest(unittest.TestCase):
 LS_OUTPUT = (
     "ID                                    IMAGE                        "
     "OS     ARCH   STATE    IP                CPUS  MEMORY    STARTED\n"
-    "4aa8f7c0-b73a-4d45-9326-f643a122cd0b  ghcr.io/siemens/kas/kas:5.4  "
+    "4aa8f7c0-b73a-4d45-9326-f643a122cd0b  ghcr.io/siemens/kas/kas:5.5  "
     "linux  arm64  running  192.168.64.76/24  18    43008 MB  "
     "2026-08-12T07:31:56Z\n"
 )
@@ -554,7 +554,7 @@ def inspect_payload(host_port=8801, container_port=8801, ip="192.168.64.76/24",
     return json.dumps([{
         "configuration": {
             "id": "4aa8f7c0-b73a-4d45-9326-f643a122cd0b",
-            "image": {"reference": "ghcr.io/siemens/kas/kas:5.4"},
+            "image": {"reference": "ghcr.io/siemens/kas/kas:5.5"},
             "publishedPorts": [{
                 "containerPort": container_port,
                 "count": 1,
