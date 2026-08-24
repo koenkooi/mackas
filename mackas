@@ -133,6 +133,8 @@ MACKAS_DL_MIRROR_PATH
 MACKAS_USE_HTTP_MIRRORS
 MACKAS_HTTP_MIRROR_SSTATE
 MACKAS_HTTP_MIRROR_DL
+MACKAS_SSTATE_PUSH_DEST
+MACKAS_SSTATE_PUSH_STAGE
 MACKAS_PROJECT_URL
 MACKAS_PROJECT_BRANCH
 MACKAS_PROJECT_DIR
@@ -717,6 +719,17 @@ set_defaults() {
 	MACKAS_USE_HTTP_MIRRORS=0
 	MACKAS_HTTP_MIRROR_SSTATE="http://linux-computer.local:8100/sstate"
 	MACKAS_HTTP_MIRROR_DL="http://linux-computer.local:8100/downloads"
+
+	# Where 'sstate push' publishes to, and where it stages first. Both empty
+	# by default: push is explicit and does nothing until a destination is
+	# named. The destination is an rsync/ssh target ('user@host:/srv/.../
+	# sstate'), never an HTTP URL -- mackas-mirrord's read path is anonymous
+	# and read-only on purpose, so the write path goes over ssh instead.
+	# The staging directory is a real host path (it is the only place the
+	# manifest verification can run), so it wants room for every NEW object
+	# one push carries; empty means $MACKAS_BASE/sstate-push.
+	MACKAS_SSTATE_PUSH_DEST=""
+	MACKAS_SSTATE_PUSH_STAGE=""    # derived from MACKAS_BASE if empty
 
 	# The project to build. Empty here on purpose -- there is no baked-in
 	# default project. meta-ai (github.com/qualcomm-linux/meta-ai, branch
@@ -6353,15 +6366,29 @@ cmd_dump() {
 # mount, so files land owned by the invoking user already and a `chown -R`
 # there fails "Operation not permitted".
 
-# fetch_tmp_subdir SUB DEST VAR DEFAULT [EXTRA] -- copy the guest directory VAR
-# resolves to out of the TMPDIR volume into DEST/SUB[/EXTRA]. Returns non-zero
-# (with a clear message) when that directory is absent -- e.g. no build has run,
-# so there is no tmp/buildstats -- rather than letting a raw `cp` error surface.
+# fetch_volume_subdir VOL MOUNT SUB DEST VAR DEFAULT [EXTRA] [MACHINE] [NEWER]
+# -- copy the guest directory VAR resolves to, out of the ext4 volume VOL
+# mounted at MOUNT, into DEST/SUB[/EXTRA]. Returns non-zero (with a clear
+# message) when that directory is absent -- e.g. no build has run, so there is
+# no tmp/buildstats -- rather than letting a raw `cp` error surface.
 # Idempotent within one EXTRA: re-copying the same EXTRA overwrites in place.
 #
-# The name is historical: nothing here requires the source to sit under
-# /build/tmp, and several objects need not. A distro may move DEPLOY_DIR
-# anywhere it likes (Angstrom points it at ${TOPDIR}/deploy), buildhistory
+# VOL/MOUNT are parameters because publication reads a DIFFERENT volume than
+# retrieval does: `sstate push` stages out of MACKAS_VOL_SSTATE at /sstate,
+# every retrieve object out of MACKAS_VOL_TMP at /build. Nothing in the
+# mechanism was ever tmp-specific. MOUNT is the whole `-v` suffix, so it can
+# carry a `:ro` -- push has no business writing to what it publishes.
+#
+# An empty VAR means "use DEFAULT verbatim, ask bitbake nothing": push needs
+# no project checkout and no kas-container context, exactly like sstate_prune.
+# NEWER, if set, is an epoch cutoff -- only files modified after it are copied,
+# and the source manifest covers exactly that subset. sstate objects are
+# written once and never modified, so mtime is a trustworthy newness signal.
+# Returns 2 when nothing matched, which is a normal outcome, not a failure.
+#
+# Nothing here requires the source to sit under /build/tmp either, and
+# several retrieve objects do not. A distro may move DEPLOY_DIR anywhere it
+# likes (Angstrom points it at ${TOPDIR}/deploy), buildhistory
 # lives at ${TOPDIR}/buildhistory (a sibling of tmp/), and the SPDX tree
 # lives under DEPLOY_DIR/spdx/${SPDX_VERSION} (inheriting DEPLOY_DIR's
 # relocatability). Only the FALLBACK used when bitbake-getvar cannot answer
@@ -6380,7 +6407,7 @@ cmd_dump() {
 # itself already does guest-side (see check_buildstats_accumulation).
 # Print the POSIX-sh script that, run from inside the directory being
 # verified, emits a sorted "<relpath>#<chunk>\t<cksum-line>" manifest of
-# every regular file under it -- fetch_tmp_subdir's way of checking a cp -r
+# every regular file under it -- fetch_volume_subdir's way of checking a cp -r
 # copy actually matches its source instead of trusting it blind. A file over
 # 256M (keep in sync with retrieve_verify_local()'s own threshold) is split
 # into up to 8 whole-MiB byte-range chunks so one huge deploy image
@@ -6398,11 +6425,19 @@ cmd_dump() {
 # also has the property the batching below depends on -- given multiple
 # paths on one invocation, it labels each line with the exact path it was
 # given, so a batch's own internal ordering is never load-bearing.
+#
+# $1, if given, is an extra `find` predicate (mackas-generated, always
+# `-newermt @<epoch>`) restricting the manifest to the same subset a staged
+# copy took -- empty for every retrieve, which verifies whole trees. It is
+# emitted as a quoted assignment and expanded UNQUOTED below so it splits back
+# into find's two arguments; BOTH find passes below carry it or the batched
+# small-file half would checksum the whole tree. Empty leaves find as it was.
 retrieve_verify_script() {
+	printf 'newer="%s"\n' "${1:-}"
 	cat <<'EOS'
 : > /tmp/.mackas-verify-jobs
 mkdir -p /tmp/.mackas-verify-batches
-find . -type f -size +268435456c -printf '%s %p\n' | while read -r size path; do
+find . -type f $newer -size +268435456c -printf '%s %p\n' | while read -r size path; do
 	rel="${path#./}"
 	size_mb=$(( (size + 1048575) / 1048576 ))
 	chunk_mb=$(( (size_mb + 7) / 8 ))
@@ -6420,7 +6455,7 @@ done
 		sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
 		printf "%s#%s\t%s\n" "$1" "$2" "$sum"
 	' _
-	find . -type f ! -size +268435456c -print0 | \
+	find . -type f $newer ! -size +268435456c -print0 | \
 		xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' /tmp/.mackas-verify-batches
 	find /tmp/.mackas-verify-batches -type f -exec cat {} + | \
 		LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
@@ -6510,8 +6545,16 @@ retrieve_verify_local() {
 	return $rc
 }
 
-fetch_tmp_subdir() {
-	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" guest destsub quiet_undefined=0 rc
+fetch_volume_subdir() {
+	local vol="$1" mount="$2" sub="$3" dest="$4" var="$5" default="$6"
+	local extra="${7:-}" machine="${8:-}" newer="${9:-}"
+	local guest destsub quiet_undefined=0 rc
+
+	# NEWER is an epoch, not a file: the throwaway container mounts the
+	# volume and the staging directory, nothing else, so there is no host
+	# stamp file in there to point `find -newer` at.
+	local find_newer=""
+	[ -n "$newer" ] && find_newer="-newermt @$newer"
 
 	# buildhistory and sbom are the objects whose variables are only ever
 	# defined by an optional bbclass (see bitbake_getvar): BUILDHISTORY_DIR
@@ -6523,29 +6566,37 @@ fetch_tmp_subdir() {
 		buildhistory|sbom) quiet_undefined=1 ;;
 	esac
 
-	# Distros can redefine where these actually land (e.g. Angstrom sets
-	# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
-	# ask bitbake itself rather than assume the default layout.
-	guest="$(bitbake_getvar "$var" "$quiet_undefined")"; rc=$?
-	if [ "$rc" -eq 2 ]; then
+	if [ -z "$var" ]; then
+		# 'sstate push': the guest path IS the mount point, and there is no
+		# project checkout to ask -- exactly like sstate_prune, which also
+		# only runs `find` against a mounted volume. Skipping bitbake_getvar
+		# is what keeps push usable with no kas-container context at all.
 		guest="$default"
-	elif [ "$rc" -ne 0 ]; then
-		guest="$default"
-		warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
-	elif [ -n "$machine" ]; then
-		# 'retrieve deploy images MACHINE' (item 24): DEPLOY_DIR_IMAGE was just
-		# resolved for real, for the PROJECT's currently configured MACHINE --
-		# bitbake has no CLI knob to re-resolve it under a different one
-		# without reconfiguring the checkout. OE-core's bitbake.conf always
-		# names this directory's final path component literally ${MACHINE}
-		# regardless of how a distro redefines DEPLOY_DIR itself (the
-		# multiconfig/SDK machinery across the ecosystem depends on that), so
-		# swapping only the trailing component of the REAL resolved path is a
-		# distro-safe substitution -- never a blind 'DEPLOY_DIR/images/
-		# $machine' guess built without asking bitbake first. Only done on
-		# the rc=0 (real answer) path -- $default above is already built with
-		# $machine appended where it belongs, by the caller.
-		guest="${guest%/*}/$machine"
+	else
+		# Distros can redefine where these actually land (e.g. Angstrom sets
+		# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
+		# ask bitbake itself rather than assume the default layout.
+		guest="$(bitbake_getvar "$var" "$quiet_undefined")"; rc=$?
+		if [ "$rc" -eq 2 ]; then
+			guest="$default"
+		elif [ "$rc" -ne 0 ]; then
+			guest="$default"
+			warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
+		elif [ -n "$machine" ]; then
+			# 'retrieve deploy images MACHINE' (item 24): DEPLOY_DIR_IMAGE was just
+			# resolved for real, for the PROJECT's currently configured MACHINE --
+			# bitbake has no CLI knob to re-resolve it under a different one
+			# without reconfiguring the checkout. OE-core's bitbake.conf always
+			# names this directory's final path component literally ${MACHINE}
+			# regardless of how a distro redefines DEPLOY_DIR itself (the
+			# multiconfig/SDK machinery across the ecosystem depends on that), so
+			# swapping only the trailing component of the REAL resolved path is a
+			# distro-safe substitution -- never a blind 'DEPLOY_DIR/images/
+			# $machine' guess built without asking bitbake first. Only done on
+			# the rc=0 (real answer) path -- $default above is already built with
+			# $machine appended where it belongs, by the caller.
+			guest="${guest%/*}/$machine"
+		fi
 	fi
 
 	# Existence probe AND a real size measurement in the SAME container hop --
@@ -6563,13 +6614,24 @@ fetch_tmp_subdir() {
 	# already use. NOT `2>/dev/null` on the outer command: a genuine runtime
 	# failure (the VM never started, the image is missing) must still reach
 	# the user, not be silently folded into "no such directory".
-	local probe rc=0 size_kb=""
-	probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
-		sh -c "[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0")" || rc=$?
+	#
+	# With NEWER set, `du -sk` would report the whole 40G sstate volume when
+	# a handful of objects is what is actually about to move, so the subset
+	# is summed instead -- printed in du's own "<kb><TAB>..." shape so the
+	# parse below stays one code path. The object COUNT rides along in the
+	# second field, and is what distinguishes "nothing new" from "absent".
+	local probe rc=0 size_kb="" newer_count="" probe_cmd
+	if [ -n "$find_newer" ]; then
+		probe_cmd="[ -d $(printf '%q' "$guest") ] || exit 1; cd $(printf '%q' "$guest") && find . -type f $find_newer -printf '%s\\n' | LC_ALL=C awk '{ s += \$1; n++ } END { printf \"%d\\t%d objects\\n\", (s + 1023) / 1024, n }'; exit 0"
+	else
+		probe_cmd="[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0"
+	fi
+	probe="$(container run --rm -u 0:0 -v "$vol:$mount" "$KAS_IMAGE" \
+		sh -c "$probe_cmd")" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		case "$sub" in
 			buildstats)
-				warn "  no $guest in '$MACKAS_VOL_TMP' -- has a build run yet? ($SCRIPT_CMD smoketest)"
+				warn "  no $guest in '$vol' -- has a build run yet? ($SCRIPT_CMD smoketest)"
 				;;
 			buildhistory)
 				# By far the likeliest reason, and one a bare "no such
@@ -6582,7 +6644,7 @@ fetch_tmp_subdir() {
 				# from a completely different cause. Say what to add and
 				# where, so this is one edit away from working rather than
 				# a hunt through the manual.
-				warn "  no $guest in '$MACKAS_VOL_TMP' -- this project does not INHERIT buildhistory."
+				warn "  no $guest in '$vol' -- this project does not INHERIT buildhistory."
 				warn "  Nothing records it unless you ask: add to your kas config's local_conf_header"
 				warn "  (or conf/local.conf):  INHERIT += \"buildhistory\""
 				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
@@ -6598,14 +6660,14 @@ fetch_tmp_subdir() {
 				# either when the class is not inherited -- the same "absent"
 				# symptom from a different cause. Name both, and the one-line
 				# fix, rather than a bare "no such directory".
-				warn "  no $guest in '$MACKAS_VOL_TMP' -- no SPDX/SBOM output has been generated."
+				warn "  no $guest in '$vol' -- no SPDX/SBOM output has been generated."
 				warn "  OE-core inherits create-spdx by default, but a distro can drop it and older"
 				warn "  releases did not have it. If it is not inherited, add to your kas config's"
 				warn "  local_conf_header (or conf/local.conf):  INHERIT += \"create-spdx\""
 				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
 				;;
 			*)
-				warn "  no $guest in '$MACKAS_VOL_TMP'; skipping $sub"
+				warn "  no $guest in '$vol'; skipping $sub"
 				;;
 		esac
 		return 1
@@ -6619,8 +6681,16 @@ fetch_tmp_subdir() {
 	# candidate; the LAST such line wins, in case more than one appears.
 	size_kb="$(printf '%s\n' "$probe" | awk '/^[0-9]+[ \t]/ { v = $1 } END { print v }')"
 	case "$size_kb" in ''|*[!0-9]*) size_kb="" ;; esac
+	if [ -n "$find_newer" ]; then
+		newer_count="$(printf '%s\n' "$probe" | awk '/^[0-9]+[ \t]/ { v = $2 } END { print v }')"
+		case "$newer_count" in ''|*[!0-9]*) newer_count=0 ;; esac
+		if [ "$newer_count" -eq 0 ]; then
+			info "  $sub: nothing newer than the stamp -- nothing to stage"
+			return 2
+		fi
+	fi
 	if [ -n "$size_kb" ]; then
-		info "  $sub: $(fmt_kb "$size_kb") to transfer to $dest"
+		info "  $sub: $(fmt_kb "$size_kb")${newer_count:+ in $newer_count object(s)} to transfer to $dest"
 
 		# Warn, never refuse: retrieve is a copy, not a destructive operation,
 		# and a df estimate can be wrong (sparse files, other things writing
@@ -6668,6 +6738,26 @@ fetch_tmp_subdir() {
 	# lying around.
 	run rm -rf "${dest:?}/${destsub:?}"
 	run mkdir -p "$dest/$destsub"
+
+	# `cp -r` has no subset form, so a NEWER staging pass lists the matching
+	# files once and hands that list to tar. NUL-delimited: a 40G cache is
+	# no place to discover that one object's name contains a newline. The
+	# same predicate goes to retrieve_verify_script below, so the source
+	# manifest covers exactly the set that was copied -- the two `find` runs
+	# agree because the volume is provably idle (volume_in_use refused
+	# otherwise) and sstate objects are write-once.
+	local copy_cmd fallback_cmd
+	if [ -n "$find_newer" ]; then
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cd $(printf '%q' "$guest") && find . -type f $find_newer -print0 > /tmp/.mackas-stage-list && tar -S -C $(printf '%q' "$guest") --null -T /tmp/.mackas-stage-list -cf - | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+		# No cp -r to fall back FROM: tar IS the safer mechanism here, so a
+		# mismatch retries it once and then dies, rather than pretending a
+		# third algorithm exists.
+		fallback_cmd="$copy_cmd"
+	else
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/")"
+		fallback_cmd="tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+	fi
+
 	# DRY_RUN, its own early branch, same shape volume_fsck_one()'s STEP E
 	# uses: the real path below captures container run's output via command
 	# substitution to compare it, which -- unlike a plain `run container
@@ -6675,18 +6765,26 @@ fetch_tmp_subdir() {
 	# it needs one of its own.
 	if [ "$DRY_RUN" -eq 1 ]; then
 		run container run --rm -u 0:0 \
-			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)"
-		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
+			-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
+			sh -c "$copy_cmd && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$find_newer")"
+		if [ -n "$find_newer" ]; then
+			info "  (dry-run: nothing was copied or verified; a real run retries the copy once on a checksum mismatch, then fails)"
+		else
+			info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
+		fi
 		return 0
 	fi
 	local src_manifest dst_manifest
 	src_manifest="$(container run --rm -u 0:0 \
-		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)")"
+		-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
+		sh -c "$copy_cmd && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$find_newer")")"
 	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
-		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
+		if [ -n "$find_newer" ]; then
+			warn "  '$sub' failed verification after the staged copy -- retrying it"
+		else
+			warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
+		fi
 		# Diagnostic, not a fix: this mismatch has been seen both as a
 		# deterministic locale-collation artifact (fixed -- see LC_ALL=C
 		# above) and, separately, as a genuinely intermittent failure even
@@ -6704,20 +6802,28 @@ fetch_tmp_subdir() {
 		run rm -rf "${dest:?}/${destsub:?}"
 		run mkdir -p "$dest/$destsub"
 		run container run --rm -u 0:0 \
-			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+			-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
+			sh -c "$fallback_cmd"
 		dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 		[ "$src_manifest" = "$dst_manifest" ] || die "'$sub' still fails verification after the tar fallback" \
 			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
-		warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
+		if [ -n "$find_newer" ]; then
+			warn "  '$sub' needed a second attempt -- the first staged copy produced wrong content"
+		else
+			warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
+		fi
 	fi
-	did "retrieved $sub -> $dest/$destsub"
+	if [ -n "$find_newer" ]; then
+		did "staged $sub -> $dest/$destsub"
+	else
+		did "retrieved $sub -> $dest/$destsub"
+	fi
 
 	[ "$sub" = "buildstats" ] && check_buildstats_accumulation "$dest/$destsub" "$guest"
 	return 0
 }
 
-# check_buildstats_accumulation DIR GUEST -- DIR is what fetch_tmp_subdir just
+# check_buildstats_accumulation DIR GUEST -- DIR is what fetch_volume_subdir just
 # retrieved (one or more BUILDNAME subdirs); GUEST is their guest-side parent
 # (e.g. /build/tmp/buildstats). buildstats.bbclass opens build_stats in
 # APPEND mode at both BuildStarted and BuildCompleted and never truncates or
@@ -6825,7 +6931,7 @@ EOF
 
 # retrieve <object>... [--dest DIR] -- copy one or more build-output directories
 # out of the TMPDIR volume. Each object names a bitbake variable that resolves
-# to the real guest path (never a guessed one -- see fetch_tmp_subdir), plus the
+# to the real guest path (never a guessed one -- see fetch_volume_subdir), plus the
 # name it lands under on the host: 'logs' is the CLI-facing plural of tmp/log,
 # and 'buildhistory' resolves to ${TOPDIR}/buildhistory, outside tmp/ entirely.
 cmd_retrieve() {
@@ -6862,7 +6968,7 @@ cmd_retrieve() {
 						*)
 							# A MACHINE substitutes straight into the trailing
 							# path component of a resolved guest path (see
-							# fetch_tmp_subdir), which is now %q-quoted for the
+							# fetch_volume_subdir), which is now %q-quoted for the
 							# guest sh -c -- but a shell metacharacter surviving
 							# that quoting intact (e.g. embedded in the printed
 							# --dry-run preview, or in warn/die/info messages)
@@ -6923,7 +7029,7 @@ cmd_retrieve() {
 	# ALL THREE volumes via kas_runtime_args() -- not just TMPDIR -- so all
 	# three must be checked, same as cmd_exec/kas_project_subcommand_preflight.
 	require_volumes_free "$SCRIPT_CMD retrieve"
-	# fetch_tmp_subdir's existence+size probe now always attaches the volume
+	# fetch_volume_subdir's existence+size probe now always attaches the volume
 	# for real, dry-run or not (item 33) -- refuse before that if it does not
 	# exist yet at all, the same guard clean_tmp_deploy/sstate_prune already
 	# have, rather than let a bind-mount of a not-yet-created named volume
@@ -6941,7 +7047,7 @@ cmd_retrieve() {
 	info ""
 
 	# One retrieve-generated timestamp for buildstats specifically (see
-	# fetch_tmp_subdir's own comment): every OTHER object overwrites its dest
+	# fetch_volume_subdir's own comment): every OTHER object overwrites its dest
 	# in place on purpose (latest logs, latest deploy IS what you want), but
 	# buildstats needs a fresh subdirectory per retrieval so successive
 	# retrievals never merge into the same host path -- MACKAS_RETRIEVE_TS is
@@ -6974,7 +7080,7 @@ cmd_retrieve() {
 				var="DEPLOY_DIR_IMAGE"
 				# Everything after the second ':' is the optional MACHINE
 				# override (empty when the user just wrote 'deploy images'
-				# with none), see fetch_tmp_subdir's own comment for how it
+				# with none), see fetch_volume_subdir's own comment for how it
 				# is applied to a REAL bitbake-getvar answer. Appended here
 				# too, to the FALLBACK default -- unlike the real answer, the
 				# fallback has no existing trailing MACHINE component to
@@ -6989,12 +7095,13 @@ cmd_retrieve() {
 				sub="deploy/images${machine:+/$machine}"
 				;;
 		esac
-		# fetch_tmp_subdir itself now measures and prints the real size to
+		# fetch_volume_subdir itself now measures and prints the real size to
 		# transfer (and warns if $dest looks too small) -- replacing what used
 		# to be one hardcoded "deploy can be large" guess that said nothing
 		# about the other three objects and nothing real about this
 		# project's actual deploy/ contents.
-		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra" "$machine"; then
+		if fetch_volume_subdir "$MACKAS_VOL_TMP" /build \
+			"$sub" "$dest" "$var" "$default" "$extra" "$machine"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
 			[ "$it" = "buildhistory" ] && got_buildhistory=1
@@ -7089,7 +7196,7 @@ resolve_buildstats_dir() {
 # the retrieved shape can be PATH/<BUILDNAME>/build_stats (older data, or any
 # other tool that hands this a flat dir) OR
 # PATH/<retrieve-timestamp>/<BUILDNAME>/build_stats (what `retrieve
-# buildstats` produces now -- see fetch_tmp_subdir/cmd_retrieve) -- and should
+# buildstats` produces now -- see fetch_volume_subdir/cmd_retrieve) -- and should
 # not need to hardcode a depth at all. Unlike a single "newest wins" pick, the
 # SVG chart is cheap and per-build charts should not be merged into one
 # answer -- each build gets its own SVG, named after it.
@@ -7166,7 +7273,7 @@ buildstats_render_svg() {
 		# Three host bind-mounts, no named volume: bsdir, svg_dir and stage
 		# are already plain host directories (buildstats analyze works on
 		# what `retrieve buildstats` already copied out), so unlike
-		# fetch_tmp_subdir this never touches oe-build-tmp and needs no
+		# fetch_volume_subdir this never touches oe-build-tmp and needs no
 		# one-VM check.
 		if ! run container run --rm \
 			-v "$pbc:/pbc:ro" -v "$bsdir:/in:ro" -v "$stage:/out" \
@@ -7695,17 +7802,23 @@ cmd_buildhistory() {
 
 sstate_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD sstate${C_RST} -- manage the shared sstate cache volume.
+${C_BLD}$SCRIPT_CMD sstate${C_RST} -- manage and publish the sstate cache volume.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD sstate prune --older-than N[d]
+  $SCRIPT_CMD sstate push [--dest USER@HOST:/PATH] [--full]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
   prune --older-than N[d]   Delete sstate objects bitbake has not reused in
                             at least N days. Reports what would go and how
                             much space it frees first; only deletes after
                             confirmation (or with -y/--yes).
+  push [--dest ...]         Publish sstate objects to a mirror over rsync/ssh.
+                            --dest defaults to MACKAS_SSTATE_PUSH_DEST; --full
+                            ignores the incremental stamp and offers the whole
+                            volume again.
 
+${C_BLD}PRUNE${C_RST}
 bitbake touches (updates the mtime of) an sstate object every time it finds
 and reuses it -- see sstate.bbclass's sstate_eventhandler and the
 setscene-valid check, both call oe.utils.touch()/os.utime() on a hit. So
@@ -7722,12 +7835,34 @@ signature -- see openembedded-core's own scripts/sstate-cache-management.py,
 run inside a project checkout. '$SCRIPT_CMD sstate prune' does not replace
 it; it solves the coarser "nothing has touched this in months" case.
 
+${C_BLD}PUSH${C_RST}
+Objects newer than this volume+destination's own stamp are copied out of the
+volume into a host staging directory (MACKAS_SSTATE_PUSH_STAGE, default
+\$MACKAS_BASE/sstate-push) and verified there with the same checksum manifest
+'$SCRIPT_CMD retrieve' uses, before anything touches the network. The volume is
+released before the transfer, which then runs as two rsync passes -- every
+object first, the .siginfo files second, so a consumer reading the mirror
+mid-push never finds a signature whose object is missing.
+
+Everything is sent with --ignore-existing and never --inplace: a published
+object is immutable, the first writer wins, and each one appears at the
+destination atomically. Re-running a push is therefore always safe, and a
+lost stamp costs a full rescan rather than a wrong result.
+
+Push before you prune. Once an object is on the mirror, pruning it locally
+costs an HTTP refetch instead of a rebuild.
+
+The destination is an rsync/ssh target, not an HTTP URL: mackas-mirrord serves
+the read path anonymously and read-only, and that is a property worth keeping
+-- so the write path is authenticated out of band, over ssh.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after the subcommand.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. prune refuses while a
-  running build (smoketest/shell) still holds the sstate volume.
+  Only one VM may access an ext4 image at a time. Both prune and push
+  refuse while a running build (smoketest/shell) still holds the sstate
+  volume.
 EOF
 }
 
@@ -7830,6 +7965,183 @@ sstate_prune() {
 	fi
 }
 
+# push_stamp_key VOL DEST -- a filesystem-safe name for one volume+destination
+# pair's push stamp. The readable prefix says what the file belongs to; the
+# cksum of the exact pair is what makes it correct, since two destinations
+# differing only in punctuation sanitize to the same prefix -- and a shared
+# stamp would silently skip objects the OTHER mirror never received.
+push_stamp_key() {
+	local pair="$1|$2" slug sum
+	slug="$(printf '%s' "$pair" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)"
+	sum="$(printf '%s' "$pair" | cksum | awk '{print $1}')"
+	printf '%s-%s\n' "$slug" "$sum"
+}
+
+# push_stamp_write FILE EPOCH -- record a completed push.
+#
+# The epoch is the moment the SCAN started, not the moment rsync finished, so
+# an object written while the push ran is picked up by the next one rather
+# than skipped; --ignore-existing makes re-offering it free. It is stored as
+# the file's CONTENT, never as its mtime: copying, restoring or syncing the
+# state directory rewrites mtimes, and a stamp that silently jumped forward
+# would skip objects the mirror never got. A stamp that is lost or unreadable
+# costs a full rescan -- slow, never wrong.
+push_stamp_write() {
+	local file="$1" epoch="$2"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		return 0
+	fi
+	mkdir -p "$(dirname "$file")"
+	printf '%s\n' "$epoch" > "$file"
+}
+
+# sstate_push -- publish new sstate objects to a mirror, over rsync/ssh.
+#
+# The order of the steps is the design, not an implementation detail:
+#
+#   1. refuse a volume a running build still holds (the one-VM rule);
+#   2. stage only what is newer than THIS volume+destination's stamp into a
+#      host directory, and verify that copy with the same chunked-cksum
+#      manifest `retrieve` uses;
+#   3. release the volume -- the staging container has exited by the time
+#      anything touches the network;
+#   4. rsync in two passes, payload before siginfo;
+#   5. write the stamp only once rsync has exited clean.
+#
+# Staging on the host instead of pushing from inside the container is the
+# whole point of (2): the verified-copy path exists only here, and it exists
+# because a real >18G artifact was once copied with the right size and the
+# wrong content -- a shared mirror is the last place to skip that. It also
+# keeps push credentials on the host (the throwaway container stays
+# network-free and credential-free) and keeps a long transfer out of the
+# window where the volume is held.
+sstate_push() {
+	local dest="" full=0 key stamp since="" since_desc now stage stage_root rc=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dest)   dest="${2:-}"
+				[ -n "$dest" ] || die "--dest needs a value, e.g. user@host:/srv/mackas/sstate" \
+					"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH"
+				shift 2 ;;
+			--dest=*) dest="${1#*=}"; shift ;;
+			--full)   full=1; shift ;;
+			-*) die "unknown option for 'sstate push': $1" "$SCRIPT_CMD sstate --help" ;;
+			*) die "unexpected argument for 'sstate push': $1" \
+				"$SCRIPT_CMD sstate push [--dest USER@HOST:/PATH] [--full]" ;;
+		esac
+	done
+
+	[ -n "$dest" ] || dest="$MACKAS_SSTATE_PUSH_DEST"
+	[ -n "$dest" ] || die "'sstate push' needs a destination" \
+		"set MACKAS_SSTATE_PUSH_DEST=user@host:/srv/mackas/sstate in $(config_hint), or pass --dest"
+	case "$dest" in
+		# rsync reads a leading '-' as an option, and the write path is the
+		# one place a typo reaches another machine.
+		-*) die "the push destination may not start with '-' (got '$dest')" \
+			"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH" ;;
+		*:*) ;;
+		*) die "the push destination must be a remote rsync target, e.g. user@host:/srv/mackas/sstate (got '$dest')" \
+			"the mirror's READ path is anonymous and read-only on purpose, so the write path goes over ssh; that split is the design (docs/storage.md)" ;;
+	esac
+
+	require_mackas_root
+	command -v rsync >/dev/null 2>&1 || die "rsync is not on PATH" \
+		"'sstate push' transfers with rsync over ssh; macOS ships one at /usr/bin/rsync"
+	# The daemon does not survive a reboot; start it before the volume_in_use
+	# check below, same reasoning as sstate_prune/run_kas.
+	ensure_container_running
+
+	# One-VM rule: never attach the volume a build might still hold. Refuse
+	# loudly rather than corrupt an ext4 image mounted by two VMs at once --
+	# read-only is no exemption, the staging mount below is `:ro` for content
+	# safety, not for concurrency.
+	if volume_in_use "$MACKAS_VOL_SSTATE"; then
+		die "volume '$MACKAS_VOL_SSTATE' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD sstate push'"
+	fi
+
+	key="$(push_stamp_key "$MACKAS_VOL_SSTATE" "$dest")"
+	stamp="$MACKAS_BASE/state/sstate-push/$key.stamp"
+	if [ "$full" -eq 0 ] && [ -f "$stamp" ]; then
+		since="$(head -1 "$stamp" 2>/dev/null || true)"
+		case "$since" in
+			''|*[!0-9]*)
+				since=""
+				warn "  unreadable push stamp ($stamp) -- rescanning everything" ;;
+		esac
+	fi
+	now="$(date +%s)"
+	since_desc="everything (no usable stamp yet)"
+	[ -n "$since" ] && since_desc="objects newer than $(date -r "$since" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '@%s' "$since")"
+
+	# One staging tree per volume+destination, wiped before use and after a
+	# clean transfer: it holds a second copy of every NEW object, so a
+	# leftover would quietly grow. A failed push deliberately leaves it for
+	# inspection.
+	stage_root="${MACKAS_SSTATE_PUSH_STAGE:-$MACKAS_BASE/sstate-push}"
+	stage="$stage_root/$key"
+
+	info "${C_BLD}mackas sstate push${C_RST}"
+	info "  volume     : $MACKAS_VOL_SSTATE"
+	info "  destination: $dest"
+	info "  pushing    : $since_desc"
+	info "  staging in : $stage"
+	info ""
+
+	run rm -rf "${stage:?}"
+	run mkdir -p "$stage"
+
+	# An empty VAR: no bitbake, no project, no kas-container context -- the
+	# guest path IS the mount point. `:ro` because publishing must not be able
+	# to write to what it publishes.
+	fetch_volume_subdir "$MACKAS_VOL_SSTATE" "/sstate:ro" \
+		sstate "$stage" "" /sstate "" "" "$since" || rc=$?
+	case "$rc" in
+		0) ;;
+		2)	# Nothing matched, so nothing can be missed by moving the stamp
+			# forward -- and doing so keeps the next push's scan cheap.
+			push_stamp_write "$stamp" "$now"
+			run rm -rf "${stage:?}"
+			info "Nothing to push -- '$dest' is already current for '$MACKAS_VOL_SSTATE'."
+			return 0 ;;
+		*) die "could not stage '$MACKAS_VOL_SSTATE' for push (rc=$rc)" \
+			"nothing was transferred and the push stamp is unchanged; $stage was left in place" ;;
+	esac
+
+	# The staging container has exited, so the volume is free again for the
+	# whole (potentially long) transfer below.
+	local src="$stage/sstate/" pass_rc=0
+
+	# Two passes, payload first. bitbake decides an sstate object is
+	# available by finding its .siginfo, so a consumer listing the mirror
+	# mid-push must never see one whose object has not landed yet.
+	#
+	# --ignore-existing is the point of the whole transport: published
+	# objects become immutable and the first writer wins, so two pushers
+	# racing on one hash-derived path need no lock (they are pushing
+	# identical bytes anyway), and a re-offered object costs a directory
+	# listing rather than a re-upload. NEVER --inplace: rsync's default
+	# temp-file-then-rename is what makes each object appear atomically,
+	# the same same-directory-rename pattern sstate.bbclass itself uses.
+	run rsync -rlt --ignore-existing --exclude='lost+found' --exclude='*.siginfo' "$src" "$dest" || pass_rc=$?
+	[ "$pass_rc" -eq 0 ] || die "rsync failed on the payload pass (rc=$pass_rc)" \
+		"nothing was stamped, so the next '$SCRIPT_CMD sstate push' retries the same objects; check ssh access to $dest"
+
+	pass_rc=0
+	run rsync -rlt --ignore-existing --exclude='lost+found' --include='*/' --include='*.siginfo' --exclude='*' "$src" "$dest" || pass_rc=$?
+	[ "$pass_rc" -eq 0 ] || die "rsync failed on the siginfo pass (rc=$pass_rc)" \
+		"the objects themselves landed; re-run '$SCRIPT_CMD sstate push' once $dest is reachable again"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "  (dry-run: nothing was transferred and the push stamp is unchanged)"
+		return 0
+	fi
+	push_stamp_write "$stamp" "$now"
+	run rm -rf "${stage:?}"
+	did "pushed '$MACKAS_VOL_SSTATE' -> $dest (stamp: $stamp)"
+}
+
 cmd_sstate() {
 	local sub="" rest=() a want_help=0
 	for a in "$@"; do
@@ -7851,9 +8163,10 @@ cmd_sstate() {
 
 	case "${sub:-help}" in
 		prune)  sstate_prune ${rest+"${rest[@]}"} ;;
+		push)   sstate_push ${rest+"${rest[@]}"} ;;
 		help)   sstate_usage ;;
 		*) die "unknown 'sstate' subcommand: $sub" \
-			"$SCRIPT_CMD sstate --help  (prune)" ;;
+			"$SCRIPT_CMD sstate --help  (prune, push)" ;;
 	esac
 }
 
@@ -10504,7 +10817,8 @@ ${C_BLD}COMMANDS${C_RST}
              '$SCRIPT_CMD buildstats --help'.
   buildhistory  Work with a buildhistory tree already retrieved: analyze
              what changed between two builds. '$SCRIPT_CMD buildhistory --help'.
-  sstate     Prune sstate objects bitbake hasn't reused in a while.
+  sstate     Prune sstate objects bitbake hasn't reused in a while, or push
+             new ones to a mirror. '$SCRIPT_CMD sstate --help'.
              '$SCRIPT_CMD sstate --help'.
   monitor    Show live bitbake progress from a build started with
              MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
