@@ -1092,10 +1092,13 @@ added/removed/upgraded, the biggest `PKGSIZE` movers, and per-image
 `IMAGESIZE`/installed-package deltas, read via host `git` plumbing (`git
 diff --name-status` plus one `git cat-file --batch` — no container, no
 bitbake, cost proportional to what changed rather than the size of the
-tree). `PKGSIZE` and `IMAGESIZE` are both already recorded in KiB
-(buildhistory.bbclass's own convention — `IMAGESIZE` comes from `du -ks`),
-not bytes. A package-size change is listed only past >1% or >64 KiB;
-smaller changes are still counted into the net total. `--detail`
+tree). `PKGSIZE` and `IMAGESIZE` do **not** share a unit: `IMAGESIZE` is
+recorded in KiB (`buildhistory.bbclass`'s `du -ks`), but `PKGSIZE` is bytes
+(oe-core's `oe/packagedata.py` sums real file sizes, no KiB conversion) —
+`buildhistory analyze` converts `PKGSIZE` to KiB itself before comparing it
+against the threshold below or printing it. A package-size change is listed
+only past >1% or >64 KiB; smaller changes are still counted into the net
+total. `--detail`
 additionally runs openembedded-core's own `scripts/buildhistory-diff`
 inside a throwaway kas-image container for the per-field semantics
 (`RDEPENDS` version-constraint comparisons, unified diffs of

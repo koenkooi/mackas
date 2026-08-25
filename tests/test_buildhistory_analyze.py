@@ -156,7 +156,12 @@ class DiffModeTests(unittest.TestCase):
         self.assertEqual(ch["packages_removed"], [])
 
     def test_pkgsize_delta_and_percentage(self):
-        # PKGSIZE is already in KiB -- these numbers are KiB, not bytes.
+        # PKGSIZE (buildhistory.bbclass, straight from oe-core's
+        # oe/packagedata.py) is BYTES -- confirmed by reading that source
+        # directly (a real os.stat().st_size sum, no /1024 anywhere). These
+        # write_package() values are bytes; analyze_diff() must convert to
+        # KiB (see the module's own comment) before it does anything else
+        # with them, so the assertions below are in KiB.
         self.repo.write_recipe("cortexa57", "busybox", "1.36.1", "r0", ["busybox"])
         self.repo.write_package("cortexa57", "busybox", "busybox", 1000000)
         self.repo.commit("Build 1", tag="build-minus-1")
@@ -165,10 +170,12 @@ class DiffModeTests(unittest.TestCase):
 
         rep = bha.analyze_diff(self.repo.path, "build-minus-1", "HEAD", 10, False)
         pc = rep["packages"]["changed"][0]
-        self.assertEqual(pc["pkgsize"], [1000000, 900000])
-        self.assertEqual(pc["delta"], -100000)
+        self.assertAlmostEqual(pc["pkgsize"][0], 1000000 / 1024.0, places=4)
+        self.assertAlmostEqual(pc["pkgsize"][1], 900000 / 1024.0, places=4)
+        self.assertAlmostEqual(pc["delta"], (900000 - 1000000) / 1024.0, places=4)
         self.assertAlmostEqual(pc["pct"], -10.0, places=1)
-        self.assertEqual(rep["packages"]["size_delta_total"], -100000)
+        self.assertAlmostEqual(rep["packages"]["size_delta_total"],
+                                (900000 - 1000000) / 1024.0, places=4)
 
     def test_imagesize_delta(self):
         # IMAGESIZE is already in KiB (`du -ks`) -- these numbers are KiB.
@@ -198,26 +205,91 @@ class DiffModeTests(unittest.TestCase):
         self.assertEqual(im["packages_removed"], ["openssl-bin"])
 
     def test_threshold_hides_small_changes_but_still_counts_them(self):
-        # PKGSIZE is already in KiB (buildhistory.bbclass's own convention,
-        # matching IMAGESIZE's `du -ks`) -- 10000 -> 10050 is +50 KiB (under
-        # the 64 KiB floor) and +0.5% (under the 1% floor), so BOTH
-        # thresholds miss: must be counted into the net total and the
-        # hidden tally, but not individually listed.
+        # PKGSIZE is bytes (see test_pkgsize_delta_and_percentage); a 50-byte
+        # bump is a tiny fraction of a KiB, so it misses the 64 KiB floor by
+        # a wide margin regardless of the unit bug -- kept as a real bytes
+        # value (not a suspiciously round KiB number) so this test would
+        # have failed loudly if the /1024 conversion were ever removed
+        # (50 bytes read as "50 KiB" would wrongly clear the 64 KiB floor).
         self.repo.write_recipe("cortexa57", "tiny", "1.0", "r0", ["tiny"])
         self.repo.write_package("cortexa57", "tiny", "tiny", 10000)
         self.repo.commit("Build 1", tag="build-minus-1")
         self.repo.write_package("cortexa57", "tiny", "tiny", 10050)
         self.repo.commit("Build 2")
 
+        expected_delta = (10050 - 10000) / 1024.0
+
         rep = bha.analyze_diff(self.repo.path, "build-minus-1", "HEAD", 10, False)
         self.assertEqual(rep["packages"]["changed"], [])
         self.assertEqual(rep["packages"]["n_hidden"], 1)
-        self.assertEqual(rep["packages"]["hidden_delta_total"], 50)
-        self.assertEqual(rep["packages"]["size_delta_total"], 50)
+        self.assertAlmostEqual(rep["packages"]["hidden_delta_total"],
+                                expected_delta, places=4)
+        self.assertAlmostEqual(rep["packages"]["size_delta_total"],
+                                expected_delta, places=4)
 
         rep_all = bha.analyze_diff(self.repo.path, "build-minus-1", "HEAD", 10, True)
         self.assertEqual(len(rep_all["packages"]["changed"]), 1)
         self.assertEqual(rep_all["packages"]["n_hidden"], 0)
+
+    def test_pkgsize_bytes_just_over_the_kib_threshold_is_shown(self):
+        # The inverse pin: a delta that is genuinely >= 64 KiB in real KiB
+        # terms must clear the floor and be listed. 70000 bytes ~= 68.36
+        # KiB of growth -- comfortably over 64 KiB only after the /1024
+        # conversion; read as raw bytes it would also "clear" 64 (any
+        # multi-thousand-byte number does), so this alone wouldn't catch a
+        # regression, but combined with the hidden-small-change test above
+        # (which WOULD catch a removed conversion) it pins both directions.
+        self.repo.write_recipe("cortexa57", "grower", "1.0", "r0", ["grower"])
+        self.repo.write_package("cortexa57", "grower", "grower", 1000000)
+        self.repo.commit("Build 1", tag="build-minus-1")
+        self.repo.write_package("cortexa57", "grower", "grower", 1070000)
+        self.repo.commit("Build 2")
+
+        rep = bha.analyze_diff(self.repo.path, "build-minus-1", "HEAD", 10, False)
+        self.assertEqual(len(rep["packages"]["changed"]), 1)
+        pc = rep["packages"]["changed"][0]
+        self.assertAlmostEqual(pc["delta"], 70000 / 1024.0, places=4)
+
+    def test_size_movers_table_does_not_collapse_similarly_named_packages(self):
+        # Real bug, reported live against a real build (a new recipe,
+        # qemuarmv5/console-pico-image, whose base package name is exactly
+        # 20 chars): the formatted table used to truncate every name to 20
+        # chars, so "bluetooth-pan-client" and every one of its OE-default
+        # sub-packages ("bluetooth-pan-client-dev", "...-dbg", "...-doc",
+        # "...-staticdev", "...-src") printed as the SAME string, making the
+        # table useless for telling which package actually moved.
+        base = "bluetooth-pan-client"  # exactly 20 chars, the real trigger
+        self.assertEqual(len(base), 20)
+        suffixes = ["", "-dev", "-dbg", "-doc", "-staticdev", "-src"]
+        self.repo.write_recipe("armv5e", base, "1.0", "r0",
+                                [base + s for s in suffixes])
+        self.repo.commit("Build 1", tag="build-minus-1")
+        for s in suffixes:
+            self.repo.write_package("armv5e", base, base + s, 12697)
+        self.repo.commit("Build 2")
+
+        rep = bha.analyze_diff(self.repo.path, "build-minus-1", "HEAD", 10, False)
+        text = bha.format_summary_diff(rep)
+        for s in suffixes:
+            self.assertIn(base + s, text,
+                          "%r must appear whole, not truncated into %r"
+                          % (base + s, base))
+
+    def test_size_movers_table_marks_real_truncation_visibly(self):
+        # The inverse: a name that genuinely exceeds the column width is
+        # still cut (an unbounded column would let one pathological name
+        # blow out the whole table) -- but must say so with "...", never
+        # silently, per this project's no-silent-truncation rule.
+        long_name = "a" * 55
+        self.repo.write_recipe("cortexa57", "longrecipe", "1.0", "r0", [long_name])
+        self.repo.commit("Build 1", tag="build-minus-1")
+        self.repo.write_package("cortexa57", "longrecipe", long_name, 12697)
+        self.repo.commit("Build 2")
+
+        rep = bha.analyze_diff(self.repo.path, "build-minus-1", "HEAD", 10, False)
+        text = bha.format_summary_diff(rep)
+        self.assertNotIn(long_name, text)
+        self.assertIn("...", text)
 
     def test_top_n_truncates(self):
         for i in range(5):
@@ -296,7 +368,10 @@ class SnapshotModeTests(unittest.TestCase):
         rep = bha.analyze_snapshot(self.path, 10)
         self.assertEqual(rep["mode"], "snapshot")
         self.assertEqual(rep["packages"]["count"], 1)
-        self.assertEqual(rep["packages"]["total_size"], 1000000)
+        # PKGSIZE is bytes -- total_size is converted to KiB (IMAGESIZE is
+        # already KiB via `du -ks` and is untouched).
+        self.assertAlmostEqual(rep["packages"]["total_size"],
+                                1000000 / 1024.0, places=4)
         self.assertEqual(len(rep["images"]), 1)
         self.assertEqual(rep["images"][0]["imagesize"], 50000000)
         self.assertEqual(rep["images"][0]["n_packages"], 1)

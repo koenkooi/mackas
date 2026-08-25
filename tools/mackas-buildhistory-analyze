@@ -79,11 +79,19 @@ import re
 import subprocess
 import sys
 
-# PKGSIZE and IMAGESIZE are both already in KiB -- buildhistory.bbclass
-# writes PKGSIZE straight from bitbake's own PKGSIZE variable (Kbytes, by OE
-# convention: see e.g. IMAGE_ROOTFS_EXTRA_SPACE's identical "Kbytes"
-# convention in bitbake.conf), and IMAGESIZE via `du -ks` (buildhistory.bbclass's
-# buildhistory_get_imageinfo). Neither is bytes -- do not divide by 1024 again.
+# PKGSIZE and IMAGESIZE do NOT share a unit -- this was gotten wrong once
+# (both assumed to already be KiB) and is worth pinning precisely. IMAGESIZE
+# really is KiB: buildhistory.bbclass's buildhistory_get_imageinfo computes
+# it with `du -ks`. PKGSIZE is bytes: oe-core's oe/packagedata.py sums real
+# `os.stat().st_size` values with no /1024 anywhere (confirmed by reading
+# that source directly, not by analogy to another variable's convention --
+# the previous version of this comment cited IMAGE_ROOTFS_EXTRA_SPACE's
+# "Kbytes" wording, which is a different variable entirely and was never
+# actually checked against PKGSIZE's own producer). Every PKGSIZE value is
+# therefore converted to KiB (divide by 1024.0) at the point it is parsed,
+# immediately below and in analyze_snapshot() -- everything downstream
+# (fmt_kib/fmt_kib_delta, the 64 KiB threshold) assumes KiB input and must
+# not be handed raw bytes.
 THRESHOLD_PCT = 1.0
 THRESHOLD_KIB = 64
 
@@ -431,8 +439,10 @@ def analyze_diff(path, from_rev, to_rev, top, show_all):
     for (arch, recipe, pkg), d in sorted(c["pkgs"].items()):
         old_kv = parse_kv(blob_for(d, from_sha, "old"))
         new_kv = parse_kv(blob_for(d, to_sha, "new"))
-        old_size = parse_int(old_kv.get("PKGSIZE")) if d.get("old") else None
-        new_size = parse_int(new_kv.get("PKGSIZE")) if d.get("new") else None
+        # /1024.0: PKGSIZE is bytes, everything downstream (fmt_kib(_delta),
+        # THRESHOLD_KIB) expects KiB -- see the module-level comment above.
+        old_size = parse_int(old_kv.get("PKGSIZE")) / 1024.0 if d.get("old") else None
+        new_size = parse_int(new_kv.get("PKGSIZE")) / 1024.0 if d.get("new") else None
         if old_size is None and new_size is None:
             continue
         delta = (new_size or 0) - (old_size or 0)
@@ -551,7 +561,7 @@ def analyze_snapshot(path, top):
         elif PKG_LATEST_RE.match(rel):
             packages += 1
             kv = parse_kv(read_worktree_file(path, rel))
-            total_pkgsize += parse_int(kv.get("PKGSIZE"))
+            total_pkgsize += parse_int(kv.get("PKGSIZE")) / 1024.0
 
     images_root = os.path.join(path, "images")
     for root, _dirs, files in os.walk(images_root):
@@ -657,11 +667,23 @@ def format_summary_diff(rep):
     out.append("  size movers (PKGSIZE, top %d of %d changed packages, net %s)"
                 % (len(p["changed"]), p["n_total_changed"],
                    fmt_kib_delta(p["size_delta_total"])))
+    # A fixed 20-char truncation silently ate real package names: OE's
+    # default package splits (-dev, -dbg, -doc, -staticdev, -src, -locale)
+    # routinely push a name past 20 chars, and a base name that is ITSELF
+    # 20 chars (e.g. "bluetooth-pan-client") made every one of its
+    # sub-packages print identically with no visible sign anything was cut.
+    # Size the column to the widest name actually in THIS report instead
+    # (capped, and only that far-out tail gets an explicit "..." marker, so
+    # truncation is never silent).
+    name_width = min(40, max((len(pc["name"]) for pc in p["changed"]), default=20))
     for pc in p["changed"]:
         state = "new" if pc["new"] else "removed" if pc["removed"] else (
             "%+.1f%%" % pc["pct"] if pc["pct"] is not None else "")
-        out.append("    %-20s %10s   %8s -> %8s   %s"
-                    % (pc["name"][:20], fmt_kib_delta(pc["delta"]),
+        name = pc["name"]
+        if len(name) > name_width:
+            name = name[:name_width - 3] + "..."
+        out.append("    %-*s %10s   %8s -> %8s   %s"
+                    % (name_width, name, fmt_kib_delta(pc["delta"]),
                        fmt_kib(pc["pkgsize"][0]), fmt_kib(pc["pkgsize"][1]),
                        state))
     if p["n_hidden"]:
