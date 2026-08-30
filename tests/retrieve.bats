@@ -800,7 +800,7 @@ STUB
 @test "retrieve: a failing copy container is a clear error, not a checksum mismatch" {
 	MOCK_TMP_HAS="buildstats" MOCK_COPY_FAIL=1 mk retrieve buildstats
 	[ "$status" -ne 0 ]
-	[[ "$output" == *"copy container failed"* ]]
+	[[ "$output" == *"failed"*"not treating this as a verified copy"* ]]
 	[[ "$output" == *"MACKAS_MEMORY"* ]]
 	[[ "$output" != *"falling back"* ]]
 }
