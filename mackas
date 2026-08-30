@@ -8777,7 +8777,7 @@ cmd_runtime_args() {
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
 			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" runtime-args ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" runtime-args ;;
 			-*) die "unknown option for 'runtime-args': $1" "$SCRIPT_CMD runtime-args --help" ;;
 			*) die "unexpected argument for 'runtime-args': $1" "$SCRIPT_CMD runtime-args --help" ;;
 		esac
