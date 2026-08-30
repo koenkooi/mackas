@@ -386,7 +386,10 @@ refute_call() {
 	# hardcoded literal on the wrong command. Pin the source form: both the probe
 	# and the copy run as -u 0:0.
 	grep -qF -- 'probe="$(container run --rm -u 0:0 -v "$vol:$mount" "$KAS_IMAGE" \' "$MACKAS"
-	grep -qF -- 'du -sk $(printf '"'"'%q'"'"' "$guest")' "$MACKAS"
+	# The probe %q-quotes $guest ONCE, into $q_guest, and uses it in both the
+	# size branch and the incremental one push drives.
+	grep -qF -- 'q_guest="$(printf '"'"'%q'"'"' "$guest")"' "$MACKAS"
+	grep -qF -- 'du -sk $q_guest' "$MACKAS"
 	grep -qF -- '-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE"' "$MACKAS"
 	# ...and that retrieve is what passes the TMPDIR volume at /build, since
 	# $vol/$mount are now parameters shared with 'sstate push'.

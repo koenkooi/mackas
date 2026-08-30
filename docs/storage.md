@@ -813,9 +813,15 @@ One push, in the order the steps have to happen in:
 1. **Refuse a held volume.** One VM per ext4 image; a running build wins.
 2. **Stage.** A throwaway container mounts the sstate volume **read-only**
    plus a host staging directory (`MACKAS_SSTATE_PUSH_STAGE`, default
-   `$MACKAS_BASE/sstate-push`) and copies only the objects newer than this
-   volume+destination's stamp. sstate objects are written once and never
-   modified, so mtime is a trustworthy newness signal.
+   `$MACKAS_BASE/sstate-push`) and copies only the objects whose mtime is
+   newer than this volume+destination's stamp. sstate objects are **not**
+   write-once: bitbake touches one every time it *reuses* it — the same
+   `os.utime()` that `sstate prune`'s `-mtime +N` depends on — so the
+   selection is everything recent builds wrote *or reused*, not only what is
+   new. That direction is safe (it over-selects, never misses, and
+   `--ignore-existing` makes re-offering an object free on the wire), but
+   every over-selected object is still byte-copied into staging and
+   checksummed there. Size the staging filesystem for the **reuse** set.
 3. **Verify.** The same chunked-`cksum` manifest `retrieve` uses runs
    in-container over the source subset and on the host over the staged copy;
    a mismatch retries the copy once and then dies. This exists because a real
@@ -843,7 +849,23 @@ and holds the epoch at which the scan *started*, as file content rather than
 as the file's own mtime: copying or restoring the state directory rewrites
 mtimes, and a stamp that silently jumped forward would skip objects the mirror
 never received. One stamp per volume+destination pair, so pushing one volume
-to two mirrors keeps two independent positions.
+to two mirrors keeps two independent positions. The pair is hashed into the
+filename, not just sanitized into it: two destinations differing only in
+punctuation slug to the same string, and one shared stamp would silently skip
+the objects the other mirror never got.
+
+**A scan that could not answer never stamps.** "The scan matched nothing" is
+the one outcome that moves the stamp forward, so it must be impossible to
+confuse with "the scan broke". The in-container probe checks `find`'s own
+status rather than a pipeline's (the guest shell has no `pipefail`, so a
+pipeline reports `awk`'s status and a dead `find` looks like an empty result),
+prints a completion marker the host insists on, and treats an unreadable
+object count as an error rather than a zero. On any uncertainty push rescans
+or fails; it never stamps. The same reasoning is why push refuses outright
+when the sstate volume does not exist yet — an absent named volume
+bind-mounts as an *empty* one, which scans as "nothing new". Getting this
+wrong drops objects that really existed below the cutoff permanently, so they
+are never offered to the mirror again.
 
 **Transport: rsync over ssh, deliberately not an HTTP PUT.** Adding a write
 path to `mackas-mirrord` is rejected outright — its read-only-ness is the
