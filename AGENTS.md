@@ -68,8 +68,10 @@ installed, daemon not running") at the front of `PATH` for every file except the
 opt-in ones below. Do not remove it — before it existed, any test running
 `mackas status`/`check`/`setup` without planting its own fake reached a dev Mac's
 real binary, and a wedged daemon hung the entire run. A test that needs specific
-answers still prepends its own fake, which wins. `tests/hermetic.bats` guards all
-of this. The four exceptions — `tests/real_runtime.bats`
+answers still prepends its own fake, which wins. `tests/hermetic.bats` guards
+all of this from inside a bats file; `run-tests.sh` guards what a bats file
+cannot see out to, planting a recording `container` behind the stub and failing
+the run if anything called it. The four exceptions — `tests/real_runtime.bats`
 (real Apple `container`), `tests/volume_resize_real.bats` (real volume grow),
 `tests/diskmon_real.bats` (real bitbake driving a volume near-full) and
 `tests/workspace_image_real.bats` (real `hdiutil`) — self-skip unless
