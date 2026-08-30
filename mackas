@@ -989,6 +989,39 @@ path_is_owned_and_unwritable_by_others() {
 	return 0
 }
 
+# Both selectors named a config file. Printed as die()'s hint, so it follows
+# root_hint()'s shape: one command per line, copy-pasteable.
+#
+# Worth the length because of WHERE this fires. The common case is not a user
+# passing both by hand -- it is a --project wrapper meeting a $MACKAS_CONF the
+# caller exported in a shell rc, so the selector named in the error is one the
+# user never set, and a bare "drop one" tells them to unset something they have
+# never heard of. Show both resolved values, and give the escape for whichever
+# one they actually control.
+selector_conflict_hint() {
+	local sel_src="$1" sel="$2" path_src="$3" path="$4"
+	printf 'these are mutually exclusive -- one picks a pinned project, the other names a path outright -- and mackas will not rank them for you.\n'
+	printf '\n'
+	printf '    %-24s %s\n' "$sel_src" "$sel"
+	printf '    %-24s %s\n' "$path_src" "$path"
+	printf '\n'
+	if [ "$path_src" = "\$MACKAS_CONF" ]; then
+		printf 'To keep the project and ignore the path, for one command:\n'
+		printf '    MACKAS_CONF= <your command>\n'
+		printf 'or for the rest of this shell:\n'
+		printf '    unset MACKAS_CONF\n'
+	else
+		printf 'To keep the project instead, drop the %s flag.\n' "$path_src"
+	fi
+	printf '\n'
+	if [ "$sel_src" = "\$MACKAS_PROJECT_SELECT" ]; then
+		printf 'To keep the path instead:\n'
+		printf '    unset MACKAS_PROJECT_SELECT\n'
+	else
+		printf 'To keep the path instead, drop the %s flag.\n' "$sel_src"
+	fi
+}
+
 load_config() {
 	local explicit="${1:-}" allow_missing="${2:-0}" select="${3:-}"
 	local f
@@ -1016,8 +1049,8 @@ load_config() {
 		path_hint="check \$MACKAS_CONF, or unset it to use the default search path"
 	fi
 	if [ -n "$sel" ] && [ -n "$path" ]; then
-		die "$sel_src and $path_src both choose a config file: '$sel' and '$path'" \
-			"drop one -- $sel_src picks a pinned project, $path_src names a path outright"
+		die "$sel_src and $path_src both choose a config file" \
+			"$(selector_conflict_hint "$sel_src" "$sel" "$path_src" "$path")"
 	fi
 
 	if [ -n "$sel" ]; then
@@ -4521,14 +4554,22 @@ MACKAS_GITCONFIG=$q_gitconfig
 SCRIPT_NAME=$q_scriptname
 
 # Which pinned project's config every value above was frozen from, empty for
-# the default search path. It is replayed into the live recompute below so
-# that call resolves the SAME config this file was generated from -- without
-# it, a wrapper written by '$SCRIPT_NAME --project A setup' would recompute
+# the default search path. Replayed into the live recompute below: without it,
+# a wrapper written by '$SCRIPT_NAME --project A setup' would recompute
 # --runtime-args off whatever the default search path finds, and hand another
 # project's ext4 volumes to a build whose work dir and gitconfig are A's.
 # Passed explicitly even when empty, which also stops an exported
 # \$MACKAS_PROJECT_SELECT in the calling shell from re-aiming this wrapper at
 # a project it was not built for.
+#
+# This pins the SELECTOR only, not \$MACKAS_CONF -- so it does NOT guarantee
+# the recompute resolves the same config this file was generated from. With
+# this pin empty, an exported \$MACKAS_CONF still re-aims the recompute at
+# another config's volume names while the values above stay frozen to the
+# first: the same hazard, through the other door. Freezing a typed path into
+# a generated file is a separate design call (a path is a per-invocation
+# request and can go stale), tracked in issue #96 -- do not read this pin as
+# closing that case.
 MACKAS_PROJECT_PIN=$q_projsel
 
 # There is deliberately NO frozen copy of --runtime-args in this file any
@@ -10765,8 +10806,10 @@ ${C_BLD}CONFIGURATION${C_RST}
     ~/.mackas.conf
 
   Naming a path and selecting a project are mutually exclusive -- they are two
-  answers to the same question, so mackas refuses rather than ranks them. The
-  selector picks WHICH file is sourced; it is not a fifth precedence rung.
+  answers to the same question, so mackas refuses rather than ranks them, and
+  says which command drops the one you did not mean. The selector picks WHICH
+  file is sourced; it is not a fifth precedence rung. An empty value is refused
+  either way: --config= behaves like --config \"\", --project= like --project \"\".
 
   '$SCRIPT_CMD --project NAME setup' pins NAME into the generated kas-container
   wrapper, so a hand-typed 'kas-container ...' recomputes --runtime-args
@@ -10852,7 +10895,10 @@ main() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--config) config_flag="${2:-}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift 2 ;;
-			--config=*) config_flag="${1#*=}"; shift ;;
+			# Same arity check as the space-separated form: --config= silently
+			# falling through to $MACKAS_CONF or the search path made an
+			# explicit-but-empty override resolve to a DIFFERENT file.
+			--config=*) config_flag="${1#*=}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift ;;
 			# Only the flag's arity is checked here. The NAME itself is
 			# validated in load_config, the one place that turns it into a
 			# path, so nothing can ever reach that path unchecked -- and so
