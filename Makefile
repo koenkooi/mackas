@@ -19,7 +19,7 @@ test:
 
 lint shellcheck:
 	shellcheck -s bash mackas bin/docker run-tests.sh \
-		tests/mock/container tests/mock/bin/container
+		tests/mock/container tests/mock/bin/*
 
 syntax:
 	/bin/bash -n mackas

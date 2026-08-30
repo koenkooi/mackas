@@ -477,8 +477,12 @@ write_env_sh() {
 	# mackas's own checkout (SCRIPT_DIR) rides along after homebrew so a bare
 	# 'mackas ...' works from any directory once env.sh is sourced -- still
 	# behind the shim and homebrew, ahead of the user's own $PATH.
+	#
+	# The homebrew dir is $BREW_BIN, not the literal: the hermetic suite aims
+	# MACKAS_BREW_BIN at its own stubs so this generated PATH cannot put a real
+	# `container` ahead of them. units.bats pins the shipped default.
 	write_env_sh
-	grep -qF "export PATH='$SHIM_DIR':/opt/homebrew/bin:'$SCRIPT_DIR':\"\$PATH\"" "$MACKAS_ENV_SH"
+	grep -qF "export PATH='$SHIM_DIR':'$BREW_BIN':'$SCRIPT_DIR':\"\$PATH\"" "$MACKAS_ENV_SH"
 }
 
 @test "env.sh: still sets KAS_CONTAINER_ENGINE, BB_NUMBER_THREADS and PARALLEL_MAKE" {

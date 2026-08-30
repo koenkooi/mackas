@@ -13,13 +13,14 @@
 #
 # None of this touches the real Apple container runtime, the build SSD, the
 # network, sudo, NFS, or the mirror host -- it is safe to run anywhere, any time.
-# The runtime half of that is enforced, not merely intended: helpers.bash puts
-# tests/mock/bin (a stub `container`) at the front of PATH for every file except
-# the *_real ones, tests/hermetic.bats fails if that guard slips, and this
-# script plants a recording `container` behind the stub -- ahead of any real
-# one -- so the run fails outright if some test got past it anyway.
-# The mirror-server tests bind 127.0.0.1 on port 0, which is an ephemeral port
-# the kernel picks and nothing else can already hold.
+# For four host tools that is ENFORCED, not merely intended: helpers.bash puts
+# tests/mock/bin (stub `container`, `curl`, `mdfind` and `diskutil`) at the
+# front of PATH -- and at MACKAS_BREW_BIN, so mackas' own PATH prepend cannot
+# jump past it -- for every file except the *_real ones; tests/hermetic.bats
+# fails if that guard slips; and this script plants recorders behind the stubs,
+# ahead of any real binary, so the run fails outright if some test got past
+# them anyway. The mirror-server tests bind 127.0.0.1 on port 0, which is an
+# ephemeral port the kernel picks and nothing else can already hold.
 #
 # The exceptions are the *_real.bats suites -- real_runtime (real Apple
 # container), volume_resize_real (real volume grow), diskmon_real (real
@@ -46,13 +47,22 @@ rc=0
 hdr() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
 # Whole-run hermeticity guard, planted before anything runs. helpers.bash
-# shadows `container` with tests/mock/bin for every hermetic bats file; this
-# recorder sits BEHIND that stub and IN FRONT of any real binary, so a call
-# landing here is one that got past the stub -- a file that skipped
+# shadows these four host tools with tests/mock/bin for every hermetic bats
+# file; these recorders sit BEHIND those stubs and IN FRONT of any real binary,
+# so a call landing here is one that got past them -- a file that skipped
 # `load helpers`, rebuilt PATH from scratch, or was wrongly exempted -- or a
 # Python test that shelled out for real. That is the slip hermetic.bats cannot
 # see from inside a single bats file, and the one that once hung a whole run.
-# Off under MACKAS_REAL_RUNTIME=1, where the opt-in suites want the real CLI.
+#
+# The list is exactly the host tools mackas resolves by bare name that the
+# suite actually reaches: the container runtime, the network (curl), Spotlight
+# (mdfind) and the host's disks (diskutil). It is what "hermetic" is enforced
+# to mean here -- see AGENTS.md, which says so in those terms rather than
+# claiming more. check_network()'s ping/showmount are NOT on it, only because
+# they sit behind MACKAS_USE_NFS_MIRRORS=1 and no test enables it; add them
+# here and in tests/mock/bin the day one does.
+#
+# Off under MACKAS_REAL_RUNTIME=1, where the opt-in suites want the real tools.
 guard_log=""
 if [ "${MACKAS_REAL_RUNTIME:-}" != "1" ]; then
 	guard_dir="$(mktemp -d "${TMPDIR:-/tmp}/mackas-hermetic.XXXXXX")"
@@ -60,16 +70,24 @@ if [ "${MACKAS_REAL_RUNTIME:-}" != "1" ]; then
 	trap 'rm -rf "$guard_dir"' EXIT
 	guard_log="$guard_dir/calls"
 	mkdir -p "$guard_dir/bin"
-	cat > "$guard_dir/bin/container" <<-SH
-		#!/bin/sh
-		printf '%s\n' "\$*" >> "$guard_log"
-		exit 1
-	SH
-	chmod +x "$guard_dir/bin/container"
+	for guard_tool in container curl mdfind diskutil; do
+		cat > "$guard_dir/bin/$guard_tool" <<-SH
+			#!/bin/sh
+			printf '$guard_tool %s\n' "\$*" >> "$guard_log"
+			exit 1
+		SH
+		chmod +x "$guard_dir/bin/$guard_tool"
+	done
 	PATH="$guard_dir/bin:$PATH"
 	# Named so tests/fixtures/hermeticity-breach.bats can call THIS and never
 	# risk a real binary; hermetic.bats drives that file through here.
 	export MACKAS_TEST_HERMETIC_RECORDER="$guard_dir/bin/container"
+else
+	# Never inherit the name of an OUTER run's recorder: hermetic.bats runs
+	# this script nested, and a stale value would tell the breach fixture it
+	# had a safe `container` to call when this run planted none -- reddening
+	# the outer run for a breach that was the point of the inner one.
+	unset MACKAS_TEST_HERMETIC_RECORDER
 fi
 
 hdr "shellcheck"
@@ -79,7 +97,7 @@ if command -v shellcheck >/dev/null 2>&1; then
 	# `A && B || C`) that older ones do not, and an info note must not flip a
 	# clean run to a failure on one machine but not another.
 	if shellcheck --severity=warning -s bash mackas bin/docker run-tests.sh \
-		tests/mock/container tests/mock/bin/container; then
+		tests/mock/container tests/mock/bin/*; then
 		echo "shellcheck: clean"
 	else
 		echo "shellcheck: FAILED" >&2
@@ -152,8 +170,8 @@ else
 fi
 
 if [ -n "$guard_log" ] && [ -s "$guard_log" ]; then
-	echo "hermeticity: FAILED -- a test reached a container CLI past tests/mock/bin's stub:" >&2
-	sort -u "$guard_log" | sed 's/^/    container /' >&2
+	echo "hermeticity: FAILED -- a test reached a real host tool past tests/mock/bin's stubs:" >&2
+	sort -u "$guard_log" | sed 's/^/    /' >&2
 	rc=1
 fi
 

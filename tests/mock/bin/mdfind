@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# The `mdfind` every hermetic bats file gets, alongside this directory's
+# `container` stub.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Measured before it existed: one `./run-tests.sh` made 66 real Spotlight
+# queries for kMDItemFSName == 'volume.img', from adopt.bats and the `check`
+# rungs in volumes_cmd.bats, volume_dirty_bit.bats, config.bats and
+# check_status_daemon_down.bats. Those answers come from whatever the host
+# happens to have indexed, so a stray volume.img anywhere on a developer's
+# machine could change what a test saw -- a hermeticity hole and a
+# reproducibility one at the same time.
+#
+# Answers "Spotlight found nothing": no output, exit 0, exactly like the real
+# mdfind on a query that matches no file. A test that wants a hit sets
+# MACKAS_MDFIND to its own script, which mackas prefers over PATH.
+
+exit 0
