@@ -418,6 +418,14 @@ def render(state, ctx):
         failed = state.get("failed_count") or 0
         if failed and status == "building":
             line += f"  ({failed} failed so far)"
+        # bridge_restarts is normally 0 for the whole build; nonzero means
+        # the bridge's own HTTP server thread crashed and came back (see
+        # mackasjson.py's _serve_forever_resilient) -- surface it rather
+        # than let a recovered bridge look identical to one that never had
+        # a problem.
+        restarts = state.get("bridge_restarts") or 0
+        if restarts:
+            line += f"  (bridge restarted {restarts}x)"
 
     changed = line != ctx["last_line"]
     if ctx["is_tty"]:

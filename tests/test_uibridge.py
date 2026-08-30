@@ -19,9 +19,11 @@
 # named setscene failures would accuse innocent recipes on a perfectly healthy
 # build, which is worse than saying nothing.
 
+import contextlib
 import http.client
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -105,6 +107,7 @@ class BridgeTestCase(unittest.TestCase):
             "failed_count": 0,
             "task_progress": [],
             "recent_events": [],
+            "bridge_restarts": 0,
         })
         # The sub-task progress pidmaps are module globals too, and a pid
         # left over from a previous test would attribute the next test's
@@ -1042,6 +1045,70 @@ class TerminalLingerDefaultsTest(BridgeTestCase):
         # what counts as terminal -- catch it here, fast and unconditional.
         self.assertEqual(bridge.TERMINAL_LINGER_SECONDS, 5.0)
         self.assertEqual(bridge.TERMINAL_STATUSES, ("success", "failed"))
+
+
+class DoGetSurvivesAClientThatGivesUpTest(BridgeTestCase):
+    """A real incident: a poller giving up mid-response (mackas-monitor's own
+    2.0s REQUEST_TIMEOUT can do exactly this) made self.wfile.write() raise
+    BrokenPipeError inside do_GET(), which used to reach socketserver's own
+    handle_error path. Pinned without a real socket -- constructing a bare
+    _Handler via __new__ and a wfile stand-in that always raises reproduces
+    the write failure deterministically, at whichever point in the response
+    it first occurs (headers or body -- both go through self.wfile.write)."""
+
+    class _RaisingWfile:
+        def write(self, data):
+            raise BrokenPipeError("[Errno 32] Broken pipe")
+
+    def _handler(self):
+        h = bridge._Handler.__new__(bridge._Handler)
+        h.path = "/"
+        h.request_version = "HTTP/1.1"
+        h.requestline = "GET / HTTP/1.1"
+        h.wfile = self._RaisingWfile()
+        return h
+
+    def test_a_broken_pipe_mid_response_does_not_propagate(self):
+        self._handler().do_GET()  # must not raise
+
+    def test_a_broken_pipe_is_reported_on_stderr(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            self._handler().do_GET()
+        self.assertIn("client disconnected", buf.getvalue())
+
+
+class ServeForeverResilientTest(BridgeTestCase):
+    """serve_forever() returning at all -- other than via main()'s own
+    httpd.shutdown() at build end -- means the bridge has gone dark for
+    whatever ran it. The wrapper must restart it, count the restart in
+    served state, and never let the exception escape the thread."""
+
+    class _FlakyServer:
+        def __init__(self, fail_times):
+            self.fail_times = fail_times
+            self.calls = 0
+
+        def serve_forever(self):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise RuntimeError("boom %d" % self.calls)
+            return  # stands in for a real shutdown()
+
+    def test_restarts_after_a_crash_and_counts_it(self):
+        srv = self._FlakyServer(fail_times=2)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            bridge._serve_forever_resilient(srv)
+        self.assertEqual(srv.calls, 3)
+        self.assertEqual(bridge._state["bridge_restarts"], 2)
+        self.assertIn("restarting", buf.getvalue())
+
+    def test_a_clean_return_never_counts_as_a_restart(self):
+        srv = self._FlakyServer(fail_times=0)
+        bridge._serve_forever_resilient(srv)
+        self.assertEqual(srv.calls, 1)
+        self.assertEqual(bridge._state["bridge_restarts"], 0)
 
 
 if __name__ == "__main__":
