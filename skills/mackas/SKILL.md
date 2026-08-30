@@ -630,7 +630,59 @@ unconditionally, so for one-off commands there is no flag to remember or to get
 wrong. Full mechanism:
 [architecture.md](../../docs/architecture.md#-k-bundles-five-steps-and-dropping-it-resets-repos).
 
-### When it is needed: sibling layers with local-only commits
+### Decide with this procedure, not from memory
+
+The two failure modes below pull in opposite directions, and both are silent.
+Do not decide from habit or from what the last build in this shell needed —
+the answer depends on **this** composition, and it is cheap to check.
+
+**Step 1 — list the repos this composition declares.**
+
+```sh
+mackas dump                     # writes $MACKAS_LOGS/dump-<timestamp>.yml
+```
+
+Read the `repos:` block of that file. kas only checks out or patches repos it
+declares, so a layer that is merely present under `work/` but absent from this
+block cannot be touched by this build, whatever flags you pass.
+
+**Step 2 — for each declared repo, ask whether it carries local-only commits.**
+
+```sh
+git -C "$MACKAS_BASE/work/<repo>" log --oneline @{u}..HEAD
+```
+
+Non-empty output means that repo is **at risk**: kas resets clean repos to the
+configured branch head, and commits do not protect a repo the way uncommitted
+tracked changes do.
+
+**Step 3 — read the answer off this table. Do not interpolate.**
+
+| Local-only commits? | Touching `patches:`? | Do this |
+|---|---|---|
+| no | no | **no `--skip` flags** |
+| no | yes | **no `--skip` flags** |
+| yes | no | `--skip repos_checkout --skip repos_apply_patches` |
+| yes | yes | **conflict — resolve it, do not guess** (below) |
+
+The last row is a genuine conflict: the pair is what protects your commits, and
+also what blocks the new patch. Resolve it explicitly — land the patch by
+building once without the flags and re-applying your commits afterwards, or
+carry the change as a commit in the repo instead of a `patches:` entry. Do not
+run the build hoping one of the two wins.
+
+**Step 4 — if a `patches:` entry was involved at all, verify it applied.**
+Mandatory, not advisory: a suppressed patch fails with the *original pre-patch
+error*, which is indistinguishable from the patch being wrong.
+
+```sh
+grep 'Patch applied.*<your patch file name>' <build log>
+```
+
+No match means the patch did not apply, whatever else the log says. The same
+blind spot applies to `mackas exec`, which always skips that step.
+
+### Why: kas resets clean repos, and commits do not protect them
 
 **kas force-resets clean repos to the configured branch head at build start.**
 This is kas behaviour, not mackas's. Uncommitted modified *tracked* files
@@ -644,8 +696,7 @@ moment ago and protected the build is, the instant you `git commit` or `git am`
 that fix, clean-but-ahead — and clean-but-ahead is not protected. A freshly
 `git am`'d fix survives *zero* `kas-container` invocations before being reset,
 with no error and no warning beyond an easy-to-miss "Repository X checked out
-to `<old sha>`" log line. **Pass the pair proactively while any repo in the
-composition carries local-only commits — do not wait to notice the loss.**
+to `<old sha>`" log line.
 
 ```sh
 cd "$MACKAS_BASE/work"
@@ -666,11 +717,7 @@ effect under `-k`. Use the explicit `--skip` pair, which is surgical. A
 hand-typed `kas-container ... -k ...` through `env.sh` now prints a one-line
 stderr heads-up about this rather than staying silent about it.
 
-### When it backfires: blocking fresh patches
-
-**Only pass the `--skip` pair when the *active* composition actually includes a
-repo that needs it. Do not carry it over reflexively from other work in the same
-session.**
+### Why: the pair also blocks patches you *want*
 
 `--skip repos_apply_patches` does not only protect already-patched repos from
 re-patching: it blocks kas from applying **any** `patches:` block for **every**
@@ -680,17 +727,8 @@ Observed failure mode: after adding a new `patches:` entry for a repo with no
 local commits, building with the habitual `--skip` pair silently used the
 *pristine, unpatched* checkout. The patch was simply never applied, and bitbake
 failed with exactly the original pre-patch error — **indistinguishable from "the
-patch doesn't work"**, with no hint the skip flags were the cause.
-
-kas only resets/patches repos actually declared in the *composed* config's
-`repos:` block, so a fragment that never pulls in a given layer was not going to
-touch it regardless — the pair buys no protection there and costs the new patch.
-Check which repos the current composition declares before deciding whether
-`--skip` is needed at all. **After adding a `patches:` entry, do at least one
-build with no `--skip` flags** (or grep the log for
-`Patch applied.*<new patch name>`) to confirm it really applied before trusting
-the result. The same blind spot applies to `mackas exec`, which always skips
-that step.
+patch doesn't work"**, with no hint the skip flags were the cause. That is why
+step 4 is mandatory rather than a suggestion.
 
 (For what a `patches:` entry looks like in practice, meta-angstrom's
 `kas/angstrom.yml` on `wrynose` carries one against `openembedded-core`, sourced
