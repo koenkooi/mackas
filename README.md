@@ -472,7 +472,19 @@ refused outright if it fails — deliberately stricter than `--config`, which
 is exempt. mackas derives the `--project` path itself from a bare name in a
 fixed, guessable place; a path you typed is a request, a path mackas guessed
 is an ambush surface. Names are validated before they become a path: no path
-separators, no `..`, no leading `-`, letters/digits/`.`/`_`/`-` only.
+separators, no `..`, no leading `-`, letters/digits/`.`/`_`/`-` only. When
+`mackas set` has to create `~/.config/mackas/projects/` it does so at mode
+`700` regardless of your umask, so a `umask 002` login cannot produce a
+directory the same check then refuses.
+
+`mackas --project NAME setup` also bakes the selector into the generated
+`kas-container` wrapper. The wrapper recomputes `--runtime-args` on every
+call, and it replays `NAME` into that recompute — so a hand-typed
+`kas-container build ...` gets the volumes belonging to the project whose
+work dir and gitconfig the wrapper was built with, not whatever the default
+search path happens to find. The selector is passed explicitly even when
+empty, so an exported `$MACKAS_PROJECT_SELECT` cannot re-aim one project's
+wrapper at another project's volumes.
 
 Every setting is also an environment variable of the same name, and
 `--set NAME=VALUE` overrides both for the one command it rides along with.
