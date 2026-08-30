@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#
+# The `container` every hermetic bats file gets: helpers.bash puts this
+# directory at the front of PATH, so a test that forgets its own fake still
+# cannot reach a dev Mac's real /opt/homebrew/bin/container.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Without this the suite was hermetic only on a machine with no runtime
+# installed (CI). On a dev Mac `mackas status`/`check`/`setup` reached the
+# real CLI from cli.bats, setup_kas_container.bats, volumes.bats and
+# workspace_attach.bats -- harmless while the daemon answers, but a wedged
+# apiserver makes every client call block forever and the whole suite hangs
+# with no child process to point at.
+#
+# It answers as "CLI installed, daemon not running": every probe fails and
+# nothing is listed. That is what mackas already sees on CI, so it changes no
+# expectation. A test needing a different answer writes its own fake and
+# prepends that, which still wins.
+#
+# MACKAS_TEST_CONTAINER_LOG, when set, collects one line per call; only
+# hermetic.bats uses it, to prove mackas really lands here.
+
+if [ -n "${MACKAS_TEST_CONTAINER_LOG:-}" ]; then
+	printf '%s\n' "$*" >> "$MACKAS_TEST_CONTAINER_LOG" 2>/dev/null || true
+fi
+
+exit 1

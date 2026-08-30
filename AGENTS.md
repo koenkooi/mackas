@@ -26,7 +26,7 @@ break by accident.
   progress as JSON over HTTP; `bitbake` is a wrapper bind-mounted directly over
   the checkout's own `bin/bitbake` for the lifetime of one container run (a
   PATH shadow does not work — see the file's own header for why).
-- `tests/` — 38 `*.bats` files + 7 `test_*.py` files.
+- `tests/` — 40 `*.bats` files + 7 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security, monitor-app.
 - `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to
@@ -61,7 +61,15 @@ make pytest        # the Python unittest suite only
 ```
 
 The suite is **hermetic** — no `container` runtime, no network, no sudo, no real
-build — so it runs anywhere. The four exceptions — `tests/real_runtime.bats`
+build — so it runs anywhere. The runtime half of that is *enforced*, not merely
+intended: mackas resolves the `container` CLI through `PATH`, so
+`tests/helpers.bash` puts a stub (`tests/mock/bin/container`, answering "CLI
+installed, daemon not running") at the front of `PATH` for every file except the
+opt-in ones below. Do not remove it — before it existed, any test running
+`mackas status`/`check`/`setup` without planting its own fake reached a dev Mac's
+real binary, and a wedged daemon hung the entire run. A test that needs specific
+answers still prepends its own fake, which wins. `tests/hermetic.bats` guards all
+of this. The four exceptions — `tests/real_runtime.bats`
 (real Apple `container`), `tests/volume_resize_real.bats` (real volume grow),
 `tests/diskmon_real.bats` (real bitbake driving a volume near-full) and
 `tests/workspace_image_real.bats` (real `hdiutil`) — self-skip unless
@@ -123,6 +131,9 @@ a partial run.
   know it can. Several tests here were once vacuous.
 - **Never `grep -qv PATTERN` to assert absence** — it passes on any multi-line
   input. Use `! ... | grep -q PATTERN`.
+- **Every bats file starts with `load helpers`**, including one that needs
+  nothing else from it: that is what installs the `container` stub, and
+  `tests/hermetic.bats` fails on a file that skips it.
 - Logic guarded by `set -e` that bats cannot trigger should be covered by a
   **source-grep** test instead of pretending a runtime test exercises it.
 - The shim ↔ kas contract is pinned by a recorded argv fixture keyed to
