@@ -86,6 +86,12 @@ reversible), then presents `externalActions` (GitHub comments, closes, any
 other outward-facing change) to the user as a plain list before running
 any of them for real.
 
+## Check every stage, not just the end
+
+An empty result is ambiguous by default, and that ambiguity is the failure mode this pattern is most prone to: `{ localEdits: [] }` reads identically whether every topic was researched and genuinely needed no change, or every research agent came back empty and nothing was ever looked at. Count both stages explicitly and hand the counts back with the results.
+
+The rules the skeleton below encodes: a research slot only counts as usable if it actually carries the text the agent claims to have read (`text_seen`); zero usable slots is a hard failure, not an empty result set; a partially-filled run is reported as `PARTIAL` with the missing topic ids named, never quietly downgraded to "nothing to change"; the same for integration batches. The workflow's return value carries one `verdict` field -- `COMPLETE` or `PARTIAL` -- so the orchestrating turn has a single thing to branch on rather than having to re-derive it from array lengths.
+
 ## Known gotcha: pass data as script literals, not via `args`
 
 The `Workflow` tool's `args` parameter does not reliably reach the script —
@@ -136,6 +142,12 @@ const researched = await pipeline(topics, (t) =>
   agent(`Research: ${t.focus}\n\nFirst read the CURRENT real text yourself (do not trust anything pre-supplied). Then do REAL online research -- web search, fetch real pages, clone+read real source if useful (remove the clone after). Be honest if nothing changed.`,
     { schema: RESEARCH_SCHEMA, model: 'haiku', phase: 'Research', label: 'research:' + t.id }))
 
+// Checkpoint 1. A slot with no text_seen means that topic was never actually
+// researched; without this the miss disappears into an empty localEdits later.
+const researchMissing = topics.filter((t, i) => !(researched[i] && researched[i].text_seen)).map((t) => t.id)
+if (researchMissing.length === topics.length)
+  throw new Error(`RESEARCH FAILED: 0/${topics.length} topics returned usable output`)
+
 phase('Integrate')
 const byId = {}
 topics.forEach((t, i) => { byId[t.id] = { topic: t, research: researched[i] } })
@@ -151,12 +163,22 @@ const integrated = await pipeline(batches, (batchIds) => {
     { schema: INTEGRATE_SCHEMA, model: 'opus', effort: 'high', phase: 'Integrate', label: 'integrate:' + batchIds.join('+') })
 })
 
+// Checkpoint 2, same rule one stage later.
+const integrateMissing = batches.filter((b, i) => !integrated[i]).map((b) => b.join('+'))
+if (integrateMissing.length === batches.length)
+  throw new Error(`INTEGRATION FAILED: 0/${batches.length} batches returned`)
+
 const localEdits = integrated.filter(Boolean).flatMap((r) => r.localEdits || [])
 const externalActions = integrated.filter(Boolean).flatMap((r) => r.externalActions || [])
-return { localEdits, externalActions }
+return {
+  verdict: researchMissing.length || integrateMissing.length ? 'PARTIAL' : 'COMPLETE',
+  counts: { topics: topics.length, researched: topics.length - researchMissing.length,
+            batches: batches.length, integrated: batches.length - integrateMissing.length,
+            localEdits: localEdits.length, externalActions: externalActions.length },
+  researchMissing, integrateMissing, localEdits, externalActions,
+}
 ```
 
-After the workflow returns: apply `localEdits` yourself (read each target
-file fresh, apply the edit, re-verify — don't trust line numbers from
-research that ran minutes ago), then list `externalActions` for the user
-before running any of them.
+After the workflow returns, read `verdict` before anything else. `PARTIAL` means the topics in `researchMissing`/`integrateMissing` were never covered -- report them as unresearched, never as "nothing to change". A thrown error means the run produced nothing and there is nothing to apply.
+
+Apply `localEdits` one at a time, each with its own check: read the target file fresh (never trust a line number from research that ran minutes ago), confirm the text the edit anchors on is still there verbatim, apply, and confirm it landed. An edit whose anchor no longer matches is a FAILED edit, not a skipped one -- name it in the final report alongside the count of edits that did apply. Then list `externalActions` for the user before running any of them.

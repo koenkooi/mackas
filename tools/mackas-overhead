@@ -59,6 +59,14 @@ HONEST CAVEATS (printed in the summary too)
     not guessed.
   * RSS across VM + daemons can double-count shared pages; treat host RSS as an
     upper bound on private footprint.
+
+EXIT STATUS
+  0  a real host process set was sampled (and, with --buildstats, the guest
+     side parsed and the two windows matched)
+  2  nothing usable was measured -- no matching host process during the whole
+     window, or a --buildstats comparison that was asked for and could not be
+     made. A zeroed report is otherwise indistinguishable from a real
+     measurement of an idle machine.
 """
 import argparse, json, os, re, signal, subprocess, sys, time
 
@@ -274,6 +282,7 @@ class Sampler:
             "host": {
                 "wall_s": round(wall, 1),
                 "samples": self.n_samples,
+                "matched_pids": len(self.last_cpu),
                 "interval_s": self.interval,
                 "peak_rss_mb": round(peak_rss / 2**20, 1),
                 "mean_rss_mb": round(mean_rss / 2**20, 1),
@@ -328,8 +337,8 @@ def human(out):
     h = out["host"]
     L = []
     L.append("=== mackas host-side overhead ===")
-    L.append("wall %.0fs  samples=%d  interval=%ss"
-             % (h["wall_s"], h["samples"], h["interval_s"]))
+    L.append("wall %.0fs  samples=%d  interval=%ss  matched pids=%d"
+             % (h["wall_s"], h["samples"], h["interval_s"], h["matched_pids"]))
     L.append("host RSS  peak %.1f MB  mean %.1f MB   (VM + container daemons)"
              % (h["peak_rss_mb"], h["mean_rss_mb"]))
     L.append("host CPU  %.1f CPU-seconds consumed during window" % h["cpu_s"])
@@ -376,9 +385,11 @@ def main():
         procs = snapshot(args.pattern)
         if not procs:
             print("dry-run: NO matching host processes (no container running?)")
+            return 2
         for pid, d in sorted(procs.items()):
             print("  pid %-6d %-32s rss=%.1fMB cpu=%.1fs"
                   % (pid, d["comm"], d["rss"] / 2**20, d["cpu"]))
+        print("dry-run: %d matching host processes" % len(procs))
         return 0
 
     jsonl = open(args.jsonl, "a") if args.jsonl else None
@@ -395,14 +406,29 @@ def main():
     if jsonl:
         jsonl.close()
 
+    rc = 0
     guest = guest_cpu_seconds(args.buildstats)
+    if args.buildstats and guest is None:
+        print("mackas-overhead: error: --buildstats %s holds no parsable task "
+              "files; no guest comparison was made" % args.buildstats,
+              file=sys.stderr)
+        rc = 2
     out = s.summary(guest)
+    if not s.last_cpu:
+        # Zeros here are not "the host was idle" -- nothing was ever matched,
+        # so there is no measurement at all behind the numbers below.
+        print("mackas-overhead: error: no host process matched the pattern "
+              "during the sampling window; nothing was measured",
+              file=sys.stderr)
+        rc = 2
+    elif "unavailable" in out.get("overhead", {}):
+        rc = 2
     if args.json:
         json.dump(out, sys.stdout, indent=1)
         print()
     else:
         print(human(out))
-    return 0
+    return rc
 
 
 if __name__ == "__main__":

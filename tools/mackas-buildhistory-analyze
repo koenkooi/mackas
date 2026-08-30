@@ -220,20 +220,33 @@ def batch_cat_file(path, refs):
     idx = 0
     n = len(data)
     for ref in refs:
-        nl = data.index(b"\n", idx)
+        # Every failure below means the stream desynced, which silently
+        # mis-assigns every blob after it -- a wrong report, not a partial
+        # one. Fail loudly instead.
+        nl = data.find(b"\n", idx)
+        if nl < 0:
+            raise GitError("git cat-file --batch output ended mid-stream at %s"
+                            % ref)
         header = data[idx:nl].decode(errors="replace")
         idx = nl + 1
         parts = header.split()
         if len(parts) >= 2 and parts[-1] == "missing":
             out[ref] = None
             continue
-        size = int(parts[2])
+        try:
+            size = int(parts[2])
+        except (IndexError, ValueError):
+            raise GitError("unparsable git cat-file --batch header %r for %s"
+                            % (header, ref))
         content = data[idx:idx + size]
+        if len(content) != size:
+            raise GitError("git cat-file --batch returned %d of %d bytes for %s"
+                            % (len(content), size, ref))
         idx += size + 1  # +1: cat-file --batch always appends one \n
         out[ref] = content.decode(errors="replace")
     if idx != n:
-        # Tolerate trailing noise rather than crash a report over it.
-        pass
+        raise GitError("git cat-file --batch left %d unread bytes after %d refs"
+                        % (n - idx, len(refs)))
     return out
 
 
@@ -246,7 +259,10 @@ def ls_tree_paths(path, rev, prefix):
     r = run_git(path, ["ls-tree", "-r", "--name-only", "-z", rev, "--",
                         prefix])
     if r.returncode != 0:
-        return []
+        # A prefix that matches nothing still exits 0 with empty output, so a
+        # non-zero status is a real failure -- swallowing it would report
+        # "0 unchanged recipes" as if it were a measurement.
+        raise GitError("git ls-tree failed for %s at %s" % (prefix, rev))
     out = r.stdout.decode(errors="replace").split("\x00")
     return [p for p in out if p]
 
