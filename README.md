@@ -284,9 +284,15 @@ the `.siginfo` files second, so a consumer reading the mirror mid-push never
 finds a signature whose object is missing. Nothing is ever sent with
 `--inplace`; published objects are immutable and the first writer wins, which
 is also why two machines pushing at once need no locking. The stamp advances
-only after rsync exits clean, so an interrupted push simply re-offers the same
-objects next time, and a lost stamp costs a full rescan rather than a wrong
-result.
+only after rsync exits clean — and only when the scan that produced it
+provably ran and provably matched nothing, so a probe that broke costs a
+rescan rather than silently dropping objects below the cutoff. An interrupted
+push simply re-offers the same objects next time.
+
+The cutoff is mtime, and bitbake touches an sstate object every time it
+*reuses* one, so a push offers what recent builds wrote **or reused**. It
+never misses; it does mean the staging directory wants room for the reuse
+set, not just the new one.
 
 **Push before you prune.** Once an object is on the mirror, pruning it locally
 downgrades from "forced rebuild" to "HTTP refetch".
