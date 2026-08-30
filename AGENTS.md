@@ -61,18 +61,32 @@ make pytest        # the Python unittest suite only
 ```
 
 The suite is **hermetic** — no `container` runtime, no network, no sudo, no real
-build — so it runs anywhere. The runtime half of that is *enforced*, not merely
-intended: mackas resolves the `container` CLI through `PATH`, so
-`tests/helpers.bash` puts a stub (`tests/mock/bin/container`, answering "CLI
-installed, daemon not running") at the front of `PATH` for every file except the
-opt-in ones below. Do not remove it — before it existed, any test running
-`mackas status`/`check`/`setup` without planting its own fake reached a dev Mac's
-real binary, and a wedged daemon hung the entire run. A test that needs specific
-answers still prepends its own fake, which wins. `tests/hermetic.bats` guards
-all of this from inside a bats file; `run-tests.sh` guards what a bats file
-cannot see out to, planting a recording `container` behind the stub and failing
-the run if anything called it. The four exceptions — `tests/real_runtime.bats`
-(real Apple `container`), `tests/volume_resize_real.bats` (real volume grow),
+build — so it runs anywhere.
+
+**What is actually enforced, and only this:** mackas resolves four host tools by
+bare name — `container`, `curl`, `mdfind` and `diskutil` — and those four are
+stubbed for every file except the opt-in ones below. `tests/helpers.bash` puts
+`tests/mock/bin` at the front of `PATH` *and* points `MACKAS_BREW_BIN` at it,
+because mackas prepends a Homebrew bin dir to the `PATH` of every child it
+launches and a hardcoded one outranked the stub inside that child. Do not remove
+either half — before they existed, one run made 114 calls to a dev Mac's real
+`container` (a wedged daemon then hung the entire run), 9 real HTTPS requests to
+`ghcr.io`, 66 Spotlight queries and 24 `diskutil` reads of the host's disks. A
+test that needs specific answers still prepends its own fake, which wins.
+`tests/hermetic.bats` guards this from inside a bats file; `run-tests.sh` guards
+what a bats file cannot see out to, planting recorders behind the stubs and
+failing the run if anything called them. Nothing enforces the rest of the claim
+— the suite reads the host filesystem freely and scratches in `/tmp` — so treat
+"no sudo, no real build" as discipline, not a guarantee, and extend the guard
+rather than the claim if that changes.
+
+Note the `container` stub presents "CLI on `PATH`, nothing answering", which is
+**not** what CI presents (CI has no `container` at all) and mackas branches
+differently on the two; `hermetic.bats` covers the CLI-absent branch outright
+rather than leaving it to whichever machine happens to run the suite.
+
+The four exceptions — `tests/real_runtime.bats` (real Apple `container`),
+`tests/volume_resize_real.bats` (real volume grow),
 `tests/diskmon_real.bats` (real bitbake driving a volume near-full) and
 `tests/workspace_image_real.bats` (real `hdiutil`) — self-skip unless
 `MACKAS_REAL_RUNTIME=1`; they are dev-Mac-only and never CI-gated, and each

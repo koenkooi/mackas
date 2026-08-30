@@ -75,23 +75,41 @@ no-dependencies rule). `make pytest` runs just the Python half.
 ### Hermetic by default
 
 **Nothing in the default suite touches the real Apple `container` runtime,
-the build SSD, the network, sudo, NFS, or any mirror host.** The seams that
-make that possible:
+the build SSD, the network, sudo, NFS, or any mirror host.** For the four
+host tools mackas resolves by bare name that could reach any of those —
+`container`, `curl`, `mdfind` and `diskutil` — that is *enforced*, not merely
+intended, and it is exactly those four: nothing stops a test from reading the
+host filesystem, and the suite's own scratch dirs live under `/tmp`. The
+seams that make it work:
 
-- `tests/helpers.bash` puts `tests/mock/bin` — holding a stub `container`
-  that answers "CLI installed, daemon not running" — at the front of `PATH`
-  for every file except the four opt-in real-runtime suites, so mackas
-  cannot resolve a dev Mac's real binary even from a test that plants no
-  fake of its own. This is load-bearing rather than belt-and-braces: mackas
-  finds the runtime CLI through `PATH`, so before the stub existed `mackas
-  status`/`check`/`setup` in `cli.bats`, `setup_kas_container.bats`,
-  `volumes.bats` and `workspace_attach.bats` all called the real thing —
-  invisible while the daemon answered, and a whole-suite hang with no child
-  process to blame once its apiserver wedged and every client call started
-  blocking forever. `tests/hermetic.bats` fails if the guard slips, and
-  `run-tests.sh` plants a second, recording `container` behind the stub so a
-  whole run fails outright if any test got past it — the shape hermetic.bats
-  cannot see, since it can only look out from inside its own file;
+- `tests/helpers.bash` puts `tests/mock/bin` at the front of `PATH` for every
+  file except the four opt-in real-runtime suites, so mackas cannot resolve a
+  real one even from a test that plants no fake of its own. Each stub fails
+  closed (`mdfind` reports "found nothing", the other three exit non-zero);
+  the `container` one deliberately presents a state no real machine does —
+  CLI on `PATH`, nothing answering — so every machine sees the same thing.
+  Note that is *not* the CLI-ABSENT state CI used to present, and mackas
+  branches differently on the two; `tests/hermetic.bats` covers the absent
+  branch outright rather than leaving it to whichever machine runs the suite.
+- `helpers.bash` also points `MACKAS_BREW_BIN` at the same directory, because
+  mackas prepends a Homebrew bin dir to the `PATH` of every child it launches
+  (kas-container needs GNU realpath ahead of `/usr/bin`'s). Hardcoded, that
+  dir outranked the stub *inside the child* — the one code path the stub
+  exists to shadow, and one no bats file can see out to.
+
+  This is load-bearing rather than belt-and-braces. Measured on a single
+  `./run-tests.sh` before the stubs: 114 calls to a dev Mac's real
+  `/opt/homebrew/bin/container` from `mackas status`/`check`/`setup` in
+  `cli.bats`, `setup_kas_container.bats`, `volumes.bats` and
+  `workspace_attach.bats` — invisible while the daemon answered, and a
+  whole-suite hang with no child process to blame once its apiserver wedged
+  and every client call started blocking forever — plus 9 real HTTPS requests
+  to `ghcr.io`, 66 Spotlight queries whose answers depended on what the host
+  had indexed, and 24 `diskutil info` reads of the host's boot volume.
+  `tests/hermetic.bats` fails if the guard slips, and `run-tests.sh` plants
+  recorders for all four behind the stubs so a whole run fails outright if
+  any test got past them — the shape hermetic.bats cannot see, since it can
+  only look out from inside its own file;
 - the shim tests inject a mock `container` via `MACKAS_CONTAINER_BIN` that
   echoes its argv, which makes flag translation fully assertable with no VM;
 - command-level tests run against a fake `kas-container` (and fake
@@ -111,7 +129,7 @@ make that possible:
 | `tests/kas_argv_replay.bats` | The *kas half* of the shim contract: the real `docker` argv kas-container 5.5 issues (recorded in `tests/fixtures/kas-container-5.5.argv`) replayed through the shim, asserting no dropped flag reaches `container`, no hard-fail fires, the IMAGE boundary forwards verbatim, and every `-v`/`-e` value survives. A guard test fails if the pinned `KAS_CONTAINER_VERSION` has no matching fixture. |
 | `tests/config.bats` | Precedence: defaults < config file < env < `--set`. Search order, spaces in values. |
 | `tests/cli.bats` | `--help`, `--version`, unknown command/option exit codes, flag placement, `--dry-run` mutating nothing. |
-| `tests/hermetic.bats` | The hermeticity guarantee itself: `container` on `PATH` resolves to `tests/mock/bin`'s stub, a real binary planted later on `PATH` is never called by `mackas status`, every bats file `load helpers` (so none can miss the stub), and the files exempted from it are exactly those that self-skip without `MACKAS_REAL_RUNTIME=1`. Plus the two halves no ordinary test reaches: helpers' exemption branch, sourced with the filename faked, must stub an unknown name and exempt only the named ones; and `run-tests.sh`'s whole-run recorder must actually redden a run, driven by `tests/fixtures/hermeticity-breach.bats` — a file outside `bats tests/`'s glob that drops the stub off `PATH` and calls `container` on purpose. |
+| `tests/hermetic.bats` | The hermeticity guarantee itself: all four of `container`/`curl`/`mdfind`/`diskutil` resolve to `tests/mock/bin`'s stubs, recorders planted *directly behind* that directory are never called by `mackas status` (behind it, not at the end of `PATH`, or the assertion would be vacuous on every machine that has a real tool earlier — i.e. every dev Mac), every bats file `load helpers` (so none can miss the stubs), and the files exempted are exactly those that self-skip without `MACKAS_REAL_RUNTIME=1`. Plus the halves no ordinary test reaches: the Homebrew dir mackas prepends inside its children, proved to be `MACKAS_BREW_BIN` by aiming it at a `container` of its own and then showing helpers' value lands on the stub instead; the CLI-ABSENT branch, which the stub no longer presents on any machine; helpers' exemption branch, sourced with the filename faked, which must stub an unknown name and exempt only the named ones; and `run-tests.sh`'s whole-run recorder, which must redden a run when breached and — under `MACKAS_REAL_RUNTIME=1`, where it is deliberately not planted — must not. The breach is driven by `tests/fixtures/hermeticity-breach.bats`, a file outside `bats tests/`'s glob that drops the stub off `PATH` and calls `container` on purpose. |
 | `tests/units.bats` | Pure helpers (`size_to_gb`, `nearest_existing_dir`, `derive_paths`, …), sourced via `MACKAS_LIB_ONLY=1`. |
 | `tests/mirrors.bats` | The generated mirror stanza: `downloadfilename=` on `http://` and not on `file://`, custom URLs, the both-enabled conflict. |
 | `tests/volumes.bats` | The `--runtime-args` string (`-c`/`-m`, each `-v vol:/path -e VAR=/path`), and what `env.sh` must **not** say: no `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`, no `KAS_EXTRA_RUNTIME_ARGS`, no `BB_HASHSERVE_DB_DIR`. `BB_DISKMON_DIRS`'s *exact* multi-line form on disk (asserted as exact bytes, because substring matches cannot catch a mangled multi-line form), `BB_HASHSERVE_DB_DIR`, the generated gitconfig (`safe.directory = *`, never overwriting one the user already set), `clear_buildstats_before_build` (`MACKAS_BUILDSTATS_ACCUMULATE` gating, skipping a not-yet-created volume, a failure never failing the build), and the `kas-container` **function**'s `macos-local.yml` auto-append (from `work/` and from inside the checkout, extra kas args surviving the append, a boolean flag like `-k` between the subcommand and `<files>` still finding `<files>`, a value-taking flag like `--skip STEP` — including the `--x=y` single-token form and the exact multi-`--skip` sequence recommended as the repo-state-preserving alternative to `-k` — also still finding `<files>`, backing off untouched on a flag it truly does not recognize, no double-append when already named, `MACKAS_KAS_AUTO_FRAGMENT=0`, and no-op when no project is configured). Plus that function's `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation: from `work/` and from inside the checkout, the fragment never leaking into the derived config, deriving **nothing** for a sibling-spanning chain or a foreign cwd, still firing when no project is configured (the case it exists for), never overriding an already-set value, `MACKAS_KAS_AUTO_PROJECT=0`/`MACKAS_KAS_AUTO_FRAGMENT=0` honoured when exported *before* `env.sh` is sourced, the note printing once per shell, and zsh agreeing with bash. Plus that the function delegates to the `$KAS_CONTAINER_BIN` wrapper script exactly once per call, with `MACKAS_KAS_FRAGMENT_DONE=1` set and the file list (fragment already appended) forwarded unmodified, and a source-grep confirming `run_kas`/`kas_shell_ro` invoke `KAS_CONTAINER_REAL` directly, never `KAS_CONTAINER_BIN` — the wrapper is only ever meant to sit between a hand-typed invocation and `.real`, not between mackas's own commands and `.real`. The live `--runtime-args` recompute and its frozen fallback (issue #25) are deliberately **not** here: that logic moved out of the env.sh function into the generated `$KAS_CONTAINER_BIN` wrapper SCRIPT, and is covered by `tests/kas_wrapper.bats` (behaviour, against a fake `.real` recorder) and `tests/setup_kas_container.bats` (generation) — a plain argv-printing fake `kas-container` cannot exercise it. What this file still pins on that front is `kas_runtime_args()` itself: the `MACKAS_MONITOR=0`/`=1` bridge wiring (per-file `-v` mounts, never a whole-directory mount of `mackas-uibridge/`, `-p`/`MACKAS_MONITOR_PORT`, bitbake found under any checkout name, and each skip path — no work directory yet, no bitbake checkout yet — adding nothing to the args while saying on stderr that it did not, since silently ignoring an opt-in is the one outcome a user cannot diagnose), and that the `runtime-args` plumbing command prints exactly that function's value. |

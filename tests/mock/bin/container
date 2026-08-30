@@ -1,23 +1,34 @@
 #!/usr/bin/env bash
 #
 # The `container` every hermetic bats file gets: helpers.bash puts this
-# directory at the front of PATH, so a test that forgets its own fake still
-# cannot reach a dev Mac's real /opt/homebrew/bin/container.
+# directory at the front of PATH, and points MACKAS_BREW_BIN here too, so a
+# test that forgets its own fake cannot reach a dev Mac's real
+# /opt/homebrew/bin/container -- not even through the Homebrew dir mackas
+# prepends to its children's PATH.
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Without this the suite was hermetic only on a machine with no runtime
-# installed (CI). On a dev Mac `mackas status`/`check`/`setup` reached the
-# real CLI from cli.bats, setup_kas_container.bats, volumes.bats and
+# installed. On a dev Mac `mackas status`/`check`/`setup` reached the real CLI
+# from cli.bats, setup_kas_container.bats, volumes.bats and
 # workspace_attach.bats -- harmless while the daemon answers, but a wedged
 # apiserver makes every client call block forever and the whole suite hangs
 # with no child process to point at.
 #
-# It answers as "CLI installed, daemon not running": every probe fails and
-# nothing is listed. That is what mackas already sees on CI, so it changes no
-# expectation. A test needing a different answer writes its own fake and
-# prepends that, which still wins.
+# It fails closed: every call exits non-zero, `--version` included. mackas
+# reads that as "CLI on PATH, but nothing answers" -- deliberately a synthetic
+# state rather than an imitation of any particular machine. In particular it
+# is NOT what CI presents: CI has no `container` at all, so mackas takes its
+# CLI-ABSENT branch there (`ck_fail "'container' CLI not installed"`, which
+# returns before the daemon and kernel rungs), and this stub takes the
+# CLI-PRESENT one. Nothing in the suite asserted on that branch either way --
+# it was accidental coverage of whichever machine happened to run the tests --
+# so the stub trades it for the same answers everywhere; hermetic.bats covers
+# the CLI-absent branch outright now instead of leaving it to chance.
+#
+# A test needing different answers writes its own fake and prepends that,
+# which still wins.
 #
 # MACKAS_TEST_CONTAINER_LOG, when set, collects one line per call; only
 # hermetic.bats uses it, to prove mackas really lands here.

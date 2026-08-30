@@ -306,7 +306,7 @@ teardown() {
 	MACKAS_SHORT_LINK="/nonexistent-short-link-xyzzy"
 	derive_paths
 	out="$(kas_env_prefix)"
-	printf '%s\n' "$out" | grep -qF "PATH=$SHIM_DIR:/opt/homebrew/bin:\$PATH"
+	printf '%s\n' "$out" | grep -qF "PATH=$SHIM_DIR:$BREW_BIN:\$PATH"
 	printf '%s\n' "$out" | grep -qF "KAS_WORK_DIR=$MACKAS_WORK"
 	printf '%s\n' "$out" | grep -qF 'KAS_BUILD_DIR= DL_DIR= SSTATE_DIR='
 	printf '%s\n' "$out" | grep -qF "GITCONFIG_FILE=$MACKAS_GITCONFIG"
@@ -395,6 +395,17 @@ teardown() {
 			fi
 		done
 	done
+}
+
+@test "guard: the Homebrew PATH prepend has one seam and /opt/homebrew/bin as its only default" {
+	# mackas prepends this dir to the PATH of every child it launches, ahead of
+	# whatever the caller's own PATH resolved. A second hardcoded copy would
+	# reopen the hole tests/hermetic.bats closes by pointing MACKAS_BREW_BIN at
+	# the suite's stubs -- and would be invisible from inside a bats file,
+	# because it only bites in the child.
+	[ "$(grep -cF 'BREW_BIN="${MACKAS_BREW_BIN:-/opt/homebrew/bin}"' "$MACKAS")" -eq 1 ]
+	[ "$BREW_BIN" = "$MOCK_BIN" ]   # what helpers.bash sets it to, in-process
+	! grep -nE 'PATH=[^#]*/opt/homebrew/bin' "$MACKAS"
 }
 
 @test "guard: MACKAS_ROOT has no built-in disk-path default in the source" {
