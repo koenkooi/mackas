@@ -216,6 +216,32 @@ class RenderTest(unittest.TestCase):
         out = self._render(state, ctx)
         self.assertNotIn("failed", out)
 
+    def test_bridge_restarts_surfaces_when_nonzero(self):
+        # Normally 0 for the whole build; nonzero means the bridge's own
+        # HTTP server thread crashed and came back (mackasjson.py's
+        # _serve_forever_resilient) -- a recovered bridge must not look
+        # identical to one that never had a problem.
+        ctx = self._ctx()
+        state = {
+            "status": "building",
+            "current": {"recipe": "zlib", "task": "do_compile"},
+            "progress": {"done": 5, "total": 10},
+            "bridge_restarts": 2,
+        }
+        out = self._render(state, ctx)
+        self.assertIn("bridge restarted 2x", out)
+
+    def test_no_bridge_restart_note_when_it_never_happened(self):
+        ctx = self._ctx()
+        state = {
+            "status": "building",
+            "current": {"recipe": "zlib", "task": "do_compile"},
+            "progress": {"done": 5, "total": 10},
+            "bridge_restarts": 0,
+        }
+        out = self._render(state, ctx)
+        self.assertNotIn("restarted", out)
+
     def test_header_prints_once_not_on_every_poll(self):
         ctx = self._ctx()
         state = {

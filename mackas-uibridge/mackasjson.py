@@ -83,6 +83,7 @@
 import json
 import os
 import socketserver
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -144,6 +145,11 @@ _state = {
     # see _observe_task_progress and _publish_task_progress.
     "task_progress": [],
     "recent_events": [],
+    # Bumped each time the HTTP server thread itself dies and gets restarted
+    # (see _serve_forever_resilient) -- normally 0 for the whole build. A
+    # nonzero value here is the one place a consumer can tell the bridge went
+    # dark and came back, distinct from an ordinary transient poll failure.
+    "bridge_restarts": 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -513,6 +519,21 @@ class _Handler(BaseHTTPRequestHandler):
         pass  # bitbake's own console is the log; stay quiet on stdout/stderr.
 
     def do_GET(self):
+        # A poller that gives up mid-response (mackas-monitor's own
+        # REQUEST_TIMEOUT is 2.0s) closes its end while this is still
+        # writing, which raises BrokenPipeError/ConnectionError here --
+        # expected, not a bug, and nothing can be done once it happens
+        # (the peer is already gone). Catching it here keeps it from
+        # reaching socketserver's own handle_error path, which prints a
+        # traceback for every occurrence and is where an unrelated
+        # earlier fd/socket-exhaustion incident was first noticed.
+        try:
+            self._do_GET()
+        except (BrokenPipeError, ConnectionError, OSError) as exc:
+            print("mackasjson: client disconnected mid-response (%r)" % (exc,),
+                  file=sys.stderr)
+
+    def _do_GET(self):
         if self.path != "/":
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -560,10 +581,32 @@ class _FastBindHTTPServer(ThreadingHTTPServer):
         self.server_port = port
 
 
+def _serve_forever_resilient(httpd):
+    """serve_forever() returning at all -- other than via main()'s own
+    httpd.shutdown() at build end -- means the listening socket has gone
+    dark for whatever ran it, with nothing left to ever answer a poll again
+    for the rest of the build. A single request's own failure can't cause
+    that (socketserver already isolates it -- see do_GET's own comment for
+    the one path this module additionally guards), but nothing rules out
+    every other cause (fd exhaustion, a stdlib edge case), so treat any
+    unexpected return as a crash and keep the bridge alive on the same port
+    rather than trust that it can't happen."""
+    while True:
+        try:
+            httpd.serve_forever()
+            return  # only reached via shutdown() -- a real, intended stop
+        except Exception as exc:
+            with _lock:
+                _state["bridge_restarts"] += 1
+            print("mackasjson: bridge server thread crashed (%r), restarting"
+                  % (exc,), file=sys.stderr)
+
+
 def main(server, eventHandler, params):
     _set_targets(params)
     httpd = _FastBindHTTPServer(("0.0.0.0", PORT), _Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread = threading.Thread(target=_serve_forever_resilient, args=(httpd,),
+                               daemon=True)
     thread.start()
     linger = True
     try:
