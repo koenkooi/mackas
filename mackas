@@ -77,6 +77,16 @@ CONTAINER_TESTED_VERSION="1.1.0"
 # Apple `container` requires macOS 26 (Tahoe) or newer on Apple silicon.
 MACOS_MIN_MAJOR=26
 
+# The Homebrew bin dir prepended to the PATH of every child mackas launches
+# (kas-container needs GNU realpath ahead of /usr/bin's BSD one), and baked
+# into the env.sh and kas-container wrapper it generates.
+#
+# Test seam (undocumented, cf. MACKAS_CONTAINER_BIN/MACKAS_MDFIND): hardcoding
+# it put a dev Mac's real `container` AHEAD of whatever the caller's own PATH
+# resolved, inside the very children a hermetic test's stub exists to shadow.
+# tests/helpers.bash points this at that stub instead.
+BREW_BIN="${MACKAS_BREW_BIN:-/opt/homebrew/bin}"
+
 # Apple container's own volume storage root. There is no config knob for
 # this in container 1.1.0, so relocation is done by symlinking the dir.
 CONTAINER_VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
@@ -3527,9 +3537,10 @@ setup_shim_and_env() {
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
-	local q_fragrepo q_autofrag q_autoproj
+	local q_fragrepo q_autofrag q_autoproj q_brew
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
+	q_brew="$(shq "$BREW_BIN")"
 	q_work="$(shq "$MACKAS_WORK")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
@@ -3559,11 +3570,11 @@ setup_shim_and_env() {
 #   source $MACKAS_ENV_SH
 #
 # The shim MUST come before /usr/local/bin (the real Docker CLI lives there).
-# /opt/homebrew/bin must come before /usr/bin so kas-container finds GNU realpath.
+# $BREW_BIN must come before /usr/bin so kas-container finds GNU realpath.
 # $SCRIPT_NAME's own checkout is on PATH too, so '$SCRIPT_NAME ...' works from
 # any directory once this is sourced -- no more cd-ing back to the repo first.
 $mirrors_note
-export PATH=$q_shim:/opt/homebrew/bin:$q_scriptdir:"\$PATH"
+export PATH=$q_shim:$q_brew:$q_scriptdir:"\$PATH"
 
 # Force kas-container's engine selection instead of relying on its
 # 'docker -v | grep ^Docker' probe.
@@ -4351,7 +4362,7 @@ fi
 # GITCONFIG_FILE honours one already in the environment (":-", exactly like
 # env.sh's own GITCONFIG_FILE handling) -- a value the user exported
 # themselves always wins over the one baked in here at generation time.
-exec env PATH="\$SHIM_DIR:/opt/homebrew/bin:\$PATH" \\
+exec env PATH="\$SHIM_DIR:$BREW_BIN:\$PATH" \\
 	MACKAS_KAS_WRAPPED=1 \\
 	KAS_CONTAINER_ENGINE=$MACKAS_KAS_ENGINE \\
 	KAS_WORK_DIR="\$MACKAS_WORK" \\
@@ -5088,8 +5099,8 @@ cmd_adopt() {
 # the printed command line, to be expanded by the user's shell, not ours.
 kas_env_vars() {
 	local want_build_vars="$1"
-	printf 'PATH=%s:/opt/homebrew/bin:$PATH KAS_CONTAINER_ENGINE=%s KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s KAS_CONTAINER_IMAGE=%s' \
-		"$SHIM_DIR" "$MACKAS_KAS_ENGINE" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$KAS_IMAGE"
+	printf 'PATH=%s:%s:$PATH KAS_CONTAINER_ENGINE=%s KAS_WORK_DIR=%s KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= GITCONFIG_FILE=%s KAS_CONTAINER_IMAGE=%s' \
+		"$SHIM_DIR" "$BREW_BIN" "$MACKAS_KAS_ENGINE" "$MACKAS_WORK" "${GITCONFIG_FILE:-$MACKAS_GITCONFIG}" "$KAS_IMAGE"
 	[ "$want_build_vars" = "1" ] && printf ' BB_NUMBER_THREADS=%s PARALLEL_MAKE=%s' "$MACKAS_CPUS" "-j $MACKAS_CPUS"
 }
 
@@ -5128,7 +5139,7 @@ kas_env_prefix() {
 kas_invoke_env() {
 	local rt_args="$1" gitconfig="$2" want_build_vars="$3"; shift 3
 	if [ "$want_build_vars" = "1" ]; then
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		PATH="$SHIM_DIR:$BREW_BIN:$PATH" \
 		KAS_CONTAINER_ENGINE="$MACKAS_KAS_ENGINE" \
 		KAS_WORK_DIR="$MACKAS_WORK" \
 		KAS_BUILD_DIR='' \
@@ -5140,7 +5151,7 @@ kas_invoke_env() {
 		PARALLEL_MAKE="-j $MACKAS_CPUS" \
 		"$KAS_CONTAINER_REAL" --runtime-args "$rt_args" "$@"
 	else
-		PATH="$SHIM_DIR:/opt/homebrew/bin:$PATH" \
+		PATH="$SHIM_DIR:$BREW_BIN:$PATH" \
 		KAS_CONTAINER_ENGINE="$MACKAS_KAS_ENGINE" \
 		KAS_WORK_DIR="$MACKAS_WORK" \
 		KAS_BUILD_DIR='' \

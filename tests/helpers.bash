@@ -23,16 +23,32 @@ export SHIM MACKAS MOCK_CONTAINER MOCK_BIN
 MACKAS_TEST_REAL_FILES="real_runtime.bats volume_resize_real.bats diskmon_real.bats workspace_image_real.bats"
 export MACKAS_TEST_REAL_FILES
 
-# Shadow the real `container` everywhere else. mackas resolves the runtime CLI
-# through PATH and only some tests plant their own fake; the rest used to fall
-# through to a dev Mac's /opt/homebrew/bin/container -- invisible while the
-# daemon answers, a suite-wide hang once it wedges. An unknown filename gets
-# the stub too, which is the safe direction. A test wanting its own answers
-# still prepends its own fakebin, which wins over this.
+# Shadow the host tools mackas resolves through PATH -- `container`, `curl`,
+# `mdfind`, `diskutil` -- everywhere else. Only some tests plant their own
+# fake; the rest used to fall through to the real ones: a dev Mac's
+# /opt/homebrew/bin/container (invisible while the daemon answers, a
+# suite-wide hang once it wedges), a real HTTPS request to ghcr.io, and a
+# Spotlight query whose answer depends on what happens to be indexed on the
+# machine. An unknown filename gets the stubs too, which is the safe
+# direction. A test wanting its own answers still prepends its own fakebin,
+# which wins over this.
+#
+# MACKAS_BREW_BIN is the second half of the same guard: mackas prepends a
+# Homebrew bin dir to the PATH of every child it launches, and hardcoded that
+# dir outranked MOCK_BIN *inside the child* -- so a real `container` stayed
+# reachable from the one code path the stub exists to shadow. Point it at the
+# stubs. The opt-in real-runtime files get neither, and so get the genuine
+# binaries they are there to exercise -- unset outright rather than just left
+# alone, since bats can be reached through a process that already exported it
+# (hermetic.bats runs run-tests.sh nested).
 _mackas_test_file="${BATS_TEST_FILENAME:-}"
 case " $MACKAS_TEST_REAL_FILES " in
-*" ${_mackas_test_file##*/} "*) ;;
-*) PATH="$MOCK_BIN:$PATH" ;;
+*" ${_mackas_test_file##*/} "*) unset MACKAS_BREW_BIN ;;
+*)
+	PATH="$MOCK_BIN:$PATH"
+	MACKAS_BREW_BIN="$MOCK_BIN"
+	export MACKAS_BREW_BIN
+	;;
 esac
 unset _mackas_test_file
 

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# The `diskutil` every hermetic bats file gets, alongside this directory's
+# `container` stub.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Measured before it existed: one `./run-tests.sh` made 24 real `diskutil info
+# /System/Volumes/Data` calls, from check_target_volume() in
+# workspace_attach.bats, volumes_cmd.bats, volume_dirty_bit.bats and
+# check_status_daemon_down.bats -- reading the host's own boot volume to decide
+# what those tests printed.
+#
+# Fails closed, which check_target_volume() already handles as "could not
+# determine" (both its call sites carry a `|| true` for exactly a failing
+# diskutil, and check_discard_support.bats' own fake uses the same non-zero
+# exit to mean this). Nothing else in the suite asserts on the filesystem-type
+# lines; check_discard_support.bats, which does, prepends its own fake.
+
+exit 1

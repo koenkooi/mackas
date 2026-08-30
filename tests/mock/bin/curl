@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# The `curl` every hermetic bats file gets, alongside this directory's
+# `container` stub.
+#
+# Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Measured before it existed: one `./run-tests.sh` made 9 real HTTPS requests
+# to https://ghcr.io/v2/, from check_network() in config.bats,
+# volume_dirty_bit.bats and check_status_daemon_down.bats -- so the suite
+# needed the internet to behave the way it does on a connected machine, and
+# "no network" in AGENTS.md was aspirational.
+#
+# Fails closed, printing nothing. check_network()'s `code="$(curl ...)" ||
+# code="000"` then reports ghcr.io as unreachable, which is the truth in a
+# hermetic run; nothing in the suite asserts on that rung's verdict or on
+# `check`'s exit status. Printing nothing also matters: real curl prints
+# '000' AND exits non-zero, which is exactly the '000\n000' trap
+# check_network()'s own comment warns about.
+#
+# setup_kas_container()'s download uses curl too. No un-faked test reaches it
+# (the ones that do plant their own fakebin curl, which wins), and a failed
+# download is the right answer here anyway.
+
+exit 1
