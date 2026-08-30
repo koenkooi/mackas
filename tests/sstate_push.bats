@@ -63,8 +63,9 @@ setup() {
 	MOCK_VERIFY_CORRUPT=""
 	MOCK_VERIFY_CORRUPT_ALWAYS=""
 	MOCK_PROBE_BREAK=""
+	MOCK_COPY_DIE=""
 	export MOCK_BUSY_VOLUME MOCK_NO_VOLUME MOCK_RSYNC_FAIL
-	export MOCK_VERIFY_CORRUPT MOCK_VERIFY_CORRUPT_ALWAYS MOCK_PROBE_BREAK
+	export MOCK_VERIFY_CORRUPT MOCK_VERIFY_CORRUPT_ALWAYS MOCK_PROBE_BREAK MOCK_COPY_DIE
 
 	mkdir -p "$TESTDIR/fakebin"
 	cat > "$TESTDIR/fakebin/container" <<'EOF'
@@ -128,7 +129,22 @@ last="${@: -1}"
 case "$last" in
 	*".mackas-verify-jobs"*)
 		echo 'COPY:primary' >> "$CLOG"
+		# The copy container itself dying before it ever prints a manifest --
+		# distinct from MOCK_VERIFY_CORRUPT, which lets the container finish
+		# and prints a manifest that then disagrees.
+		case "${MOCK_COPY_DIE:-}" in
+			before-copy) exit 17 ;;
+		esac
 		stage_copy primary
+		case "${MOCK_COPY_DIE:-}" in
+			after-copy) exit 17 ;;
+			# Simulates the guest script's own exit-13 path: the source tar
+			# failed after the extract side had already consumed a partial
+			# stream, so files may exist but the source-failure marker fired.
+			# The mock cannot run the real guest pipeline, so it reproduces
+			# the OBSERVABLE contract instead: some files staged, exit 13.
+			source-tar) exit 13 ;;
+		esac
 		# The "source" manifest: the real retrieve_verify_local(), extracted
 		# from the real mackas and run against the fixture that was just
 		# copied FROM.
@@ -962,4 +978,88 @@ probe_last_clause() {
 	# with the transport paragraph deleted.
 	printf '%s\n' "$output" | grep -qF 'sent with --ignore-existing and never --inplace'
 	[ "$(rsync_calls)" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# The copy container itself dying: no exit-status check existed at all. set -e
+# is suspended here because both call sites invoke fetch_volume_subdir in a
+# condition, so a dead container left src_manifest empty -- and the staging
+# dir, already created empty before the copy runs, made retrieve_verify_local
+# return empty too. Empty equalled empty: a dead copy read as VERIFIED, and on
+# the push path that stamps -- the same "scan that could not answer" hazard
+# as the section above, one function over.
+# ---------------------------------------------------------------------------
+
+@test "sstate push: a copy container that dies before copying anything is refused, not verified" {
+	MOCK_COPY_DIE=before-copy push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'failed'
+	[ "$(rsync_calls)" -eq 0 ]
+	[ -z "$(stamp_file)" ]
+}
+
+@test "sstate push: a copy container that dies AFTER copying but before its manifest is refused" {
+	# The dangerous half: files may already be staged, but no manifest was
+	# printed to compare against. Empty-vs-empty must not read as verified.
+	MOCK_COPY_DIE=after-copy push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'failed'
+	[ "$(rsync_calls)" -eq 0 ]
+	[ -z "$(stamp_file)" ]
+}
+
+@test "sstate push: an incremental copy where the SOURCE tar fails is refused" {
+	# The guest sh has no pipefail: 'tar -cf - | tar -xf -' only reports the
+	# EXTRACT side's status. Killing the source tar has to be surfaced some
+	# other way, or an incomplete read of the volume looks like a clean copy.
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_COPY_DIE=source-tar push
+	[ "$status" -ne 0 ]
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: a normal copy is unaffected by the new guest-side checks" {
+	# Negative control: the die guards must not fire on a clean run.
+	push
+	[ "$status" -eq 0 ]
+	[ "$(rsync_calls)" -gt 0 ]
+	[ -n "$(stamp_file)" ]
+}
+
+# ---------------------------------------------------------------------------
+# The guest-side guards above are inside a string the mock never executes --
+# it inspects argv and returns canned output, so no runtime test can reach
+# the copy_cmd string's own content. Per AGENTS.md: logic bats cannot trigger
+# is covered by a source-grep test instead of pretending a runtime test
+# exercises it. Each guard is grepped for individually and separately, the
+# way the probe guards in the section above are -- one test per guard, so
+# deleting any single one fails a test that names it.
+# ---------------------------------------------------------------------------
+
+@test "sstate push guest copy: find's own exit status is checked" {
+	grep -qF 'stage-list || exit 11' "$REAL_MACKAS"
+}
+
+@test "sstate push guest copy: a failed SOURCE tar is detected despite no pipefail" {
+	# The guest sh has no pipefail, so 'tar ... -cf - | tar ... -xf -' alone
+	# only reports the extract side. The source side must mark its own
+	# failure into a file the pipeline's tail can still see.
+	grep -qF '|| echo bad > /tmp/.mackas-tar-src' "$REAL_MACKAS"
+}
+
+@test "sstate push guest copy: the source-failure marker is checked after the pipeline" {
+	grep -qF '[ ! -s /tmp/.mackas-tar-src ] || exit 13' "$REAL_MACKAS"
+}
+
+@test "sstate push guest copy: the EXTRACT side's own exit status is checked" {
+	grep -qF -- '-xf - || exit 12' "$REAL_MACKAS"
+}
+
+@test "sstate push guest copy: the source-failure marker is reset before each copy" {
+	# Without this, a marker left by a PRIOR failed push would fail every
+	# push after it, including a genuinely clean one.
+	grep -qF 'rm -f /tmp/.mackas-tar-src' "$REAL_MACKAS"
 }
