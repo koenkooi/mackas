@@ -224,6 +224,108 @@ pin() {
 	! printf '%s\n' "$output" | grep -q 'from-home'
 }
 
+# ---------------------------------------------------------------------------
+# ...and graded on what is really there, never on a symlink standing in for it
+#
+# `ln -s` applies the umask, so a link's own mode is only ever a record of
+# that umask -- measured on macOS: 022 -> 755, 002 -> 775, 000 -> 777,
+# 077 -> 700. 755 is squarely inside what path_is_owned_and_unwritable_by_others
+# accepts, so grading the LINK accepts anything it points at. Each of these
+# builds the link under an explicit `umask 022`, so the fixture pins that
+# measured 755 rather than inheriting whatever umask ran the suite.
+# ---------------------------------------------------------------------------
+
+@test "a projects directory that is a symlink is graded by the real directory" {
+	# The demonstrated hole: with the link graded instead of its target, a
+	# config sitting in a 0777 directory anyone can write gets sourced.
+	rmdir "$PROJDIR"
+	mkdir -p "$TESTDIR/shared"
+	chmod 777 "$TESTDIR/shared"
+	( umask 022 && ln -s "$TESTDIR/shared" "$PROJDIR" )
+	[ "$(stat -f '%Lp' "$PROJDIR")" = "755" ]   # the link itself: the umask, nothing more
+	cat > "$TESTDIR/shared/pwned.conf" <<-EOF
+	touch "$TESTDIR/PWNED"
+	MACKAS_KAS_CONFIG="from-unsafe"
+	EOF
+	chmod 600 "$TESTDIR/shared/pwned.conf"
+	run "$MACKAS" --project pwned status
+	[ "$status" -ne 0 ]
+	[ ! -e "$TESTDIR/PWNED" ]
+	printf '%s\n' "$output" | grep -qi 'refusing to source'
+}
+
+@test "a project config that is a symlink is graded by the file it points at" {
+	# The same blindness on the file side: the link is ours and 0755, the
+	# file it names is world-writable.
+	cat > "$TESTDIR/real.conf" <<-EOF
+	touch "$TESTDIR/PWNED"
+	MACKAS_KAS_CONFIG="from-unsafe"
+	EOF
+	chmod 666 "$TESTDIR/real.conf"
+	( umask 022 && ln -s "$TESTDIR/real.conf" "$PROJDIR/pwned.conf" )
+	run "$MACKAS" --project pwned status
+	[ "$status" -ne 0 ]
+	[ ! -e "$TESTDIR/PWNED" ]
+	printf '%s\n' "$output" | grep -qi 'refusing to source'
+}
+
+@test "a project config symlinked into a world-writable directory is refused" {
+	# Link and target are both 0600 and ours; the DIRECTORY the target sits
+	# in is the hole, and it is only reachable by resolving the link.
+	mkdir -p "$TESTDIR/shared"
+	chmod 777 "$TESTDIR/shared"
+	cat > "$TESTDIR/shared/real.conf" <<-EOF
+	touch "$TESTDIR/PWNED"
+	MACKAS_KAS_CONFIG="from-unsafe"
+	EOF
+	chmod 600 "$TESTDIR/shared/real.conf"
+	( umask 022 && ln -s "$TESTDIR/shared/real.conf" "$PROJDIR/pwned.conf" )
+	run "$MACKAS" --project pwned status
+	[ "$status" -ne 0 ]
+	[ ! -e "$TESTDIR/PWNED" ]
+}
+
+@test "a project config kept as a symlink to a safe file IS still sourced" {
+	# The other side of the check: a dotfiles-style link into a directory
+	# that passes on its own merits must keep working, or the fix above is
+	# just a refusal of every symlink.
+	mkdir -p "$TESTDIR/dotfiles"
+	chmod 755 "$TESTDIR/dotfiles"
+	cat > "$TESTDIR/dotfiles/real.conf" <<-EOF
+	touch "$TESTDIR/RAN"
+	MACKAS_KAS_CONFIG="from-dotfiles"
+	EOF
+	chmod 600 "$TESTDIR/dotfiles/real.conf"
+	( umask 022 && ln -s "$TESTDIR/dotfiles/real.conf" "$PROJDIR/ok.conf" )
+	run "$MACKAS" --project ok status
+	[ "$status" -eq 0 ]
+	[ -e "$TESTDIR/RAN" ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-dotfiles" ]
+}
+
+@test "'projects' reports a config in a symlinked unsafe directory as unsafe" {
+	# The third caller of config_file_is_safe: it never sources, but it
+	# reports the same verdict, so it must not be fooled either.
+	rmdir "$PROJDIR"
+	mkdir -p "$TESTDIR/shared"
+	chmod 777 "$TESTDIR/shared"
+	( umask 022 && ln -s "$TESTDIR/shared" "$PROJDIR" )
+	echo 'MACKAS_KAS_CONFIG="from-unsafe"' > "$TESTDIR/shared/p.conf"
+	chmod 600 "$TESTDIR/shared/p.conf"
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -q 'unsafe'
+}
+
+@test "a DIRECTORY at NAME.conf is refused before it reaches the shell" {
+	# Readable, ours, 0755 -- so it passes the safety grade untouched and
+	# used to land on `. "$f"` as a raw, localized "is a directory" error.
+	mkdir -p "$PROJDIR/p.conf"
+	run "$MACKAS" --project p status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'not a regular file'
+}
+
 @test "--config is still exempt from the check the selector enforces" {
 	# The asymmetry is the design, not an oversight: a typed path is a
 	# request, a derived one is an ambush surface.
