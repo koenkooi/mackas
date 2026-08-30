@@ -33,3 +33,10 @@ kas-upstream/
 # and the unittest suite both drop these.
 __pycache__/
 *.py[cod]
+
+# Scratch worktrees Claude Code's Workflow tool creates under an isolated
+# agent (isolation: 'worktree') -- each one is a nested git repo, so a bare
+# `git add -A` stages it whole with no diff, the exact near-miss that added
+# twelve of them to a single commit here. Auto-cleaned when unchanged; stale
+# ones are safe to `git worktree remove` by hand.
+.claude/worktrees/
