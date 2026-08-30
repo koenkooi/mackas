@@ -117,8 +117,12 @@ teardown() {
 
 # write_self_stub OUTPUT EXITCODE [STDERR] -- (re)write the fake MACKAS_SELF
 # binary: answers "runtime-args" with OUTPUT on stdout, STDERR (if given) on
-# stderr, and exits EXITCODE; refuses anything else. Every call's argv is
-# appended to $SELF_REC, so a test can assert WHICH flags the wrapper passed.
+# stderr, and exits EXITCODE; refuses anything else. Every call's argv, and
+# the $MACKAS_PROJECT_SELECT it was handed, are appended to $SELF_REC, so a
+# test can assert WHICH flags and WHICH project the wrapper passed. The
+# '<unset>' marker keeps "never passed" distinguishable from "passed empty",
+# which is the whole difference between inheriting the calling shell's
+# selector and overriding it.
 # Does NOT regenerate the wrapper -- MACKAS_SELF is a fixed path baked in
 # once; only its CONTENT changes here.
 write_self_stub() {
@@ -126,6 +130,7 @@ write_self_stub() {
 	{
 		printf '#!/usr/bin/env bash\n'
 		printf 'printf "ARGV:%%s\\n" "$*" >> "$SELF_REC"\n'
+		printf 'printf "SEL:%%s\\n" "${MACKAS_PROJECT_SELECT-<unset>}" >> "$SELF_REC"\n'
 		printf 'if [ "$1" = "runtime-args" ]; then\n'
 		if [ -n "$errmsg" ]; then
 			printf '\tprintf "%%s\\n" %s >&2\n' "$(printf '%q' "$errmsg")"
@@ -521,4 +526,64 @@ rec_runtime_args_value() {
 		"$SHIM_DIR:$BREW_BIN:"*) ;;
 		*) echo "BREW_BIN did not survive generation intact: $got" >&2; return 1 ;;
 	esac
+}
+
+# ---------------------------------------------------------------------------
+# 12: the selector propagates into the live recompute.
+#
+# The wrapper freezes MACKAS_WORK/KAS_IMAGE/MACKAS_GITCONFIG from whatever
+# config `setup` ran against, but recomputes --runtime-args on every call. If
+# that recompute resolves a DIFFERENT config, the build gets one project's
+# ext4 volumes beside another project's work dir -- on the hand-typed
+# kas-container path, which is the primary real-world workflow. So the
+# generated wrapper replays the project it was built for, and passes it
+# EXPLICITLY even when empty, so an exported $MACKAS_PROJECT_SELECT in the
+# calling shell cannot re-aim a wrapper at a project it was never built for.
+# ---------------------------------------------------------------------------
+
+@test "selector: a wrapper written under --project replays that project into the live recompute" {
+	PROJECT_SELECTED="proj-a"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+@test "selector: an exported \$MACKAS_PROJECT_SELECT cannot re-aim a wrapper built for another project" {
+	PROJECT_SELECTED="proj-a"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( (MACKAS_PROJECT_SELECT=proj-b "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+	sel_b="$(grep -c '^SEL:proj-b$' "$SELF_REC" || true)"
+	[ "$sel_b" -eq 0 ]
+}
+
+@test "selector: a wrapper written with no project passes an EMPTY selector, not the caller's" {
+	# lib_setup left PROJECT_SELECTED empty, i.e. the default search path.
+	# The recompute must still see an empty selector rather than inheriting
+	# whatever the calling shell exported -- otherwise the same mismatch
+	# appears in the other direction.
+	cd "$TESTDIR"
+	out="$( (MACKAS_PROJECT_SELECT=proj-b "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_b="$(grep -c '^SEL:proj-b$' "$SELF_REC" || true)"
+	[ "$sel_b" -eq 0 ]
+}
+
+@test "selector: a project name with a shell metacharacter is baked in inert" {
+	# PROJECT_SELECTED reaches the generated file through shq(), like every
+	# other interpolated value. validate_project_select refuses this name at
+	# the CLI; the point here is that write_kas_wrapper does not depend on
+	# that check to keep the generated file from executing what it embeds.
+	PROJECT_SELECTED="a'\$(touch $TESTDIR/pwned)b"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ ! -e "$TESTDIR/pwned" ]
+	grep -qxF "SEL:a'\$(touch $TESTDIR/pwned)b" "$SELF_REC"
 }
