@@ -909,6 +909,9 @@ validate_project_select() {
 	local name="$1" src="$2" hint
 	hint="$SCRIPT_CMD projects  (lists the pinned ones)"
 	case "$name" in
+		# Both callers reject an empty name before getting here; kept so the
+		# function is safe standalone, since "" would name <dir>/.conf -- a
+		# perfectly legal hidden file.
 		"") die "$src needs a project name" "$hint" ;;
 		-*) die "$src: a project name cannot start with '-': $name" "$hint" ;;
 		.|..|*..*) die "$src: a project name cannot be '.' or contain '..': $name" "$hint" ;;
@@ -933,9 +936,20 @@ config_grep_setting() {
 	line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$name=" "$file" 2>/dev/null | tail -1 || true)"
 	[ -n "$line" ] || return 1
 	v="${line#*=}"
+	# Trailing whitespace is not part of the value, and leaving it on would
+	# stop a quoted value from matching its own closing quote below.
+	while [ "$v" != "${v%[[:space:]]}" ]; do v="${v%[[:space:]]}"; done
 	case "$v" in
-		"'"*"'") v="${v#\'}"; v="${v%\'}" ;;
+		"'"*"'")
+			v="${v#\'}"; v="${v%\'}"
+			# shq() renders an embedded apostrophe as the four characters
+			# '\'' -- undo that, or a value `$SCRIPT_NAME set` wrote itself
+			# reads back mangled here.
+			case "$v" in *\'*) v="$(printf '%s' "$v" | sed "s/'\\\\''/'/g")" ;; esac ;;
 		'"'*'"') v="${v#\"}"; v="${v%\"}" ;;
+		# Unquoted: a shell assignment's bare value ends at the first
+		# whitespace, so a trailing '# comment' is shell, not value.
+		*) v="${v%%[[:space:]]*}" ;;
 	esac
 	printf '%s\n' "$v"
 }
@@ -1257,8 +1271,16 @@ cmd_set() {
 	# The target may sit in a directory that does not exist yet -- writing the
 	# first pinned project's config under ~/.config/mackas/projects/ is exactly
 	# that case, and config_write_setting's mv would fail on it.
+	#
+	# Created under umask 077, never the ambient one: --project holds this
+	# directory to config_file_is_safe(), and under a `umask 002` login (a real
+	# configuration, not a hypothetical one) an inherited umask would make the
+	# directory group-writable -- so bootstrapping a project config here would
+	# produce one --project then refuses to source. The subshell keeps the
+	# umask off everything else; run() is a plain function, with no state to
+	# lose across it.
 	local dir; dir="$(dirname "$file")"
-	[ -d "$dir" ] || run mkdir -p "$dir"
+	[ -d "$dir" ] || ( umask 077 && run mkdir -p "$dir" ) || die "could not create $dir"
 	config_write_setting "$file" "$name" "$value"
 	if [ "$DRY_RUN" -eq 1 ]; then
 		info "  would write $name=$value to $file"
@@ -4458,7 +4480,7 @@ write_kas_wrapper() {
 	# turning it into a variable put it straight back inside a raw "..." until
 	# this line existed. No q_rtargs: the frozen --runtime-args string is gone
 	# from the generated file entirely (issue #96) -- there is nothing to quote.
-	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_scriptname
+	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_scriptname q_projsel
 	q_real="$(shq "$KAS_CONTAINER_REAL")"
 	q_shim="$(shq "$SHIM_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -4467,6 +4489,8 @@ write_kas_wrapper() {
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
 	q_scriptname="$(shq "$SCRIPT_NAME")"
+	# Empty unless this setup ran under --project/$MACKAS_PROJECT_SELECT.
+	q_projsel="$(shq "$PROJECT_SELECTED")"
 
 	run mkdir -p "$MACKAS_BIN"
 	cat > "$KAS_CONTAINER_BIN" <<EOF
@@ -4495,6 +4519,17 @@ MACKAS_WORK=$q_work
 KAS_IMAGE=$q_image
 MACKAS_GITCONFIG=$q_gitconfig
 SCRIPT_NAME=$q_scriptname
+
+# Which pinned project's config every value above was frozen from, empty for
+# the default search path. It is replayed into the live recompute below so
+# that call resolves the SAME config this file was generated from -- without
+# it, a wrapper written by '$SCRIPT_NAME --project A setup' would recompute
+# --runtime-args off whatever the default search path finds, and hand another
+# project's ext4 volumes to a build whose work dir and gitconfig are A's.
+# Passed explicitly even when empty, which also stops an exported
+# \$MACKAS_PROJECT_SELECT in the calling shell from re-aiming this wrapper at
+# a project it was not built for.
+MACKAS_PROJECT_PIN=$q_projsel
 
 # There is deliberately NO frozen copy of --runtime-args in this file any
 # more (issue #96). It used to be the fallback for a failed live recompute,
@@ -4571,7 +4606,7 @@ done
 # below could explain itself, and it also keeps the exit status, which a
 # bare assignment discards.
 _mackas_rt_rc=0
-rt="\$("\$MACKAS_SELF" runtime-args --require-volumes-free)" || _mackas_rt_rc=\$?
+rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free)" || _mackas_rt_rc=\$?
 
 # FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
 # computing this string is a safety guard -- a held volume, two volume names
@@ -10733,6 +10768,10 @@ ${C_BLD}CONFIGURATION${C_RST}
   answers to the same question, so mackas refuses rather than ranks them. The
   selector picks WHICH file is sourced; it is not a fifth precedence rung.
 
+  '$SCRIPT_CMD --project NAME setup' pins NAME into the generated kas-container
+  wrapper, so a hand-typed 'kas-container ...' recomputes --runtime-args
+  against that project's config too, not the default search path.
+
   It is sourced as shell, so it is only looked for in places that are yours:
   a searched file, and a --project one, are refused unless you (or root) own
   the file and its directory and neither is writable by group or other. A
@@ -10820,7 +10859,11 @@ main() {
 			# --help stays typeable from anywhere, exactly as it is with an
 			# unreadable --config.
 			--project) project_flag="${2:-}"; [ -n "$project_flag" ] || die "--project needs a NAME" "$SCRIPT_CMD projects"; shift 2 ;;
-			--project=*) project_flag="${1#*=}"; shift ;;
+			# Checked here too: an empty value would otherwise fall through to
+			# the search path (or to an exported $MACKAS_PROJECT_SELECT), so
+			# '--project=' would silently select something other than what was
+			# asked for while '--project ""' dies.
+			--project=*) project_flag="${1#*=}"; [ -n "$project_flag" ] || die "--project needs a NAME" "$SCRIPT_CMD projects"; shift ;;
 			--set) parse_set "${2:-}"; shift 2 ;;
 			--set=*) parse_set "${1#*=}"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
