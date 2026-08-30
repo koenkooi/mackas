@@ -12,7 +12,29 @@ export REPO_ROOT
 SHIM="$REPO_ROOT/bin/docker"
 MACKAS="$REPO_ROOT/mackas"
 MOCK_CONTAINER="$REPO_ROOT/tests/mock/container"
-export SHIM MACKAS MOCK_CONTAINER
+MOCK_BIN="$REPO_ROOT/tests/mock/bin"
+export SHIM MACKAS MOCK_CONTAINER MOCK_BIN
+
+# The four non-hermetic opt-in files, which want the genuine binary. Named
+# outright rather than globbed: real_runtime.bats does not match *_real.bats,
+# and a glob would also hand the real runtime to any future file that happened
+# to be named that way. hermetic.bats cross-checks this against the files that
+# actually self-skip without MACKAS_REAL_RUNTIME=1.
+MACKAS_TEST_REAL_FILES="real_runtime.bats volume_resize_real.bats diskmon_real.bats workspace_image_real.bats"
+export MACKAS_TEST_REAL_FILES
+
+# Shadow the real `container` everywhere else. mackas resolves the runtime CLI
+# through PATH and only some tests plant their own fake; the rest used to fall
+# through to a dev Mac's /opt/homebrew/bin/container -- invisible while the
+# daemon answers, a suite-wide hang once it wedges. An unknown filename gets
+# the stub too, which is the safe direction. A test wanting its own answers
+# still prepends its own fakebin, which wins over this.
+_mackas_test_file="${BATS_TEST_FILENAME:-}"
+case " $MACKAS_TEST_REAL_FILES " in
+*" ${_mackas_test_file##*/} "*) ;;
+*) PATH="$MOCK_BIN:$PATH" ;;
+esac
+unset _mackas_test_file
 
 # The bats tmpdir (/tmp or $BATS_TEST_TMPDIR) is case-INSENSITIVE APFS on a
 # stock Mac, same as most dev machines' /tmp. `setup` refuses a case-insensitive

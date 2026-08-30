@@ -13,6 +13,9 @@
 #
 # None of this touches the real Apple container runtime, the build SSD, the
 # network, sudo, NFS, or the mirror host -- it is safe to run anywhere, any time.
+# The runtime half of that is enforced, not merely intended: helpers.bash puts
+# tests/mock/bin (a stub `container`) at the front of PATH for every file except
+# the *_real ones, and tests/hermetic.bats fails if that guard slips.
 # The mirror-server tests bind 127.0.0.1 on port 0, which is an ephemeral port
 # the kernel picks and nothing else can already hold.
 #
@@ -46,7 +49,8 @@ if command -v shellcheck >/dev/null 2>&1; then
 	# newer builds emit info-level notes (e.g. SC2015 on an intentional
 	# `A && B || C`) that older ones do not, and an info note must not flip a
 	# clean run to a failure on one machine but not another.
-	if shellcheck --severity=warning -s bash mackas bin/docker run-tests.sh tests/mock/container; then
+	if shellcheck --severity=warning -s bash mackas bin/docker run-tests.sh \
+		tests/mock/container tests/mock/bin/container; then
 		echo "shellcheck: clean"
 	else
 		echo "shellcheck: FAILED" >&2
