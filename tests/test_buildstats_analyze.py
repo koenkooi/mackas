@@ -314,7 +314,7 @@ class ChildRusageDriftGuardTest(TmpTest):
 def write_two_level_build(root, ts, buildname, tasks):
     """Write buildstats/<ts>/<buildname>/ -- the shape `mackas retrieve
     buildstats` now produces (each retrieval nested under its own timestamp;
-    see fetch_tmp_subdir/cmd_retrieve in mackas). Returns the buildstats
+    see fetch_volume_subdir/cmd_retrieve in mackas). Returns the buildstats
     parent dir (two levels above the BUILDNAME dir)."""
     parent = os.path.join(root, "buildstats")
     bsdir = os.path.join(parent, ts, buildname)
@@ -332,7 +332,7 @@ def write_two_level_build(root, ts, buildname, tasks):
 
 class TwoLevelNestingTest(TmpTest):
     """`retrieve buildstats` nests each retrieval under its own timestamp
-    (fetch_tmp_subdir's EXTRA param), so a real BUILDNAME dir can now sit two
+    (fetch_volume_subdir's EXTRA param), so a real BUILDNAME dir can now sit two
     levels under the path `buildstats analyze` is pointed at -- resolution
     must be recursive, not hardcode one fixed level."""
 
