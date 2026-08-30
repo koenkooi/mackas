@@ -408,6 +408,29 @@ teardown() {
 	! grep -nE 'PATH=[^#]*/opt/homebrew/bin' "$MACKAS"
 }
 
+@test "guard: both generated-file writers quote BREW_BIN, and validate_settings sees it" {
+	# The seam is an INPUT, and it reaches two files that are shell code:
+	# env.sh (sourced by the user) and the kas-container wrapper (/bin/sh).
+	# setup_shim_and_env() shq()d it for the PATH line but pasted it raw into
+	# the comment above -- a newline there ends the comment and the rest is
+	# code -- and write_kas_wrapper(), which shq()s every other value it bakes
+	# in, pasted it raw inside a double-quoted PATH string. Both are the class
+	# setup_shim_and_env()'s own comment records as already fixed once.
+	#
+	# The other three uses are not generated files and need no quoting:
+	# kas_env_vars()'s printf argument (display text) and kas_invoke_env()'s
+	# two real assignments, in mackas' own shell.
+	[ "$(grep -cF 'q_brew="$(shq "$BREW_BIN")"' "$MACKAS")" -eq 2 ]
+	# The wrapper must expand its OWN variable at run time, not mackas' value
+	# at generation time.
+	grep -qF 'exec env PATH="\$SHIM_DIR:\$BREW_BIN:\$PATH"' "$MACKAS"
+	# Nothing may interpolate it into a generated comment again.
+	[ "$(grep -cF '# $BREW_BIN' "$MACKAS" || true)" -eq 0 ]
+	# And it is under validate_settings, so a newline cannot reach either
+	# writer in the first place.
+	grep -qxF 'BREW_BIN' "$MACKAS"
+}
+
 @test "guard: MACKAS_ROOT has no built-in disk-path default in the source" {
 	# The default assignment must be empty. A regex catch-all for any
 	# 'MACKAS_ROOT="/...' default would have caught the old shipped disk.
