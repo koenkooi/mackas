@@ -451,6 +451,17 @@ pin() {
 	run "$MACKAS" get MACKAS_MEMORY --project meta-ai
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qi 'must come BEFORE'
+
+	# runtime-args is the one tail-capturing command the selector sweep
+	# missed: it redirected --config/--set and left --project to fall
+	# through to a generic "unknown option".
+	run "$MACKAS" runtime-args --project meta-ai
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'must come BEFORE'
+
+	run "$MACKAS" runtime-args --project=meta-ai
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'must come BEFORE'
 }
 
 # ---------------------------------------------------------------------------
