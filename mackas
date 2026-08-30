@@ -6798,7 +6798,7 @@ fetch_volume_subdir() {
 	# otherwise), so no mtime can move between them.
 	local copy_cmd fallback_cmd
 	if [ -n "$find_newer" ]; then
-		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cd $(printf '%q' "$guest") && find . -type f $find_newer -print0 > /tmp/.mackas-stage-list && tar -S -C $(printf '%q' "$guest") --null -T /tmp/.mackas-stage-list -cf - | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cd $(printf '%q' "$guest") && find . -type f $find_newer -print0 > /tmp/.mackas-stage-list || exit 11; rm -f /tmp/.mackas-tar-src; { tar -S -C $(printf '%q' "$guest") --null -T /tmp/.mackas-stage-list -cf - || echo bad > /tmp/.mackas-tar-src; } | tar -S -C $(printf '%q' "/out/$destsub") -xf - || exit 12; [ ! -s /tmp/.mackas-tar-src ] || exit 13"
 		# No cp -r to fall back FROM: tar IS the safer mechanism here, so a
 		# mismatch retries it once and then dies, rather than pretending a
 		# third algorithm exists.
@@ -6825,9 +6825,23 @@ fetch_volume_subdir() {
 		return 0
 	fi
 	local src_manifest dst_manifest
+	# The container's own status was never checked, and set -e is suspended
+	# here because both call sites invoke this function in a condition. A copy
+	# container that died before printing its manifest left src_manifest empty
+	# -- and the staging dir, already created empty above, made
+	# retrieve_verify_local return empty too, so the two compared EQUAL and a
+	# dead copy read as a verified one. On the push path that then stamps, and
+	# the objects are never offered to the mirror again. Refuse instead: the
+	# guest script exits 11/12/13 for a find, an extract or a source-tar
+	# failure, the last of which no pipeline status would have surfaced.
+	local copy_rc=0
 	src_manifest="$(container run --rm -u 0:0 \
 		-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "$copy_cmd && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$find_newer")")"
+		sh -c "$copy_cmd && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$find_newer")")" || copy_rc=$?
+	if [ "$copy_rc" -ne 0 ]; then
+		warn "  copying '$sub' out of '$vol' failed (exit $copy_rc) -- not treating this as a verified copy"
+		return 3
+	fi
 	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
 		if [ -n "$find_newer" ]; then

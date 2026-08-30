@@ -871,6 +871,19 @@ bind-mounts as an *empty* one, which scans as "nothing new". Getting this
 wrong drops objects that really existed below the cutoff permanently, so they
 are never offered to the mirror again.
 
+**The same never-verified-never-stamps rule applies to the copy that follows
+the scan, not only the scan itself.** The container that stages objects out
+of the volume can die before it ever prints a manifest to compare against;
+because `set -e` is suspended everywhere `fetch_volume_subdir` is called
+under a condition, that silently leaves both sides of the comparison empty —
+an empty manifest equals an empty manifest, and a dead copy reads as a
+*verified* one. Push checks the copy container's own exit status rather than
+trusting an empty comparison, and, on the incremental path, the guest-side
+`tar | tar` pipeline gets the same treatment as the scan's `find`: the guest
+shell has no `pipefail`, so a source `tar` that dies mid-stream is invisible
+to anything watching only the extract side's status, and is instead marked
+into a file the pipeline's tail checks explicitly.
+
 **Transport: rsync over ssh, deliberately not an HTTP PUT.** Adding a write
 path to `mackas-mirrord` is rejected outright — its read-only-ness is the
 security property being asked for. The split *is* the design: read path
