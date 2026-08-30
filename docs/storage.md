@@ -861,7 +861,11 @@ status rather than a pipeline's (the guest shell has no `pipefail`, so a
 pipeline reports `awk`'s status and a dead `find` looks like an empty result),
 prints a completion marker the host insists on, and treats an unreadable
 object count as an error rather than a zero. On any uncertainty push rescans
-or fails; it never stamps. The same reasoning is why push refuses outright
+or fails; it never stamps. That holds on **every** path, not only the
+incremental one: `--full` and a first push (no stamp yet, so no cutoff to
+scan against) go through a plain `du` instead, and it ends in the same
+completion marker — a probe that exits clean without reaching its end is
+refused there too. The same reasoning is why push refuses outright
 when the sstate volume does not exist yet — an absent named volume
 bind-mounts as an *empty* one, which scans as "nothing new". Getting this
 wrong drops objects that really existed below the cutoff permanently, so they
