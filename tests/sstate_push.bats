@@ -686,27 +686,133 @@ seed_stamp() {
 	[ "$(printf '%s\n' "$body" | grep -c 'find \. -type f \$newer' || true)" -eq 2 ]
 }
 
-@test "sstate push: both probe shapes check their own status and mark completion" {
-	# The GUEST half of the two tests above: a mock decides for itself what
-	# to print, so only the source can pin what the real probe does. The
-	# guest shell has no pipefail, so a `find | awk` reports awk's status and
-	# a find that died mid-scan still looks like an empty result -- find's
-	# status is checked on its own, the completion marker is printed last,
-	# and neither shape ends in a status-swallowing `exit 0`.
-	local probe size_probe
-	probe="$(grep -F 'mackas-scan' "$MACKAS" | head -1)"
-	[ -n "$probe" ]
-	printf '%s\n' "$probe" | grep -qF '.mackas-scan || exit'
-	printf '%s\n' "$probe" | grep -q 'awk .*MACKAS-SCAN-OK'
-	assert_fails grep -qF '; exit 0' <<< "$probe"
+# ---------------------------------------------------------------------------
+# The guest probe strings themselves.
+#
+# Nothing hermetic can run them: they execute inside the container, under the
+# guest's dash, and BSD find has no -printf. So every guard in them is pinned
+# by source-grep (AGENTS.md's rule for logic bats cannot reach) -- one grep
+# per guard, each naming its own clause. A single
+# `grep -F '.mackas-scan || exit'` once stood in for all of them, and the
+# probe has TWO clauses ending that way, so deleting either left it green.
+# ---------------------------------------------------------------------------
 
-	# The stampless shape --full and a first push take. Nothing here can
-	# truncate, but it stamps the same way, so it proves it finished the
-	# same way -- the marker AFTER the measurement, not instead of it.
-	size_probe="$(grep -F 'probe_cmd=' "$MACKAS" | grep -F 'du -sk $q_guest')"
-	[ -n "$size_probe" ]
-	printf '%s\n' "$size_probe" | grep -q 'du -sk .*MACKAS-SCAN-OK'
-	assert_fails grep -qF '; exit 0' <<< "$size_probe"
+# The incremental (find) probe, straight out of the source. Exactly one line
+# must match, so a second scan shape cannot hide behind a `head -1`.
+scan_probe() {
+	local lines
+	lines="$(grep -F 'probe_cmd=' "$MACKAS" | grep -F '/tmp/.mackas-scan')"
+	if [ "$(printf '%s\n' "$lines" | grep -c . || true)" -ne 1 ]; then
+		printf 'expected exactly one scan probe_cmd= line, got:\n%s\n' "$lines" >&2
+		return 1
+	fi
+	printf '%s\n' "$lines"
+}
+
+# The stampless (du) probe --full and every first push take.
+size_probe() {
+	local lines
+	lines="$(grep -F 'probe_cmd=' "$MACKAS" | grep -F 'du -sk $q_guest')"
+	if [ "$(printf '%s\n' "$lines" | grep -c . || true)" -ne 1 ]; then
+		printf 'expected exactly one du probe_cmd= line, got:\n%s\n' "$lines" >&2
+		return 1
+	fi
+	printf '%s\n' "$lines"
+}
+
+# COUNT occurrences of a fixed string in a probe -- `grep -c` counts matching
+# LINES, and a probe is one line, so it reads 1 for a clause present twice.
+# Insisting on exactly one occurrence is what makes each pin unambiguous.
+probe_has_once() {
+	local pat="$1" probe="$2" n
+	n="$(printf '%s\n' "$probe" | grep -oF -- "$pat" | grep -c . || true)"
+	if [ "${n:-0}" -ne 1 ]; then
+		printf 'expected exactly 1 occurrence of:\n  %s\n--- got %s, in ---\n%s\n' \
+			"$pat" "${n:-0}" "$probe" >&2
+		return 1
+	fi
+}
+
+# A probe's final clause: everything after the last `; `, minus the `"` that
+# closes the shell assignment. `.*; ` is greedy, so the `;` inside awk's own
+# program does not split it early.
+probe_last_clause() {
+	printf '%s\n' "$1" | sed 's/.*; //; s/"$//'
+}
+
+@test "sstate push: the scan probe tests the directory itself, with the reserved status 1" {
+	# 1 is fetch_volume_subdir's "not there" answer and nothing else's: the
+	# caller prints a different message and a different fix for it. Every
+	# other guard in this probe must therefore avoid 1.
+	probe_has_once '[ -d $q_guest ] || exit 1;' "$(scan_probe)"
+}
+
+@test "sstate push: the scan probe checks its own cd" {
+	# find runs on `.`, so a cd that silently failed would scan the image's
+	# root instead of the sstate dir -- plausible output, wrong volume.
+	probe_has_once 'cd $q_guest || exit 8;' "$(scan_probe)"
+}
+
+@test "sstate push: the scan probe checks find's own exit status" {
+	# The headline invariant. The guest sh has no pipefail and find alone
+	# decides what is newer than the stamp, so a find that dies mid-walk
+	# otherwise reads as an EMPTY result -- the one answer that advances the
+	# stamp and drops those objects from the mirror for good. Pinned on
+	# find's own redirect, not on the shared filename, which awk's clause
+	# carries too.
+	probe_has_once '> /tmp/.mackas-scan || exit 9;' "$(scan_probe)"
+}
+
+@test "sstate push: the scan probe checks awk's own exit status" {
+	# awk is what turns the scan into the "<kb><TAB><n> objects" line the
+	# caller parses; if it dies the caller gets no count at all. Pinned on
+	# the clause that closes awk's program, so find's redirect to the same
+	# file cannot satisfy it.
+	probe_has_once "}' /tmp/.mackas-scan || exit 10" "$(scan_probe)"
+}
+
+@test "sstate push: the scan probe prints its completion marker last, and never exits 0" {
+	# The marker is the caller's proof the script reached its end (rc=11
+	# otherwise), so it has to be the LAST clause -- printed only once awk
+	# has also finished -- and a trailing `exit 0` would hand back success
+	# from anywhere. Anchored on the clause itself, never on the `exit 10`
+	# in front of it, so removing awk's guard fails only awk's own test.
+	local probe
+	probe="$(scan_probe)"
+	[ "$(probe_last_clause "$probe")" = "printf 'MACKAS-SCAN-OK\\\\n'" ]
+	assert_fails grep -qF '; exit 0' <<< "$probe"
+}
+
+@test "sstate push: the scan probe runs no pipeline" {
+	# Why find's status is checkable at all: the guest sh is dash, which has
+	# no pipefail, so `find | awk` would report awk's status and a dead find
+	# would look like an empty scan. find writes a file, awk reads it back.
+	# `||` is not a pipeline.
+	# Extracted first, THEN stripped: `scan_probe | sed` would swallow a
+	# failed extraction into an empty string and pass on nothing at all.
+	local probe stripped
+	probe="$(scan_probe)"
+	stripped="$(printf '%s\n' "$probe" | sed 's/||/@@/g')"
+	assert_fails grep -qF '|' <<< "$stripped"
+}
+
+@test "sstate push: the stampless probe tests the directory too, with the same status 1" {
+	# --full and every first push take this shape, and a new user hits it
+	# first, so the 1-vs-3 split has to hold here as well.
+	probe_has_once '[ -d $q_guest ] || exit 1;' "$(size_probe)"
+}
+
+@test "sstate push: the stampless probe marks completion after the measurement" {
+	# Nothing here can truncate a scan, but it stamps exactly as the
+	# incremental path does, so it proves it finished the same way: the
+	# marker AFTER du, never instead of it, and never a trailing `exit 0`.
+	# du itself stays unguarded on purpose -- its failure loses only the
+	# size, and printf still marks the probe complete.
+	local probe
+	probe="$(size_probe)"
+	probe_has_once 'du -sk $q_guest 2>/dev/null;' "$probe"
+	[ "$(probe_last_clause "$probe")" = "printf 'MACKAS-SCAN-OK\\\\n'" ]
+	assert_fails grep -qF '; exit 0' <<< "$probe"
 }
 
 # ---------------------------------------------------------------------------
