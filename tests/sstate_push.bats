@@ -9,11 +9,12 @@
 # a fake `rsync` on PATH, so nothing here reaches the Apple container runtime,
 # a volume, a network or an ssh host. The container mock models the two calls
 # that matter: the newer-than-the-stamp probe (which reports a scripted object
-# count and size) and the staged copy, which really populates the host staging
-# directory from a fixture and prints the "source" manifest by extracting
-# retrieve_verify_local() fresh out of the real mackas -- the same trick
-# retrieve.bats uses, so an uncorrupted copy verifies and a corrupted one does
-# not, without a second manifest implementation to keep in sync. The rsync
+# count and size, and can be told to break in each of the ways that must NOT
+# advance the stamp) and the staged copy, which really populates the host
+# staging directory from a fixture and prints the "source" manifest by
+# extracting retrieve_verify_local() fresh out of the real mackas -- the same
+# trick retrieve.bats uses, so an uncorrupted copy verifies and a corrupted one
+# does not, without a second manifest implementation to keep in sync. The rsync
 # mock records its argv, which is what pins the two-pass ordering and the
 # --ignore-existing / never --inplace contract.
 
@@ -57,10 +58,13 @@ setup() {
 	: > "$RLOG"
 
 	MOCK_BUSY_VOLUME=""
+	MOCK_NO_VOLUME=""
 	MOCK_RSYNC_FAIL=""
 	MOCK_VERIFY_CORRUPT=""
 	MOCK_VERIFY_CORRUPT_ALWAYS=""
-	export MOCK_BUSY_VOLUME MOCK_RSYNC_FAIL MOCK_VERIFY_CORRUPT MOCK_VERIFY_CORRUPT_ALWAYS
+	MOCK_PROBE_BREAK=""
+	export MOCK_BUSY_VOLUME MOCK_NO_VOLUME MOCK_RSYNC_FAIL
+	export MOCK_VERIFY_CORRUPT MOCK_VERIFY_CORRUPT_ALWAYS MOCK_PROBE_BREAK
 
 	mkdir -p "$TESTDIR/fakebin"
 	cat > "$TESTDIR/fakebin/container" <<'EOF'
@@ -76,7 +80,7 @@ case "$1 $2" in
 	"system start") exit 0 ;;
 	"volume ls")
 		echo "NAME TYPE DRIVER OPTIONS"
-		echo "oe-build-sstate named local size=40G"
+		[ -n "${MOCK_NO_VOLUME:-}" ] || echo "oe-build-sstate named local size=40G"
 		exit 0
 		;;
 	"container ls"|"ls ")
@@ -123,6 +127,7 @@ stage_copy() {
 last="${@: -1}"
 case "$last" in
 	*".mackas-verify-jobs"*)
+		echo 'COPY:primary' >> "$CLOG"
 		stage_copy primary
 		# The "source" manifest: the real retrieve_verify_local(), extracted
 		# from the real mackas and run against the fixture that was just
@@ -133,13 +138,38 @@ case "$last" in
 		;;
 	*".mackas-stage-list"*)
 		# The retry after a verification mismatch: the same tar-from-a-list
-		# copy, with no manifest of its own.
+		# copy, with no manifest of its own. Tagged, because the primary
+		# copy's own command string carries the identical stage-list marker
+		# -- grepping for it cannot tell the two apart, and once did not.
+		echo 'COPY:retry' >> "$CLOG"
 		stage_copy retry
 		exit 0
 		;;
-	*"-printf"*)
-		# The newer-than-the-stamp probe: "<kb><TAB><n> objects".
+	*".mackas-scan"*)
+		# The newer-than-the-stamp probe: "<kb><TAB><n> objects", then the
+		# marker saying the scan ran all the way through. Each break mode is
+		# one of the ways a probe can wrongly look like it found nothing.
+		case "${MOCK_PROBE_BREAK:-}" in
+			exit0)
+				# What a `find | awk` under a pipefail-less shell does when
+				# find dies: clean exit, no output at all.
+				exit 0 ;;
+			rc)
+				echo "find: /sstate: Input/output error" >&2
+				exit 9 ;;
+			truncated)
+				# The nastiest shape: find died after listing nothing, so awk
+				# summed nothing and the scan "succeeded" with a perfectly
+				# well-formed EMPTY answer -- the one that advances the stamp.
+				printf '0\t0 objects\n'
+				exit 0 ;;
+			garbage)
+				printf '%s\tmany objects\n' "${MOCK_NEWER_KB:-64}"
+				printf 'MACKAS-SCAN-OK\n'
+				exit 0 ;;
+		esac
 		printf '%s\t%s objects\n' "${MOCK_NEWER_KB:-64}" "${MOCK_NEWER_COUNT:-2}"
+		printf 'MACKAS-SCAN-OK\n'
 		exit 0
 		;;
 	*"du -sk"*)
@@ -217,9 +247,29 @@ refute_rsync() {
 	fi
 }
 
+# $output must not contain LITERAL. A function, never a bare `! ... | grep -q`,
+# which set -e does not abort on anywhere but a test's final line.
+refute_out() {
+	if printf '%s\n' "$output" | grep -qF -- "$1"; then
+		printf 'expected this NOT in the output:\n  %s\n--- output ---\n%s\n' \
+			"$1" "$output" >&2
+		return 1
+	fi
+}
+
 rsync_calls() {
 	local n
 	n="$(grep -c '^RSYNC:' "$RLOG" 2>/dev/null || true)"
+	printf '%s\n' "${n:-0}"
+}
+
+# How many times the mock took its RETRY branch -- the stage-list copy with no
+# manifest script appended. The primary copy's command string carries the same
+# stage-list marker, so grepping the argv for it cannot tell the two apart,
+# which is exactly how the retry once went untested.
+retry_calls() {
+	local n
+	n="$(grep -c '^COPY:retry$' "$CLOG" 2>/dev/null || true)"
 	printf '%s\n' "${n:-0}"
 }
 
@@ -227,6 +277,17 @@ rsync_calls() {
 # tests find it rather than hardcode it.
 stamp_file() {
 	find "$ROOT/state/sstate-push" -name '*.stamp' 2>/dev/null | head -1
+}
+
+stamp_count() {
+	local n
+	n="$(find "$ROOT/state/sstate-push" -name '*.stamp' 2>/dev/null | grep -c . || true)"
+	printf '%s\n' "${n:-0}"
+}
+
+# Only observable after a push that FAILED: a clean one wipes the stage again.
+stage_dir() {
+	find "$ROOT/sstate-push" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1
 }
 
 # One successful push, then a clean slate. A first push has no stamp, so it
@@ -258,12 +319,46 @@ seed_stamp() {
 	[ "$(rsync_calls)" -eq 0 ]
 }
 
+@test "sstate push: refuses a destination starting with '-'" {
+	# A valid-looking USER@HOST:PATH in every other respect, so only the
+	# dedicated leading-'-' refusal can reject it -- rsync would read it as
+	# an option, on the one command that reaches another machine.
+	mk --set "MACKAS_SSTATE_PUSH_DEST=-oProxyCommand=id:/srv/mackas/sstate" -y sstate push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'may not start with'
+	[ "$(rsync_calls)" -eq 0 ]
+}
+
 @test "sstate push: --dest overrides the configured destination" {
 	mk --set "MACKAS_SSTATE_PUSH_DEST=mirror@wrong.invalid:/wrong" -y \
 		sstate push --dest "$DEST"
 	[ "$status" -eq 0 ]
 	assert_rsync "[$DEST]"
 	refute_rsync "[mirror@wrong.invalid:/wrong]"
+}
+
+@test "sstate push: the --dest=VALUE form overrides it too" {
+	mk --set "MACKAS_SSTATE_PUSH_DEST=mirror@wrong.invalid:/wrong" -y \
+		sstate push --dest="$DEST"
+	[ "$status" -eq 0 ]
+	assert_rsync "[$DEST]"
+	refute_rsync "[mirror@wrong.invalid:/wrong]"
+}
+
+@test "sstate push: an empty --dest= is refused, not silently ignored" {
+	# Falling through to the configured destination would publish to the very
+	# mirror the user was trying to override.
+	mk --set "MACKAS_SSTATE_PUSH_DEST=$DEST" -y sstate push --dest=
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'needs a value'
+	[ "$(rsync_calls)" -eq 0 ]
+}
+
+@test "sstate push: a --dest with no value at all is refused" {
+	mk --set "MACKAS_SSTATE_PUSH_DEST=$DEST" -y sstate push --dest
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'needs a value'
+	[ "$(rsync_calls)" -eq 0 ]
 }
 
 @test "sstate push: an unknown option is refused" {
@@ -273,8 +368,27 @@ seed_stamp() {
 	[ "$(rsync_calls)" -eq 0 ]
 }
 
+@test "sstate push: no rsync on PATH is refused before anything is attached" {
+	# `command -v rsync` can only be exercised by a PATH that genuinely has
+	# no rsync anywhere on it, so mirror every entry of the current one into
+	# a single directory and drop just that link.
+	local nors="$TESTDIR/norsync" p
+	mkdir -p "$nors"
+	( IFS=:
+	  for p in $PATH; do
+		[ -d "$p" ] || continue
+		ln -sf "$p"/* "$nors/" 2>/dev/null || true
+	  done )
+	rm -f "$nors/rsync"
+	PATH="$nors" push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'rsync is not on PATH'
+	refute_call "oe-build-sstate:/sstate"
+	[ -z "$(stamp_file)" ]
+}
+
 # ---------------------------------------------------------------------------
-# One-VM rule
+# One-VM rule, and the volume existing at all
 # ---------------------------------------------------------------------------
 
 @test "sstate push: refuses when a running container holds the sstate volume" {
@@ -298,6 +412,22 @@ seed_stamp() {
 	refute_call "[-v] [oe-build-sstate:/sstate]"
 }
 
+@test "sstate push: a volume that does not exist is refused, and never stamped" {
+	# An absent named volume bind-mounts as an EMPTY one, which scans as
+	# "nothing newer" -- the one answer that advances the stamp. So it has to
+	# be refused before the probe attaches anything, exactly as retrieve
+	# refuses it.
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_NO_VOLUME=1 push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'does not exist yet'
+	refute_call "oe-build-sstate:/sstate"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
 # ---------------------------------------------------------------------------
 # The stamp
 # ---------------------------------------------------------------------------
@@ -308,6 +438,45 @@ seed_stamp() {
 	[ -n "$(stamp_file)" ]
 	run cat "$(stamp_file)"
 	printf '%s\n' "$output" | grep -qE '^[0-9]+$'
+}
+
+@test "sstate push: the stamp records when the scan started, not a later time" {
+	# An object written DURING a push has to be re-offered by the next one,
+	# so the stamp may never run ahead of the scan that produced it.
+	local before after stamped
+	before="$(date +%s)"
+	push
+	[ "$status" -eq 0 ]
+	after="$(date +%s)"
+	stamped="$(cat "$(stamp_file)")"
+	[ "$stamped" -ge "$before" ]
+	[ "$stamped" -le "$after" ]
+}
+
+@test "sstate push: 'now' is read before the scan, not after it" {
+	# The wall-clock bound above catches a skewed stamp but cannot see the
+	# ORDER of two statements a fraction of a second apart -- pin that in the
+	# source, the way AGENTS.md asks for logic bats cannot reach.
+	local body now_ln scan_ln
+	body="$(awk '/^sstate_push\(\) \{/,/^}/' "$MACKAS")"
+	now_ln="$(printf '%s\n' "$body" | grep -n 'now="\$(date +%s)"' | head -1 | cut -d: -f1)"
+	scan_ln="$(printf '%s\n' "$body" | grep -nF 'fetch_volume_subdir "$MACKAS_VOL_SSTATE"' | head -1 | cut -d: -f1)"
+	[ -n "$now_ln" ]
+	[ -n "$scan_ln" ]
+	[ "$now_ln" -lt "$scan_ln" ]
+}
+
+@test "sstate push: destinations that sanitize alike still get separate stamps" {
+	# These two slug to the identical string -- every '@', ':' and '/'
+	# becomes '_' -- so only the cksum half of the key keeps them apart. One
+	# shared stamp would silently skip objects the OTHER mirror never got.
+	mk --set "MACKAS_SSTATE_PUSH_DEST=mirror@example.invalid:/srv/mackas/sstate" \
+		-y sstate push
+	[ "$status" -eq 0 ]
+	mk --set "MACKAS_SSTATE_PUSH_DEST=mirror@example.invalid:/srv:mackas:sstate" \
+		-y sstate push
+	[ "$status" -eq 0 ]
+	[ "$(stamp_count)" -eq 2 ]
 }
 
 @test "sstate push: an existing stamp becomes find's -newermt cutoff" {
@@ -346,13 +515,97 @@ seed_stamp() {
 	[ "$output" = "1700000000" ]
 }
 
-@test "sstate push: nothing new stamps and transfers nothing" {
+@test "sstate push: nothing new ADVANCES the stamp and transfers nothing" {
 	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
 	MOCK_NEWER_COUNT=0 push
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'nothing to push'
 	[ "$(rsync_calls)" -eq 0 ]
-	[ -n "$(stamp_file)" ]
+	run cat "$(stamp_file)"
+	printf '%s\n' "$output" | grep -qE '^[0-9]+$'
+	[ "$output" -gt 1700000000 ]
+}
+
+# ---------------------------------------------------------------------------
+# A probe that could not answer must never read as "nothing new"
+#
+# "the scan matched nothing" is the ONE outcome that moves the stamp forward.
+# If a broken scan is indistinguishable from it, every object that really
+# existed drops below the cutoff permanently and is never offered to the
+# mirror again -- the exact opposite of what the stamp is for.
+# ---------------------------------------------------------------------------
+
+@test "sstate push: a probe that exits clean without finishing does not stamp" {
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_PROBE_BREAK=exit0 push
+	[ "$status" -ne 0 ]
+	refute_out "Nothing to push"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: a well-formed EMPTY answer from a scan that never finished does not stamp" {
+	# find died having listed nothing, awk faithfully summed nothing, and the
+	# result is indistinguishable from a genuine "nothing new" -- unless the
+	# scan has to prove it ran to the end.
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_PROBE_BREAK=truncated push
+	[ "$status" -ne 0 ]
+	refute_out "Nothing to push"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: a probe that fails outright does not stamp" {
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_PROBE_BREAK=rc push
+	[ "$status" -ne 0 ]
+	refute_out "Nothing to push"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: an unparseable object count does not stamp" {
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_PROBE_BREAK=garbage push
+	[ "$status" -ne 0 ]
+	refute_out "Nothing to push"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: the epoch predicate reaches BOTH find passes of the manifest" {
+	# retrieve_verify_script splits into a chunked large-file find and a
+	# batched small-file find (issue #94). The staged copy took only the
+	# subset, so a manifest half that walked the WHOLE volume could never
+	# match it -- and nothing hermetic can run that guest-side script (BSD
+	# find has no -printf), so pin it in the source.
+	local body
+	body="$(awk '/^retrieve_verify_script\(\) \{/,/^}/' "$MACKAS")"
+	[ "$(printf '%s\n' "$body" | grep -c 'find \. -type f' || true)" -eq 2 ]
+	[ "$(printf '%s\n' "$body" | grep -c 'find \. -type f \$newer' || true)" -eq 2 ]
+}
+
+@test "sstate push: the incremental probe checks find's own status" {
+	# The guest shell has no pipefail, so a `find | awk` reports awk's status
+	# and a find that died mid-scan still looks like an empty result. No mock
+	# can model that, so pin the shape: find's status checked on its own, a
+	# completion marker printed last, and no status-swallowing `exit 0`.
+	local probe
+	probe="$(grep -F 'mackas-scan' "$MACKAS" | head -1)"
+	[ -n "$probe" ]
+	printf '%s\n' "$probe" | grep -qF '.mackas-scan || exit'
+	printf '%s\n' "$probe" | grep -qF 'MACKAS-SCAN-OK'
+	assert_fails grep -qF '; exit 0"' <<< "$probe"
 }
 
 # ---------------------------------------------------------------------------
@@ -412,6 +665,23 @@ seed_stamp() {
 	assert_rsync "$TESTDIR/elsewhere/"
 }
 
+@test "sstate push: the staging tree is wiped before it is refilled" {
+	# It holds a second copy of every new object, so anything left behind by
+	# a previous push would be re-published and would quietly grow. Only a
+	# FAILED push leaves the stage in place to observe.
+	local stage
+	MOCK_RSYNC_FAIL=1 push
+	[ "$status" -ne 0 ]
+	stage="$(stage_dir)"
+	[ -n "$stage" ]
+	touch "$stage/left-over-from-a-previous-push"
+	MOCK_RSYNC_FAIL=1 push
+	[ "$status" -ne 0 ]
+	[ "$stage" = "$(stage_dir)" ]
+	[ ! -e "$stage/left-over-from-a-previous-push" ]
+	[ -d "$stage/sstate" ]
+}
+
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
@@ -429,7 +699,12 @@ seed_stamp() {
 	MOCK_VERIFY_CORRUPT=1 push
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qi 'failed verification after the staged copy'
-	assert_call ".mackas-stage-list"
+	# Exactly one retry: a copy carrying the stage list but NOT the manifest
+	# script, the only thing that distinguishes it from the primary copy.
+	[ "$(retry_calls)" -eq 1 ]
+	# ...and the incremental path stages with tar-from-a-list throughout,
+	# because cp -r has no subset form.
+	refute_call "cp -r"
 	[ "$(rsync_calls)" -eq 2 ]
 }
 
@@ -455,7 +730,10 @@ seed_stamp() {
 	[ "$status" -eq 0 ]
 	[ "$(rsync_calls)" -eq 0 ]
 	[ -z "$(stamp_file)" ]
-	printf '%s\n' "$output" | grep -qi 'dry-run'
+	# push's OWN dry-run line: a bare 'dry-run' match is already satisfied by
+	# fetch_volume_subdir's staging message and pins nothing here.
+	printf '%s\n' "$output" | grep -qF 'nothing was transferred and the push stamp is unchanged'
+	refute_out "pushed 'oe-build-sstate'"
 }
 
 # ---------------------------------------------------------------------------
