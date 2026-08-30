@@ -56,9 +56,12 @@ fetches. mackas orchestrates these; it does not vouch for them.
   than an ambush. A project name is validated before it becomes a path (no
   path separator, no `..`, no leading `-`, a restricted character class), and
   an unsafe project file is *refused*, never quietly replaced by the next
-  search-path candidate. `mackas projects` lists the pinned configs by
-  **grepping** them, never sourcing — listing a directory of shell files must
-  not run any of them. `./mackas.conf` is *not* in the search path at all, for
+  search-path candidate. When `mackas set` has to create
+  `~/.config/mackas/projects/` it does so at mode `700` rather than inheriting
+  the ambient umask, so a `umask 002` login cannot bootstrap a project config
+  that the very same check then refuses. `mackas projects` lists the pinned
+  configs by **grepping** them, never sourcing — listing a directory of shell
+  files must not run any of them. `./mackas.conf` is *not* in the search path at all, for
   the same reason: a cwd-relative config any untrusted tree could drop in was
   code execution needing no exploit. Every value written into a generated
   file is validated first (`validate_settings` rejects `"`, backticks and control

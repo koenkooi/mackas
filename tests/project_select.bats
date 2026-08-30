@@ -551,3 +551,95 @@ pin() {
 	printf '%s\n' "$output" | grep -q 'USAGE'
 	printf '%s\n' "$output" | grep -qi 'grepping'
 }
+
+# ---------------------------------------------------------------------------
+# Bootstrapping the projects directory must not defeat the selector's own
+# safety check
+# ---------------------------------------------------------------------------
+
+@test "set --project creates the projects directory unwritable by group, whatever the umask" {
+	# `umask 002` is a real login configuration, not a hypothetical one -- it
+	# is the case config_file_is_safe's own comment names. Inheriting it here
+	# would make ~/.config/mackas/projects group-writable, and --project would
+	# then refuse the very file this bootstrap just wrote.
+	rm -rf "$HOME/.config"
+	( umask 002; "$MACKAS" --project fresh set MACKAS_VOLUME_NAME lax-umask )
+	[ -f "$PROJDIR/fresh.conf" ]
+
+	local mode
+	for d in "$HOME/.config" "$HOME/.config/mackas" "$PROJDIR"; do
+		mode="$(stat -f '%Lp' "$d")"
+		case "${mode%?}" in *[2367]) echo "group-writable: $d ($mode)" >&2; return 1 ;; esac
+		case "${mode#??}" in [2367]) echo "other-writable: $d ($mode)" >&2; return 1 ;; esac
+	done
+
+	# The check that actually matters: the file is readable back through the
+	# selector, rather than refused as unsafe.
+	run "$MACKAS" --project fresh get MACKAS_VOLUME_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "lax-umask" ]
+}
+
+# ---------------------------------------------------------------------------
+# config_grep_setting's assignment shapes, read back through `projects` (the
+# only caller). MACKAS_VOLUME_* rather than MACKAS_ROOT, so nothing here also
+# trips the "its MACKAS_ROOT does not exist" note.
+# ---------------------------------------------------------------------------
+
+@test "projects: reads an 'export NAME=' assignment, and drops a trailing comment from a bare value" {
+	pin shapes <<-'EOF'
+	export MACKAS_VOLUME_NAME=exported-bare # and a trailing comment
+	EOF
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE '^ +MACKAS_VOLUME_NAME +exported-bare$'
+}
+
+@test "projects: the LAST assignment wins, as sourcing the file would give" {
+	pin shapes <<-'EOF'
+	MACKAS_VOLUME_NAME='first'
+	MACKAS_VOLUME_NAME='middle'
+	MACKAS_VOLUME_NAME='last-wins'
+	EOF
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE '^ +MACKAS_VOLUME_NAME +last-wins$'
+	! printf '%s\n' "$output" | grep -q 'first'
+}
+
+@test "projects: a value 'set' wrote with an apostrophe in it reads back unmangled" {
+	# shq() renders an embedded apostrophe as '\'' ; printing that back raw
+	# is a corrupt listing of a file mackas itself wrote.
+	run "$MACKAS" --project apos set MACKAS_VOLUME_NAME "it's-here"
+	[ "$status" -eq 0 ]
+	grep -qF "MACKAS_VOLUME_NAME='it'\\''s-here'" "$PROJDIR/apos.conf"
+
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE "^ +MACKAS_VOLUME_NAME +it's-here\$"
+}
+
+# ---------------------------------------------------------------------------
+# The empty-value form of the flag
+# ---------------------------------------------------------------------------
+
+@test "--project= with nothing after it is an error, not a silent fall-through" {
+	# The separated form already dies; without the same check here, '--project='
+	# would quietly drop back to the search path (or to an exported
+	# \$MACKAS_PROJECT_SELECT), selecting something other than what was asked.
+	echo 'MACKAS_KAS_CONFIG="from-search-path"' > "$HOME/.mackas.conf"
+	chmod 600 "$HOME/.mackas.conf"
+	run "$MACKAS" --project= status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'needs a NAME'
+	! printf '%s\n' "$output" | grep -q 'from-search-path'
+}
+
+@test "--project= does not fall back to an exported \$MACKAS_PROJECT_SELECT either" {
+	pin other <<-'EOF'
+	MACKAS_KAS_CONFIG="from-other"
+	EOF
+	MACKAS_PROJECT_SELECT=other run "$MACKAS" --project= status
+	[ "$status" -ne 0 ]
+	! printf '%s\n' "$output" | grep -q 'from-other'
+}
