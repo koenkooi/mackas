@@ -323,7 +323,9 @@ rec_runtime_args_value() {
 	cd "$TESTDIR"
 	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
 	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
-	grep -qxF 'ARGV:runtime-args --require-volumes-free' "$SELF_REC"
+	# Both flags, on ONE recompute: the one-VM check and the identity check
+	# ride the same call. The work dir varies per test dir, so match the shape.
+	grep -qE '^ARGV:runtime-args --require-volumes-free --expect-work /' "$SELF_REC"
 }
 
 @test "refusal: a partial args string (limits present, no volume mounts) refuses to launch, recorder never created" {
@@ -586,4 +588,14 @@ rec_runtime_args_value() {
 	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
 	[ ! -e "$TESTDIR/pwned" ]
 	grep -qxF "SEL:a'\$(touch $TESTDIR/pwned)b" "$SELF_REC"
+}
+
+# The wrapper freezes MACKAS_WORK/KAS_IMAGE/gitconfig but recomputes volumes
+# LIVE, so a config resolving a different root would hand this build another
+# project's ext4 volumes while its sources stay put. Identity is compared
+# rather than the config path being frozen, so an ambient $MACKAS_CONF keeps
+# working whenever it agrees and is refused only when it does not.
+
+@test "the generated wrapper passes --expect-work with its frozen MACKAS_WORK" {
+	grep -qF -- '--expect-work "$MACKAS_WORK"' "$MACKAS_BIN/kas-container"
 }
