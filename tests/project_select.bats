@@ -643,3 +643,66 @@ pin() {
 	[ "$status" -ne 0 ]
 	! printf '%s\n' "$output" | grep -q 'from-other'
 }
+
+# The refusal's HINT, not just its exit status. This fires most often from a
+# --project wrapper meeting a $MACKAS_CONF exported in a shell rc, where the
+# selector named in the error is one the user never set -- so the hint has to
+# show both resolved values and give the escape for whichever one they control.
+
+@test "selector conflict: the hint shows BOTH resolved values, not just the names" {
+	pin meta-ai <<-'EOF'
+	MACKAS_KAS_CONFIG="from-pin"
+	EOF
+	printf 'MACKAS_KAS_CONFIG="from-env"\n' > "$TESTDIR/env.conf"
+	MACKAS_CONF="$TESTDIR/env.conf" MACKAS_PROJECT_SELECT=meta-ai run "$MACKAS" status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -q "meta-ai"
+	printf '%s\n' "$output" | grep -qF "$TESTDIR/env.conf"
+}
+
+@test "selector conflict: the hint gives the command to blank \$MACKAS_CONF" {
+	pin meta-ai <<-'EOF'
+	MACKAS_KAS_CONFIG="from-pin"
+	EOF
+	printf 'MACKAS_KAS_CONFIG="from-env"\n' > "$TESTDIR/env.conf"
+	MACKAS_CONF="$TESTDIR/env.conf" MACKAS_PROJECT_SELECT=meta-ai run "$MACKAS" status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_CONF= <your command>'
+	printf '%s\n' "$output" | grep -qF 'unset MACKAS_CONF'
+}
+
+@test "selector conflict: a FLAG-sourced path says drop the flag, not unset a variable" {
+	pin meta-ai <<-'EOF'
+	MACKAS_KAS_CONFIG="from-pin"
+	EOF
+	printf 'MACKAS_KAS_CONFIG="from-env"\n' > "$TESTDIR/env.conf"
+	MACKAS_PROJECT_SELECT=meta-ai run "$MACKAS" --config "$TESTDIR/env.conf" status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'drop the --config flag'
+	# It must NOT tell them to unset a variable they never set.
+	! printf '%s\n' "$output" | grep -qF 'unset MACKAS_CONF'
+}
+
+@test "selector conflict: a FLAG-sourced selector says drop the flag, not unset a variable" {
+	pin meta-ai <<-'EOF'
+	MACKAS_KAS_CONFIG="from-pin"
+	EOF
+	printf 'MACKAS_KAS_CONFIG="from-env"\n' > "$TESTDIR/env.conf"
+	MACKAS_CONF="$TESTDIR/env.conf" run "$MACKAS" --project meta-ai status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'drop the --project flag'
+	! printf '%s\n' "$output" | grep -qF 'unset MACKAS_PROJECT_SELECT'
+}
+
+@test "--config= (empty) is refused exactly like --config \"\"" {
+	run "$MACKAS" --config= status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--config needs a FILE'
+}
+
+@test "--config= does not fall back to an exported \$MACKAS_CONF" {
+	printf 'MACKAS_KAS_CONFIG="from-env"\n' > "$TESTDIR/env.conf"
+	MACKAS_CONF="$TESTDIR/env.conf" run "$MACKAS" --config= status
+	[ "$status" -ne 0 ]
+	! printf '%s\n' "$output" | grep -q 'from-env'
+}

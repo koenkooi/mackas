@@ -450,6 +450,13 @@ Which file gets sourced, first match wins:
 | `~/.config/mackas/config` | |
 | `~/.mackas.conf` | |
 
+Naming a path and selecting a project are mutually exclusive — two answers to
+the same question — so mackas refuses rather than ranking them, and the refusal
+prints both resolved values plus the command to drop whichever one you did not
+mean. An empty value is refused too: `--config=` and `--config ""` behave
+identically, as do `--project=` and `--project ""`, so an explicit-but-empty
+override can never quietly resolve to a different file.
+
 `./mackas.conf` is deliberately **not** searched: the config is sourced as
 shell, so a cwd config would let any untrusted tree you `cd` into (an
 unpacked tarball, a cloned repo) run code the moment you invoke `mackas`. To
