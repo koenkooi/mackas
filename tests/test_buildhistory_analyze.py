@@ -16,6 +16,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ANALYZER = os.path.join(HERE, os.pardir, "tools", "mackas-buildhistory-analyze")
@@ -401,6 +402,55 @@ class ParseHelperTests(unittest.TestCase):
 
     def test_parse_lineset_drops_blanks(self):
         self.assertEqual(bha.parse_lineset("a\n\nb\n \n"), {"a", "b"})
+
+
+class GitPlumbingFailureTests(unittest.TestCase):
+    """A swallowed git failure is reported as a measurement: "0 unchanged
+    recipes" from a failed ls-tree, or blobs read off a desynced cat-file
+    stream and mis-assigned to the wrong refs."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = BuildHistoryFixture(self._tmp.name)
+        self.repo.write_recipe("cortexa57", "busybox", "1.36.1", "r0",
+                                ["busybox"])
+        self.repo.commit("build")
+
+    def test_ls_tree_failure_is_not_an_empty_listing(self):
+        with self.assertRaises(bha.GitError):
+            bha.ls_tree_paths(self.repo.path, "nosuchrev", "packages/")
+
+    def test_a_prefix_matching_nothing_is_still_empty_not_an_error(self):
+        # git exits 0 for a pathspec that matches nothing, which is why a
+        # non-zero status above can be treated as a real failure.
+        head = bha.resolve_commit(self.repo.path, "HEAD")
+        self.assertEqual(bha.ls_tree_paths(self.repo.path, head, "sdk/"), [])
+
+    def _cat_file(self, stdout, refs):
+        class _R:
+            returncode = 0
+        r = _R()
+        r.stdout = stdout
+        with mock.patch.object(bha, "run_git", return_value=r):
+            return bha.batch_cat_file(self.repo.path, refs)
+
+    def test_a_truncated_blob_is_an_error_not_a_short_read(self):
+        with self.assertRaises(bha.GitError):
+            self._cat_file(b"deadbeef blob 100\nshort",
+                            ["deadbeef:packages/cortexa57/busybox/latest"])
+
+    def test_trailing_bytes_after_the_last_ref_are_an_error(self):
+        with self.assertRaises(bha.GitError):
+            self._cat_file(b"deadbeef blob 2\nhi\nJUNK",
+                            ["deadbeef:packages/cortexa57/busybox/latest"])
+
+    def test_a_well_formed_stream_still_reads(self):
+        got = self._cat_file(
+            b"deadbeef blob 2\nhi\n",
+            ["deadbeef:packages/cortexa57/busybox/latest"])
+        self.assertEqual(
+            got, {"deadbeef:packages/cortexa57/busybox/latest": "hi"})
 
 
 if __name__ == "__main__":

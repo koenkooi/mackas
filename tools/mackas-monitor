@@ -27,6 +27,12 @@ polls an already-running build's already-published bridge.
 If that published port resets instead of answering -- an Apple `container`
 port-forward bug, not a bridge one (see resolve_direct_endpoint) -- the poll
 switches to the container's own address and carries on.
+
+EXIT STATUS
+  0  reached the bridge; the build succeeded, or --once printed a snapshot
+  1  reached the bridge; the build itself failed
+  2  never got a usable answer -- nothing listening, or something on that
+     port that is not a mackas progress bridge
 """
 
 import argparse
@@ -107,11 +113,28 @@ output and the exit status are unchanged either way.
 """
 
 
+class BridgePayloadError(Exception):
+    """The port answered, but not with a progress-bridge payload.
+
+    Port 8801 is a plain published port like any other; something else can be
+    sitting on it. Without this the response goes straight into json.loads and
+    every downstream `state.get` -- a traceback where the answer is "that is
+    not the bridge"."""
+
+
 def fetch(port, host=LOOPBACK):
     with urllib.request.urlopen(
         f"http://{host}:{port}/", timeout=REQUEST_TIMEOUT
     ) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        raw = resp.read().decode("utf-8", "replace")
+    try:
+        state = json.loads(raw)
+    except ValueError:
+        raise BridgePayloadError("the response is not JSON")
+    if not isinstance(state, dict):
+        raise BridgePayloadError(
+            "the response is a JSON %s, not an object" % type(state).__name__)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +697,13 @@ def main(argv=None):
         while True:
             try:
                 state = fetch(port, host)
+            except BridgePayloadError as exc:
+                print(
+                    f"{host}:{port} answered, but {exc} -- something other "
+                    f"than a mackas progress bridge is listening there",
+                    file=sys.stderr,
+                )
+                return EXIT_UNREACHABLE
             # socket.timeout is only an alias of TimeoutError from Python
             # 3.10 on; mackas's stdlib-only floor is 3.7, and a bare timeout
             # can propagate unwrapped (see _underlying_os_error's docstring),
