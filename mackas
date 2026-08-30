@@ -434,8 +434,11 @@ apply_cli_overrides() {
 }
 
 # Settings that get interpolated into something this script GENERATES -- the
-# shell of env.sh, the /bin/sh of the kas-container wrapper, or the YAML of the
-# kas fragment.
+# shell of env.sh, the /bin/sh of the kas-container wrapper, the YAML of the
+# kas fragment -- or into an argv it builds from them: the host side of a
+# `-v` bind mount, an rsync target. Registering a setting is a four-place
+# edit (SETTING_NAMES, a default, this list, the docs); leaving it off here
+# is what makes an unvalidated value reach one of those.
 #
 # BREW_BIN is the odd one out: not a name in SETTING_NAMES, but the value the
 # MACKAS_BREW_BIN seam feeds into both generated shell files, so it belongs
@@ -457,6 +460,8 @@ MACKAS_SSTATE_MIRROR_PATH
 MACKAS_DL_MIRROR_PATH
 MACKAS_HTTP_MIRROR_SSTATE
 MACKAS_HTTP_MIRROR_DL
+MACKAS_SSTATE_PUSH_DEST
+MACKAS_SSTATE_PUSH_STAGE
 MACKAS_PROJECT_URL
 MACKAS_PROJECT_BRANCH
 MACKAS_PROJECT_DIR
@@ -6921,10 +6926,10 @@ fetch_volume_subdir() {
 	# a VM boot is the expensive part, not the extra `du`. Always runs for
 	# real, dry-run or not (same reasoning as clean_tmp_deploy/sstate_prune's
 	# own probes): a --dry-run preview is more useful showing the REAL
-	# transfer size than an assumed yes. The trailing `exit 0` means a `du`
-	# failure (permissions, an exotic guest fs) never masks a directory that
-	# DOES exist -- size reporting is a nicety, not a precondition; only a
-	# missing directory (the `[ -d ] || exit 1`) is treated as absent.
+	# transfer size than an assumed yes. A `du` failure (permissions, an
+	# exotic guest fs) never masks a directory that DOES exist -- size
+	# reporting is a nicety, not a precondition; only a missing directory
+	# (the `[ -d ] || exit 1`) is treated as absent.
 	# printf %q quotes $guest safely for the sh -c string. `|| rc=$?` (never a
 	# bare `rc=$?` on the next line) -- under this script's set -euo
 	# pipefail, a failing substitution trips set -e before a later bare
@@ -6943,24 +6948,34 @@ fetch_volume_subdir() {
 	# non-zero code is a probe that BROKE, and gets its own return below.
 	# The two have to stay distinguishable from each other and from an empty
 	# answer, because push stamps on the empty one (see sstate_push) and must
-	# never stamp on a broken one.
+	# never stamp on a broken one. Both probe shapes therefore end in the
+	# same MACKAS-SCAN-OK marker, checked unconditionally below: whether the
+	# push is incremental, --full or the very first one, a probe that exited
+	# clean without reaching its end must not read as an answer.
 	local probe rc=0 size_kb="" newer_count="" probe_cmd q_guest
 	q_guest="$(printf '%q' "$guest")"
 	if [ -n "$find_newer" ]; then
-		# Not a `find | awk` pipeline, and no trailing `exit 0`: the guest sh
-		# is dash, which has no pipefail, so a find that dies mid-scan still
-		# leaves the pipeline exiting 0 and reads as "nothing newer" -- the
-		# one answer that advances the stamp. find's status is checked on its
-		# own, and MACKAS-SCAN-OK is printed only once awk has also finished,
-		# so a truncated or half-run scan cannot pass for an empty one.
+		# Not a `find | awk` pipeline: the guest sh is dash, which has no
+		# pipefail, so a find that dies mid-scan still leaves the pipeline
+		# exiting 0 and reads as "nothing newer" -- the one answer that
+		# advances the stamp. find's status is checked on its own, and
+		# MACKAS-SCAN-OK is printed only once awk has also finished, so a
+		# truncated or half-run scan cannot pass for an empty one.
 		probe_cmd="[ -d $q_guest ] || exit 1; cd $q_guest || exit 8; find . -type f $find_newer -printf '%s\\n' > /tmp/.mackas-scan || exit 9; LC_ALL=C awk '{ s += \$1; n++ } END { printf \"%d\\t%d objects\\n\", (s + 1023) / 1024, n }' /tmp/.mackas-scan || exit 10; printf 'MACKAS-SCAN-OK\\n'"
 	else
-		probe_cmd="[ -d $q_guest ] || exit 1; du -sk $q_guest 2>/dev/null; exit 0"
+		# The SAME completion marker, never a trailing `exit 0`, even though
+		# this branch has no scan to truncate: `sstate push` reaches it on
+		# --full and on every FIRST push (no stamp yet, so no cutoff and no
+		# find), and stamps afterwards exactly as the incremental path does.
+		# A guard that only covered the incremental path would leave the
+		# never-stamp rule off the path a new user hits first. printf, not
+		# `exit 0`, is also what keeps du's own failure a nicety: du writes
+		# nothing, printf still succeeds, and only the size is lost.
+		probe_cmd="[ -d $q_guest ] || exit 1; du -sk $q_guest 2>/dev/null; printf 'MACKAS-SCAN-OK\\n'"
 	fi
 	probe="$(container run --rm -u 0:0 -v "$vol:$mount" "$KAS_IMAGE" \
 		sh -c "$probe_cmd")" || rc=$?
-	if [ -n "$find_newer" ] && [ "$rc" -eq 0 ] && \
-	   ! printf '%s\n' "$probe" | grep -q '^MACKAS-SCAN-OK$'; then
+	if [ "$rc" -eq 0 ] && ! printf '%s\n' "$probe" | grep -q '^MACKAS-SCAN-OK$'; then
 		rc=11
 	fi
 	if [ "$rc" -eq 1 ]; then
