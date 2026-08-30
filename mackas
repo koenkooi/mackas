@@ -85,6 +85,9 @@ MACOS_MIN_MAJOR=26
 # it put a dev Mac's real `container` AHEAD of whatever the caller's own PATH
 # resolved, inside the very children a hermetic test's stub exists to shadow.
 # tests/helpers.bash points this at that stub instead.
+#
+# It reaches two generated files, so it is in SETTINGS_INTERPOLATED and is
+# shq()-quoted by both writers -- a seam is still an input.
 BREW_BIN="${MACKAS_BREW_BIN:-/opt/homebrew/bin}"
 
 # Apple container's own volume storage root. There is no config knob for
@@ -421,8 +424,16 @@ apply_cli_overrides() {
 }
 
 # Settings that get interpolated into something this script GENERATES -- the
-# shell of env.sh, or the YAML of the kas fragment.
+# shell of env.sh, the /bin/sh of the kas-container wrapper, or the YAML of the
+# kas fragment.
+#
+# BREW_BIN is the odd one out: not a name in SETTING_NAMES, but the value the
+# MACKAS_BREW_BIN seam feeds into both generated shell files, so it belongs
+# under the same check as everything else here. It is the DERIVED name, not
+# MACKAS_BREW_BIN, because BREW_BIN is what is interpolated and is always set
+# (a default) -- `set -u` would abort on the unset seam variable.
 SETTINGS_INTERPOLATED="
+BREW_BIN
 MACKAS_ROOT
 MACKAS_SHORT_LINK
 MACKAS_VOLUME_NAME
@@ -463,13 +474,17 @@ MACKAS_KAS_CONFIG
 # This runs before derive_paths(), so the derived mirror paths inherit an
 # already-checked MACKAS_ROOT and need no second pass.
 validate_settings() {
-	local n v
+	local n v where
 	for n in $SETTINGS_INTERPOLATED; do
 		eval "v=\"\${$n}\""
+		# BREW_BIN is not settable by that name -- name the seam that feeds it,
+		# so the fix points somewhere the reader can actually edit.
+		where="$n in $(config_hint)"
+		[ "$n" = "BREW_BIN" ] && where="MACKAS_BREW_BIN in the environment"
 		case "$v" in
 			*'"'*|*'`'*|*[[:cntrl:]]*)
 				die "$n contains a double quote, a backtick or a control character" \
-					"remove it from $n in $(config_hint) -- $SCRIPT_NAME cannot write such a value into the env.sh and kas fragment it generates without corrupting them"
+					"remove it from $where -- $SCRIPT_NAME cannot write such a value into the env.sh, kas-container wrapper and kas fragment it generates without corrupting them"
 				;;
 		esac
 		# A literal backslash is legal on APFS but has never once shown up in a
@@ -484,7 +499,7 @@ validate_settings() {
 		case "$v" in
 			*'\'*)
 				die "$n contains a literal backslash: $v" \
-					"this usually means backslash-escaped spaces got combined with quotes in $(config_hint) -- backslash is not special inside double quotes, so it survives as a literal character instead of escaping the space. Use EITHER plain quotes (\"$n=/path with spaces\") OR backslash escapes with no surrounding quotes (\`$n=/path\\ with\\ spaces\`), not both."
+					"this usually means backslash-escaped spaces got combined with quotes in $where -- backslash is not special inside double quotes, so it survives as a literal character instead of escaping the space. Use EITHER plain quotes (\"$n=/path with spaces\") OR backslash escapes with no surrounding quotes (\`$n=/path\\ with\\ spaces\`), not both."
 				;;
 		esac
 	done
@@ -3570,7 +3585,9 @@ setup_shim_and_env() {
 #   source $MACKAS_ENV_SH
 #
 # The shim MUST come before /usr/local/bin (the real Docker CLI lives there).
-# $BREW_BIN must come before /usr/bin so kas-container finds GNU realpath.
+# The Homebrew bin dir must come before /usr/bin so kas-container finds GNU
+# realpath (it is the second entry below; NOT interpolated into this comment,
+# where a newline in it would end the comment and make the rest code).
 # $SCRIPT_NAME's own checkout is on PATH too, so '$SCRIPT_NAME ...' works from
 # any directory once this is sourced -- no more cd-ing back to the repo first.
 $mirrors_note
@@ -4209,9 +4226,15 @@ write_kas_wrapper() {
 		return
 	fi
 
-	local q_real q_shim q_self q_work q_image q_gitconfig q_rtargs q_scriptname
+	# Every value that becomes CODE below is shq()-quoted first, for the reason
+	# spelled out in setup_shim_and_env(): the raw form was an injection.
+	# BREW_BIN is on this list because it used to be a hardcoded literal --
+	# turning it into a variable put it straight back inside a raw "..." until
+	# this line existed.
+	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_rtargs q_scriptname
 	q_real="$(shq "$KAS_CONTAINER_REAL")"
 	q_shim="$(shq "$SHIM_DIR")"
+	q_brew="$(shq "$BREW_BIN")"
 	q_self="$(shq "$SCRIPT_DIR/$SCRIPT_NAME")"
 	q_work="$(shq "$MACKAS_WORK")"
 	q_image="$(shq "$KAS_IMAGE")"
@@ -4240,6 +4263,7 @@ write_kas_wrapper() {
 
 KAS_CONTAINER_REAL=$q_real
 SHIM_DIR=$q_shim
+BREW_BIN=$q_brew
 MACKAS_SELF=$q_self
 MACKAS_WORK=$q_work
 KAS_IMAGE=$q_image
@@ -4362,7 +4386,7 @@ fi
 # GITCONFIG_FILE honours one already in the environment (":-", exactly like
 # env.sh's own GITCONFIG_FILE handling) -- a value the user exported
 # themselves always wins over the one baked in here at generation time.
-exec env PATH="\$SHIM_DIR:$BREW_BIN:\$PATH" \\
+exec env PATH="\$SHIM_DIR:\$BREW_BIN:\$PATH" \\
 	MACKAS_KAS_WRAPPED=1 \\
 	KAS_CONTAINER_ENGINE=$MACKAS_KAS_ENGINE \\
 	KAS_WORK_DIR="\$MACKAS_WORK" \\

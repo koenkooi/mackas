@@ -587,6 +587,59 @@ write_env_sh() {
 	printf '%s\n' "$out" | grep -qi 'MACKAS_HTTP_MIRROR_SSTATE'
 }
 
+@test "settings: a hostile MACKAS_BREW_BIN is refused, and the fix names the seam" {
+	# BREW_BIN is not a config setting -- it is the MACKAS_BREW_BIN test seam --
+	# and it sat outside validate_settings entirely while feeding BOTH generated
+	# shell files. Each shape below is a way out of one of them: '"' and a
+	# backtick out of the kas-container wrapper's exec line, a newline out of
+	# env.sh's comment block.
+	local shape
+	for shape in \
+		'/opt/x"; echo INJECTED; "' \
+		'/opt/x`touch /tmp/mackas-brew-pwned`' \
+		"$(printf '/opt/x\necho INJECTED')"
+	do
+		BREW_BIN="$shape"
+		out="$( (validate_settings) 2>&1 )" && rc=0 || rc=$?
+		[ "$rc" -ne 0 ]
+		printf '%s\n' "$out" | grep -qF 'BREW_BIN contains'
+		# config_hint() would send the reader to a file this value is not in.
+		printf '%s\n' "$out" | grep -qF 'MACKAS_BREW_BIN in the environment'
+		printf '%s\n' "$out" | grep -q 'next:'
+	done
+	[ ! -e /tmp/mackas-brew-pwned ]
+
+	# Non-vacuous: an ordinary Homebrew path passes the same call.
+	BREW_BIN=/opt/homebrew/bin
+	out="$( (validate_settings) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ]
+}
+
+@test "env.sh: a hostile BREW_BIN corrupts neither the comment block nor the PATH line" {
+	# The seam reaches env.sh twice: shq()d into the export PATH line, and --
+	# until this test -- pasted RAW into the comment two lines above it, where a
+	# newline ends the comment and everything after it is code the user's
+	# interactive shell runs on `source`. Measured before the fix: the first
+	# `touch` below really ran.
+	BREW_BIN="$(printf '/opt/x\ntouch %s/BREW-PWNED\n:/opt/y`touch %s/BREW-PWNED2`' "$TESTDIR" "$TESTDIR")"
+	write_env_sh
+
+	/bin/bash -n "$MACKAS_ENV_SH"
+	/bin/zsh -n "$MACKAS_ENV_SH"
+
+	/bin/bash -c '. "$1" >/dev/null 2>&1' _ "$MACKAS_ENV_SH" || true
+	[ ! -e "$TESTDIR/BREW-PWNED" ]
+	[ ! -e "$TESTDIR/BREW-PWNED2" ]
+
+	# ...and the correctness half: the value still arrives verbatim, as the
+	# single PATH entry right after the shim.
+	got="$(/bin/bash -c '. "$1" >/dev/null 2>&1; printf "%s" "$PATH"' _ "$MACKAS_ENV_SH")"
+	case "$got" in
+		"$SHIM_DIR:$BREW_BIN:"*) ;;
+		*) echo "BREW_BIN did not survive generation intact: $got" >&2; return 1 ;;
+	esac
+}
+
 @test "settings: spaces, \$ and apostrophes in MACKAS_ROOT are ALLOWED" {
 	# A volume named "My Build Disk" has spaces, and /Users/o'brien is a name,
 	# not an attack. Refusing these would be the fix eating the feature.
