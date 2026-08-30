@@ -171,8 +171,10 @@ kas-container's own top-level subcommands (never `kas_shell_ro()`'s
 `rsync`: the one-VM refusal, the read-only staging mount, the stamp being
 honoured as `find`'s cutoff and advanced only after a clean transfer, the
 two-pass ordering (`.siginfo` second), `--ignore-existing` on every pass with
-`--inplace` on none, and a verification failure aborting before anything
-reaches the network;
+`--inplace` on none, a verification failure aborting before anything reaches
+the network, and — the property the whole stamp exists for — every way a
+probe can fail or come back unreadable leaving the stamp exactly where it
+was, since only "the scan matched nothing" may advance it;
 `workspace_attach` covers the fail-closed workspace-image attach guard's
 whole decision table against a stubbed `hdiutil`. The `*_real` files are the opt-in suites described below.
 
