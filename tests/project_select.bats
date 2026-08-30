@@ -706,3 +706,48 @@ pin() {
 	[ "$status" -ne 0 ]
 	! printf '%s\n' "$output" | grep -q 'from-env'
 }
+
+# The generated wrapper freezes MACKAS_WORK/KAS_IMAGE/gitconfig but recomputes
+# volumes LIVE, so a config resolving a different root would hand a build
+# another project's ext4 volumes while its sources and gitconfig stay put.
+# Identity is compared rather than the config path being frozen into the
+# wrapper, so an ambient $MACKAS_CONF keeps working whenever it agrees.
+
+@test "--expect-work: a matching root still prints args" {
+	mkdir -p "$TESTDIR/rootA/work"
+	printf 'MACKAS_ROOT=%s\n' "$TESTDIR/rootA" > "$TESTDIR/A.conf"
+	MACKAS_CONF="$TESTDIR/A.conf" run "$MACKAS" runtime-args --expect-work "$TESTDIR/rootA/work"
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -q -- '-v .*:/build'
+}
+
+@test "--expect-work: a DIFFERENT root is refused, naming both" {
+	mkdir -p "$TESTDIR/rootA/work" "$TESTDIR/rootB/work"
+	printf 'MACKAS_ROOT=%s\n' "$TESTDIR/rootB" > "$TESTDIR/B.conf"
+	MACKAS_CONF="$TESTDIR/B.conf" run "$MACKAS" runtime-args --expect-work "$TESTDIR/rootA/work"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "$TESTDIR/rootA/work"
+	printf '%s\n' "$output" | grep -qF "$TESTDIR/rootB/work"
+}
+
+@test "--expect-work: the refusal prints NO args string to accidentally use" {
+	mkdir -p "$TESTDIR/rootA/work" "$TESTDIR/rootB/work"
+	printf 'MACKAS_ROOT=%s\n' "$TESTDIR/rootB" > "$TESTDIR/B.conf"
+	MACKAS_CONF="$TESTDIR/B.conf" run "$MACKAS" runtime-args --expect-work "$TESTDIR/rootA/work"
+	[ "$status" -ne 0 ]
+	! printf '%s\n' "$output" | grep -q -- '-v .*:/build'
+}
+
+@test "--expect-work: the refusal says how to drop \$MACKAS_CONF" {
+	mkdir -p "$TESTDIR/rootA/work" "$TESTDIR/rootB/work"
+	printf 'MACKAS_ROOT=%s\n' "$TESTDIR/rootB" > "$TESTDIR/B.conf"
+	MACKAS_CONF="$TESTDIR/B.conf" run "$MACKAS" runtime-args --expect-work "$TESTDIR/rootA/work"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'unset MACKAS_CONF'
+}
+
+@test "--expect-work needs a value" {
+	run "$MACKAS" runtime-args --expect-work
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--expect-work needs a DIR'
+}
