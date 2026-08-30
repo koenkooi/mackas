@@ -641,11 +641,16 @@ What to know when driving it:
 - It refuses while a build holds the sstate volume, like every other volume
   operation here.
 - Objects are staged to a host directory and checksum-verified there before
-  anything is transferred, so the first push of a warm cache needs transient
-  room for the new objects (`MACKAS_SSTATE_PUSH_STAGE` moves that elsewhere).
+  anything is transferred, so a push needs transient room for everything it
+  offers (`MACKAS_SSTATE_PUSH_STAGE` moves that elsewhere). Size that for the
+  **reuse** set: the cutoff is mtime and bitbake touches an object every time
+  it reuses one, so a push after a big build offers what that build reused as
+  well as what it wrote. Nothing is missed either way, and re-offering costs
+  nothing on the wire.
 - Re-running is always safe: everything is sent `--ignore-existing`, and the
-  stamp only advances after a clean transfer. An interrupted push just
-  re-offers the same objects.
+  stamp only advances after a clean transfer *and* a scan that provably
+  finished. An interrupted push, a broken probe or a lost stamp all cost a
+  rescan, never a wrong result.
 - The destination is an ssh target, not a URL. The mirror's HTTP side is
   read-only by design.
 

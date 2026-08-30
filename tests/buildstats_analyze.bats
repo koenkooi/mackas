@@ -112,7 +112,7 @@ assert_call() {
 }
 
 @test "buildstats analyze: finds a build_stats nested under retrieve's own timestamp dir" {
-	# The shape `mackas retrieve buildstats` produces now (fetch_tmp_subdir's
+	# The shape `mackas retrieve buildstats` produces now (fetch_volume_subdir's
 	# EXTRA param): buildstats/<retrieve-timestamp>/<BUILDNAME>/build_stats,
 	# one level deeper than the old flat buildstats/<BUILDNAME>/. Resolution
 	# must be recursive, not hardcode one fixed level.
