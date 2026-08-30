@@ -150,10 +150,10 @@ case "$last" in
 		# marker saying the scan ran all the way through. Each break mode is
 		# one of the ways a probe can wrongly look like it found nothing.
 		case "${MOCK_PROBE_BREAK:-}" in
-			exit0)
-				# What a `find | awk` under a pipefail-less shell does when
-				# find dies: clean exit, no output at all.
-				exit 0 ;;
+			nodir)
+				# The `[ -d /sstate ] || exit 1` half: the volume is there,
+				# the directory inside it is not.
+				exit 1 ;;
 			rc)
 				echo "find: /sstate: Input/output error" >&2
 				exit 9 ;;
@@ -173,7 +173,22 @@ case "$last" in
 		exit 0
 		;;
 	*"du -sk"*)
+		# The stampless probe. --full and every FIRST push take this branch
+		# (no cutoff, so nothing for find to select against) and stamp
+		# afterwards exactly as the incremental one does, so it has to prove
+		# it finished too. Only the break mode that shape can actually
+		# produce is modelled; the rest are indistinguishable here from
+		# their incremental counterparts, which is the whole point.
+		case "${MOCK_PROBE_BREAK:-}" in
+			truncated)
+				# A perfectly well-formed size line from a script that never
+				# reached its end -- indistinguishable from a real answer
+				# unless the marker below is insisted on.
+				printf '%s\t/sstate\n' "${MOCK_DU_KB:-4096}"
+				exit 0 ;;
+		esac
 		printf '%s\t/sstate\n' "${MOCK_DU_KB:-4096}"
+		printf 'MACKAS-SCAN-OK\n'
 		exit 0
 		;;
 esac
@@ -368,6 +383,39 @@ seed_stamp() {
 	[ "$(rsync_calls)" -eq 0 ]
 }
 
+# ---------------------------------------------------------------------------
+# Both push settings go through validate_settings
+#
+# Registering a setting is a four-place edit, and SETTINGS_INTERPOLATED is the
+# place that is easy to miss: MACKAS_SSTATE_PUSH_STAGE becomes the HOST side
+# of `-v <stage>:/out` and MACKAS_SSTATE_PUSH_DEST becomes rsync's target, so
+# an unchecked value reaches an argv either way (invariant 5). Nothing else in
+# the suite exercises those two registrations -- delete the two lines and
+# every other test stays green while the refusal silently disappears.
+# ---------------------------------------------------------------------------
+
+@test "sstate push: a hostile MACKAS_SSTATE_PUSH_STAGE is refused before anything is attached" {
+	mk --set "MACKAS_SSTATE_PUSH_DEST=$DEST" \
+		--set 'MACKAS_SSTATE_PUSH_STAGE=/tmp/stage`id`' -y sstate push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_SSTATE_PUSH_STAGE'
+	printf '%s\n' "$output" | grep -q 'next:'
+	refute_call "oe-build-sstate:/sstate"
+	[ "$(rsync_calls)" -eq 0 ]
+	[ -z "$(stamp_file)" ]
+}
+
+@test "sstate push: a hostile MACKAS_SSTATE_PUSH_DEST is refused before anything is attached" {
+	mk --set 'MACKAS_SSTATE_PUSH_DEST=mirror@example.invalid:/srv/"; id; "' \
+		-y sstate push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_SSTATE_PUSH_DEST'
+	printf '%s\n' "$output" | grep -q 'next:'
+	refute_call "oe-build-sstate:/sstate"
+	[ "$(rsync_calls)" -eq 0 ]
+	[ -z "$(stamp_file)" ]
+}
+
 @test "sstate push: no rsync on PATH is refused before anything is attached" {
 	# `command -v rsync` can only be exercised by a PATH that genuinely has
 	# no rsync anywhere on it, so mirror every entry of the current one into
@@ -534,14 +582,34 @@ seed_stamp() {
 # If a broken scan is indistinguishable from it, every object that really
 # existed drops below the cutoff permanently and is never offered to the
 # mirror again -- the exact opposite of what the stamp is for.
+#
+# The rule has to hold on all three entry conditions, not just the
+# incremental one: --full and a first push (no stamp yet) skip the cutoff
+# entirely and take the `du` probe instead, and they stamp just the same.
 # ---------------------------------------------------------------------------
 
-@test "sstate push: a probe that exits clean without finishing does not stamp" {
+@test "sstate push: a FIRST push whose probe never finished does not stamp" {
+	# No stamp yet, so no cutoff, so the `du` probe -- the path a new user
+	# hits before any other. It reported a perfectly well-formed size and
+	# exited clean without reaching its end; stamping here would put every
+	# object that already existed below the next push's cutoff forever.
+	[ -z "$(stamp_file)" ]
+	MOCK_PROBE_BREAK=truncated push
+	[ "$status" -ne 0 ]
+	assert_call "du -sk"
+	[ "$(rsync_calls)" -eq 0 ]
+	[ -z "$(stamp_file)" ]
+}
+
+@test "sstate push --full does not stamp when the probe never finished" {
+	# Same probe as the first push above, but with a stamp already on disk:
+	# this is where the damage is visible, since --full is exactly what a
+	# user reaches for after a suspect push.
 	seed_stamp
 	printf '1700000000\n' > "$(stamp_file)"
-	MOCK_PROBE_BREAK=exit0 push
+	MOCK_PROBE_BREAK=truncated push --full
 	[ "$status" -ne 0 ]
-	refute_out "Nothing to push"
+	refute_call "-newermt"
 	[ "$(rsync_calls)" -eq 0 ]
 	run cat "$(stamp_file)"
 	[ "$output" = "1700000000" ]
@@ -561,11 +629,34 @@ seed_stamp() {
 	[ "$output" = "1700000000" ]
 }
 
-@test "sstate push: a probe that fails outright does not stamp" {
+@test "sstate push: a probe that fails outright does not stamp, and says the scan broke" {
+	# fetch_volume_subdir's 3: the probe ran and could not answer. The
+	# message has to be the "could not scan" one, never the "no such
+	# directory" one -- see the pair below for why the two are kept apart.
 	seed_stamp
 	printf '1700000000\n' > "$(stamp_file)"
 	MOCK_PROBE_BREAK=rc push
 	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "could not scan 'oe-build-sstate' for sstate"
+	refute_out "no /sstate in"
+	refute_out "Nothing to push"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: an absent directory is reported as absent, not as a broken scan" {
+	# The other half of the 1-vs-3 split: `[ -d /sstate ] || exit 1` inside a
+	# volume that DOES exist. Both refusals leave the stamp alone, so exit
+	# status alone cannot tell them apart -- only the message can, and the
+	# whole reason the two codes are kept distinct is that they are different
+	# problems with different fixes.
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_PROBE_BREAK=nodir push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "no /sstate in 'oe-build-sstate'"
+	refute_out "could not scan"
 	refute_out "Nothing to push"
 	[ "$(rsync_calls)" -eq 0 ]
 	run cat "$(stamp_file)"
@@ -595,17 +686,27 @@ seed_stamp() {
 	[ "$(printf '%s\n' "$body" | grep -c 'find \. -type f \$newer' || true)" -eq 2 ]
 }
 
-@test "sstate push: the incremental probe checks find's own status" {
-	# The guest shell has no pipefail, so a `find | awk` reports awk's status
-	# and a find that died mid-scan still looks like an empty result. No mock
-	# can model that, so pin the shape: find's status checked on its own, a
-	# completion marker printed last, and no status-swallowing `exit 0`.
-	local probe
+@test "sstate push: both probe shapes check their own status and mark completion" {
+	# The GUEST half of the two tests above: a mock decides for itself what
+	# to print, so only the source can pin what the real probe does. The
+	# guest shell has no pipefail, so a `find | awk` reports awk's status and
+	# a find that died mid-scan still looks like an empty result -- find's
+	# status is checked on its own, the completion marker is printed last,
+	# and neither shape ends in a status-swallowing `exit 0`.
+	local probe size_probe
 	probe="$(grep -F 'mackas-scan' "$MACKAS" | head -1)"
 	[ -n "$probe" ]
 	printf '%s\n' "$probe" | grep -qF '.mackas-scan || exit'
-	printf '%s\n' "$probe" | grep -qF 'MACKAS-SCAN-OK'
-	assert_fails grep -qF '; exit 0"' <<< "$probe"
+	printf '%s\n' "$probe" | grep -q 'awk .*MACKAS-SCAN-OK'
+	assert_fails grep -qF '; exit 0' <<< "$probe"
+
+	# The stampless shape --full and a first push take. Nothing here can
+	# truncate, but it stamps the same way, so it proves it finished the
+	# same way -- the marker AFTER the measurement, not instead of it.
+	size_probe="$(grep -F 'probe_cmd=' "$MACKAS" | grep -F 'du -sk $q_guest')"
+	[ -n "$size_probe" ]
+	printf '%s\n' "$size_probe" | grep -q 'du -sk .*MACKAS-SCAN-OK'
+	assert_fails grep -qF '; exit 0' <<< "$size_probe"
 }
 
 # ---------------------------------------------------------------------------
@@ -647,8 +748,14 @@ seed_stamp() {
 
 @test "sstate push: no rsync invocation in the source carries --inplace" {
 	# The prose above it says "NEVER --inplace", so a bare source grep would
-	# match its own comment: pin the invocations themselves.
-	! grep -n 'run rsync' "$MACKAS" | grep -q -- '--inplace'
+	# match its own comment: pin the invocations themselves. Push's own two
+	# passes are asserted to BE in that set first, because an absence check
+	# over a grep that matched nothing passes forever -- respelling the call
+	# site would otherwise retire this test silently.
+	local calls
+	calls="$(grep -n 'run rsync' "$MACKAS")"
+	[ "$(printf '%s\n' "$calls" | grep -c -- '--ignore-existing')" -eq 2 ]
+	assert_fails grep -q -- '--inplace' <<< "$calls"
 }
 
 @test "sstate push: the staged copy, not the volume, is what rsync reads" {
@@ -743,7 +850,10 @@ seed_stamp() {
 @test "sstate --help documents push" {
 	mk sstate --help
 	[ "$status" -eq 0 ]
-	printf '%s\n' "$output" | grep -qF 'sstate push'
-	printf '%s\n' "$output" | grep -qi 'ignore-existing'
+	printf '%s\n' "$output" | grep -qF 'sstate push [--dest USER@HOST:/PATH] [--full]'
+	# The sentence that documents the transport, not merely the word: the
+	# heredoc says "--ignore-existing" twice, so a loose match stays green
+	# with the transport paragraph deleted.
+	printf '%s\n' "$output" | grep -qF 'sent with --ignore-existing and never --inplace'
 	[ "$(rsync_calls)" -eq 0 ]
 }
