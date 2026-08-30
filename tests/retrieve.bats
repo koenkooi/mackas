@@ -174,10 +174,11 @@ for a in "$@"; do
 done
 
 # The combined existence+size probe: `... sh -c "[ -d <guest> ] || exit 1;
-# du -sk <guest> 2>/dev/null; exit 0"`. Succeed (and print a MOCK_DU_KB-sized
-# `du -sk` line) only for a listed sub; MOCK_DU_FAIL models a `du` that errors
-# on an existing directory -- still exit 0 (existence, not size, gates
-# success), just nothing printed.
+# du -sk <guest> 2>/dev/null; printf 'MACKAS-SCAN-OK\n'"`. Succeed (and print
+# a MOCK_DU_KB-sized `du -sk` line, then the completion marker mackas insists
+# on) only for a listed sub; MOCK_DU_FAIL models a `du` that errors on an
+# existing directory -- still exit 0 WITH the marker (existence, not size,
+# gates success), just no size line.
 case "${@: -1}" in
 	*"du -sk"*)
 		# MOCK_PROBE_RUNTIME_FAIL models the container RUNTIME itself failing
@@ -193,6 +194,7 @@ case "${@: -1}" in
 		case " $MOCK_TMP_HAS " in
 			*" $sub "*)
 				[ -n "${MOCK_DU_FAIL:-}" ] || printf '%s\t%s\n' "${MOCK_DU_KB:-4096}" "$guest"
+				[ -n "${MOCK_PROBE_UNFINISHED:-}" ] || printf 'MACKAS-SCAN-OK\n'
 				exit 0
 				;;
 			*) exit 1 ;;
@@ -603,6 +605,18 @@ EOF
 	[ "$status" -eq 0 ]
 	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
 	! printf '%s\n' "$output" | grep -qF 'to transfer'
+}
+
+@test "retrieve: a probe that exits clean without finishing is not an answer" {
+	# The size branch of the probe ends in the same MACKAS-SCAN-OK marker the
+	# incremental one does ('sstate push' reaches this branch on --full and on
+	# every first push, and stamps afterwards). Distinct from MOCK_DU_FAIL
+	# above: there the SCRIPT finished and only du failed, which stays a
+	# nicety; here the script itself never reached its end.
+	MOCK_TMP_HAS="buildstats" MOCK_PROBE_UNFINISHED=1 mk retrieve buildstats
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "could not scan 'oe-build-tmp' for buildstats"
+	[ ! -d "$ROOT/artifacts/buildstats" ]
 }
 
 @test "retrieve: a genuine runtime failure's stderr reaches the user, not swallowed" {
