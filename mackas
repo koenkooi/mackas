@@ -6694,9 +6694,15 @@ cmd_dump() {
 # An empty VAR means "use DEFAULT verbatim, ask bitbake nothing": push needs
 # no project checkout and no kas-container context, exactly like sstate_prune.
 # NEWER, if set, is an epoch cutoff -- only files modified after it are copied,
-# and the source manifest covers exactly that subset. sstate objects are
-# written once and never modified, so mtime is a trustworthy newness signal.
-# Returns 2 when nothing matched, which is a normal outcome, not a failure.
+# and the source manifest covers exactly that subset. sstate objects are NOT
+# write-once (bitbake touches one on every reuse -- the same os.utime()
+# 'sstate prune' relies on), so this over-selects rather than misses: what it
+# names is everything recent builds wrote or reused.
+#
+# The three failure-ish returns are deliberately distinct, because `sstate
+# push` ADVANCES ITS STAMP on one of them: 1 is "the directory is not there",
+# 2 is "the scan ran and matched nothing" (a normal outcome, safe to stamp),
+# 3 is "the scan did not produce a trustworthy answer" (never stamp).
 #
 # Nothing here requires the source to sit under /build/tmp either, and
 # several retrieve objects do not. A distro may move DEPLOY_DIR anywhere it
@@ -6932,15 +6938,32 @@ fetch_volume_subdir() {
 	# is summed instead -- printed in du's own "<kb><TAB>..." shape so the
 	# parse below stays one code path. The object COUNT rides along in the
 	# second field, and is what distinguishes "nothing new" from "absent".
-	local probe rc=0 size_kb="" newer_count="" probe_cmd
+	#
+	# Exit 1 stays reserved for "the directory is not there"; every other
+	# non-zero code is a probe that BROKE, and gets its own return below.
+	# The two have to stay distinguishable from each other and from an empty
+	# answer, because push stamps on the empty one (see sstate_push) and must
+	# never stamp on a broken one.
+	local probe rc=0 size_kb="" newer_count="" probe_cmd q_guest
+	q_guest="$(printf '%q' "$guest")"
 	if [ -n "$find_newer" ]; then
-		probe_cmd="[ -d $(printf '%q' "$guest") ] || exit 1; cd $(printf '%q' "$guest") && find . -type f $find_newer -printf '%s\\n' | LC_ALL=C awk '{ s += \$1; n++ } END { printf \"%d\\t%d objects\\n\", (s + 1023) / 1024, n }'; exit 0"
+		# Not a `find | awk` pipeline, and no trailing `exit 0`: the guest sh
+		# is dash, which has no pipefail, so a find that dies mid-scan still
+		# leaves the pipeline exiting 0 and reads as "nothing newer" -- the
+		# one answer that advances the stamp. find's status is checked on its
+		# own, and MACKAS-SCAN-OK is printed only once awk has also finished,
+		# so a truncated or half-run scan cannot pass for an empty one.
+		probe_cmd="[ -d $q_guest ] || exit 1; cd $q_guest || exit 8; find . -type f $find_newer -printf '%s\\n' > /tmp/.mackas-scan || exit 9; LC_ALL=C awk '{ s += \$1; n++ } END { printf \"%d\\t%d objects\\n\", (s + 1023) / 1024, n }' /tmp/.mackas-scan || exit 10; printf 'MACKAS-SCAN-OK\\n'"
 	else
-		probe_cmd="[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0"
+		probe_cmd="[ -d $q_guest ] || exit 1; du -sk $q_guest 2>/dev/null; exit 0"
 	fi
 	probe="$(container run --rm -u 0:0 -v "$vol:$mount" "$KAS_IMAGE" \
 		sh -c "$probe_cmd")" || rc=$?
-	if [ "$rc" -ne 0 ]; then
+	if [ -n "$find_newer" ] && [ "$rc" -eq 0 ] && \
+	   ! printf '%s\n' "$probe" | grep -q '^MACKAS-SCAN-OK$'; then
+		rc=11
+	fi
+	if [ "$rc" -eq 1 ]; then
 		case "$sub" in
 			buildstats)
 				warn "  no $guest in '$vol' -- has a build run yet? ($SCRIPT_CMD smoketest)"
@@ -6984,6 +7007,12 @@ fetch_volume_subdir() {
 		esac
 		return 1
 	fi
+	if [ "$rc" -ne 0 ]; then
+		# The probe itself failed, which is NOT the same answer as an empty
+		# scan -- see the return-code note in this function's header.
+		warn "  could not scan '$vol' for $sub (rc=$rc)${probe:+: $probe}"
+		return 3
+	fi
 
 	# NOT the first line: $probe is captured through $(...), not a real TTY,
 	# so Apple container's own boot-progress reporting ("[3/6] Fetching
@@ -6995,7 +7024,13 @@ fetch_volume_subdir() {
 	case "$size_kb" in ''|*[!0-9]*) size_kb="" ;; esac
 	if [ -n "$find_newer" ]; then
 		newer_count="$(printf '%s\n' "$probe" | awk '/^[0-9]+[ \t]/ { v = $2 } END { print v }')"
-		case "$newer_count" in ''|*[!0-9]*) newer_count=0 ;; esac
+		case "$newer_count" in
+			# NEVER a 0 fallback here: 0 is the answer that advances the
+			# stamp, so an unreadable count has to be a failure instead.
+			''|*[!0-9]*)
+				warn "  could not read $sub's object count from the scan of '$vol'"
+				return 3 ;;
+		esac
 		if [ "$newer_count" -eq 0 ]; then
 			info "  $sub: nothing newer than the stamp -- nothing to stage"
 			return 2
@@ -7057,7 +7092,7 @@ fetch_volume_subdir() {
 	# same predicate goes to retrieve_verify_script below, so the source
 	# manifest covers exactly the set that was copied -- the two `find` runs
 	# agree because the volume is provably idle (volume_in_use refused
-	# otherwise) and sstate objects are write-once.
+	# otherwise), so no mtime can move between them.
 	local copy_cmd fallback_cmd
 	if [ -n "$find_newer" ]; then
 		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cd $(printf '%q' "$guest") && find . -type f $find_newer -print0 > /tmp/.mackas-stage-list && tar -S -C $(printf '%q' "$guest") --null -T /tmp/.mackas-stage-list -cf - | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
@@ -8159,7 +8194,15 @@ mid-push never finds a signature whose object is missing.
 Everything is sent with --ignore-existing and never --inplace: a published
 object is immutable, the first writer wins, and each one appears at the
 destination atomically. Re-running a push is therefore always safe, and a
-lost stamp costs a full rescan rather than a wrong result.
+lost stamp costs a full rescan rather than a wrong result. So does a scan
+that could not answer: only a scan that provably ran and provably matched
+nothing moves the stamp forward.
+
+The stamp selects on mtime, and bitbake touches an sstate object every time
+it REUSES it -- so a push offers everything recent builds wrote or reused,
+not only what is new. Nothing is missed that way, and --ignore-existing makes
+a re-offer free on the wire, but every re-offered object is still staged and
+checksummed on the host: size MACKAS_SSTATE_PUSH_STAGE for the reuse set.
 
 Push before you prune. Once an object is on the mirror, pruning it locally
 costs an HTTP refetch instead of a rebuild.
@@ -8336,7 +8379,10 @@ sstate_push() {
 				[ -n "$dest" ] || die "--dest needs a value, e.g. user@host:/srv/mackas/sstate" \
 					"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH"
 				shift 2 ;;
-			--dest=*) dest="${1#*=}"; shift ;;
+			--dest=*) dest="${1#*=}"
+				[ -n "$dest" ] || die "--dest needs a value, e.g. user@host:/srv/mackas/sstate" \
+					"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH"
+				shift ;;
 			--full)   full=1; shift ;;
 			-*) die "unknown option for 'sstate push': $1" "$SCRIPT_CMD sstate --help" ;;
 			*) die "unexpected argument for 'sstate push': $1" \
@@ -8361,7 +8407,9 @@ sstate_push() {
 	command -v rsync >/dev/null 2>&1 || die "rsync is not on PATH" \
 		"'sstate push' transfers with rsync over ssh; macOS ships one at /usr/bin/rsync"
 	# The daemon does not survive a reboot; start it before the volume_in_use
-	# check below, same reasoning as sstate_prune/run_kas.
+	# and volume_exists checks below, same reasoning as sstate_prune/run_kas
+	# and cmd_retrieve: with the daemon down, volume_exists' 'container volume
+	# ls' reads as "does not exist yet" rather than the actual problem.
 	ensure_container_running
 
 	# One-VM rule: never attach the volume a build might still hold. Refuse
@@ -8372,6 +8420,15 @@ sstate_push() {
 		die "volume '$MACKAS_VOL_SSTATE' is attached to a running container" \
 			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD sstate push'"
 	fi
+
+	# fetch_volume_subdir's probe attaches the volume for real, --dry-run or
+	# not -- the same guard cmd_retrieve has. die rather than warn: an
+	# absent volume bind-mounts as an EMPTY one, which scans as "nothing
+	# newer" and is exactly the answer that would move the stamp past
+	# objects nothing ever read.
+	volume_exists "$MACKAS_VOL_SSTATE" || \
+		die "volume '$MACKAS_VOL_SSTATE' does not exist yet" \
+			"nothing was pushed and the stamp is unchanged ($SCRIPT_CMD setup)"
 
 	key="$(push_stamp_key "$MACKAS_VOL_SSTATE" "$dest")"
 	stamp="$MACKAS_BASE/state/sstate-push/$key.stamp"
@@ -8409,11 +8466,16 @@ sstate_push() {
 	# to write to what it publishes.
 	fetch_volume_subdir "$MACKAS_VOL_SSTATE" "/sstate:ro" \
 		sstate "$stage" "" /sstate "" "" "$since" || rc=$?
+	# rc=2 is the ONLY non-zero code that stamps, and that is the whole point
+	# of fetch_volume_subdir keeping 1/2/3 apart: it means the scan really ran
+	# and really matched nothing, so nothing can be missed by moving the stamp
+	# forward -- and doing so keeps the next push's scan cheap. A failed or
+	# unparseable scan (3) is indistinguishable from "nothing new" only if you
+	# let it be; stamping there would drop the objects that DO exist below the
+	# cutoff permanently, which is the opposite of what the stamp is for.
 	case "$rc" in
 		0) ;;
-		2)	# Nothing matched, so nothing can be missed by moving the stamp
-			# forward -- and doing so keeps the next push's scan cheap.
-			push_stamp_write "$stamp" "$now"
+		2)	push_stamp_write "$stamp" "$now"
 			run rm -rf "${stage:?}"
 			info "Nothing to push -- '$dest' is already current for '$MACKAS_VOL_SSTATE'."
 			return 0 ;;
@@ -11159,7 +11221,6 @@ ${C_BLD}COMMANDS${C_RST}
              what changed between two builds. '$SCRIPT_CMD buildhistory --help'.
   sstate     Prune sstate objects bitbake hasn't reused in a while, or push
              new ones to a mirror. '$SCRIPT_CMD sstate --help'.
-             '$SCRIPT_CMD sstate --help'.
   monitor    Show live bitbake progress from a build started with
              MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
   clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the
