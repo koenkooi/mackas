@@ -53,9 +53,11 @@ fetches. mackas orchestrates these; it does not vouch for them.
   `--config` or `$MACKAS_CONF` is deliberately exempt, being a request rather
   than an ambush. `./mackas.conf` is *not* in the search path at all, for the
   same reason: a cwd-relative config any untrusted tree could drop in was code
-  execution needing no exploit. Every setting written into a generated
+  execution needing no exploit. Every value written into a generated
   file is validated first (`validate_settings` rejects `"`, backticks and control
-  characters) so a value cannot break out of the shell or YAML it lands in. The
+  characters) so a value cannot break out of the shell or YAML it lands in —
+  including the undocumented `MACKAS_BREW_BIN` test seam, which is not a
+  setting but is still an input, and reaches both generated shell files. The
   git "dubious ownership" workaround is scoped to a generated `GITCONFIG_FILE`,
   never applied globally, and never silently changes one you set — if your own
   `GITCONFIG_FILE` is missing, or lacks `safe.directory = *`, `setup` asks

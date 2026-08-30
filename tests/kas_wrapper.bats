@@ -204,6 +204,13 @@ rec_env() {
 	awk '/^ENV_BEGIN/{e=1;next} /^ENV_END/{exit} e' "$KREC"
 }
 
+# The recorded value of ONE variable out of that environment. First match only:
+# an exported bash function spans several lines, so a later line could
+# otherwise be mistaken for a second definition.
+rec_env_var() {
+	rec_env | sed -n "s/^$1=//p" | head -1
+}
+
 # The exact value token passed to --runtime-args on the first call.
 rec_runtime_args_value() {
 	awk '/^ARG:--runtime-args$/{getline; sub(/^ARG:/,""); print; exit}' "$KREC"
@@ -437,4 +444,49 @@ rec_runtime_args_value() {
 	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
 	[ -e "$KREC" ]
 	printf '%s\n' "$out" | grep -qF 'did not go through the env.sh shell function'
+}
+
+# ---------------------------------------------------------------------------
+# 11: the exec line's PATH. Nothing read this line until it grew a seam: the
+# Homebrew dir was a hardcoded literal, and turning it into $BREW_BIN put it
+# back inside a raw "..." -- the exact injection setup_shim_and_env()'s own
+# comment records as already fixed once, in the other generated file.
+# ---------------------------------------------------------------------------
+
+@test "PATH: the shim comes first, then the Homebrew dir, then the caller's own PATH" {
+	# The shim must outrank /usr/local/bin's real Docker CLI, and the Homebrew
+	# dir must outrank /usr/bin's BSD realpath -- both only if this order holds.
+	cd "$TESTDIR"
+	out="$( (PATH="/marker-dir-xyzzy:$PATH" "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	got="$(rec_env_var PATH)"
+	case "$got" in
+		"$SHIM_DIR:$BREW_BIN:/marker-dir-xyzzy:"*) ;;
+		*) echo "wrapper PATH is not shim:brew:caller -- $got" >&2; return 1 ;;
+	esac
+}
+
+@test "PATH: a hostile BREW_BIN lands inert instead of injecting into the wrapper" {
+	# This writer shq()s every other value it bakes in. Measured before the
+	# fix: the backtick below ran at every hand-typed kas-container invocation,
+	# and the '"' ended the PATH string so .real was never reached at all.
+	BREW_BIN='/opt/x`touch '"$TESTDIR"'/BREW-PWNED`"; touch '"$TESTDIR"'/BREW-PWNED2; :"'
+	write_kas_wrapper
+	/bin/sh -n "$KAS_CONTAINER_BIN"
+
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ ! -e "$TESTDIR/BREW-PWNED" ]
+	[ ! -e "$TESTDIR/BREW-PWNED2" ]
+
+	# .real really was reached (a broken exec line stops short of it), and the
+	# value arrived verbatim as one inert PATH entry.
+	[ -e "$KREC" ]
+	got="$(rec_env_var PATH)"
+	case "$got" in
+		"$SHIM_DIR:$BREW_BIN:"*) ;;
+		*) echo "BREW_BIN did not survive generation intact: $got" >&2; return 1 ;;
+	esac
 }
