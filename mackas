@@ -964,19 +964,48 @@ config_grep_setting() {
 # is exactly as good as being able to edit it -- and a group-writable $HOME is
 # a real configuration, not a hypothetical one.
 #
+# Both sides are graded on what is REALLY there, never on a symlink standing
+# in for it. `ln -s` applies the umask, so a link's mode records only what the
+# umask was when it was made -- measured here: 022 -> 755, 002 -> 775,
+# 000 -> 777, 077 -> 700 -- and the usual 755 sails straight through
+# path_is_owned_and_unwritable_by_others(). Grading a link therefore grades
+# nothing: a config in a symlinked, world-writable projects directory would be
+# sourced with the directory it actually sits in never looked at. So resolve
+# the directory (`resolve_path` is physical), and walk a symlinked file to the
+# bytes that would really run -- grading, at every hop, the directory the link
+# itself sits in, since whoever can write that can re-aim it.
+#
 # This is deliberately NOT applied to --config or $MACKAS_CONF: those are the
 # user naming a file on purpose, and refusing them would break the legitimate
 # case of a config kept on a shared volume.
 config_file_is_safe() {
-	local f="$1" d
+	local f="$1" d target hops=0
+	while [ -L "$f" ]; do
+		# A chain this long is a loop or an attack, not a dotfiles setup.
+		hops=$((hops + 1))
+		[ "$hops" -le 16 ] || return 1
+		d="$(resolve_path "$(dirname "$f")")"
+		path_is_owned_and_unwritable_by_others "$d" || return 1
+		# Flagless readlink only -- BSD and GNU agree on that one form
+		# (see check's own readlink note).
+		target="$(readlink "$f")" || return 1
+		case "$target" in
+			/*) f="$target" ;;
+			*)  f="$d/$target" ;;
+		esac
+	done
 	path_is_owned_and_unwritable_by_others "$f" || return 1
-	d="$(dirname "$f")"
+	d="$(resolve_path "$(dirname "$f")")"
 	path_is_owned_and_unwritable_by_others "$d" || return 1
 	return 0
 }
 
 path_is_owned_and_unwritable_by_others() {
 	local p="$1" owner mode grp oth
+	# stat(1) below is lstat, and a symlink's own mode is only the umask that
+	# made it (022 -> 755), which says nothing about what it points at. Refuse
+	# rather than grade a meaningless number: callers resolve first.
+	if [ -L "$p" ]; then return 1; fi
 	# BSD stat: %u = owner uid, %Lp = the low 3 octal permission digits.
 	owner="$(stat -f '%u' "$p" 2>/dev/null)" || return 1
 	mode="$(stat -f '%Lp' "$p" 2>/dev/null)" || return 1
@@ -1095,6 +1124,12 @@ load_config() {
 			die "no pinned project '$sel': $f is not readable" \
 				"$SCRIPT_CMD projects  (lists the pinned ones)"
 		fi
+		# A directory (or a fifo) here is readable, and a 0755 directory of
+		# ours passes the grade below untouched -- it would reach `. "$f"`
+		# and come back out as a raw shell error. -f follows symlinks, so a
+		# config kept as a link to a real file still qualifies.
+		[ -f "$f" ] || die "not a config file: $f is not a regular file" \
+			"$SCRIPT_CMD projects  (lists the pinned ones)"
 		# STRICTER than the typed paths below, deliberately. mackas built this
 		# path itself out of a bare name, in a fixed and entirely guessable
 		# place -- that is the ambush shape the search path is guarded against,
@@ -1102,7 +1137,7 @@ load_config() {
 		# the search path: the caller asked for THIS project, and silently
 		# loading a different one is worse than stopping.
 		if ! config_file_is_safe "$f"; then
-			die "refusing to source $f: it (or its directory) is owned by someone else or writable by group/other" \
+			die "refusing to source $f: it (or the directory it really lives in) is owned by someone else or writable by group/other" \
 				"chmod go-w $(printf '%q' "$f") $(printf '%q' "$(projects_dir)")"
 		fi
 		# shellcheck disable=SC1090
@@ -1130,6 +1165,10 @@ load_config() {
 			fi
 			die "config file not readable: $path" "$path_hint"
 		fi
+		# Same reason as the selector's check above: `.` on a directory is a
+		# raw shell error, and a typed path is the likeliest place to land on
+		# one (a tab-completed directory name).
+		[ -f "$path" ] || die "not a config file: $path is not a regular file" "$path_hint"
 		# shellcheck disable=SC1090  # user-supplied config, path known at runtime only
 		. "$path"
 		CONFIG_FILE_USED="$path"
@@ -1152,9 +1191,11 @@ load_config() {
 		"$HOME/.config/mackas/config" \
 		"$HOME/.mackas.conf"
 	do
-		if [ -r "$f" ]; then
+		# -f as well as -r: a directory at either name is readable but would
+		# reach `. "$f"` as a raw shell error. Not a match, so keep looking.
+		if [ -f "$f" ] && [ -r "$f" ]; then
 			if ! config_file_is_safe "$f"; then
-				warn "ignoring $f: it (or its directory) is owned by someone else or writable by group/other"
+				warn "ignoring $f: it (or the directory it really lives in) is owned by someone else or writable by group/other"
 				warn "  mackas SOURCES this file as shell. To use it: chmod go-w $(printf '%q' "$f")"
 				continue
 			fi

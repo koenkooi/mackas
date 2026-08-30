@@ -293,6 +293,70 @@ ext4_volume_names() {
 	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
 }
 
+@test "a searched config that is a symlink is graded by the file it points at" {
+	# `ln -s` applies the umask, so the link's own mode is only a record of
+	# that umask -- measured on macOS: 022 -> 755, 002 -> 775, 000 -> 777,
+	# 077 -> 700 -- and 755 is inside what the check accepts. Grading the
+	# link therefore accepts whatever it aims at. Built under an explicit
+	# umask so the fixture pins the measured 755 rather than the suite's.
+	echo 'MACKAS_KAS_CONFIG="from-elsewhere"' > "$TESTDIR/real.conf"
+	chmod 666 "$TESTDIR/real.conf"
+	( umask 022 && ln -s "$TESTDIR/real.conf" "$HOME/.mackas.conf" )
+	[ "$(stat -f '%Lp' "$HOME/.mackas.conf")" = "755" ]
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a searched config in a SYMLINKED world-writable directory is ignored" {
+	# The directory side. ~/.config/mackas is a link; the 0777 directory it
+	# points at is what anyone can drop a config into, and it is reached
+	# only by resolving the link.
+	mkdir -p "$TESTDIR/shared"
+	chmod 777 "$TESTDIR/shared"
+	echo 'MACKAS_KAS_CONFIG="from-shared"' > "$TESTDIR/shared/config"
+	chmod 600 "$TESTDIR/shared/config"
+	mkdir -p "$HOME/.config"
+	( umask 022 && ln -s "$TESTDIR/shared" "$HOME/.config/mackas" )
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a config kept as a symlink into a safe directory is still used" {
+	# The other side: the ordinary dotfiles setup must survive the check
+	# above, or it is just a blanket refusal of symlinks.
+	mkdir -p "$TESTDIR/dotfiles"
+	chmod 755 "$TESTDIR/dotfiles"
+	echo 'MACKAS_KAS_CONFIG="from-dotfiles"' > "$TESTDIR/dotfiles/real.conf"
+	chmod 644 "$TESTDIR/dotfiles/real.conf"
+	( umask 022 && ln -s "$TESTDIR/dotfiles/real.conf" "$HOME/.mackas.conf" )
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-dotfiles" ]
+}
+
+@test "a DIRECTORY at a searched path is skipped, and the search goes on" {
+	# Readable and ours, so it passes the safety grade untouched and used to
+	# reach `. "$f"` -- a raw shell error that aborted the whole run under
+	# set -e, taking the perfectly good next candidate with it.
+	mkdir -p "$HOME/.config/mackas/config"
+	echo 'MACKAS_KAS_CONFIG="from-home"' > "$HOME/.mackas.conf"
+	chmod 644 "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-home" ]
+}
+
+@test "a DIRECTORY named by \$MACKAS_CONF is refused with a clear message" {
+	mkdir -p "$TESTDIR/adir"
+	MACKAS_CONF="$TESTDIR/adir" run "$MACKAS" status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'not a regular file'
+}
+
 @test "an explicit --config is used even when group-writable" {
 	# The ownership check is for files mackas goes LOOKING for. A path the
 	# user named is a decision already made, and refusing it would break a

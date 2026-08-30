@@ -474,7 +474,10 @@ combining them is refused rather than ranked, because silently ignoring
 either one is how you build against a project you did not mean.
 
 A `--project` file is held to the same ownership check a *searched* config
-is (yours or root's, not group/world-writable, file and directory both), and
+is (a regular file, yours or root's, not group/world-writable, file and
+directory both — and graded through symlinks, on the file that would really
+be sourced and the directory it really sits in, because `ln -s` applies the
+umask and a link's own mode therefore says nothing about its target), and
 refused outright if it fails — deliberately stricter than `--config`, which
 is exempt. mackas derives the `--project` path itself from a bare name in a
 fixed, guessable place; a path you typed is a request, a path mackas guessed
