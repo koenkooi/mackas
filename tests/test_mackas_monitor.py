@@ -806,6 +806,23 @@ class PollLoopFallbackTest(unittest.TestCase):
         ls_calls = [c for c in run.call_args_list if c[0][0][1] == "ls"]
         self.assertEqual(len(ls_calls), 1)
 
+    def test_a_non_bridge_answer_is_a_verdict_not_a_traceback(self):
+        # 8801 is an ordinary published port; something else can hold it. The
+        # body then reaches json.loads and every state.get() after it, so
+        # without the guard the user gets a traceback instead of an answer.
+        urlopen = mock.Mock(return_value=_FakeResponse("<html>hello</html>"))
+        rc, _, err, run = self._main(urlopen)
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        self.assertIn("not JSON", err)
+        self.assertIn("other than a mackas progress bridge", err)
+        run.assert_not_called()
+
+    def test_valid_json_that_is_not_an_object_is_caught_too(self):
+        urlopen = mock.Mock(return_value=_FakeResponse('["ok"]'))
+        rc, _, err, _ = self._main(urlopen)
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        self.assertIn("JSON list, not an object", err)
+
     def test_the_original_host_port_is_what_gets_resolved(self):
         # --port names the HOST port; the lookup must match on that, and then
         # poll the container port behind it.

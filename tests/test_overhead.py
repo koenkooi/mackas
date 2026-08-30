@@ -18,13 +18,20 @@
 #   * snapshot       -- self-exclusion (the sampler must not count its own
 #     grep-y match), the KiB->bytes conversion, and the friendly_label order
 #     (the VM's XPC label must win over its container-runtime-linux parent).
+#   * main's exit status -- a run that matched no host process, and a
+#     --buildstats comparison that could not be made, both print zeros that
+#     read exactly like a real measurement; only the exit code tells them
+#     apart.
 #
 # None of this runs `ps` or `container`: subprocess.run is monkeypatched with
 # canned output, and the Sampler is built by hand.
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
+import sys
 import unittest
 from unittest import mock
 
@@ -224,6 +231,55 @@ class SummaryMismatchGuardTest(unittest.TestCase):
         out = s.summary(None)
         self.assertNotIn("overhead", out)
         self.assertNotIn("guest", out)
+
+
+_PS_NO_MATCH = (
+    "  999     128 00:01.0 Finder /System/Library/CoreServices/Finder.app/Finder\n")
+
+
+class MainExitStatusTest(unittest.TestCase):
+    """A zeroed report is indistinguishable from a real measurement of an idle
+    machine, so 'nothing matched' and 'the guest comparison you asked for could
+    not be made' have to be exit codes, not just absent sections."""
+
+    def _main(self, argv, ps=_PS_OUTPUT):
+        out, err = io.StringIO(), io.StringIO()
+        # Sampler.run() replaced by one sample: no sleeping, no signal timer.
+        with mock.patch.object(oh.subprocess, "run",
+                               return_value=_FakeRun(ps)), \
+                mock.patch.object(oh.signal, "signal"), \
+                mock.patch.object(oh.Sampler, "run",
+                                  lambda self: self.sample_once()), \
+                mock.patch.object(sys, "argv", ["mackas-overhead"] + argv), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = oh.main()
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_dry_run_with_no_matching_processes_is_not_success(self):
+        rc, out, _ = self._main(["--dry-run"], ps=_PS_NO_MATCH)
+        self.assertEqual(rc, 2)
+        self.assertIn("NO matching host processes", out)
+
+    def test_dry_run_with_matches_reports_the_count(self):
+        rc, out, _ = self._main(["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("dry-run: 2 matching host processes", out)
+
+    def test_a_window_that_matched_nothing_is_not_success(self):
+        rc, _, err = self._main([], ps=_PS_NO_MATCH)
+        self.assertEqual(rc, 2)
+        self.assertIn("nothing was measured", err)
+
+    def test_a_real_sample_set_succeeds_and_names_the_pid_count(self):
+        rc, out, err = self._main([])
+        self.assertEqual(rc, 0)
+        self.assertIn("matched pids=2", out)
+        self.assertEqual(err, "")
+
+    def test_an_unusable_buildstats_dir_is_not_success(self):
+        rc, _, err = self._main(["--buildstats", os.path.join(HERE, "nope")])
+        self.assertEqual(rc, 2)
+        self.assertIn("no guest comparison was made", err)
 
 
 if __name__ == "__main__":
