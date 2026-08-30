@@ -134,7 +134,11 @@ a partial run.
    Preserve that order.
 5. **Never source or write files unsafely.** A config file is sourced only if it
    passes `config_file_is_safe` (owned by us or root, not group/world-writable —
-   file *and* directory). Interpolated settings are checked by `validate_settings`
+   file *and* directory), and only if it is a regular file. Both sides are graded
+   through symlinks, never on the link: `ln -s` applies the umask, so a link is
+   mode 755 at the usual one (measured: 022 → 755, 002 → 775, 000 → 777,
+   077 → 700) and would sail through the check while pointing anywhere at all.
+   Interpolated settings are checked by `validate_settings`
    (reject `"`, backtick, control chars) before being written into the generated
    `env.sh` / gitconfig / kas fragment.
 6. **The shim's scope is fixed:** it covers what kas-container v5.4 issues plus
