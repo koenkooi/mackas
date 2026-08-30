@@ -819,3 +819,63 @@ shared-sstate" ]
 	[ "$status" -eq 0 ]
 	[ "$(setting MACKAS_FSTRIM_AUTO)" = "1" ]
 }
+
+@test "a symlink CHAIN with a world-writable hop in the middle is refused" {
+	# The final link and the final file both grade safe on their own -- the
+	# hole is only reachable by resolving through it, so a check that grades
+	# just the endpoints (as opposed to every hop) would miss this entirely.
+	echo 'MACKAS_KAS_CONFIG="from-end"' > "$TESTDIR/real.conf"
+	chmod 600 "$TESTDIR/real.conf"
+	mkdir -p "$TESTDIR/open"
+	chmod 777 "$TESTDIR/open"
+	( umask 022 && ln -s "$TESTDIR/real.conf" "$TESTDIR/open/mid.conf" )
+	( umask 022 && ln -s "$TESTDIR/open/mid.conf" "$HOME/.mackas.conf" )
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a RELATIVE symlink target is graded relative to the link's own directory, accept side" {
+	mkdir -p "$TESTDIR/rel"
+	chmod 755 "$TESTDIR/rel"
+	echo 'MACKAS_KAS_CONFIG="from-rel-safe"' > "$TESTDIR/rel/safe.conf"
+	chmod 644 "$TESTDIR/rel/safe.conf"
+	( cd "$TESTDIR/rel" && umask 022 && ln -s safe.conf rel-safe.conf )
+	rm -f "$HOME/.mackas.conf"
+	ln -s "$TESTDIR/rel/rel-safe.conf" "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-rel-safe" ]
+}
+
+@test "a RELATIVE symlink target is graded relative to the link's own directory, refuse side" {
+	mkdir -p "$TESTDIR/rel"
+	chmod 755 "$TESTDIR/rel"
+	echo 'MACKAS_KAS_CONFIG="from-rel-unsafe"' > "$TESTDIR/rel/unsafe.conf"
+	chmod 666 "$TESTDIR/rel/unsafe.conf"
+	( cd "$TESTDIR/rel" && umask 022 && ln -s unsafe.conf rel-unsafe.conf )
+	rm -f "$HOME/.mackas.conf"
+	ln -s "$TESTDIR/rel/rel-unsafe.conf" "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a config reached through a SYMLINKED but genuinely safe directory is still used" {
+	# The directory-side accept case. path_is_owned_and_unwritable_by_others
+	# refuses a symlinked directory outright -- so this path only works
+	# because config_file_is_safe resolves the link to the REAL directory
+	# first and grades that, rather than grading the link itself.
+	mkdir -p "$TESTDIR/dotfiles"
+	chmod 755 "$TESTDIR/dotfiles"
+	echo 'MACKAS_KAS_CONFIG="from-linked-dir"' > "$TESTDIR/dotfiles/real.conf"
+	chmod 644 "$TESTDIR/dotfiles/real.conf"
+	( umask 022 && ln -s "$TESTDIR/dotfiles" "$TESTDIR/link" )
+	rm -f "$HOME/.mackas.conf"
+	ln -s "$TESTDIR/link/real.conf" "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-linked-dir" ]
+}
