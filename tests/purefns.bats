@@ -1,7 +1,10 @@
 #!/usr/bin/env bats
 #
 # Pure-function coverage gaps, exercised in lib-mode (MACKAS_LIB_ONLY=1):
-# ip_in_cidr / ip_to_int, fmt_kb's locale guard, and volume_size's sed parse.
+# ip_in_cidr / ip_to_int, fmt_kb's locale guard, volume_size's sed parse,
+# buildhistory_repo_state's classification, and config_file_is_safe's symlink
+# handling (the cases no command line can reach, plus the measured platform
+# fact that whole check rests on).
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -283,4 +286,70 @@ bh_commit() {
 	buildhistory_repo_state "$TESTDIR/nogit2" build-minus-1 HEAD 0
 	PATH="$savepath"
 	[ "$BH_STATE" = "nogit" ]
+}
+
+# ---------------------------------------------------------------------------
+# config_file_is_safe / path_is_owned_and_unwritable_by_others
+#
+# The security primitive behind the config search path and the --project
+# selector, called here directly: its symlink handling has cases the command
+# line cannot reach, because `[ -r ]`/`[ -f ]` at every call site resolve the
+# path (and refuse a loop) before it is ever asked.
+# ---------------------------------------------------------------------------
+
+@test "ln -s applies the umask, so a symlink's own mode records only that" {
+	# The platform fact the whole check rests on, measured rather than
+	# assumed: a link is NOT 777, so it never fails the grade by itself, and
+	# at the usual umask it is 755 -- squarely inside what
+	# path_is_owned_and_unwritable_by_others accepts.
+	local m umask_val want
+	for m in 022:755 002:775 000:777 077:700 027:750; do
+		umask_val="${m%%:*}"; want="${m##*:}"
+		( umask "$umask_val" && ln -s /nonexistent "$TESTDIR/l$umask_val" )
+		[ "$(stat -f '%Lp' "$TESTDIR/l$umask_val")" = "$want" ]
+	done
+}
+
+@test "path_is_owned_and_unwritable_by_others refuses a symlink instead of grading it" {
+	# stat(1) is lstat, so grading the link grades the umask above. The
+	# target here is a perfectly safe 0600 file; the point is that the answer
+	# for the LINK must not be inherited from it either -- callers resolve
+	# first, and a link arriving here is a caller bug, not a pass.
+	echo 'MACKAS_MEMORY="8g"' > "$TESTDIR/target.conf"
+	chmod 600 "$TESTDIR/target.conf"
+	( umask 022 && ln -s "$TESTDIR/target.conf" "$TESTDIR/link.conf" )
+	path_is_owned_and_unwritable_by_others "$TESTDIR/target.conf"
+	assert_fails path_is_owned_and_unwritable_by_others "$TESTDIR/link.conf"
+}
+
+@test "config_file_is_safe walks a symlink chain to the file that would be sourced" {
+	# Three hops, every link ours and 0755, ending on a world-writable file.
+	echo 'MACKAS_MEMORY="8g"' > "$TESTDIR/end.conf"
+	chmod 666 "$TESTDIR/end.conf"
+	( umask 022 && ln -s "$TESTDIR/end.conf" "$TESTDIR/c.conf" )
+	( umask 022 && ln -s "$TESTDIR/c.conf"   "$TESTDIR/b.conf" )
+	( umask 022 && ln -s "$TESTDIR/b.conf"   "$TESTDIR/a.conf" )
+	assert_fails config_file_is_safe "$TESTDIR/a.conf"
+	# ...and the same chain onto a 0600 file is accepted, so the refusal
+	# above is the endpoint's mode and not the depth.
+	chmod 600 "$TESTDIR/end.conf"
+	config_file_is_safe "$TESTDIR/a.conf"
+}
+
+@test "config_file_is_safe terminates on a symlink loop" {
+	# Unreachable from the command line -- every call site's `[ -r ]`/`[ -f ]`
+	# fails with ELOOP first -- so the hop cap is pinned here, on the function
+	# itself. Run with a deadline: without the cap this never returns, and a
+	# hung suite is a worse signal than a red test.
+	( umask 022 && ln -s "$TESTDIR/loop-a.conf" "$TESTDIR/loop-b.conf" )
+	( umask 022 && ln -s "$TESTDIR/loop-b.conf" "$TESTDIR/loop-a.conf" )
+	local pid i=0
+	config_file_is_safe "$TESTDIR/loop-a.conf" & pid=$!
+	while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+	if kill -0 "$pid" 2>/dev/null; then
+		kill -9 "$pid" 2>/dev/null
+		echo "config_file_is_safe did not return on a symlink loop" >&2
+		return 1
+	fi
+	assert_fails wait "$pid"
 }

@@ -50,8 +50,13 @@ fetches. mackas orchestrates these; it does not vouch for them.
   finds or derives on its own — the search path (`~/.config/mackas/config`,
   `~/.mackas.conf`) and the `--project NAME` /`$MACKAS_PROJECT_SELECT`
   selector, which resolves to `~/.config/mackas/projects/NAME.conf` — is
-  executed only if it is owned by you (or root) and not group/world-writable,
-  file and directory both (`config_file_is_safe`); one you name yourself with
+  executed only if it is a regular file owned by you (or root) and not
+  group/world-writable, file and directory both (`config_file_is_safe`) —
+  graded on what is really there, never on a symlink standing in for it, since
+  `ln -s` applies the umask (measured: `022` → `755`, `002` → `775`,
+  `000` → `777`, `077` → `700`), so a link's own mode records the umask and
+  nothing about its target, and grading the link would accept a config sitting
+  in a world-writable directory the link points at; one you name yourself with
   `--config` or `$MACKAS_CONF` is deliberately exempt, being a request rather
   than an ambush. A project name is validated before it becomes a path (no
   path separator, no `..`, no leading `-`, a restricted character class), and
