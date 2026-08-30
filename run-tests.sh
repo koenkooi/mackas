@@ -15,7 +15,9 @@
 # network, sudo, NFS, or the mirror host -- it is safe to run anywhere, any time.
 # The runtime half of that is enforced, not merely intended: helpers.bash puts
 # tests/mock/bin (a stub `container`) at the front of PATH for every file except
-# the *_real ones, and tests/hermetic.bats fails if that guard slips.
+# the *_real ones, tests/hermetic.bats fails if that guard slips, and this
+# script plants a recording `container` behind the stub -- ahead of any real
+# one -- so the run fails outright if some test got past it anyway.
 # The mirror-server tests bind 127.0.0.1 on port 0, which is an ephemeral port
 # the kernel picks and nothing else can already hold.
 #
@@ -42,6 +44,33 @@ cd -- "$(dirname -- "$0")"
 rc=0
 
 hdr() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
+
+# Whole-run hermeticity guard, planted before anything runs. helpers.bash
+# shadows `container` with tests/mock/bin for every hermetic bats file; this
+# recorder sits BEHIND that stub and IN FRONT of any real binary, so a call
+# landing here is one that got past the stub -- a file that skipped
+# `load helpers`, rebuilt PATH from scratch, or was wrongly exempted -- or a
+# Python test that shelled out for real. That is the slip hermetic.bats cannot
+# see from inside a single bats file, and the one that once hung a whole run.
+# Off under MACKAS_REAL_RUNTIME=1, where the opt-in suites want the real CLI.
+guard_log=""
+if [ "${MACKAS_REAL_RUNTIME:-}" != "1" ]; then
+	guard_dir="$(mktemp -d "${TMPDIR:-/tmp}/mackas-hermetic.XXXXXX")"
+	# EXIT, not the end of the script: the bats-missing path exits early.
+	trap 'rm -rf "$guard_dir"' EXIT
+	guard_log="$guard_dir/calls"
+	mkdir -p "$guard_dir/bin"
+	cat > "$guard_dir/bin/container" <<-SH
+		#!/bin/sh
+		printf '%s\n' "\$*" >> "$guard_log"
+		exit 1
+	SH
+	chmod +x "$guard_dir/bin/container"
+	PATH="$guard_dir/bin:$PATH"
+	# Named so tests/fixtures/hermeticity-breach.bats can call THIS and never
+	# risk a real binary; hermetic.bats drives that file through here.
+	export MACKAS_TEST_HERMETIC_RECORDER="$guard_dir/bin/container"
+fi
 
 hdr "shellcheck"
 if command -v shellcheck >/dev/null 2>&1; then
@@ -120,6 +149,12 @@ if [ $# -gt 0 ]; then
 	bats "$@" || rc=1
 else
 	bats tests/ || rc=1
+fi
+
+if [ -n "$guard_log" ] && [ -s "$guard_log" ]; then
+	echo "hermeticity: FAILED -- a test reached a container CLI past tests/mock/bin's stub:" >&2
+	sort -u "$guard_log" | sed 's/^/    container /' >&2
+	rc=1
 fi
 
 if [ "$rc" -eq 0 ]; then
