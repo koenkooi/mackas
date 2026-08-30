@@ -998,6 +998,34 @@ path_is_owned_and_unwritable_by_others() {
 # user never set, and a bare "drop one" tells them to unset something they have
 # never heard of. Show both resolved values, and give the escape for whichever
 # one they actually control.
+# The wrapper's frozen work dir disagrees with the one the config now in
+# effect resolves. Name both, and say which knob to drop -- the same shape as
+# selector_conflict_hint(), because it is the same class of mistake: something
+# ambient re-aiming a build the user thought was pinned.
+wrapper_identity_hint() {
+	local expect="$1" src=""
+	if [ -n "${MACKAS_CONF:-}" ]; then src="\$MACKAS_CONF"; fi
+	printf 'the wrapper'"'"'s frozen work directory and the config now in effect disagree, so the volumes about to be mounted are not this project'"'"'s.\n'
+	printf '\n'
+	printf '    %-22s %s\n' "wrapper built for" "$expect"
+	printf '    %-22s %s\n' "config now resolves" "$MACKAS_WORK"
+	if [ -n "$src" ]; then
+		printf '    %-22s %s\n' "chosen by" "$src = ${MACKAS_CONF}"
+	fi
+	printf '\n'
+	if [ -n "$src" ]; then
+		printf 'To build this project, for one command:\n'
+		printf '    MACKAS_CONF= <your command>\n'
+		printf 'or for the rest of this shell:\n'
+		printf '    unset MACKAS_CONF\n'
+	else
+		printf 'Re-run setup if this root moved:\n'
+		printf '    %s setup %s\n' "$SCRIPT_CMD" "$MACKAS_ROOT"
+	fi
+	printf '\n'
+	printf 'To build the other project, use its own generated kas-container.\n'
+}
+
 selector_conflict_hint() {
 	local sel_src="$1" sel="$2" path_src="$3" path="$4"
 	printf 'these are mutually exclusive -- one picks a pinned project, the other names a path outright -- and mackas will not rank them for you.\n'
@@ -4647,7 +4675,7 @@ done
 # below could explain itself, and it also keeps the exit status, which a
 # bare assignment discards.
 _mackas_rt_rc=0
-rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free)" || _mackas_rt_rc=\$?
+rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK")" || _mackas_rt_rc=\$?
 
 # FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
 # computing this string is a safety guard -- a held volume, two volume names
@@ -8625,7 +8653,7 @@ mounts, mirror mounts if enabled, the live-progress-bridge args if
 MACKAS_MONITOR=1) and nothing else.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD runtime-args [--require-volumes-free]
+  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR]
 
 Not something you normally run directly: the generated \`kas-container\`
 wrapper calls this itself, once per invocation, so a setting that
@@ -8634,6 +8662,14 @@ effect on a hand-typed \`kas-container build/shell <files>\` the same way it
 already does for '$SCRIPT_CMD smoketest'/'shell' -- not just after the next
 '$SCRIPT_CMD setup'. Exists so that fact has one implementation instead of
 being copied into the generated wrapper.
+
+${C_BLD}--expect-work DIR${C_RST} refuses when the config in effect resolves a
+different work directory than DIR. The wrapper passes the MACKAS_WORK it
+was generated with: volumes are recomputed live while work dir, image and
+gitconfig stay frozen in it, so a config naming another root would mount
+another project's ext4 volumes under this project's sources. Comparing
+identities rather than freezing the config path keeps an ambient
+\$MACKAS_CONF usable whenever it agrees, and refuses only when it does not.
 
 ${C_BLD}--require-volumes-free${C_RST} applies the one-VM rule first and prints nothing
 if it fails: refuse, naming the volume, when a running container already
@@ -8689,11 +8725,13 @@ EOF
 # the wrapper starts the container runtime before it gets here, because
 # volume_in_use() short-circuits to "not in use" with the daemon down.
 cmd_runtime_args() {
-	local want_help=0 require_free=0
+	local want_help=0 require_free=0 expect_work=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
 			--require-volumes-free) require_free=1; shift ;;
+			--expect-work) expect_work="${2:-}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift 2 ;;
+			--expect-work=*) expect_work="${1#*=}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
@@ -8707,6 +8745,19 @@ cmd_runtime_args() {
 	if [ "$want_help" -eq 1 ]; then
 		runtime_args_usage
 		return 0
+	fi
+
+	# The generated wrapper passes the MACKAS_WORK it was built with. Volumes
+	# are recomputed live (so `mackas set` takes effect without regenerating
+	# the wrapper) while work dir, image and gitconfig stay frozen in it -- so
+	# a config that resolves a DIFFERENT root would hand this build another
+	# project's ext4 volumes while its sources and gitconfig stay put. Compare
+	# identities rather than freezing the config path into the wrapper: an
+	# ambient $MACKAS_CONF keeps working whenever it is consistent, and is
+	# refused only when it actually disagrees.
+	if [ -n "$expect_work" ] && [ "$expect_work" != "$MACKAS_WORK" ]; then
+		die "this wrapper was generated for a different configuration" \
+			"$(wrapper_identity_hint "$expect_work")"
 	fi
 
 	# Before printing, never after: a caller that refuses on a held volume must
