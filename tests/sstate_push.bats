@@ -64,8 +64,11 @@ setup() {
 	MOCK_VERIFY_CORRUPT_ALWAYS=""
 	MOCK_PROBE_BREAK=""
 	MOCK_COPY_DIE=""
+	MOCK_VM_EPOCH=""
+	MOCK_EPOCH_BREAK=""
 	export MOCK_BUSY_VOLUME MOCK_NO_VOLUME MOCK_RSYNC_FAIL
 	export MOCK_VERIFY_CORRUPT MOCK_VERIFY_CORRUPT_ALWAYS MOCK_PROBE_BREAK MOCK_COPY_DIE
+	export MOCK_VM_EPOCH MOCK_EPOCH_BREAK
 
 	mkdir -p "$TESTDIR/fakebin"
 	cat > "$TESTDIR/fakebin/container" <<'EOF'
@@ -205,6 +208,19 @@ case "$last" in
 		esac
 		printf '%s\t/sstate\n' "${MOCK_DU_KB:-4096}"
 		printf 'MACKAS-SCAN-OK\n'
+		exit 0
+		;;
+	"+%s")
+		# container_epoch_now: the VM-side clock read used for "now" in
+		# place of the host's own `date +%s` (issue #107). Defaults to the
+		# real host epoch so every test that never touches MOCK_VM_EPOCH
+		# keeps behaving as if the two clocks agree; the skew tests below
+		# override it to a DIFFERENT value on purpose.
+		case "${MOCK_EPOCH_BREAK:-}" in
+			rc) echo "container: VM not reachable" >&2; exit 6 ;;
+			garbage) echo "not a number"; exit 0 ;;
+		esac
+		printf '%s\n' "${MOCK_VM_EPOCH:-$(date +%s)}"
 		exit 0
 		;;
 esac
@@ -506,7 +522,10 @@ seed_stamp() {
 
 @test "sstate push: the stamp records when the scan started, not a later time" {
 	# An object written DURING a push has to be re-offered by the next one,
-	# so the stamp may never run ahead of the scan that produced it.
+	# so the stamp may never run ahead of the scan that produced it. Left at
+	# the default MOCK_VM_EPOCH (unset), the fake VM's clock tracks the real
+	# host's, so this still bounds the ordinary case where the two clocks
+	# agree -- the clock-domain tests below cover the case where they don't.
 	local before after stamped
 	before="$(date +%s)"
 	push
@@ -523,11 +542,96 @@ seed_stamp() {
 	# source, the way AGENTS.md asks for logic bats cannot reach.
 	local body now_ln scan_ln
 	body="$(awk '/^sstate_push\(\) \{/,/^}/' "$MACKAS")"
-	now_ln="$(printf '%s\n' "$body" | grep -n 'now="\$(date +%s)"' | head -1 | cut -d: -f1)"
+	now_ln="$(printf '%s\n' "$body" | grep -n 'now="\$(container_epoch_now)"' | head -1 | cut -d: -f1)"
 	scan_ln="$(printf '%s\n' "$body" | grep -nF 'fetch_volume_subdir "$MACKAS_VOL_SSTATE"' | head -1 | cut -d: -f1)"
 	[ -n "$now_ln" ]
 	[ -n "$scan_ln" ]
 	[ "$now_ln" -lt "$scan_ln" ]
+}
+
+# ---------------------------------------------------------------------------
+# Clock domain (issue #107)
+#
+# The sstate object mtimes an incremental push's cutoff is compared against
+# live entirely inside the build VM -- they are set by whatever wrote them
+# there. Apple's `container` VM is known to lag the Mac's own clock after a
+# sleep/wake, sometimes by minutes. Stamping with the HOST's clock while
+# comparing against VM-clock mtimes means a lagging VM can write an object
+# with an mtime the HOST-derived cutoff already reads as "in the past" --
+# silently and PERMANENTLY excluding it from every future incremental push.
+# The fix: read "now" from container_epoch_now() (inside the VM) instead of
+# the host's own `date +%s`, so both sides of every comparison, now and
+# later, come from the one clock that actually produced the mtimes.
+# ---------------------------------------------------------------------------
+
+@test "sstate push: the stamp follows the VM's clock, not the host's" {
+	# Give the fake VM a clock far from the real host's and confirm the
+	# stamp follows IT -- not a value `date +%s` on the host would produce.
+	local host_now
+	host_now="$(date +%s)"
+	MOCK_VM_EPOCH=$(( host_now + 10000 ))
+	push
+	[ "$status" -eq 0 ]
+	assert_call "[date] [+%s]"
+	run cat "$(stamp_file)"
+	[ "$output" = "$MOCK_VM_EPOCH" ]
+	[ "$output" != "$host_now" ]
+}
+
+@test "sstate push: an object written while the VM clock lags is not excluded by a later push" {
+	# The regression itself, constructed as directly as a shell mock can:
+	# the VM's clock answers a full hour BEHIND the real host clock during
+	# push #1 (exactly what happens after the Mac sleeps and the container
+	# VM does not catch up), so the stamp it writes is that lagging value.
+	local host_before vm_epoch
+	host_before="$(date +%s)"
+	MOCK_VM_EPOCH=$(( host_before - 3600 ))
+	push
+	[ "$status" -eq 0 ]
+	vm_epoch="$(cat "$(stamp_file)")"
+	[ "$vm_epoch" -eq "$MOCK_VM_EPOCH" ]
+	# The counterfactual this guards against: a HOST-derived stamp would
+	# have landed at or after $host_before -- strictly AHEAD of the lagging
+	# VM stamp actually recorded. Any real sstate object the VM wrote (on
+	# ITS OWN, lagging clock) between $vm_epoch and $host_before carries an
+	# mtime the old, host-derived cutoff would already have read as "not
+	# newer" and dropped forever.
+	[ "$vm_epoch" -lt "$host_before" ]
+	: > "$CLOG"
+	# The next incremental push reads that stamp back as ITS cutoff --
+	# confirm the scan is bounded by the exact (lagging) VM value, never
+	# quietly bumped up toward the host's own clock. Since `find -newermt`
+	# selects everything at or after the cutoff, bounding it at the lower,
+	# correct VM value is precisely what keeps such an object INCLUDED
+	# instead of silently and permanently dropped.
+	push
+	[ "$status" -eq 0 ]
+	assert_call "-newermt @$vm_epoch"
+	refute_call "-newermt @$host_before"
+}
+
+@test "sstate push: refuses and does not stamp when the VM clock cannot be read" {
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_EPOCH_BREAK=rc push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'could not read the clock'
+	refute_call "oe-build-sstate:/sstate"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
+}
+
+@test "sstate push: refuses and does not stamp when the VM clock probe answers garbage" {
+	seed_stamp
+	printf '1700000000\n' > "$(stamp_file)"
+	MOCK_EPOCH_BREAK=garbage push
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'could not read the clock'
+	refute_call "oe-build-sstate:/sstate"
+	[ "$(rsync_calls)" -eq 0 ]
+	run cat "$(stamp_file)"
+	[ "$output" = "1700000000" ]
 }
 
 @test "sstate push: destinations that sanitize alike still get separate stamps" {
