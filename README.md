@@ -124,7 +124,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. |
 | `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
-| `dump` | `kas dump --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. |
+| `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
 
 Options: `--config FILE`, `--project NAME`, `--set NAME=VALUE`, `--dry-run`,
 `-y/--yes` (or `-f/--force`), `-v/--verbose`, `--version`, `--help`.

@@ -190,7 +190,18 @@ refute_klog() {
 @test "dump: runs kas-container dump with all three --resolve-* flags" {
 	MACKAS_PROJECT_DIR=meta-angstrom mk dump
 	[ "$status" -eq 0 ]
-	assert_klog "[dump] [--resolve-env] [--resolve-local] [--resolve-refs]"
+	assert_klog "[--resolve-env] [--resolve-local] [--resolve-refs]"
+}
+
+# --resolve-refs alone still force-resets a clean repo to resolve a floating
+# branch/tag -- the same repos_checkout task a build runs. Unlike lock (which
+# needs that reset to pin a real commit), dump only reports what kas WOULD
+# resolve to, so it carries the same two-flag protection kas_shell_ro's
+# callers get, just spelled out directly rather than through that helper.
+@test "dump: always skips repos_checkout and repos_apply_patches (resolving refs must not reset a clean repo)" {
+	MACKAS_PROJECT_DIR=meta-angstrom mk dump
+	[ "$status" -eq 0 ]
+	assert_klog "[dump] [--skip] [repos_checkout] [--skip] [repos_apply_patches] [--resolve-env]"
 }
 
 @test "dump: blanks KAS_BUILD_DIR/DL_DIR/SSTATE_DIR like every other real invocation" {
@@ -236,7 +247,7 @@ refute_klog() {
 	printf '%s\n' "$output" | grep -qF -- '-v\ oe-build-tmp:/build'
 	printf '%s\n' "$output" | grep -qF -- 'GITCONFIG_FILE='
 	printf '%s\n' "$output" | grep -qF -- 'kas-container.real'
-	printf '%s\n' "$output" | grep -qF -- 'dump --resolve-env --resolve-local --resolve-refs kas/macos-local.yml'
+	printf '%s\n' "$output" | grep -qF -- 'dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs kas/macos-local.yml'
 	printf '%s\n' "$output" | grep -qF -- 'writing resolved config to:'
 	# dump never runs bitbake -- BB_NUMBER_THREADS/PARALLEL_MAKE would be a lie.
 	! printf '%s\n' "$output" | grep -qF -- 'BB_NUMBER_THREADS'
