@@ -668,7 +668,7 @@ The two failure modes below pull in opposite directions, and both are silent.
 Do not decide from habit or from what the last build in this shell needed —
 the answer depends on **this** composition, and it is cheap to check.
 
-**Step 1 — list the repos this composition declares.**
+**Step 1 — list the repos this composition declares, and what each resolves to.**
 
 ```sh
 mackas dump                     # writes $MACKAS_LOGS/dump-<timestamp>.yml
@@ -676,17 +676,41 @@ mackas dump                     # writes $MACKAS_LOGS/dump-<timestamp>.yml
 
 Read the `repos:` block of that file. kas only checks out or patches repos it
 declares, so a layer that is merely present under `work/` but absent from this
-block cannot be touched by this build, whatever flags you pass.
+block cannot be touched by this build, whatever flags you pass. `--resolve-refs`
+(part of what `mackas dump` always passes) has already turned each repo's
+`branch:`/`tag:`/`commit:` into the exact commit kas would check out for it —
+written back as `commit:` for a repo pinned by branch, tag or commit, or
+`refspec:` for one still on the legacy field. **That resolved value, not the
+branch name, is what Step 2 compares against** — and reading it costs nothing
+extra: resolving it is what `mackas dump` was already doing, without touching
+the checkout (see "`mackas` commands never reset repos", below — this is the
+one thing that section's `--skip repos_checkout` on `dump` itself protects).
 
-**Step 2 — for each declared repo, ask whether it carries local-only commits.**
+**Step 2 — for each declared repo, ask whether it carries commits that resolved commit's checkout would discard.**
 
 ```sh
-git -C "$MACKAS_BASE/work/<repo>" log --oneline @{u}..HEAD
+git -C "$MACKAS_BASE/work/<repo>" log --oneline <commit-from-step-1>..HEAD
 ```
 
-Non-empty output means that repo is **at risk**: kas resets clean repos to the
-configured branch head, and commits do not protect a repo the way uncommitted
-tracked changes do.
+Use the exact commit (or `refspec`) Step 1 resolved for **this** repo — never
+`@{u}`. `@{u}` names whatever this branch happens to track, which on a repo
+kas itself checked out is routinely nothing at all: a detached HEAD has no
+branch to have an upstream (`fatal: HEAD does not point to a branch`), and a
+local branch kas created rarely has one configured either (`fatal: no
+upstream configured for branch`) — `@{u}` dies outright on exactly the states
+kas leaves a checkout in, right when this step needs an answer most. Plain
+`HEAD` and a literal commit from Step 1 need neither a branch nor a tracking
+ref, so this works unchanged whichever of those states the repo is in.
+
+Non-empty output means that repo is **at risk**: kas resets a clean repo to
+the resolved commit from Step 1, and commits do not protect a repo the way
+uncommitted tracked changes do. This also covers **sibling-repo branch
+drift** (below) without a separate check: a repo sitting on some other
+branch entirely still shows up here, because whatever it carries that the
+resolved commit's history does not is exactly what `<commit-from-step-1>..HEAD`
+lists — drift is just local-only commits by another name. A repo that is
+merely *behind* (`HEAD` an ancestor of the resolved commit) prints nothing:
+kas moving it forward loses nothing that was only local.
 
 **Step 3 — read the answer off this table. Do not interpolate.**
 
@@ -782,8 +806,18 @@ deliberately *not* wrapped in the repo-preserving skips — and kas's own lock
 plugin skips only `setup_dir`/`repos_apply_patches`/`setup_environ`/
 `write_bbconfig`, leaving `repos_checkout` to run. Treat it like a build, not
 like a query: run it when you actually want a fresh lock, and not while a
-sibling layer carries local-only commits. `mackas dump` (resolved config to
-`$MACKAS_LOGS/dump-<timestamp>.yml`) writes nothing into the checkout.
+sibling layer carries local-only commits.
+
+`mackas dump` (resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`) writes
+nothing into the checkout either, but not for free: `--resolve-refs` turns a
+floating `branch:`/`tag:` into its exact current commit, which needs kas to
+actually know the repo — the same `repos_checkout` task a build runs, which
+would force-reset a clean repo exactly like a build does. `mackas dump`
+passes `--skip repos_checkout --skip repos_apply_patches` itself (not via
+`kas_shell_ro` — those two flags are enough, since `setup_dir`/
+`finish_setup_repos` still need to run so a repo that isn't cloned yet gets
+cloned and its ref resolved). This is why Step 1 of the `--skip` decision
+procedure below is safe to run before Step 2 has looked at a repo at all.
 
 If a `retrieve`/`exec` call ever *does* reset a repo, treat
 it as a signal that the mackas checkout is outdated or the fix regressed, and
@@ -858,6 +892,13 @@ while the config still says `branch: master`. kas silently re-checks-out to the
 the working tree with no error. If a build behaves as though branch-specific
 fixes are simply missing, check `git -C work/<layer> branch -r` for a remote
 branch the config does not reference, not just the working-tree state.
+
+This is the same risk Step 2 of the `--skip` decision procedure (above) checks
+for *before* a build, not just after one — `<commit-from-step-1>..HEAD` is
+non-empty for a repo drifted onto another branch exactly as it is for one
+carrying local-only commits, because from kas's own checkout's point of view
+they are the same thing: work that only exists on `HEAD`, not on the commit
+kas is configured to reset to.
 
 ## Notes and gotchas
 

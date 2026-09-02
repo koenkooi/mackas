@@ -6630,12 +6630,17 @@ ${C_BLD}$SCRIPT_CMD dump${C_RST} -- write the fully-resolved kas config next to 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD dump
 
-Runs \`kas-container dump --resolve-env --resolve-local --resolve-refs\`
-against the project's kas config and saves the resolved YAML it prints to
+Runs \`kas-container dump --skip repos_checkout --skip repos_apply_patches
+--resolve-env --resolve-local --resolve-refs\` against the project's kas
+config and saves the resolved YAML it prints to
 \$MACKAS_LOGS/dump-<timestamp>.yml -- every env var, every local override
 and every repo ref resolved to its exact value, a reproducibility record
 next to a build's own logs (see item 13 in TODO.md). Purely read-only:
-kas dump writes nothing into the checkout itself.
+kas dump writes nothing into the checkout itself -- the two --skip flags are
+load-bearing for that claim, not decorative. Resolving a branch/tag still
+needs kas to know the repo (cloning one that is missing, same as a real
+build), so setup_dir/finish_setup_repos are NOT skipped; only the two steps
+that would force-checkout or patch an EXISTING clone are.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
 
@@ -6645,6 +6650,22 @@ ${C_BLD}ONE-VM RULE${C_RST}
 EOF
 }
 
+# kas's dump plugin subclasses its checkout one, so --resolve-refs does not
+# just read state -- to turn a floating branch/tag into an exact commit it
+# runs the SAME repos_checkout task a build does, which force-resets a clean
+# repo to that resolved commit exactly like build/lock do. Confirmed against
+# real kas (5.5): a local-only commit on an otherwise-clean sibling repo is
+# silently gone after a bare `kas dump --resolve-refs`, no different from
+# what kas_shell_ro's own header describes hitting mackas retrieve before it
+# was wrapped. --skip repos_checkout stops that reset while still letting kas
+# clone a repo that is not there yet and fetch/resolve the ref -- confirmed
+# that resolution still works and still yields the real commit with the skip
+# in place. --skip repos_apply_patches is paired with it on the same
+# reasoning as everywhere else in this file (and is a no-op today -- dump
+# never reaches the patch step even unskipped -- kept for when that changes
+# out from under us). Do NOT drop either flag: this is the one thing Step 1
+# of the --skip decision procedure in skills/mackas/SKILL.md relies on dump
+# being safe to run before Step 2 has even looked at the repo.
 cmd_dump() {
 	# No argument parsing here: 'dump' is dispatched bare, like check/status/
 	# shell/destroy -- the outer parser already consumed --dry-run/-y/-v/
@@ -6664,7 +6685,8 @@ cmd_dump() {
 			"$C_DIM" "$(printf '%q' "$MACKAS_PROJECT")" \
 			"$(kas_env_vars 0)" "$(printf '%q' "$KAS_CONTAINER_REAL")" \
 			"$(printf '%q' "$rt_args")" \
-			"$(quote_cmd dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")" "$C_RST"
+			"$(quote_cmd dump --skip repos_checkout --skip repos_apply_patches \
+				--resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")" "$C_RST"
 		info "  writing resolved config to: $out"
 		return 0
 	fi
@@ -6673,7 +6695,8 @@ cmd_dump() {
 	local rc=0
 	(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
-		kas_invoke_env "$rt_args" "$gitconfig" 0 dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
+		kas_invoke_env "$rt_args" "$gitconfig" 0 dump --skip repos_checkout --skip repos_apply_patches \
+			--resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
 	) > "$out" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		rm -f "$out"
