@@ -1387,6 +1387,25 @@ cmd_set() {
 		"$SCRIPT_CMD status lists the valid names"
 	refuse_unwritable_setting_value "$value"
 
+	# Reject a value that fails the SAME per-setting checks every other
+	# command enforces (whitespace-free volume names, integer CPUS/PORT, the
+	# MEMORY/VOLUME_SIZE_* shapes...) before writing it, not after. Without
+	# this, a bad `set` writes the value successfully, and every LATER
+	# invocation -- including `unset`, the only in-tool way back -- dies in
+	# main()'s own validate_settings before it ever reaches dispatch, since
+	# that call happens unconditionally ahead of cmd_set/cmd_unset alike
+	# (issue #106). Reuse validate_settings() itself rather than duplicate
+	# its logic here: assign the candidate to $name and run it inside a
+	# command-substitution subshell, so its die() (which calls exit) only
+	# aborts the SUBSHELL -- $name keeps its real, already-validated value in
+	# this live process either way, and the message it would have printed
+	# comes back as this command substitution's captured output.
+	local validate_output
+	if ! validate_output="$(eval "$name=\"\$value\""; validate_settings 2>&1)"; then
+		printf '%s\n' "$validate_output" >&2
+		exit 1
+	fi
+
 	local file; file="$(set_target_config_file)"
 	# The target may sit in a directory that does not exist yet -- writing the
 	# first pinned project's config under ~/.config/mackas/projects/ is exactly
