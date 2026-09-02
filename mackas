@@ -8398,6 +8398,44 @@ push_stamp_write() {
 	printf '%s\n' "$epoch" > "$file"
 }
 
+# container_epoch_now -- the wall clock as read INSIDE a throwaway container,
+# not the Mac's own (issue #107). The sstate object mtimes an incremental
+# push compares its stamp against are set by whatever wrote them on the BUILD
+# VM's clock; stamping with the HOST's `date +%s` instead is only safe while
+# the two clocks agree, and Apple's `container` VM is known to lag the host's
+# after a sleep/wake -- sometimes by minutes, with nothing surfacing it. An
+# object written in that window then gets an mtime the next push's `find
+# -newermt @<host-epoch-stamp>` reads as "older than the cutoff", and it is
+# silently, permanently skipped until someone thinks to run --full. Reading
+# "now" from the same clock domain as the mtimes it will later be compared
+# against removes the skew instead of trying to bound or detect it.
+#
+# One more lightweight `container run` per push, not another VM boot -- the
+# VM is already up by the time sstate_push calls this (ensure_container_
+# running ran first), so this is just another hop through it, the same cost
+# `du -sk`'s own probe already pays for a size estimate nobody strictly needs.
+#
+# Never calls die(): like bitbake_getvar, every caller invokes this through
+# command substitution, and `exit` inside that subshell would only kill the
+# subshell, leaving the script to carry on with an empty "now" -- so failure
+# is a bare non-zero return, and the caller decides what to say and whether
+# to stop.
+container_epoch_now() {
+	local out rc=0
+	out="$(container run --rm -u 0:0 "$KAS_IMAGE" date +%s)" || rc=$?
+	[ "$rc" -eq 0 ] || return "$rc"
+	# Apple's own container tool can interleave boot-progress lines ("[3/6]
+	# Fetching kernel [0s]") ahead of the real output -- the identical noise
+	# fetch_volume_subdir's own probe already defends against (see its
+	# du -sk comment). Take the LAST line that is purely digits, never the
+	# first line unconditionally.
+	out="$(printf '%s\n' "$out" | awk '/^[0-9]+$/ { v = $0 } END { print v }')"
+	case "$out" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$out"
+}
+
 # sstate_push -- publish new sstate objects to a mirror, over rsync/ssh.
 #
 # The order of the steps is the design, not an implementation detail:
@@ -8488,7 +8526,13 @@ sstate_push() {
 				warn "  unreadable push stamp ($stamp) -- rescanning everything" ;;
 		esac
 	fi
-	now="$(date +%s)"
+	# The build VM's own clock, not the Mac's -- see container_epoch_now's
+	# header. Every "now" this command captures (this one, and since_desc
+	# below) has to come from here: it is what gets written to the stamp,
+	# and the stamp is later compared against mtimes that clock produced.
+	now="$(container_epoch_now)" || rc=$?
+	[ "$rc" -eq 0 ] || die "could not read the clock inside the build VM (rc=$rc)" \
+		"nothing was staged and the push stamp is unchanged; check 'container system status' and retry"
 	since_desc="everything (no usable stamp yet)"
 	[ -n "$since" ] && since_desc="objects newer than $(date -r "$since" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '@%s' "$since")"
 
