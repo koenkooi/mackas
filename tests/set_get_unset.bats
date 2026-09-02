@@ -89,6 +89,89 @@ CONF
 	[ "$output" = "/Volumes/My Disk/o'brien \$HOME" ]
 }
 
+# ---------------------------------------------------------------------------
+# set-time validation (issue #106): refuse_unwritable_setting_value() above
+# only catches characters that would corrupt the file itself (", `, control
+# chars) -- it does NOT run the per-setting shape checks validate_settings()
+# enforces on every other command (no whitespace in a volume name, integer-
+# only CPUS/MONITOR_PORT, the MEMORY/VOLUME_SIZE_* size shape). Before this
+# fix, a value that failed one of THOSE checks still wrote successfully, and
+# every LATER mackas invocation -- including `unset`, the only in-tool way
+# back -- died in main()'s unconditional validate_settings before dispatch
+# ever reached it. cmd_set now runs that same validation before writing, so
+# a bad value is refused up front and there is nothing left to be locked out
+# of.
+# ---------------------------------------------------------------------------
+
+@test "set: refuses a volume name with whitespace and writes nothing (issue #106)" {
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME "a b"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'contains whitespace'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: a refused value never locks a later command out, including unset (issue #106)" {
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME "a b"
+	[ "$status" -ne 0 ]
+
+	# This is the lockout the issue describes: before the fix, the write
+	# above would have succeeded, and both of these would then die in
+	# validate_settings instead of running normally.
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+
+	run "$MACKAS" unset MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'nothing to do'
+}
+
+@test "set: refuses a non-integer MACKAS_CPUS" {
+	run "$MACKAS" set MACKAS_CPUS abc
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a positive integer'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: refuses a malformed MACKAS_MEMORY" {
+	run "$MACKAS" set MACKAS_MEMORY 8x
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a size like 8g, 512m or 16'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: refuses a non-integer MACKAS_MONITOR_PORT" {
+	run "$MACKAS" set MACKAS_MONITOR_PORT abc
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a positive integer'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: refuses a malformed MACKAS_VOLUME_SIZE_TMP" {
+	run "$MACKAS" set MACKAS_VOLUME_SIZE_TMP big
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a size like 1T, 200G or 512M'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: valid values for every newly-checked setting still succeed" {
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME mackas-shared-dl
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_CPUS 8
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_MEMORY 48g
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_MONITOR_PORT 9001
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_VOLUME_SIZE_TMP 200G
+	[ "$status" -eq 0 ]
+
+	conf | grep -qF "MACKAS_VOLUME_DL_NAME='mackas-shared-dl'"
+	conf | grep -qF "MACKAS_CPUS='8'"
+	conf | grep -qF "MACKAS_MEMORY='48g'"
+	conf | grep -qF "MACKAS_MONITOR_PORT='9001'"
+	conf | grep -qF "MACKAS_VOLUME_SIZE_TMP='200G'"
+}
+
 @test "set --dry-run changes nothing on disk" {
 	run "$MACKAS" --dry-run set MACKAS_USE_NFS_MIRRORS 1
 	[ "$status" -eq 0 ]
