@@ -854,6 +854,18 @@ filename, not just sanitized into it: two destinations differing only in
 punctuation slug to the same string, and one shared stamp would silently skip
 the objects the other mirror never got.
 
+**The stamp's clock is the build VM's, not the Mac's.** The mtimes the stamp
+is later compared against (`find -newermt`) are set by whatever wrote the
+sstate object *inside the VM*, and Apple's `container` VM is known to lag the
+host's own clock after the Mac sleeps and wakes -- sometimes by minutes, with
+nothing surfacing it. A host-derived `date +%s` stamp is only correct while
+the two clocks agree; when the VM lags, an object it wrote can land with an
+mtime the host-derived cutoff already reads as "in the past", and the next
+incremental push then silently and *permanently* drops it -- only `--full`
+recovers it. `push` reads "now" from inside a throwaway container instead
+(`container_epoch_now()`), so the stamp and the mtimes it is compared against
+always come from the one clock that actually produced them.
+
 **A scan that could not answer never stamps.** "The scan matched nothing" is
 the one outcome that moves the stamp forward, so it must be impossible to
 confuse with "the scan broke". The in-container probe checks `find`'s own
