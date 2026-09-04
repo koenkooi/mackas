@@ -175,7 +175,13 @@ assert_default_volume_names() {
 	EOF
 	mk_status --set MACKAS_PROJECT_DIR=meta-ai
 	[ "$status" -eq 0 ]
-	! printf '%s\n' "$output" | grep -q 'project selected'
+	# refute_output, not a bare `! ... | grep`: this is not the test's final
+	# line, and a `!`-negated command's failure is exempt from `set -e` at
+	# ANY position (see helpers.bash's assert_fails comment) -- only on the
+	# last line does bats itself catch it via the function's return status.
+	# A bare `!` here would silently pass even if "project selected" wrongly
+	# appeared in the output.
+	refute_output 'project selected'
 	# "config file" is a multi-word status label -- same reasoning as the
 	# work/-layout test above for why setting() cannot address it.
 	printf '%s\n' "$output" | grep -qE '^  config file +<none: built-in defaults>$'
