@@ -206,6 +206,121 @@ mk() {
 	assert_fails exists_now oe-build-dl
 }
 
+@test "destroy: a project's OWN explicit override on its own dl is never 'shared with itself'" {
+	pin foo <<-'EOF'
+	MACKAS_VOLUME_DL_NAME="mackas-foo-dl"
+	EOF
+	have_volume mackas-foo-tmp
+	have_volume mackas-foo-dl
+	have_volume mackas-foo-sstate
+
+	mk --project foo destroy
+	[ "$status" -eq 0 ]
+	assert_fails exists_now mackas-foo-dl
+}
+
+# ---------------------------------------------------------------------------
+# the detector itself: things that are not a second claimant
+# ---------------------------------------------------------------------------
+
+@test "destroy: a directory named <name>.conf under projects_dir() is not a claimant" {
+	pin foo <<-'EOF'
+	EOF
+	mkdir -p "$PROJDIR/bogus.conf"
+	have_volume mackas-foo-tmp
+	have_volume mackas-foo-dl
+	have_volume mackas-foo-sstate
+
+	mk --project foo destroy
+	[ "$status" -eq 0 ]
+	assert_fails exists_now mackas-foo-dl
+}
+
+@test "destroy: a dangling symlink named <name>.conf under projects_dir() is not a claimant" {
+	pin foo <<-'EOF'
+	EOF
+	ln -s "$PROJDIR/nowhere" "$PROJDIR/dangling.conf"
+	have_volume mackas-foo-tmp
+	have_volume mackas-foo-dl
+	have_volume mackas-foo-sstate
+
+	mk --project foo destroy
+	[ "$status" -eq 0 ]
+	assert_fails exists_now mackas-foo-dl
+}
+
+@test "destroy: sharing is per-volume -- a dl-only share never blocks sstate" {
+	pin foo <<-'EOF'
+	EOF
+	pin bar <<-'EOF'
+	MACKAS_VOLUME_DL_NAME="mackas-foo-dl"
+	EOF
+	have_volume mackas-foo-dl
+
+	mk --project foo clean sstate
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'Nothing to clean'
+}
+
+@test "destroy: cannot tell if a volume is shared when a pinned config is unreadable -- fails CLOSED" {
+	pin foo <<-'EOF'
+	EOF
+	pin bar <<-'EOF'
+	MACKAS_VOLUME_DL_NAME="mackas-foo-dl"
+	EOF
+	chmod 000 "$PROJDIR/bar.conf"
+	have_volume mackas-foo-tmp
+	have_volume mackas-foo-dl
+	have_volume mackas-foo-sstate
+
+	mk --project foo destroy
+	local rc="$status"
+	chmod 600 "$PROJDIR/bar.conf"
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'cannot tell'
+	printf '%s\n' "$output" | grep -qF 'bar.conf'
+	# Refused before anything was touched -- fail closed, not fail open.
+	exists_now mackas-foo-tmp
+	exists_now mackas-foo-dl
+	exists_now mackas-foo-sstate
+}
+
+@test "clean downloads: an unreadable, UNRELATED pinned config still fails closed" {
+	# 'unrelated' on paper -- foo cannot prove that without reading it, which
+	# is exactly the point: an unreadable config is an unknown, not a no.
+	pin foo <<-'EOF'
+	EOF
+	pin unrelated <<-'EOF'
+	MACKAS_VOLUME_NAME="something-else-entirely"
+	EOF
+	chmod 000 "$PROJDIR/unrelated.conf"
+	have_volume mackas-foo-dl
+
+	mk --project foo clean downloads
+	local rc="$status"
+	chmod 600 "$PROJDIR/unrelated.conf"
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'cannot tell'
+	exists_now mackas-foo-dl
+}
+
+@test "destroy: an unreadable pinned config does not block an UNSELECTED destroy" {
+	# The guard is gated on PROJECT_SELECTED at all -- an unreadable stray
+	# file must not turn into a new failure mode for the pre-M3 default path.
+	pin foo <<-'EOF'
+	EOF
+	chmod 000 "$PROJDIR/foo.conf"
+	have_volume oe-build-tmp
+	have_volume oe-build-dl
+	have_volume oe-build-sstate
+
+	mk destroy
+	local rc="$status"
+	chmod 600 "$PROJDIR/foo.conf"
+	[ "$rc" -eq 0 ]
+	assert_fails exists_now oe-build-dl
+}
+
 # ---------------------------------------------------------------------------
 # clean downloads / sstate
 # ---------------------------------------------------------------------------
