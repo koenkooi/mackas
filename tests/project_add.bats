@@ -372,20 +372,68 @@ EOF
 	[ "$status" -eq 0 ]
 }
 
-@test "project add --from --keep-volumes, active selector's OWN config pins an explicit stem, still propagates it (known, pre-existing sharing gap -- not this guard's job)" {
+@test "project add --from --keep-volumes, active selector's OWN config pins an explicit stem colliding with it, is now refused (closes the #77 cross-project tmp collision gap)" {
 	pin other <<'EOF'
 MACKAS_VOLUME_NAME='mackas-explicit-other'
 EOF
 	mk_checkout demo https://example.com/demo.git
-	# other's stem is EXPLICIT (config_pinned_setting is true), so the new
-	# guard correctly lets it through -- an explicit choice is always
-	# trusted to propagate, same as every other precedence-and-warn case in
-	# #77. Whether two projects should share a volume unintentionally is a
-	# separate, already-known, deliberately deferred gap (see the M3
-	# integration review), not what this specific guard exists to catch.
+	# other's stem is EXPLICIT (config_pinned_setting is true), so
+	# want_explicit_stem correctly carries it forward -- but tmp is never a
+	# sharing surface (#72), so the cross-project collision guard added
+	# alongside this test refuses outright rather than silently pinning
+	# 'demo' to the exact same -tmp/-dl/-sstate volumes 'other' already
+	# owns. This closes what used to be a known, deliberately deferred gap
+	# (see the M3 integration review that first flagged it).
 	mk_add --project other project add demo --from demo --keep-volumes
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "already.*other.*build volume"
+	[ ! -e "$PROJDIR/demo.conf" ]
+}
+
+# ---------------------------------------------------------------------------
+# dl/sstate collisions: unlike tmp, sharing them is a real opt-in M1 feature,
+# so a collision here WARNS rather than refuses -- loud enough that this
+# exact bug class cannot happen silently, but without breaking a deliberate
+# 'MACKAS_VOLUME_DL_NAME=mackas-shared-dl'-style choice.
+# ---------------------------------------------------------------------------
+
+@test "project add inheriting a DIFFERENT project's explicit MACKAS_VOLUME_DL_NAME warns but still writes it" {
+	pin other <<'EOF'
+MACKAS_VOLUME_DL_NAME='mackas-shared-dl'
+EOF
+	mk_add --project other project add newname --url https://example.com/x.git --branch main
 	[ "$status" -eq 0 ]
-	grep -qxF "MACKAS_VOLUME_NAME='mackas-explicit-other'" "$PROJDIR/demo.conf"
+	printf '%s\n' "$output" | grep -qi "note:.*share a cache volume"
+	printf '%s\n' "$output" | grep -qF "mackas-shared-dl"
+	grep -qxF "MACKAS_VOLUME_DL_NAME='mackas-shared-dl'" "$PROJDIR/newname.conf"
+}
+
+@test "project add with no dl/sstate collision shows no sharing note" {
+	pin other <<'EOF'
+EOF
+	mk_add --project other project add newname --url https://example.com/x.git --branch main
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qF "share a cache volume"
+}
+
+@test "project add tmp-collision refusal and dl-collision warning are independent of --dry-run" {
+	pin other <<'EOF'
+MACKAS_VOLUME_NAME='mackas-explicit-other'
+EOF
+	mk_checkout demo https://example.com/demo.git
+	mk_add --dry-run --project other project add demo --from demo --keep-volumes
+	[ "$status" -ne 0 ]
+	[ ! -e "$PROJDIR/demo.conf" ]
+}
+
+@test "project add colliding on tmp via the fresh (non---from) path is refused the same way" {
+	pin other <<'EOF'
+MACKAS_VOLUME_NAME='mackas-explicit-other'
+EOF
+	mk_add --project other project add newname --url https://example.com/x.git --branch main
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "already.*other.*build volume"
+	[ ! -e "$PROJDIR/newname.conf" ]
 }
 
 # ---------------------------------------------------------------------------
