@@ -182,6 +182,7 @@ BUILDHISTORY_ARGS=()
 SSTATE_ARGS=()
 MONITOR_ARGS=()
 ADOPT_ARGS=()
+PROJECT_ARGS=()
 SET_ARGS=()
 GET_ARGS=()
 UNSET_ARGS=()
@@ -1537,10 +1538,13 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD projects
 
 Lists $(projects_dir)/*.conf -- the standalone
-configs '$SCRIPT_CMD adopt' writes -- and, for each, the settings that say
-where that project's build lives. Select one for a single command with
-'$SCRIPT_CMD --project NAME ...', or for a whole shell with
-\$MACKAS_PROJECT_SELECT=NAME.
+configs '$SCRIPT_CMD adopt' and '$SCRIPT_CMD project add' write -- and, for
+each, the settings that say where that project's build lives. Select one for
+a single command with '$SCRIPT_CMD --project NAME ...', or for a whole shell
+with \$MACKAS_PROJECT_SELECT=NAME.
+
+Note the singular sibling: this command LISTS what is already pinned; it
+never creates one. '$SCRIPT_CMD project add NAME' does that.
 
 Read-only, and it reads by GREPPING each file rather than sourcing it: a
 config is shell, and listing a directory of them must not run any of them.
@@ -5597,6 +5601,363 @@ cmd_adopt() {
 	if [ "$config_file" = "$(projects_dir)/$base_name.conf" ]; then
 		info "                or, pinned as it is: $SCRIPT_CMD --project $base_name ..."
 	fi
+}
+
+# ---------------------------------------------------------------------------
+# project add -- pin a project workspace under THIS Mac's own MACKAS_ROOT.
+# The in-root sibling of `adopt` (which pins a whole FOREIGN root instead):
+# both write the same kind of artifact, a standalone config at
+# ~/.config/mackas/projects/<name>.conf. See #72/#77.
+# ---------------------------------------------------------------------------
+
+project_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD project${C_RST} -- pin a project workspace under THIS Mac's own
+MACKAS_ROOT. The in-root sibling of '$SCRIPT_CMD adopt' (which pins a whole
+FOREIGN root instead): both write the same artifact, a standalone config at
+~/.config/mackas/projects/<name>.conf.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD project add <name> [--url URL --branch BRANCH | --from <checkout>]
+
+${C_BLD}SUBCOMMANDS${C_RST}
+  add <name>   Pin a project. '$SCRIPT_CMD project add --help' for the full
+               flag list.
+
+Note the plural sibling: '$SCRIPT_CMD projects' LISTS the projects already
+pinned (by either 'project add' or 'adopt'); this singular command instead
+CREATES one. '$SCRIPT_CMD projects --help' has the reading side.
+EOF
+}
+
+project_add_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD project add${C_RST} -- pin <name> as a project workspace under
+this Mac's own MACKAS_ROOT: creates \$MACKAS_WORK/<name>/ (that project's
+entire KAS_WORK_DIR -- the checkout and whatever siblings kas clones next to
+it, private to <name>; see #72) and writes a standalone config to
+~/.config/mackas/projects/<name>.conf, seeded from the settings in effect
+right now. It PINS; it does not build -- run
+'$SCRIPT_CMD --project <name> setup' afterwards for that.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD project add <name> --url URL --branch BRANCH
+  $SCRIPT_CMD project add <name> --from <checkout>
+  $SCRIPT_CMD project add <name>
+
+${C_BLD}OPTIONS${C_RST}
+  --url URL            The project's git remote. Needs --branch too. Nothing
+                       is cloned yet -- that is what 'setup' does next.
+  --branch BRANCH      The branch to build. Needs --url too.
+  --from <checkout>    Convert an EXISTING checkout already at
+                       \$MACKAS_WORK/<name>/ into a pinned project, in place --
+                       reads its remote URL and current branch instead of
+                       asking for --url/--branch. Mutually exclusive with
+                       --url/--branch. <checkout> must name that very
+                       directory (bare '<name>', 'work/<name>', or a path
+                       resolving to it) -- 'project add' never renames or
+                       moves a checkout to make names line up.
+  --keep-volumes       With --from only: keep building against whatever
+                       volumes the checkout already used (e.g. oe-build-*),
+                       explicitly -- migration path B from the multi-project
+                       design (#72): a fully supported end state, no data
+                       ever moved.
+  --derive-volumes     With --from only: the opposite -- switch this project
+                       to mackas-<name>-* going forward. The OLD volumes are
+                       left exactly as they are, not moved or deleted; only a
+                       FUTURE build reads/writes the new ones.
+
+  Neither --keep-volumes nor --derive-volumes given, --from used, and this is
+  running interactively: asked as a yes/no question. Non-interactive (no
+  tty, or -y) and neither given: keeps the existing volumes -- the choice
+  that changes nothing and never invalidates a cache is the safe default for
+  an unattended run.
+
+  Omitting --url/--branch and --from entirely pins <name> with no checkout
+  configured yet, same as an unconfigured 'setup' -- fill in
+  MACKAS_PROJECT_URL/_BRANCH later with '$SCRIPT_CMD --project <name> set
+  MACKAS_PROJECT_URL ...'.
+
+'project add <name>' refuses outright if \$MACKAS_WORK/<name>/ already exists
+and --from was not given -- a plain checkout that happens to share the name
+is not automatically adopted (#72: filesystem shape alone never decides
+anything). An already-pinned <name> is offered for overwrite, exactly like
+'$SCRIPT_CMD adopt' does for its own config file.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after 'project add'.
+
+See also: '$SCRIPT_CMD projects' lists what is already pinned; '$SCRIPT_CMD
+adopt' pins a whole FOREIGN root instead of a project inside this one.
+EOF
+}
+
+cmd_project_add() {
+	local name="" url="" branch="" from="" keep_flag="" derive_flag="" want_help=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help|help) want_help=1; shift ;;
+			--url)     url="${2:-}"
+				[ -n "$url" ] || die "--url needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--url=*)   url="${1#*=}"; shift ;;
+			--branch)  branch="${2:-}"
+				[ -n "$branch" ] || die "--branch needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--branch=*) branch="${1#*=}"; shift ;;
+			--from)    from="${2:-}"
+				[ -n "$from" ] || die "--from needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--from=*)  from="${1#*=}"; shift ;;
+			--keep-volumes)   keep_flag=1; shift ;;
+			--derive-volumes) derive_flag=1; shift ;;
+			-*) die "unknown option for 'project add': $1" "$SCRIPT_CMD project add --help" ;;
+			*)
+				[ -z "$name" ] || die "'project add' takes one name" "$SCRIPT_CMD project add --help"
+				name="$1"; shift ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		project_add_usage
+		return 0
+	fi
+
+	[ -n "$name" ] || die "'project add' needs a name" "$SCRIPT_CMD project add <name> --help"
+	validate_project_select "$name" "project add"
+
+	# --from vs --url/--branch: two different ways to answer "what does this
+	# project check out", never both.
+	if [ -n "$from" ] && { [ -n "$url" ] || [ -n "$branch" ]; }; then
+		die "'--from' and '--url'/'--branch' are mutually exclusive" \
+			"pick one way to give '$name' its checkout"
+	fi
+	if [ -n "$url" ] && [ -z "$branch" ]; then
+		die "'--url' needs '--branch' too" "$SCRIPT_CMD project add --help"
+	fi
+	if [ -n "$branch" ] && [ -z "$url" ]; then
+		die "'--branch' needs '--url' too" "$SCRIPT_CMD project add --help"
+	fi
+	if [ -n "$keep_flag" ] && [ -n "$derive_flag" ]; then
+		die "'--keep-volumes' and '--derive-volumes' are mutually exclusive" \
+			"$SCRIPT_CMD project add --help"
+	fi
+	if { [ -n "$keep_flag" ] || [ -n "$derive_flag" ]; } && [ -z "$from" ]; then
+		die "'--keep-volumes'/'--derive-volumes' only apply to a '--from' conversion" \
+			"a freshly added project has no prior volumes to keep or leave behind"
+	fi
+
+	# Mutating: it creates a directory inside work/. Same gate 'setup' and
+	# 'adopt's own hand-off to setup use.
+	require_mackas_root
+
+	hdr "mackas project add: $name"
+
+	local config_file; config_file="$(projects_dir)/$name.conf"
+	local workspace_dir; workspace_dir="$MACKAS_WORK/$name"
+
+	local proj_url="" proj_branch=""
+	if [ -n "$from" ]; then
+		# --from converts THAT VERY ENTRY in place -- #72's own wording for the
+		# work/-collision-refusal rule below. Accepting an arbitrary OTHER
+		# directory here would mean either silently renaming/moving a checkout
+		# (never -- see #72) or minting a project whose pinned
+		# MACKAS_PROJECT_DIR points at a directory with a different name than
+		# the project itself, for no benefit -- work/<name>/ IS the workspace
+		# (#72). So the value is accepted in the forms a user is likely to
+		# type (a bare name, 'work/<name>', a path) purely to give a typo a
+		# clear message, not to allow converting anything other than
+		# work/<name> itself.
+		local from_resolved
+		case "$from" in
+			/*)  from_resolved="$(resolve_path "$from")" ;;
+			*/*) from_resolved="$(resolve_path "$MACKAS_ROOT/$from")" ;;
+			*)   from_resolved="$(resolve_path "$MACKAS_WORK/$from")" ;;
+		esac
+		local workspace_resolved; workspace_resolved="$(resolve_path "$workspace_dir")"
+		if [ "$from_resolved" != "$workspace_resolved" ]; then
+			die "'--from $from' does not name $workspace_dir" \
+				"'project add' converts an existing checkout in place -- it never renames or moves one; use '$SCRIPT_CMD project add $name --from $name'"
+		fi
+		[ -d "$workspace_dir" ] || die "no checkout to convert: $workspace_dir does not exist" \
+			"drop --from to create a fresh workspace, or check the directory name"
+
+		# adopt_introspect_project itself dies with a clear message if
+		# $workspace_dir/.git turns out not to exist -- same check, same
+		# wording, reused rather than duplicated.
+		local introspected
+		introspected="$(adopt_introspect_project "$MACKAS_BASE" "$name")"
+		proj_url="$(printf '%s\n' "$introspected" | sed -n '2p')"
+		proj_branch="$(printf '%s\n' "$introspected" | sed -n '3p')"
+		info "  converting : $workspace_dir"
+		info "    url      : ${proj_url:-<none: no 'origin' remote>}"
+		info "    branch   : ${proj_branch:-<none: detached HEAD>}"
+	else
+		# The collision refusal (#72): a first-level directory under work/ is
+		# a project workspace IFF a pinned config for that name exists.
+		# work/<name>/ existing already, with no --from, means it is just an
+		# ordinary checkout that happens to share the name -- filesystem
+		# shape alone never decides anything.
+		if [ -d "$workspace_dir" ]; then
+			die "'$workspace_dir' already exists and is not being converted" \
+				"pin it in place with '$SCRIPT_CMD project add $name --from $name', or pick a different name"
+		fi
+		proj_url="$url"
+		proj_branch="$branch"
+	fi
+
+	if [ -f "$config_file" ]; then
+		confirm "  $config_file already exists -- overwrite its settings with this project?" \
+			|| die "declined -- nothing written" \
+				"pick a different name, or edit $config_file directly"
+	fi
+
+	# THE MIGRATION QUESTION (#72 path B), --from only: a checkout that
+	# already existed before being pinned may already have built against
+	# whatever $MACKAS_VOLUME_NAME currently resolves to (oe-build, on an
+	# untouched install). Ask once whether to keep that explicitly, or switch
+	# to mackas-<name>-* going forward -- either way nothing on disk moves; a
+	# fresh project (no --from) has no prior volumes to have this opinion
+	# about at all.
+	local keep=1
+	if [ -n "$from" ]; then
+		if [ -n "$keep_flag" ]; then
+			keep=1
+		elif [ -n "$derive_flag" ]; then
+			keep=0
+		elif [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ ! -t 0 ]; then
+			# Non-interactive default: KEEP. It writes nothing new to disk,
+			# changes no command's behaviour today (the checkout already
+			# built against $MACKAS_VOLUME_NAME-*), and never invalidates an
+			# existing download/sstate cache the way defaulting to a
+			# brand-new mackas-<name>-* stem would. Switching volumes is a
+			# deliberate, visible choice a human should make with eyes open
+			# (--derive-volumes, or the interactive prompt below) -- not
+			# something a script or CI run should trigger by accident.
+			keep=1
+			info "  non-interactive: keeping the existing '$MACKAS_VOLUME_NAME' volumes for '$name'"
+			info "    (pass --derive-volumes to switch to mackas-$name-* instead; nothing moves either way)"
+		else
+			if confirm "  Keep the existing volumes ($MACKAS_VOLUME_NAME-tmp/-dl/-sstate) for '$name'? Declining switches it to mackas-$name-* volumes going forward -- nothing already on disk is moved either way."; then
+				keep=1
+			else
+				keep=0
+			fi
+		fi
+	fi
+
+	# Which volume-name settings actually belong in a STANDALONE config:
+	# MACKAS_VOLUME_NAME is written explicitly only when this project is
+	# deliberately keeping a non-default stem (the migration answer above),
+	# or when THIS invocation's own settings already pinned one explicitly
+	# (config_pinned_setting, not a bare value check -- see its own comment on
+	# why: MACKAS_VOLUME_NAME's factory default is the non-empty "oe-build",
+	# so a plain value check cannot tell "explicitly oe-build" from "never
+	# touched"). Otherwise it is left unset, so mackas-<name>-* derives once
+	# --project <name> selects this file (#77 slice 1). The DL/SSTATE
+	# overrides are independent of the migration question (M1: opt-in sharing
+	# is available to any project, not just a converted one) and are carried
+	# forward under the exact same explicit-only rule.
+	local want_explicit_stem=0
+	if [ -n "$from" ]; then
+		[ "$keep" -eq 1 ] && want_explicit_stem=1
+	elif config_pinned_setting MACKAS_VOLUME_NAME; then
+		want_explicit_stem=1
+	fi
+
+	run mkdir -p "$workspace_dir"
+
+	# Created under umask 077, never the ambient one -- same reasoning as
+	# cmd_set's own bootstrap of this directory: --project holds it to
+	# config_file_is_safe(), and an inherited `umask 002` would otherwise
+	# produce a group-writable directory that then refuses to be sourced.
+	local cfg_dir; cfg_dir="$(dirname "$config_file")"
+	[ -d "$cfg_dir" ] || ( umask 077 && run mkdir -p "$cfg_dir" ) || die "could not create $cfg_dir"
+
+	# What a STANDALONE config needs, and no more: MACKAS_ROOT (which root)
+	# and MACKAS_PROJECT_DIR (which checkout under work/ -- always <name> for
+	# a project this command itself created) make it self-sufficient; the
+	# project's own identity (its git remote/branch, if any) and any
+	# volume-name override this invocation's settings are already explicit
+	# about carry the CHOICE that got the user here into the new file too.
+	# Deliberately NOT seeded: volume SIZES, CPUS/MEMORY, mirror settings,
+	# MACKAS_KAS_CONFIG -- machine-wide or build-time choices that belong to
+	# defaults/config, not to project identity. Freezing today's value of any
+	# of those into every new project's file forever is exactly the
+	# "unreadable, frozen-forever" failure mode a standalone config has to
+	# avoid (same reasoning as the M1 MACKAS_VOLUME_DL_NAME/_SSTATE_NAME
+	# design, applied here to the whole file rather than just the stem).
+	# Every value below is written OR explicitly deleted, never just
+	# conditionally written -- 'project add' on an already-pinned NAME is an
+	# overwrite (confirmed above), and config_write_setting only ever
+	# edits/appends a line, it never removes one on its own. Without the
+	# delete branches, re-running with a different answer (say,
+	# --derive-volumes after a prior --keep-volumes) would leave the OLD
+	# MACKAS_VOLUME_NAME line sitting in the file, silently disagreeing with
+	# what this run just decided. delete's own "line was not there" return of
+	# 1 is not a failure here, so it is swallowed.
+	config_write_setting "$config_file" MACKAS_ROOT "$MACKAS_ROOT"
+	config_write_setting "$config_file" MACKAS_PROJECT_DIR "$name"
+	if [ -n "$proj_url" ]; then
+		config_write_setting "$config_file" MACKAS_PROJECT_URL "$proj_url"
+		config_write_setting "$config_file" MACKAS_PROJECT_BRANCH "$proj_branch"
+	else
+		config_write_setting "$config_file" MACKAS_PROJECT_URL "" delete || true
+		config_write_setting "$config_file" MACKAS_PROJECT_BRANCH "" delete || true
+	fi
+	if [ "$want_explicit_stem" -eq 1 ]; then
+		config_write_setting "$config_file" MACKAS_VOLUME_NAME "$MACKAS_VOLUME_NAME"
+	else
+		config_write_setting "$config_file" MACKAS_VOLUME_NAME "" delete || true
+	fi
+	local s sval
+	for s in MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
+		if config_pinned_setting "$s"; then
+			eval "sval=\"\${$s}\""
+			config_write_setting "$config_file" "$s" "$sval"
+		else
+			config_write_setting "$config_file" "$s" "" delete || true
+		fi
+	done
+	did "wrote $config_file"
+	did "workspace directory: $workspace_dir"
+
+	hdr "Done"
+	if [ -n "$proj_url" ]; then
+		info "  next: $SCRIPT_CMD --project $name setup   # clones $proj_url (branch $proj_branch) and builds out the rest"
+	else
+		info "  no project URL set yet -- '$SCRIPT_CMD --project $name setup' will skip the checkout step"
+		info "    until MACKAS_PROJECT_URL/_BRANCH are set: $SCRIPT_CMD --project $name set MACKAS_PROJECT_URL <url>"
+	fi
+	info "  from now on : $SCRIPT_CMD --project $name ...   ($SCRIPT_CMD projects lists every pinned project)"
+}
+
+cmd_project() {
+	local sub="" rest=() a want_help=0
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" project ;;
+			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
+		esac
+	done
+
+	case "${sub:-help}" in
+		add)
+			# -h/--help caught above is consumed here, never forwarded, unless
+			# re-appended -- same reason cmd_volume's subcommands need it back:
+			# 'project add --help' must show project_add_usage (the specific
+			# one), not this function's own generic project_usage.
+			[ "$want_help" -eq 1 ] && rest+=("--help")
+			cmd_project_add ${rest+"${rest[@]}"} ;;
+		help)  project_usage ;;
+		*) die "unknown 'project' subcommand: $sub" \
+			"$SCRIPT_CMD project --help  (add)" ;;
+	esac
 }
 
 # ---------------------------------------------------------------------------
@@ -11425,6 +11786,8 @@ ${C_BLD}COMMANDS${C_RST}
   setup      Do the full setup. Idempotent -- safe to re-run after a crash.
   adopt      Bring a MACKAS_ROOT set up by another Mac back to a working
              build here. '$SCRIPT_CMD adopt --help'.
+  project    Pin a project workspace under THIS root -- 'project add NAME'.
+             The in-root sibling of 'adopt'. '$SCRIPT_CMD project --help'.
   smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
   status     Show what is configured and what exists on disk.
   shell      Drop into a kas shell for the project's kas config.
@@ -11713,6 +12076,16 @@ main() {
 				cmd="adopt"; shift
 				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
 				break ;;
+			project)
+				# Same shape again: project owns everything after it (its
+				# verb, 'add', and that verb's own args), captured verbatim
+				# for cmd_project. Exact-string case matching means this can
+				# never collide with the existing, plural, read-only
+				# 'projects' command below.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="project"; shift
+				if [ "$want_help" -eq 1 ]; then PROJECT_ARGS=("$@" "--help"); else PROJECT_ARGS=("$@"); fi
+				break ;;
 			runtime-args)
 				# Same shape again: runtime-args owns everything after it
 				# (--require-volumes-free), captured verbatim for
@@ -11724,7 +12097,7 @@ main() {
 			check|smoketest|status|shell|destroy|lock|dump|projects)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset projects runtime-args lock dump help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt project smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset projects runtime-args lock dump help)" ;;
 		esac
 	done
 
@@ -11769,6 +12142,7 @@ main() {
 		check)     if [ "$want_help" -eq 1 ]; then check_usage;     else cmd_check;     fi ;;
 		setup)     if [ "$want_help" -eq 1 ]; then setup_usage;     else cmd_setup ${SETUP_ARGS+"${SETUP_ARGS[@]}"}; fi ;;
 		adopt)      cmd_adopt ${ADOPT_ARGS+"${ADOPT_ARGS[@]}"} ;;
+		project)    cmd_project ${PROJECT_ARGS+"${PROJECT_ARGS[@]}"} ;;
 		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
