@@ -108,6 +108,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `check` | Preflight only. PASS/WARN/FAIL, each with the remediation command. **Default.** |
 | `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. Takes an optional root path and `--tmpdir-size`/`--sstate-size`/`--downloads-size`; asks interactively for whichever is still unconfigured. |
 | `adopt` | Bring a `MACKAS_ROOT` set up by another Mac back to a working build here — see [below](#adopting-a-root-from-another-mac). |
+| `project add` | Pin a project workspace under *this* Mac's own root — the in-root sibling of `adopt` — see [below](#pinning-a-project-workspace). |
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
@@ -121,7 +122,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
-| `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. |
+| `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. (The plural, read-only sibling of `project add`, which creates one.) |
 | `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
 | `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
@@ -426,6 +427,52 @@ yourself with `type -a kas-container`
 > [architecture.md](docs/architecture.md#running-kas-container-by-hand)
 > is what's left for the case `exec` cannot help with — a sibling-layer
 > chain, driven from `work/` directly (see above).
+
+## Pinning a project workspace
+
+`mackas adopt` pins a whole *foreign* root. `mackas project add <name>` is
+its in-root sibling: it pins a project workspace *inside this Mac's own*
+`MACKAS_ROOT`, so a second (or third) layer set builds alongside the first
+with its own `work/<name>/` and, once selected, its own volumes — see
+[Configuration](#configuration) for the selector itself and how the volume
+stem derives from it.
+
+```sh
+./mackas project add meta-qcom --url https://example.com/meta-qcom.git --branch main
+./mackas --project meta-qcom setup     # clones it, then builds out the rest
+```
+
+Both write the same kind of artifact `adopt` does: a standalone config at
+`~/.config/mackas/projects/<name>.conf`, seeded from whatever settings are
+in effect right now (`MACKAS_ROOT`, the checkout's URL/branch, and any
+volume-name override already explicit in this invocation — sizes, CPUs/
+memory and mirror settings are deliberately left out, so the file stays
+readable and does not freeze today's machine-wide defaults into every future
+project). `project add` only **pins**; it never clones or builds — that is
+what `setup`, run afterwards under `--project <name>`, still does.
+
+**A first-level directory under `work/` is a project workspace if and only
+if a pinned config for that name exists** (#72). A plain, unpinned
+`work/<name>/` — a checkout put there some other way — is just a checkout;
+`project add <name>` refuses it outright rather than silently adopting it.
+`--from <checkout>` is the deliberate opt-in: it converts that *exact*
+`work/<name>/` entry in place, reading its remote URL and current branch
+instead of asking for `--url`/`--branch`. It never renames or moves
+anything — pointing `--from` at a *different* directory than `<name>` is
+refused, not "fixed up" for you.
+
+`--from` also asks the one question the design's migration path B depends
+on: keep the checkout's existing volumes explicitly (`--keep-volumes`, e.g.
+staying on `oe-build-*`, no data ever moved) or switch it to
+`mackas-<name>-*` going forward (`--derive-volumes`; the old volumes are
+left exactly as they are, not deleted). Interactively, with neither flag,
+it asks; non-interactively (no tty, or `-y`) it keeps — the answer that
+changes nothing and can never invalidate an existing download/sstate cache.
+
+An already-pinned `<name>` is offered for overwrite, exactly like `adopt`
+does for its own config file. `mackas project add --help` has the full flag
+list; `mackas project --help` for the command family; `mackas projects`
+lists what is already pinned.
 
 ## Adopting a root from another Mac
 
