@@ -5798,7 +5798,23 @@ cmd_project_add() {
 		# work/<name>/ existing already, with no --from, means it is just an
 		# ordinary checkout that happens to share the name -- filesystem
 		# shape alone never decides anything.
-		if [ -d "$workspace_dir" ]; then
+		#
+		# EXCEPT when it is empty: 'run mkdir -p "$workspace_dir"' below is the
+		# very first mutation this command performs, strictly before the config
+		# file is written -- so an interrupted or partially-failed prior run
+		# (Ctrl-C, a full disk, anything dying between that mkdir and the last
+		# config_write_setting call) can leave exactly an empty work/<name>/
+		# behind with no pinned config to show for it. Refusing THAT unchanged
+		# would make on_interrupt()'s own promise ("nothing is left half-written
+		# that a re-run won't fix") false for this one command: a plain retry
+		# would hit this refusal, and the --from retry it suggests would in turn
+		# refuse too (adopt_introspect_project requires a real .git, which an
+		# empty directory never has) -- stranding the name with no way through
+		# except an out-of-band 'rmdir'. An empty directory carries no content
+		# that could be silently folded in or lost, so it is safe to treat as
+		# "nothing here yet" and proceed; anything containing so much as a
+		# stray file still refuses, unchanged.
+		if [ -d "$workspace_dir" ] && [ -n "$(ls -A "$workspace_dir" 2>/dev/null)" ]; then
 			die "'$workspace_dir' already exists and is not being converted" \
 				"pin it in place with '$SCRIPT_CMD project add $name --from $name', or pick a different name"
 		fi
