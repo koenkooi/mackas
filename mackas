@@ -1597,6 +1597,51 @@ cmd_projects() {
 	fi
 }
 
+# pinned_config_volume_names FILE NAME -- print FILE's resolved tmp/dl/sstate
+# volume names, one per line, in that order. NAME is FILE's own basename
+# (minus .conf) -- the name --project/$MACKAS_PROJECT_SELECT would select it
+# by. Applies the exact same derivation derive_volume_names() applies at
+# runtime: an explicit override wins when FILE sets one, otherwise the stem
+# defaults to mackas-NAME and dl/sstate fall out of the stem (#77 slice 1).
+# Read-only: every value comes from config_grep_setting -- GREPPING FILE,
+# never sourcing it, same rule cmd_projects() already follows for this whole
+# directory.
+pinned_config_volume_names() {
+	local file="$1" name="$2" stem dl sstate
+	stem="$(config_grep_setting "$file" MACKAS_VOLUME_NAME)" || stem=""
+	[ -n "$stem" ] || stem="mackas-$name"
+	dl="$(config_grep_setting "$file" MACKAS_VOLUME_DL_NAME)" || dl=""
+	[ -n "$dl" ] || dl="${stem}-dl"
+	sstate="$(config_grep_setting "$file" MACKAS_VOLUME_SSTATE_NAME)" || sstate=""
+	[ -n "$sstate" ] || sstate="${stem}-sstate"
+	printf '%s\n%s\n%s\n' "${stem}-tmp" "$dl" "$sstate"
+}
+
+# pinned_projects_referencing_volume NAME -- print, one per line, every
+# pinned project (projects_dir()/*.conf, minus the .conf suffix) whose tmp,
+# dl OR sstate volume resolves to NAME. Empty output when nobody does,
+# including when projects_dir() holds zero or one config -- "shared" needs a
+# SECOND claimant, so those cases can never produce output no matter what
+# NAME is (the glob below is the same defensive `[ -f "$f" ] || continue`
+# shape cmd_projects() already uses, so a directory with no configs at all,
+# or none yet, is silent rather than iterating a literal unexpanded glob).
+#
+# Shared by three callers that all need the same answer to "who else claims
+# this volume": adopt_unique_volume_name()'s collision probe (a candidate
+# claimed only by a pinned-but-unbuilt project's override has no volume to
+# find with volume_exists()), and destroy/clean's shared-volume refusal.
+pinned_projects_referencing_volume() {
+	local target="$1" dir f name
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		name="$(basename "$f" .conf)"
+		if pinned_config_volume_names "$f" "$name" | grep -qxF "$target"; then
+			printf '%s\n' "$name"
+		fi
+	done
+}
+
 # The kas files kas-container is actually given: the project's own config
 # (MACKAS_KAS_CONFIG) followed by the generated macOS fragment, composed last
 # so it wins. Every element is checkout-relative because run_kas() cd's into
@@ -5397,14 +5442,36 @@ adopt_introspect_project() {
 }
 
 # adopt_unique_volume_name BASE -- BASE disambiguated against every volume
-# name already in use for something else, machine-wide (no per-root ownership
-# record exists to check against, so collision-avoidance, not "is this
-# already mine", is the honest guarantee here).
+# name already in use for something else, machine-wide: MATERIALIZED, real
+# container volumes (volume_exists), AND names already CLAIMED by a
+# pinned-but-not-yet-built project's config.
+#
+# The second half is the fix: this probe was written when the three volume
+# names were one stem plus three fixed suffixes and could not be aimed
+# anywhere else, so "does <candidate>-dl exist" and "is stem <candidate>
+# taken" were the same question. M1's MACKAS_VOLUME_DL_NAME/_SSTATE_NAME
+# broke that equivalence in both directions: a pinned project can claim a
+# literal "mackas-foo-dl" through an override while its OWN stem is
+# something unrelated (volume_exists() alone would miss it -- nothing has
+# been built yet, so there is no volume to find), and a pinned project named
+# literally "foo" that has simply never built leaves "mackas-foo-dl" looking
+# just as free. pinned_projects_referencing_volume() answers the question
+# volume_exists() cannot: it reverse-GREPS every pinned config -- never
+# sources one -- applying each file's own derivation rule the same way
+# derive_volume_names() would once that file were selected.
+#
+# Still no per-root OWNERSHIP record exists (nothing here can tell "this
+# candidate is already MINE" from "someone else's", only "is this literal
+# string spoken for by ANYTHING") -- collision-avoidance, not "is this
+# already mine", remains the honest guarantee.
 adopt_unique_volume_name() {
 	local base="$1" n=2
 	local candidate="mackas-$base"
 	while volume_exists "${candidate}-tmp" || volume_exists "${candidate}-dl" \
-	   || volume_exists "${candidate}-sstate"; do
+	   || volume_exists "${candidate}-sstate" \
+	   || [ -n "$(pinned_projects_referencing_volume "${candidate}-tmp")" ] \
+	   || [ -n "$(pinned_projects_referencing_volume "${candidate}-dl")" ] \
+	   || [ -n "$(pinned_projects_referencing_volume "${candidate}-sstate")" ]; do
 		candidate="mackas-$base-$n"
 		n=$((n + 1))
 	done
