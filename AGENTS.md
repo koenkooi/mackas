@@ -8,8 +8,8 @@ break by accident.
 
 ## What this repo is
 
-- `mackas` — the whole tool, one ~10,900-line **bash 3.2** script. Subcommands:
-  `check`, `setup`, `adopt`, `smoketest`, `status`, `shell`, `exec`,
+- `mackas` — the whole tool, one ~12,400-line **bash 3.2** script. Subcommands:
+  `check`, `setup`, `adopt`, `project`, `smoketest`, `status`, `shell`, `exec`,
   `retrieve`, `buildstats`, `buildhistory`, `sstate`, `monitor`, `clean`,
   `destroy`, `volume`, `set`, `get`, `unset`, `projects`, `runtime-args`, `lock`,
   `dump`.
@@ -27,7 +27,7 @@ break by accident.
   progress as JSON over HTTP; `bitbake` is a wrapper bind-mounted directly over
   the checkout's own `bin/bitbake` for the lifetime of one container run (a
   PATH shadow does not work — see the file's own header for why).
-- `tests/` — 40 `*.bats` files + 7 `test_*.py` files.
+- `tests/` — 47 `*.bats` files + 7 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security, monitor-app.
 - `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to

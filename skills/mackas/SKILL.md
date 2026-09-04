@@ -37,16 +37,23 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
   plain directory there is on the case-insensitive drive and is exactly the
   corruption the image exists to prevent.
 - Build output lives in three ext4 volumes (names stem from
-  `MACKAS_VOLUME_NAME`, default `oe-build`):
-  - `oe-build-tmp` → `/build` (`KAS_BUILD_DIR`/`TOPDIR`) → `TMPDIR` =
+  `MACKAS_VOLUME_NAME`, default `oe-build` — or `mackas-<name>` once
+  `--project <name>`/`$MACKAS_PROJECT_SELECT` selects a pinned project and
+  nothing explicit overrides it):
+  - `${stem}-tmp` → `/build` (`KAS_BUILD_DIR`/`TOPDIR`) → `TMPDIR` =
     `/build/tmp`, and `BUILDHISTORY_DIR` defaulting to `/build/buildhistory`
-  - `oe-build-dl` → `/downloads` (`DL_DIR`)
-  - `oe-build-sstate` → `/sstate` (`SSTATE_DIR`)
+  - `${stem}-dl` → `/downloads` (`DL_DIR`)
+  - `${stem}-sstate` → `/sstate` (`SSTATE_DIR`)
 
   The last two can be named outright with `MACKAS_VOLUME_DL_NAME` /
   `MACKAS_VOLUME_SSTATE_NAME`, so check `mackas status` rather than assuming
-  the stem. Details: [architecture.md](../../docs/architecture.md#the-ext4-volumes),
-  [storage.md](../../docs/storage.md).
+  the stem — an explicit name always wins over the derived one, and `status`
+  notes it (once, informationally) whenever the two disagree. All three
+  default **private** to a pinned project; sharing the dl/sstate volumes
+  across projects is opt-in via those same two settings, never automatic and
+  never the recommendation (#72). Details:
+  [architecture.md](../../docs/architecture.md#the-ext4-volumes),
+  [storage.md](../../docs/storage.md#naming-the-cache-volumes-outright).
 
 ## Preflight (every session)
 
@@ -602,6 +609,13 @@ confirmed):
 **Prefer `mackas retrieve buildhistory` first, or `mackas clean tmp+deploy`
 instead, whenever the buildhistory record still matters.**
 
+Under an active `--project` selector, `clean downloads`/`clean sstate` (and
+bare `mackas destroy`) refuse a volume a *different* pinned project's config
+also names, rather than deleting a cache that project relies on — the
+refusal names the other project(s). Naming the volume directly, `mackas
+volume destroy <name>`, is the explicit way through when that is really what
+you want.
+
 ### Pruning sstate by age
 
 `mackas sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't
@@ -920,10 +934,14 @@ kas is configured to reset to.
   after, they die with a redirect to the correct order.
 - `--project <name>` (or `$MACKAS_PROJECT_SELECT`) sources
   `~/.config/mackas/projects/<name>.conf` — the standalone config `mackas
-  adopt` writes — instead of searching. `mackas projects` lists what is
-  pinned; `mackas status` names the one in effect. It cannot be combined with
-  `--config`/`$MACKAS_CONF`: naming a path and selecting a project are two
-  answers to the same question and mackas refuses rather than ranks them.
+  adopt` or `mackas project add <name>` writes — instead of searching.
+  `mackas projects` lists what is pinned; `mackas status` names the one in
+  effect. It cannot be combined with `--config`/`$MACKAS_CONF`: naming a path
+  and selecting a project are two answers to the same question and mackas
+  refuses rather than ranks them. `mackas project add <name> [--url URL
+  --branch BRANCH | --from <checkout>]` is `adopt`'s in-root sibling: it pins
+  a *project workspace* under this Mac's own root (`$MACKAS_WORK/<name>/`)
+  instead of a whole separate root.
 - Most destructive commands are two-phase: they scan for real (even under
   `--dry-run`), report what they would reclaim, and only act after confirmation
   or `-y`.

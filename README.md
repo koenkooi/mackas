@@ -118,8 +118,8 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `buildhistory` | `buildhistory analyze [PATH] [--from REV] [--to REV] [--detail] [--json]` summarises what changed between two builds — recipes added/removed/upgraded, the biggest PKGSIZE movers, per-image size/content deltas. `mackas buildhistory --help`. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days; `sstate push` publishes new ones to a mirror over rsync/ssh. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. Exits 0 on a build that succeeded, 1 on one that failed, 2 when no bridge is reachable — a usable scripted probe. |
-| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
-| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
+| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. `downloads`/`sstate` refuse a volume another pinned project shares (see [below](#pinning-a-project-workspace)). |
+| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. Refuses a downloads/sstate volume another pinned project shares. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
 | `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. (The plural, read-only sibling of `project add`, which creates one.) |
@@ -474,6 +474,32 @@ does for its own config file. `mackas project add --help` has the full flag
 list; `mackas project --help` for the command family; `mackas projects`
 lists what is already pinned.
 
+Once selected, a pinned project's three volumes default to
+`mackas-<name>-tmp`/`-dl`/`-sstate` — see [Configuration](#configuration) for
+exactly how that derivation and its precedence-and-warn rule work. **All
+three are private to the project by default.** `TMPDIR` has no sharing knob
+at all — two builds in one `/build` is corruption, not contention — but the
+two caches genuinely are safe to share (downloads are checksum-verified,
+sstate is hash-keyed), so `MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME`
+*can* point two projects at the same volume. Nothing here does that for you:
+sharing is opt-in per project, never the default and never the
+recommendation — an ext4 volume can be mounted by only one VM at a time, so
+sharing trades disk against sibling projects queuing on each other; an
+[HTTP mirror](docs/storage.md#http-mirrors--optional-and-not-just-an-nfs-bridge)
+buys the cross-project hit rate without that contention. Because of this,
+`mackas destroy` and `mackas clean downloads`/`clean sstate` refuse to touch
+a volume more than one pinned project references, naming the other
+project(s) instead; the explicit way through is `mackas volume destroy
+<name>`, which acts on a volume by its literal name regardless of who else
+points at it. See [storage.md](docs/storage.md#naming-the-cache-volumes-outright)
+for the full reasoning.
+
+Two supported end states, and nobody is forced to move off the first one:
+**(A) do nothing** — stay on `oe-build-*` indefinitely, fully supported, not
+deprecated — or **(B) pin it** with `project add --from`, keeping
+`oe-build-*` explicitly (`--keep-volumes`, no data ever moved) or deriving
+`mackas-<name>-*` instead (`--derive-volumes`).
+
 ## Adopting a root from another Mac
 
 `MACKAS_ROOT` is portable — an external SSD, or a disk image on a share, can
@@ -552,14 +578,14 @@ use a per-project config, name it out loud — `mackas --config ./mackas.conf
 ...` — and keep the file to assignments.
 
 `--project NAME` selects a *pinned* project: the standalone config `mackas
-adopt` writes under `~/.config/mackas/projects/`. `mackas projects` lists
-them. It is a **selector, not a fifth precedence rung** — it decides which
-single file is sourced, never a value in one, so the chain above is
-unchanged. `MACKAS_PROJECT_SELECT` is therefore not a setting: `mackas set`
-will not write it, and it takes no part in the config file's own
-resolution. Naming a path and selecting a project are mutually exclusive;
-combining them is refused rather than ranked, because silently ignoring
-either one is how you build against a project you did not mean.
+adopt` or `mackas project add` writes under `~/.config/mackas/projects/`.
+`mackas projects` lists them. It is a **selector, not a fifth precedence
+rung** — it decides which single file is sourced, never a value in one, so
+the chain above is unchanged. `MACKAS_PROJECT_SELECT` is therefore not a
+setting: `mackas set` will not write it, and it takes no part in the config
+file's own resolution. Naming a path and selecting a project are mutually
+exclusive; combining them is refused rather than ranked, because silently
+ignoring either one is how you build against a project you did not mean.
 
 A `--project` file is held to the same ownership check a *searched* config
 is (a regular file, yours or root's, not group/world-writable, file and
