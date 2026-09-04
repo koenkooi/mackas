@@ -304,6 +304,25 @@ mk() {
 	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai'" "$TESTDIR/newconfig.conf"
 }
 
+@test "adopt: an unreadable pinned config is a silent miss for the probe, not a crash" {
+	# adopt_unique_volume_name() already documents itself as collision-
+	# avoidance, not a guarantee (no per-root ownership record exists) --
+	# unlike the DESTRUCTIVE shared-volume guard, a probe picking a NAME has
+	# nothing to fail closed about, so it must simply carry on: pick the
+	# plain name, same as if the unreadable file were not there at all.
+	make_foreign_root_with_project
+	mkdir -p "$HOME/.config/mackas/projects"
+	cat > "$HOME/.config/mackas/projects/other.conf" <<-'EOF'
+	MACKAS_VOLUME_NAME='mackas-meta-ai'
+	EOF
+	chmod 000 "$HOME/.config/mackas/projects/other.conf"
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	local rc="$status"
+	chmod 600 "$HOME/.config/mackas/projects/other.conf"
+	[ "$rc" -eq 0 ]
+	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai'" "$TESTDIR/newconfig.conf"
+}
+
 @test "adopt: derives a distinct MACKAS_SHORT_LINK from the project name" {
 	make_foreign_root_with_project
 	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
