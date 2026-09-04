@@ -5924,12 +5924,38 @@ cmd_project_add() {
 	# to mackas-<name>-* going forward -- either way nothing on disk moves; a
 	# fresh project (no --from) has no prior volumes to have this opinion
 	# about at all.
+	#
+	# "Keep" can only be trusted when $MACKAS_VOLUME_NAME's current value
+	# actually says something about what THIS checkout built with: either
+	# nothing above the defaults rung pinned it at all (a plain machine-wide
+	# default/override, true regardless of any selector), or it IS genuinely
+	# pinned (config/env/--set -- a deliberate choice, safe to propagate).
+	# It stops being trustworthy the moment a DIFFERENT project's selector is
+	# the only reason it holds its current value: PROJECT_SELECTED naming
+	# some OTHER project, with nothing explicit behind it, is purely THAT
+	# project's own selector-derived default (#77 slice 1) -- it says
+	# nothing about this checkout. Confirmed by hand while reviewing #77:
+	# 'project add newname --from --keep-volumes', run while a different
+	# project was selected, silently pinned newname's config to that OTHER
+	# project's own mackas-<other>-* volumes -- an undetected collision
+	# between two projects sharing nothing, exactly what the M3
+	# shared-volume work (destroy/clean's refusal, adopt's reverse-grep)
+	# exists to prevent, just via a code path neither of those touches.
+	local keep_unsafe=0
+	if [ -n "$PROJECT_SELECTED" ] && [ "$PROJECT_SELECTED" != "$name" ] \
+	   && ! config_pinned_setting MACKAS_VOLUME_NAME; then
+		keep_unsafe=1
+	fi
+
 	local keep=1
 	if [ -n "$from" ]; then
-		if [ -n "$keep_flag" ]; then
-			keep=1
-		elif [ -n "$derive_flag" ]; then
+		if [ -n "$derive_flag" ]; then
 			keep=0
+		elif [ "$keep_unsafe" -eq 1 ]; then
+			die "cannot tell what '$name' was already built with -- '$MACKAS_VOLUME_NAME' is only the derived stem for the currently selected '$PROJECT_SELECTED', not necessarily this checkout's" \
+				"drop '--project $PROJECT_SELECTED' and re-run, or pass --derive-volumes to switch '$name' to mackas-$name-* explicitly"
+		elif [ -n "$keep_flag" ]; then
+			keep=1
 		elif [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ ! -t 0 ]; then
 			# Non-interactive default: KEEP. It writes nothing new to disk,
 			# changes no command's behaviour today (the checkout already
