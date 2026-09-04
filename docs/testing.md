@@ -159,23 +159,44 @@ seams that make it work:
 
 The table is the highlights, not the whole suite; the remaining hermetic
 files (`adopt`, `case_sensitivity`, `check_discard_support`, `lock_dump`,
-`purefns`, `require_root`, `set_get_unset`, `setup_e2e`,
+`multi_project_compat`, `project_add`, `project_volume_names`, `purefns`,
+`require_root`, `set_get_unset`, `setup_e2e`, `shared_volume_refusal`,
 `smoketest_example_project`, `smoketest_ladder`, `sstate`, `sstate_push`,
 `volume_mgmt`,
 `workspace_attach`) follow the same patterns, and each file's own header says
 exactly what it pins. `adopt` covers `adopt`'s foreign-root introspection and
-collision-free volume/link derivation; `lock_dump` covers `lock`/`dump` as
-kas-container's own top-level subcommands (never `kas_shell_ro()`'s
-`shell -c` shape), sharing one runtime-args/gitconfig/one-VM preflight;
-`sstate` covers `sstate prune`'s age-based scan and one-VM refusal, and
-`sstate_push` covers `sstate push` against a fake `container` **and** a fake
-`rsync`: the one-VM refusal, the read-only staging mount, the stamp being
-honoured as `find`'s cutoff and advanced only after a clean transfer, the
-two-pass ordering (`.siginfo` second), `--ignore-existing` on every pass with
-`--inplace` on none, a verification failure aborting before anything reaches
-the network, and — the property the whole stamp exists for — every way a
-probe can fail or come back unreadable leaving the stamp exactly where it
-was, since only "the scan matched nothing" may advance it;
+collision-free volume/link derivation — including, since M3 (#77), that the
+derivation reverse-greps pinned-but-unbuilt projects' own volume-name
+overrides too, not just what `container volume list` already shows;
+`multi_project_compat` is the M3 compatibility contract itself (#77):
+`MACKAS_PROJECT_DIR=meta-ai` with no `--project` selector must keep
+resolving `oe-build-tmp`/`-dl`/`-sstate` byte-identically, even with pinned
+projects present on disk, even when `MACKAS_PROJECT_DIR` happens to collide
+with a pinned project's own name — mutation-tested, and treated as a gate
+every later commit must keep green rather than edit to fit; `project_add`
+covers `mackas project add`'s pinning, its work/-collision and
+already-pinned refusals, `--from`'s introspection and its keep-vs-derive
+migration question (including the cross-selector refusal that stops it from
+silently inheriting an unrelated project's own derived stem), and the round
+trip back through `--project <name>`; `project_volume_names` covers the
+`mackas-<name>-*` derivation itself, every rung of the precedence chain
+still beating it, and `status`'s once-only disagreement note when an
+explicit stem disagrees with what the selector would have derived;
+`shared_volume_refusal` covers `destroy`/`clean downloads`/`clean sstate`
+refusing a volume more than one pinned project references, naming the other
+project, versus proceeding when private, versus the explicit `volume destroy
+<name>`/`volume destroy --all` escape hatches; `lock_dump` covers
+`lock`/`dump` as kas-container's own top-level subcommands (never
+`kas_shell_ro()`'s `shell -c` shape), sharing one runtime-args/gitconfig/
+one-VM preflight; `sstate` covers `sstate prune`'s age-based scan and one-VM
+refusal, and `sstate_push` covers `sstate push` against a fake `container`
+**and** a fake `rsync`: the one-VM refusal, the read-only staging mount, the
+stamp being honoured as `find`'s cutoff and advanced only after a clean
+transfer, the two-pass ordering (`.siginfo` second), `--ignore-existing` on
+every pass with `--inplace` on none, a verification failure aborting before
+anything reaches the network, and — the property the whole stamp exists for
+— every way a probe can fail or come back unreadable leaving the stamp
+exactly where it was, since only "the scan matched nothing" may advance it;
 `workspace_attach` covers the fail-closed workspace-image attach guard's
 whole decision table against a stubbed `hdiutil`; `purefns` covers helpers
 with no other home, including `config_file_is_safe`'s symlink walk and its
