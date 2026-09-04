@@ -1642,6 +1642,28 @@ pinned_projects_referencing_volume() {
 	done
 }
 
+# pinned_configs_unreadable -- print, one per line, the basename (minus
+# .conf) of every projects_dir()/*.conf that EXISTS as a regular file but
+# this process could not read (permission denied, a stale ACL, an NFS
+# hiccup while the handle is open...). This is NOT the same case as a
+# missing setting: config_grep_setting has no way to tell "the file has no
+# such line" from "grep could not open the file at all" -- both come back
+# as its ordinary return-1, so pinned_projects_referencing_volume() reads an
+# unreadable config exactly like an innocent one that references nothing.
+# That default is fine for a probe that already documents itself as
+# collision-avoidance, not a guarantee (adopt_unique_volume_name()) -- it is
+# the wrong default for a DESTRUCTIVE one. refuse_shared_volume() calls this
+# first and fails CLOSED when it is non-empty, the same "cannot tell must
+# never read as no" rule config_file_is_safe() exists for around sourcing.
+pinned_configs_unreadable() {
+	local dir f
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		[ -r "$f" ] || basename "$f" .conf
+	done
+}
+
 # The kas files kas-container is actually given: the project's own config
 # (MACKAS_KAS_CONFIG) followed by the generated macOS fragment, composed last
 # so it wins. Every element is checkout-relative because run_kas() cd's into
@@ -9879,9 +9901,25 @@ cmd_runtime_args() {
 # name from before any of this existed. Never called with TMP: it is always
 # private, mackas-<name>-tmp with no override knob at all, so it can never
 # legitimately be shared.
+#
+# Checked BEFORE the reverse-grep itself: pinned_configs_unreadable() names
+# any pinned config this process could not open, and an unreadable file
+# answers pinned_projects_referencing_volume() exactly like an unrelated
+# project that shares nothing (config_grep_setting cannot distinguish "no
+# such line" from "permission denied"). Reading that silence as "safe to
+# delete" would be the exact failure mode this whole guard exists to
+# prevent, so a destructive caller fails CLOSED here instead -- refusing
+# and naming the file, never guessing.
 refuse_shared_volume() {
-	local vol="$1" label="$2" others other_list=""
+	local vol="$1" label="$2" others other_list="" unreadable names
 	[ -n "$PROJECT_SELECTED" ] || return 0
+	unreadable="$(pinned_configs_unreadable)"
+	if [ -n "$unreadable" ]; then
+		names="$(printf '%s\n' "$unreadable" | sed 's/$/.conf/' | tr '\n' ' ')"
+		names="${names% }"
+		die "cannot tell whether '$vol' ($label) is shared: unreadable pinned config(s) $names" \
+			"fix their permissions (or remove them if stale) in $(projects_dir), then re-run"
+	fi
 	others="$(pinned_projects_referencing_volume "$vol" | grep -vxF "$PROJECT_SELECTED" || true)"
 	[ -n "$others" ] || return 0
 	other_list="$(printf '%s' "$others" | tr '\n' ' ')"
