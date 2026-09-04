@@ -5762,6 +5762,14 @@ ${C_BLD}OPTIONS${C_RST}
   that changes nothing and never invalidates a cache is the safe default for
   an unattended run.
 
+  "Keep" (asked, defaulted, or --keep-volumes given) is REFUSED outright
+  when a DIFFERENT project's --project/\$MACKAS_PROJECT_SELECT is active and
+  that project's own config does not explicitly pin a stem: the current
+  \$MACKAS_VOLUME_NAME would then be only that OTHER project's own derived
+  name, not anything this checkout actually built with -- drop the selector
+  and re-run, or pass --derive-volumes (which never looks at the ambient
+  value at all).
+
   Omitting --url/--branch and --from entirely pins <name> with no checkout
   configured yet, same as an unconfigured 'setup' -- fill in
   MACKAS_PROJECT_URL/_BRANCH later with '$SCRIPT_CMD --project <name> set
