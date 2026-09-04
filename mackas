@@ -8797,6 +8797,17 @@ EOF
 # constraint item 5/retrieve already work around. No project/kas-container
 # context is needed (unlike bitbake_getvar): this only ever runs `find`
 # against the mounted volume, never bitbake itself.
+#
+# No refuse_shared_volume() call, unlike 'clean sstate': #72 names
+# do_cleanall/do_cleansstate's blanket wipe as the footgun on a shared
+# cache -- exactly what clean_volume_target() now refuses -- but prune is
+# the opposite shape on purpose. It deletes only what NOTHING has reused in
+# N days, which is precisely the question "does any consumer still want
+# this" already answered honestly for a cache several projects share: an
+# object still useful to another pinned project keeps getting reused by
+# that project's own builds and so never ages past --older-than. A shared
+# cache is exactly the case age-based pruning is safe for by construction,
+# not the case it puts at risk.
 sstate_prune() {
 	local older_than="" days report rc=0 count=0 total_kb=0
 
@@ -9848,8 +9859,46 @@ cmd_runtime_args() {
 	printf '%s\n' "$(kas_runtime_args)"
 }
 
+# refuse_shared_volume NAME LABEL -- #72: under a project selector, destroy
+# and clean's downloads/sstate targets touch only THIS project's PRIVATE
+# volumes. A volume more than one pinned project's config resolves to is
+# SHARED -- deliberately: migration path B (keep oe-build-*, no data moves)
+# depends on exactly this being a legitimate, common choice, not a mistake
+# to refuse outright (#77's precedence-and-warn decision). Deleting or
+# recreating a shared volume out from under one project's selector would
+# take another project's cache with it with no confirmation naming what
+# else uses it -- so refuse, name the other projects, and point at the one
+# command that is allowed to act on a shared volume knowingly: naming it
+# directly with `volume destroy <name>`.
+#
+# Gated on PROJECT_SELECTED being non-empty: an unselected invocation
+# predates the whole selector feature -- #72's own "opt-in" rule, the same
+# reasoning derive_volume_names() already applies to the derived stem
+# itself -- so its behaviour stays byte-identical to before M3 existed,
+# even for two pinned configs that happen to explicitly share an oe-build-*
+# name from before any of this existed. Never called with TMP: it is always
+# private, mackas-<name>-tmp with no override knob at all, so it can never
+# legitimately be shared.
+refuse_shared_volume() {
+	local vol="$1" label="$2" others other_list=""
+	[ -n "$PROJECT_SELECTED" ] || return 0
+	others="$(pinned_projects_referencing_volume "$vol" | grep -vxF "$PROJECT_SELECTED" || true)"
+	[ -n "$others" ] || return 0
+	other_list="$(printf '%s' "$others" | tr '\n' ' ')"
+	other_list="${other_list% }"
+	die "'$vol' ($label) is shared with $other_list -- refusing to touch it under '--project $PROJECT_SELECTED'" \
+		"to act on it anyway, name it directly: $SCRIPT_CMD volume destroy $vol"
+}
+
 cmd_destroy() {
 	require_mackas_root
+
+	# Checked FIRST, before the DESTROY confirmation even prints: either
+	# everything below proceeds, or nothing does -- a refusal here must never
+	# leave TMP/legacy already gone while a shared DL or SSTATE survives.
+	refuse_shared_volume "$MACKAS_VOL_DL" "the downloads volume"
+	refuse_shared_volume "$MACKAS_VOL_SSTATE" "the sstate volume"
+
 	local what="EVERYTHING: all three ext4 volumes ($MACKAS_VOL_TMP, $MACKAS_VOL_DL,
   $MACKAS_VOL_SSTATE -- so downloads and sstate too), $MACKAS_ROOT (the project
   checkout and logs), and the $MACKAS_SHORT_LINK symlink"
@@ -9931,6 +9980,12 @@ cmd_destroy() {
 # clean_tmpdir_volume -- bare 'mackas clean' (no target): delete and recreate
 # the WHOLE TMPDIR volume. Unchanged from before targeted cleans existed --
 # see cmd_clean for how a target list routes elsewhere instead.
+#
+# No refuse_shared_volume() call: it only ever touches $MACKAS_VOL_TMP, and
+# tmp is ALWAYS private -- mackas-<name>-tmp, with no MACKAS_VOLUME_*_NAME
+# override knob at all (#77 slice 1) -- so it can never legitimately be
+# shared between two pinned projects in the first place. clean_tmp_deploy
+# (the 'tmp+deploy' target) is the same case for the same reason.
 clean_tmpdir_volume() {
 	local what="the TMPDIR volume '$MACKAS_VOL_TMP' (recreated empty) and $MACKAS_LOGS
   (the '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' cache volumes and the project
@@ -10102,6 +10157,10 @@ clean_tmp_deploy() {
 # be wiped alone without leaving the other inconsistent.
 clean_volume_target() {
 	local name="$1" size="$2" role="$3" img used=""
+	# Only ever called for the dl/sstate targets (never tmp -- see
+	# cmd_clean), so this alone covers both of #72's "clean variants that
+	# touch dl/sstate".
+	refuse_shared_volume "$name" "$role"
 	if volume_in_use "$name"; then
 		die "volume '$name' is attached to a running container" \
 			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean'"
@@ -10581,7 +10640,18 @@ volume_destroy() {
 # that does not exist is normal here (not every install has all four), not an
 # error -- and a busy one is skipped with a warning, mirroring
 # volume_fstrim_one()'s from_all shape, rather than aborting the whole run.
+#
+# refuse_shared_volume() applies here too, same as cmd_destroy(): --all
+# expands to $MACKAS_VOL_TMP/DL/SSTATE/LEGACY, the CURRENT selector's
+# resolved names, exactly the way `destroy` (bare) does -- it is not
+# "naming a volume outright" the way `volume destroy <name>` is, so it is
+# not the escape hatch #72 describes and must not silently bypass the same
+# guard destroy has, or '$SCRIPT_CMD volume destroy --all' would be a
+# trivial way around the whole feature.
 volume_destroy_all() {
+	refuse_shared_volume "$MACKAS_VOL_DL" "the downloads volume"
+	refuse_shared_volume "$MACKAS_VOL_SSTATE" "the sstate volume"
+
 	local names=("$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" "$MACKAS_VOL_LEGACY")
 	local n present=() total_kb=0 kb img
 
