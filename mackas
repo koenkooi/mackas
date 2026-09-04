@@ -389,6 +389,36 @@ setting_is_explicit() {
 	eval "[ \"\${__EXPLICIT_$1:-0}\" = 1 ]"
 }
 
+# config_pinned_setting NAME -- true if NAME was actually assigned by
+# whatever is currently loaded: the environment, --set, OR the config file
+# CONFIG_FILE_USED names. Everything but the config-file leg is exactly
+# setting_is_explicit(); the config-file leg exists because
+# mark_explicit_from_config() cannot always be trusted for it.
+#
+# The gap: mark_explicit_from_config() only ever compares the FINAL VALUE
+# against the factory default (__FACTORY_NAME, captured by snapshot_defaults()
+# right after set_defaults()) -- it has no memory of whether a line was
+# actually present in the sourced file. That is indistinguishable from
+# "never touched" for any setting whose factory default is itself a
+# non-empty string one might legitimately also choose on purpose.
+# MACKAS_VOLUME_NAME is exactly that setting: its factory default is
+# "oe-build" (set_defaults(), not empty like MACKAS_VOLUME_DL_NAME/
+# _SSTATE_NAME), and a pinned project config that explicitly writes
+# MACKAS_VOLUME_NAME="oe-build" -- migration path B of #72, "keep oe-build-*,
+# no data moves" -- produces a value byte-identical to the untouched
+# default. Trusting __EXPLICIT_MACKAS_VOLUME_NAME alone would read that
+# deliberate choice as "unset" and silently override it.
+#
+# So when the flag alone says "no", fall back to grepping the actual
+# sourced file for the line -- read-only, via config_grep_setting(), never
+# a second `.`/source -- which answers "was this line present" directly
+# instead of inferring it from a value comparison.
+config_pinned_setting() {
+	setting_is_explicit "$1" && return 0
+	[ -n "$CONFIG_FILE_USED" ] || return 1
+	config_grep_setting "$CONFIG_FILE_USED" "$1" >/dev/null
+}
+
 # --set NAME=VALUE overrides, collected during arg parsing and applied last so
 # that command-line flags beat the environment (and everything else).
 CLI_OVERRIDES=()
@@ -1739,7 +1769,32 @@ derive_paths() {
 # MACKAS_VOLUME_DL_NAME/_SSTATE_NAME: derive_paths() runs more than once per
 # invocation (adopt re-derives after picking a new stem), and backfilling
 # would pin the caches to the stem that was current the first time round.
+#
+# Same reasoning applies to the selector-derived stem default just below:
+# it is recomputed from PROJECT_SELECTED + config_pinned_setting() on every
+# call, and never written into __EXPLICIT_MACKAS_VOLUME_NAME, so it stays a
+# pure, idempotent default -- exactly like set_defaults()' own output,
+# losable to config/env/--set, not layered on top of them (#72's core rule:
+# a default, never a fifth precedence rung).
 derive_volume_names() {
+	# When a project is selected (--project / $MACKAS_PROJECT_SELECT settled
+	# on a pinned config) and nothing above the defaults rung pinned
+	# MACKAS_VOLUME_NAME to a value of its own, the stem defaults to
+	# mackas-<selected name> instead of the factory "oe-build" -- #72/#77's
+	# per-project volume naming. This can never trip validate_volume_names()'s
+	# empty/whitespace check below: validate_project_select() already
+	# restricts PROJECT_SELECTED to [A-Za-z0-9._-], and the literal prefix
+	# "mackas-" added here introduces none either.
+	#
+	# config_pinned_setting(), not setting_is_explicit() alone -- see its own
+	# comment for why: MACKAS_VOLUME_NAME's factory default is the non-empty
+	# "oe-build", so a project config that explicitly pins that exact value
+	# (migration path B of #72, "keep oe-build-*, no data moves") would
+	# otherwise read as "untouched" and get silently overridden here.
+	if [ -n "$PROJECT_SELECTED" ] && ! config_pinned_setting MACKAS_VOLUME_NAME; then
+		MACKAS_VOLUME_NAME="mackas-$PROJECT_SELECTED"
+	fi
+
 	MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
 	MACKAS_VOL_DL="${MACKAS_VOLUME_DL_NAME:-${MACKAS_VOLUME_NAME}-dl}"
 	MACKAS_VOL_SSTATE="${MACKAS_VOLUME_SSTATE_NAME:-${MACKAS_VOLUME_NAME}-sstate}"
@@ -8936,6 +8991,54 @@ though status reads only and never prompts, so none of them change anything.
 EOF
 }
 
+# status_project_volume_note -- the #77 "precedence-and-warn" note: when a
+# project is selected and an explicit volume-name setting (MACKAS_VOLUME_NAME
+# and/or the M1 MACKAS_VOLUME_DL_NAME/_SSTATE_NAME overrides) disagrees with
+# what the selector would have derived on its own, say so.
+#
+# Deliberately a plain VALUE comparison -- the three resolved MACKAS_VOL_*
+# names against the mackas-<name>-* triple the selector alone would produce
+# -- rather than re-deriving from setting_is_explicit()/config_pinned_setting.
+# The two always agree by construction: derive_volume_names() already applies
+# that exact default whenever nothing pinned MACKAS_VOLUME_NAME, so a
+# disagreement here can ONLY mean something above the defaults rung -- config
+# file, environment, or --set -- set an explicit value. Comparing values
+# needs no provenance flag at all, so it cannot be fooled by the same
+# factory-default-collision gap config_pinned_setting() exists to work around
+# (see its own comment) -- it is simply never exposed to that question here.
+#
+# "Once" is per invocation: mackas is a short-lived process with no state
+# file to remember having already said something, so this prints at most
+# once, and only from `status` (#77 requires status; a note on every command
+# would be noise on every build).
+#
+# Deliberately informational, never phrased as an error or a suggestion to
+# change anything: migration path B of #72 (explicit MACKAS_VOLUME_NAME=
+# oe-build, no data moves) is a fully supported, deliberate end state, and a
+# user who chose it on purpose must not read this as having done something
+# wrong.
+status_project_volume_note() {
+	[ -n "$PROJECT_SELECTED" ] || return 0
+	local d_tmp d_dl d_sstate
+	d_tmp="mackas-$PROJECT_SELECTED-tmp"
+	d_dl="mackas-$PROJECT_SELECTED-dl"
+	d_sstate="mackas-$PROJECT_SELECTED-sstate"
+	if [ "$MACKAS_VOL_TMP" = "$d_tmp" ] && [ "$MACKAS_VOL_DL" = "$d_dl" ] \
+	   && [ "$MACKAS_VOL_SSTATE" = "$d_sstate" ]; then
+		return 0
+	fi
+	info ""
+	info "  note: an explicit volume name is set for '$PROJECT_SELECTED', and it is"
+	info "  being honoured -- this is not an error; keeping a different stem (e.g."
+	info "  oe-build-*, with no data move) is a fully supported choice."
+	[ "$MACKAS_VOL_TMP" = "$d_tmp" ] \
+		|| info "    tmp     set: $MACKAS_VOL_TMP   (--project $PROJECT_SELECTED would derive: $d_tmp)"
+	[ "$MACKAS_VOL_DL" = "$d_dl" ] \
+		|| info "    dl      set: $MACKAS_VOL_DL   (--project $PROJECT_SELECTED would derive: $d_dl)"
+	[ "$MACKAS_VOL_SSTATE" = "$d_sstate" ] \
+		|| info "    sstate  set: $MACKAS_VOL_SSTATE   (--project $PROJECT_SELECTED would derive: $d_sstate)"
+}
+
 cmd_status() {
 	hdr "Configuration"
 	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
@@ -8943,6 +9046,7 @@ cmd_status() {
 	# the file, it is not read out of one), so the loop below never shows it.
 	if [ -n "$PROJECT_SELECTED" ]; then
 		show "project selected"   "$PROJECT_SELECTED"
+		status_project_volume_note
 	fi
 	local n
 	for n in $SETTING_NAMES; do
