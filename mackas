@@ -6004,6 +6004,68 @@ cmd_project_add() {
 		want_explicit_stem=1
 	fi
 
+	# Cross-project volume collision, checked BEFORE any mutation, now that
+	# want_explicit_stem/config_pinned_setting have settled exactly which
+	# values are actually about to be carried into $name's new file -- NOT
+	# simply what $MACKAS_VOL_TMP/_DL/_SSTATE currently resolve to for this
+	# invocation, which is the wrong thing to check: under --derive-volumes
+	# (or the fresh, no-override path), the new project's real future stem
+	# is unconditionally mackas-$name, and by construction nothing else in
+	# projects_dir() can also derive to that exact name -- there is no
+	# collision to find, whatever happens to be resolved right now for a
+	# DIFFERENT selector. Only when a value is actually going to be WRITTEN
+	# explicitly does inheriting it matter.
+	#
+	# This is what closes the gap the #77 integration review flagged:
+	# 'project add newname' run while a DIFFERENT project's selector is
+	# active can inherit that OTHER project's genuinely EXPLICIT override
+	# verbatim -- config_pinned_setting correctly says "yes, explicit" (so
+	# want_explicit_stem/the write loop below are right to carry it
+	# forward), but neither of those asks whether the value carried forward
+	# already belongs to somebody else. $name is excluded from every match:
+	# re-running 'project add' on an already-pinned project against its own
+	# selector is not a collision with itself.
+	#
+	# tmp and dl/sstate get different treatment because they have different
+	# sharing models. tmp is NEVER an opt-in surface -- #72 is explicit that
+	# there is deliberately no TMPDIR equivalent, because two builds in one
+	# /build is corruption, not contention -- so any literal collision there
+	# can only be a mistake and is refused outright, the same way M1 refuses
+	# one config's own dl and sstate resolving to a single name. dl/sstate
+	# sharing, by contrast, is a real M1 feature a user can deliberately opt
+	# into (MACKAS_VOLUME_DL_NAME=mackas-shared-dl and friends), so a
+	# collision there is only WARNED about -- loud enough that an
+	# accidental one (this bug) is impossible to miss, but not blocking a
+	# legitimate one.
+	if [ "$want_explicit_stem" -eq 1 ]; then
+		local tmp_target tmp_collides
+		tmp_target="${MACKAS_VOLUME_NAME}-tmp"
+		tmp_collides="$(pinned_projects_referencing_volume "$tmp_target" | grep -vxF "$name" || true)"
+		if [ -n "$tmp_collides" ]; then
+			local tmp_collides_list; tmp_collides_list="$(printf '%s' "$tmp_collides" | tr '\n' ' ')"
+			tmp_collides_list="${tmp_collides_list% }"
+			die "'$tmp_target' is already $tmp_collides_list's build volume -- refusing to give '$name' the same one" \
+				"tmp is never shared (#72: two builds in one /build is corruption, not contention) -- if a different project's selector is active, drop it and re-run; otherwise pass --set MACKAS_VOLUME_NAME=<a-free-stem>"
+		fi
+	fi
+	local dl_collides="" sstate_collides=""
+	if config_pinned_setting MACKAS_VOLUME_DL_NAME; then
+		dl_collides="$(pinned_projects_referencing_volume "$MACKAS_VOLUME_DL_NAME" | grep -vxF "$name" || true)"
+	fi
+	if config_pinned_setting MACKAS_VOLUME_SSTATE_NAME; then
+		sstate_collides="$(pinned_projects_referencing_volume "$MACKAS_VOLUME_SSTATE_NAME" | grep -vxF "$name" || true)"
+	fi
+	if [ -n "$dl_collides" ] || [ -n "$sstate_collides" ]; then
+		info ""
+		info "  note: '$name' is about to share a cache volume with another pinned project."
+		info "  This is not an error -- opt-in sharing is a real M1 feature -- but make sure"
+		info "  it is what you meant, especially if the currently-effective settings came"
+		info "  from something other than '$name' choosing it on purpose, e.g. a different"
+		info "  project's --project selector, the environment, or --set."
+		[ -n "$dl_collides" ] && info "    dl      $MACKAS_VOLUME_DL_NAME   (also used by: $(printf '%s' "$dl_collides" | tr '\n' ' ' | sed 's/ $//'))"
+		[ -n "$sstate_collides" ] && info "    sstate  $MACKAS_VOLUME_SSTATE_NAME   (also used by: $(printf '%s' "$sstate_collides" | tr '\n' ' ' | sed 's/ $//'))"
+	fi
+
 	run mkdir -p "$workspace_dir"
 
 	# Created under umask 077, never the ambient one -- same reasoning as
