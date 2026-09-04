@@ -114,6 +114,35 @@ hit rate; what you pay is serialization. An [HTTP mirror](#http-mirrors--optiona
 buys the hit rate without the queueing, and is the better answer whenever it
 is available.
 
+Once `--project <name>` selects a pinned project (`mackas project add`,
+[README](../README.md#pinning-a-project-workspace)), the same rule applies
+one level down: `MACKAS_VOLUME_DL_NAME`/`_SSTATE_NAME` default empty *for
+that project's own config too*, so both caches derive `mackas-<name>-dl`/
+`-sstate` and are private to it out of the box — a second pinned project
+never reads or writes the first one's cache unless one of them explicitly
+names the other's volume. That is deliberate (#72): bitbake-setup's
+`site.conf` shares sstate across setups by convention, which is fine on a
+Linux host where concurrent builds are ordinary, but wrong here for exactly
+the queueing reason above, so mackas declines that convention and makes
+sharing an opt-in per project instead of the default. Nothing about pinning
+a project changes what these two settings do or how they are named — a
+project's config is just another config file, read by the same rule.
+
+Because a shared cache volume now has more than one legitimate owner,
+`mackas destroy` and `mackas clean downloads`/`clean sstate` refuse to touch
+one that a *different* pinned project's config also resolves to, while a
+project selector is active — reverse-grepping every file under
+`~/.config/mackas/projects/` (never sourcing them) rather than trusting
+whatever happens to be mounted right now. The refusal names the other
+project(s); nothing is destroyed and nothing is left half-cleaned. The
+explicit way through is naming the volume directly: `mackas volume destroy
+<name>` (or, for `clean`'s narrower targets, drop the selector and act on
+the legacy/default config that owns the shared name). This is the same
+concern `do_cleanall`/`do_cleansstate` are a known upstream footgun for —
+deleting a cache another build still depends on — except here the one-VM
+rule already rules out a *concurrent* victim, so what remains is a build
+that has not run *yet* losing a cache it was relying on finding warm.
+
 Two practical notes: the shared volume has to exist before anything can mount
 it, and `mackas volume duplicate <existing> <newname>` is how to seed it from
 a cache you already have; and the names land unquoted in the word-split
