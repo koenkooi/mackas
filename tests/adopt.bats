@@ -246,6 +246,64 @@ mk() {
 	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai-2'" "$TESTDIR/newconfig.conf"
 }
 
+# -- M3 slice 3, part A: adopt_unique_volume_name() also reverse-greps
+# projects_dir() now, so a name claimed only through a PINNED, NOT-YET-BUILT
+# project's config (no volume_exists() would ever find) is caught too. --
+
+@test "adopt: disambiguates when a pinned-but-unbuilt project's OWN override claims the candidate's dl name" {
+	make_foreign_root_with_project
+	mkdir -p "$HOME/.config/mackas/projects"
+	cat > "$HOME/.config/mackas/projects/other.conf" <<-'EOF'
+	MACKAS_VOLUME_NAME='zzz'
+	MACKAS_VOLUME_DL_NAME='mackas-meta-ai-dl'
+	EOF
+	chmod 600 "$HOME/.config/mackas/projects/other.conf"
+	# No MOCK_EXISTING_VOLUMES: nothing has ever been built for 'other' --
+	# volume_exists() alone would find nothing here and call mackas-meta-ai
+	# free, which is exactly the gap this fix closes.
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai-2'" "$TESTDIR/newconfig.conf"
+}
+
+@test "adopt: disambiguates when a differently-named pinned project explicitly set the SAME stem" {
+	make_foreign_root_with_project
+	mkdir -p "$HOME/.config/mackas/projects"
+	cat > "$HOME/.config/mackas/projects/other.conf" <<-'EOF'
+	MACKAS_VOLUME_NAME='mackas-meta-ai'
+	EOF
+	chmod 600 "$HOME/.config/mackas/projects/other.conf"
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai-2'" "$TESTDIR/newconfig.conf"
+}
+
+@test "adopt: an unrelated pinned project's own default stem never causes a false-positive bump" {
+	make_foreign_root_with_project
+	mkdir -p "$HOME/.config/mackas/projects"
+	# Derives to mackas-other-{tmp,dl,sstate} -- nothing here collides with
+	# mackas-meta-ai-*, so adopt must pick the plain, undisambiguated name.
+	cat > "$HOME/.config/mackas/projects/other.conf" <<-'EOF'
+	MACKAS_PROJECT_DIR='other'
+	EOF
+	chmod 600 "$HOME/.config/mackas/projects/other.conf"
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai'" "$TESTDIR/newconfig.conf"
+	assert_fails grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai-2'" "$TESTDIR/newconfig.conf"
+}
+
+@test "adopt: with no pinned projects at all, the collision probe never glob-fails" {
+	make_foreign_root_with_project
+	# projects_dir() has never been created -- '*.conf' stays an unexpanded
+	# literal glob unless the guard inside pinned_projects_referencing_volume
+	# handles that (same shape cmd_projects() already relies on).
+	assert_fails test -d "$HOME/.config/mackas/projects"
+	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai'" "$TESTDIR/newconfig.conf"
+}
+
 @test "adopt: derives a distinct MACKAS_SHORT_LINK from the project name" {
 	make_foreign_root_with_project
 	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
