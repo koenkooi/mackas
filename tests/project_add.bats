@@ -318,6 +318,77 @@ assert_volumes() {
 }
 
 # ---------------------------------------------------------------------------
+# --keep-volumes under an ACTIVE, DIFFERENT project selector: $MACKAS_VOLUME_NAME
+# is only resolved to that OTHER project's own derived stem, never to
+# anything this checkout actually built with -- 'keep' must refuse rather
+# than silently pin the new project to the wrong volumes (found while
+# reviewing #77: this used to write MACKAS_VOLUME_NAME='mackas-other' into
+# demo.conf with no warning at all).
+# ---------------------------------------------------------------------------
+
+@test "project add --from --keep-volumes, run under a DIFFERENT project's active selector, is refused" {
+	pin other <<'EOF'
+EOF
+	mk_checkout demo https://example.com/demo.git
+	mk_add --project other project add demo --from demo --keep-volumes
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "cannot tell what 'demo' was already built with"
+	[ ! -e "$PROJDIR/demo.conf" ]
+}
+
+@test "project add --from, non-interactive default, run under a DIFFERENT project's active selector, is refused rather than guessing" {
+	pin other <<'EOF'
+EOF
+	mk_checkout demo https://example.com/demo.git
+	# No --keep-volumes/--derive-volumes at all: the non-interactive default
+	# would normally be 'keep', but that default is exactly what is unsafe
+	# here -- it must refuse instead of silently choosing either answer.
+	mk_add --project other project add demo --from demo
+	[ "$status" -ne 0 ]
+	[ ! -e "$PROJDIR/demo.conf" ]
+}
+
+@test "project add --from --derive-volumes, run under a DIFFERENT project's active selector, is unaffected" {
+	pin other <<'EOF'
+EOF
+	mk_checkout demo https://example.com/demo.git
+	# --derive-volumes never consults MACKAS_VOLUME_NAME's current value, so
+	# the ambiguity that blocks --keep-volumes above does not apply to it.
+	mk_add --project other project add demo --from demo --derive-volumes
+	[ "$status" -eq 0 ]
+	! grep -q '^MACKAS_VOLUME_NAME=' "$PROJDIR/demo.conf"
+}
+
+@test "project add --from --keep-volumes, selecting THIS SAME project being (re-)pinned, is unaffected" {
+	pin demo <<EOF
+MACKAS_ROOT='$ROOT'
+MACKAS_PROJECT_DIR='demo'
+EOF
+	mk_checkout demo https://example.com/demo.git
+	# PROJECT_SELECTED == the name being pinned: MACKAS_VOLUME_NAME resolves
+	# to mackas-demo (demo's own derived default), which is trivially safe
+	# either way -- must not be refused by the new guard.
+	mk_add --project demo project add demo --from demo --keep-volumes
+	[ "$status" -eq 0 ]
+}
+
+@test "project add --from --keep-volumes, active selector's OWN config pins an explicit stem, still propagates it (known, pre-existing sharing gap -- not this guard's job)" {
+	pin other <<'EOF'
+MACKAS_VOLUME_NAME='mackas-explicit-other'
+EOF
+	mk_checkout demo https://example.com/demo.git
+	# other's stem is EXPLICIT (config_pinned_setting is true), so the new
+	# guard correctly lets it through -- an explicit choice is always
+	# trusted to propagate, same as every other precedence-and-warn case in
+	# #77. Whether two projects should share a volume unintentionally is a
+	# separate, already-known, deliberately deferred gap (see the M3
+	# integration review), not what this specific guard exists to catch.
+	mk_add --project other project add demo --from demo --keep-volumes
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_VOLUME_NAME='mackas-explicit-other'" "$PROJDIR/demo.conf"
+}
+
+# ---------------------------------------------------------------------------
 # --dry-run writes nothing
 # ---------------------------------------------------------------------------
 
