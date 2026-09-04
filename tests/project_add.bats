@@ -154,6 +154,21 @@ assert_volumes() {
 	[ -f "$ROOT/work/demo/README" ]
 }
 
+@test "project add recovers cleanly from an interrupted prior run (empty leftover work/ dir)" {
+	# 'run mkdir -p "$workspace_dir"' is this command's own first mutation,
+	# strictly before the config file is ever written -- so a prior run that
+	# died between that mkdir and its last config_write_setting call (Ctrl-C,
+	# a full disk) leaves exactly this behind: an empty work/<name>/ with no
+	# pinned config. A plain re-run must finish the job, not join the earlier
+	# 'plain directory collision' refusal above -- an empty directory carries
+	# nothing that could be silently folded in or lost.
+	mkdir -p "$ROOT/work/demo"
+	mk_add project add demo --url https://example.com/demo.git --branch main
+	[ "$status" -eq 0 ]
+	[ -f "$PROJDIR/demo.conf" ]
+	grep -qxF "MACKAS_PROJECT_URL='https://example.com/demo.git'" "$PROJDIR/demo.conf"
+}
+
 @test "project add --from a DIFFERENT directory than <name> is refused, not silently converted" {
 	mk_checkout other-name https://example.com/other.git
 	mk_add project add demo --from other-name
@@ -334,6 +349,20 @@ assert_volumes() {
 	run "$MACKAS" --project demo runtime-args
 	[ "$status" -eq 0 ]
 	assert_volumes oe-build-tmp oe-build-dl oe-build-sstate
+}
+
+@test "the round trip's kept stem also surfaces the #77 disagreement note exactly once" {
+	mk_checkout demo https://example.com/demo.git
+	mk_add --set MACKAS_VOLUME_NAME=oe-build project add demo --from demo --keep-volumes
+	[ "$status" -eq 0 ]
+
+	run "$MACKAS" --project demo status
+	[ "$status" -eq 0 ]
+	local n
+	n="$(printf '%s\n' "$output" | grep -c 'note:')"
+	[ "$n" -eq 1 ]
+	printf '%s\n' "$output" | grep -qF "oe-build-tmp"
+	printf '%s\n' "$output" | grep -qF "mackas-demo-tmp"
 }
 
 @test "the round trip's MACKAS_PROJECT_DIR/URL/BRANCH resolve correctly too" {
