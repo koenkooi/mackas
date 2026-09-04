@@ -13,7 +13,10 @@
 #
 # ...or select a PINNED PROJECT by name, which resolves to
 # ~/.config/mackas/projects/<name>.conf -- the standalone config `mackas
-# adopt` writes there:
+# adopt` or `mackas project add <name>` writes there. `project add` is
+# adopt's in-root sibling: it pins a project workspace under THIS Mac's own
+# root ($MACKAS_WORK/<name>/) instead of a whole separate foreign root; see
+# `mackas project add --help` and the README.
 #
 #   mackas --project meta-ai status      # one command
 #   export MACKAS_PROJECT_SELECT=meta-ai # a whole shell
@@ -206,6 +209,14 @@
 # The stem must not contain whitespace: kas-container word-splits
 # --runtime-args, so a space would split one mount into two arguments. setup
 # refuses a name with one rather than mounting something absurd.
+#
+# Once a pinned project is selected (--project NAME / $MACKAS_PROJECT_SELECT),
+# the default here changes to "mackas-NAME" instead of "oe-build" -- but only
+# as a DEFAULT: setting MACKAS_VOLUME_NAME explicitly, here or anywhere else
+# in the precedence chain, always wins, exactly like today. Keeping an
+# explicit "oe-build" under a selector (`mackas project add --from
+# --keep-volumes`) is a fully supported end state, not a mistake -- `mackas
+# status` notes the disagreement once, informationally, never as an error.
 #MACKAS_VOLUME_NAME="oe-build"
 
 # The downloads and sstate volumes can be named outright instead of derived
@@ -229,6 +240,17 @@
 # must also resolve to three DIFFERENT names: they are all attached to one
 # container, so naming two of them alike would mount a single ext4 image twice
 # into the same VM. That is refused outright, not warned about.
+#
+# Under a pinned project (--project NAME) these two are what you would set
+# to opt one project's downloads/sstate into sharing with another's -- both
+# already default private per project (mackas-NAME-dl/-sstate) with nothing
+# set here, and sharing stays exactly as optional and unrecommended as it
+# always was. Because a shared cache volume can then legitimately belong to
+# more than one pinned project, `mackas destroy` and `mackas clean
+# downloads`/`clean sstate` refuse to touch one that a DIFFERENT project's
+# own config also names, while a selector is active -- naming the other
+# project(s) rather than guessing which one "wins". `mackas volume destroy
+# <name>` is the explicit way through that refusal.
 #MACKAS_VOLUME_DL_NAME="mackas-shared-dl"
 #MACKAS_VOLUME_SSTATE_NAME="mackas-shared-sstate"
 
