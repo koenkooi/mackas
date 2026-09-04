@@ -537,6 +537,16 @@ search path happens to find. The selector is passed explicitly even when
 empty, so an exported `$MACKAS_PROJECT_SELECT` cannot re-aim one project's
 wrapper at another project's volumes.
 
+When a project is selected, the volume stem also defaults to
+`mackas-<name>` (`mackas-<name>-tmp`/`-dl`/`-sstate`) instead of
+`oe-build` — a **default, not a new rung**: `MACKAS_VOLUME_NAME` /
+`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME` set in the
+project's own config, the environment, or `--set` still win outright, the
+same as always. `./mackas status` notes it, once and only informationally,
+whenever an explicit value disagrees with what the selector would have
+derived — keeping `oe-build-*` with no data move is a fully supported
+choice, never something the note suggests fixing.
+
 Every setting is also an environment variable of the same name, and
 `--set NAME=VALUE` overrides both for the one command it rides along with.
 For a *persistent* override use `mackas set MACKAS_MEMORY 48g` / `get`
@@ -553,7 +563,7 @@ The settings a new user actually needs:
 |---|---|---|
 | `MACKAS_ROOT` | *(none; falls back to `$PWD` with a warning)* | Where everything lives. Must be a dir on a case-sensitive volume — `setup` refuses otherwise; see below. |
 | `MACKAS_SHORT_LINK` | `$HOME/oe` | Short, space-free symlink to `MACKAS_ROOT`. |
-| `MACKAS_VOLUME_NAME` | `oe-build` | Stem for the three ext4 volumes (`-tmp`, `-dl`, `-sstate`). Must be space-free. |
+| `MACKAS_VOLUME_NAME` | `oe-build` (`mackas-<name>` once `--project NAME` is selected, unless set explicitly) | Stem for the three ext4 volumes (`-tmp`, `-dl`, `-sstate`). Must be space-free. |
 | `MACKAS_VOLUME_DL_NAME` | *(empty: `${MACKAS_VOLUME_NAME}-dl`)* | Names the downloads volume outright instead of deriving it. Must be space-free. |
 | `MACKAS_VOLUME_SSTATE_NAME` | *(empty: `${MACKAS_VOLUME_NAME}-sstate`)* | Names the sstate volume outright instead of deriving it. Must be space-free. |
 | `MACKAS_VOLUME_SIZE_TMP` | `120G` | Cap on the TMPDIR volume. |
