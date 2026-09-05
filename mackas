@@ -2170,10 +2170,13 @@ derive_paths() {
 	# Selected -> logs/<name>, so two pinned projects on one MACKAS_ROOT never
 	# share a log directory. Every one of dump's output, the smoketest log,
 	# status's "Recent logs" listing and bare `clean`'s wipe reads this single
-	# variable, so this one gate scopes all four for free -- see #79 item 3/4.
-	# Unselected, this must stay exactly $MACKAS_BASE/logs, flat -- #79's
+	# variable, so this one gate scopes all four for free. Unselected, this
+	# must stay exactly $MACKAS_BASE/logs, flat -- #79's
 	# backward-compatibility rule, same gate as MACKAS_ENV_SH/
-	# MACKAS_KAS_FRAGMENT_SRC above.
+	# MACKAS_KAS_FRAGMENT_SRC below. That compatibility cuts one way only:
+	# an unselected bare `clean` still wipes the whole flat logs/, per-project
+	# subdirectories included, because it wipes MACKAS_LOGS and that IS the
+	# flat dir when nothing is selected -- see clean_usage().
 	if [ -n "$PROJECT_SELECTED" ]; then
 		MACKAS_LOGS="$MACKAS_BASE/logs/$PROJECT_SELECTED"
 	fi
@@ -10179,6 +10182,10 @@ cmd_status() {
 	show "project checkout"   "$MACKAS_PROJECT"
 	show "kas files"          "$KAS_FILES_ARG"
 	show "env.sh"             "$MACKAS_ENV_SH"
+	# Worth a line of its own now that a selected project moves it to
+	# logs/<name>: "Recent logs" below prints bare filenames, so this is the
+	# only place that says which directory they came out of.
+	show "logs"               "$MACKAS_LOGS"
 	show "shim"               "$SHIM_DIR/docker"
 
 	hdr "Present?"
@@ -10316,7 +10323,10 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD clean [TARGET...]
 
 Bare '$SCRIPT_CMD clean' (no target) deletes and recreates the WHOLE TMPDIR
-volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. That drops everything
+volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. With a project selected
+that is only that project's own logs/<name>, never a sibling's; with none
+selected it is the flat logs/, and clearing that takes every project's
+logs/<name> sitting under it along with it. That drops everything
 under TOPDIR, not just tmp/: deploy, buildhistory (if the project inherits
 it), conf/ and cache/ all go too. DL_DIR and SSTATE_DIR are never touched --
 having them in separate volumes is exactly why this works. Only prompts once
