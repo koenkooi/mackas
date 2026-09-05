@@ -73,11 +73,14 @@ those would make kas bind-mount an APFS directory over the ext4 volumes
 ([why](docs/architecture.md#how-they-get-mounted-and-why-kas_build_dir-must-stay-unset)).
 It lives at `~/oe/env.sh` once `setup` has made the short symlink, or in
 `MACKAS_ROOT` if you set `MACKAS_SHORT_LINK=`; `./mackas status` prints where.
-With a project selected (`--project NAME` / `$MACKAS_PROJECT_SELECT`), it is
-`env-NAME.sh` instead, so two pinned projects on one `MACKAS_ROOT` never
-share a generated file; that file also exports `MACKAS_PROJECT_SELECT` for
-you, guarded the same way `GITCONFIG_FILE` is — a value your shell already
-has always wins over the one this file was generated for.
+With a project selected it is `env-NAME.sh` instead, so two pinned projects
+on one `MACKAS_ROOT` never share a generated file. *Any* selection counts,
+including the derived one — standing in a pinned workspace is enough, the
+same rung the [selector table](#configuration) lists third — so run
+`./mackas status` from where you build and source the `env.sh` line it
+prints rather than assuming. That file also exports `MACKAS_PROJECT_SELECT`
+for you, guarded the same way `GITCONFIG_FILE` is — a value your shell
+already has always wins over the one this file was generated for.
 
 ### Directory layout
 
@@ -91,7 +94,8 @@ $MACKAS_ROOT/
 │                 macos-NAME.yml once a project is selected)
 ├── logs/         smoketest/build logs (logs/NAME/ once a project is
 │                 selected, so two pinned projects never share one)
-├── env.sh        generated; source this
+├── env.sh        generated; source this (env-NAME.sh once a
+│                 project is selected)
 ├── gitconfig     generated; forwarded as GITCONFIG_FILE
 └── work/         <- every layer checkout lives HERE, as a sibling
     ├── meta-angstrom/
@@ -108,9 +112,13 @@ what kas sees. A real multi-layer BSP — a dozen `meta-*` repos, not just the
 single project `setup` clones — goes under `work/` as siblings; see
 [Driving kas directly](#driving-kas-directly).
 
-Selecting a project does not move anything already sitting flat under
-`logs/` from before a project was ever selected on this root — an older
-`dump-*.yml` or `smoketest-*.log` stays exactly where it was written.
+Selecting a project migrates nothing. Anything already sitting flat from
+before a project was ever selected on this root stays exactly where it was
+written: an older `dump-*.yml` or `smoketest-*.log` under `logs/`, and — the
+one that bites — the flat `env.sh` and `kas/macos.yml`. The first selected
+run writes `env-NAME.sh` beside the old `env.sh` rather than over it, so a
+shell that already sourced the old one keeps the old, selector-free
+environment until you source the new file.
 
 ## Commands
 
@@ -695,6 +703,19 @@ same as always. `./mackas status` notes it, once and only informationally,
 whenever an explicit value disagrees with what the selector would have
 derived — keeping `oe-build-*` with no data move is a fully supported
 choice, never something the note suggests fixing.
+
+The three generated files split the same way, on the same condition (a
+project is selected, by any of the three rungs above — the derived one
+included) and with the same goal of two pinned projects never writing over
+each other: `env.sh` becomes `env-NAME.sh`, the canonical kas fragment
+`kas/macos.yml` becomes `kas/macos-NAME.yml`, and `logs/` becomes
+`logs/NAME/`, which carries `dump`'s output, the smoketest logs, `status`'s
+"Recent logs" listing and bare `clean`'s wipe with it. The in-checkout
+fragment copy keeps its plain `kas/macos-local.yml` name either way: each
+project has its own checkout, so there is nothing to collide with there.
+Nothing is migrated (see [Directory layout](#directory-layout)), and the
+isolation is one-way — a bare `clean` with *no* project selected still
+clears the whole flat `logs/`, every `logs/NAME/` under it included.
 
 Every setting is also an environment variable of the same name, and
 `--set NAME=VALUE` overrides both for the one command it rides along with.
