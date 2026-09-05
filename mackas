@@ -1129,9 +1129,15 @@ wrapper_identity_hint() {
 # The wrapper's replayed pin (tier 2, $MACKAS_PROJECT_SELECT) and the
 # directory (or kas chain) this call actually runs from name two different
 # pinned projects. Same shape as wrapper_identity_hint()/selector_conflict_
-# hint(): name both, and give the fix for each -- re-aim the wrapper for
-# good, or use mackas's own project-aware commands instead of the hand-typed
-# kas-container for just this one build.
+# hint(): name both, then give a fix for each of the two things the user
+# could have meant.
+#
+# Both one-off escapes name OTHER, not the pin. Getting here means the
+# caller cd'd into OTHER's workspace (or typed a chain naming it) and then
+# ran a hand-typed kas-container -- so building OTHER is overwhelmingly the
+# intent, and offering only "$SCRIPT_CMD --project $pinned shell" answers a
+# question nobody standing there asked. Re-running `setup` is the heavier of
+# the two fixes (it re-does the whole root), so the cheap one comes first.
 wrapper_pin_conflict_hint() {
 	local pinned="$1" other="$2" other_src="$3"
 	printf 'the wrapper replays the project it was generated for, and %s names a different one -- mackas will not rank them for you.\n' "$other_src"
@@ -1139,10 +1145,11 @@ wrapper_pin_conflict_hint() {
 	printf '    %-24s %s\n' "wrapper pinned to" "$pinned"
 	printf '    %-24s %s\n' "$other_src" "$other"
 	printf '\n'
+	printf 'To build %s right now, leaving the wrapper as it is -- use %s'"'"'s own commands rather than the hand-typed kas-container:\n' "$other" "$SCRIPT_CMD"
+	printf '    %s --project %s shell   (or smoketest)\n' "$SCRIPT_CMD" "$other"
 	printf 'To make this wrapper build %s from here on:\n' "$other"
 	printf '    %s --project %s setup\n' "$SCRIPT_CMD" "$other"
-	printf 'To build %s for just this one command, use %s'"'"'s own commands instead of the hand-typed kas-container:\n' "$pinned" "$SCRIPT_CMD"
-	printf '    %s --project %s shell   (or smoketest)\n' "$SCRIPT_CMD" "$pinned"
+	printf 'If %s is what you meant instead, run the hand-typed kas-container from ITS own workspace: this refuses only where the pin and the directory disagree.\n' "$pinned"
 }
 
 selector_conflict_hint() {
