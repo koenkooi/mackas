@@ -950,6 +950,11 @@ PROJECT_SELECTED=""
 # has to check both.
 PROJECT_SELECT_SOURCE=""
 
+# project_select_resolution_note() fires at most once per process even though
+# derive_paths() (which is where volume names are final) runs more than once
+# per invocation -- see that function's own comment.
+PROJECT_SELECT_NOTE_SHOWN=0
+
 # Where a project's pinned, standalone config lives. `adopt` already writes one
 # here; `--project NAME` reads exactly this path back.
 projects_dir() { printf '%s/.config/mackas/projects' "$HOME"; }
@@ -1245,6 +1250,31 @@ derive_project_candidates() {
 			"$cand"|"$cand"/*) printf '%s\t%s\n' "$name" "$cand" ;;
 		esac
 	done
+}
+
+# How PROJECT_SELECTED came to be in force, as a clause for a message that
+# already names it -- "... under X". Every #78 tier gets a truthful phrasing
+# here, not just the explicit --project case these messages predate.
+project_select_description() {
+	case "$PROJECT_SELECT_SOURCE" in
+		--project) printf -- "--project %s" "$PROJECT_SELECTED" ;;
+		"\$MACKAS_PROJECT_SELECT") printf '$MACKAS_PROJECT_SELECT=%s' "$PROJECT_SELECTED" ;;
+		*) printf "the project '%s', derived from \$PWD" "$PROJECT_SELECTED" ;;
+	esac
+}
+
+# The escape hatch for "this selection is not what you want here". An
+# explicit --project/$MACKAS_PROJECT_SELECT selector is something the caller
+# typed and can drop or unset; a #78 tier-3 derivation was never typed at
+# all, so the only real escapes are to stand somewhere else or to name a
+# project explicitly instead -- telling a derived selection to "drop
+# --project NAME" would be a lie: there is no such flag to drop.
+project_select_drop_hint() {
+	case "$PROJECT_SELECT_SOURCE" in
+		--project) printf "drop '--project %s'" "$PROJECT_SELECTED" ;;
+		"\$MACKAS_PROJECT_SELECT") printf 'unset $MACKAS_PROJECT_SELECT' ;;
+		*) printf 'run from outside this workspace, or pass --project/--config explicitly' ;;
+	esac
 }
 
 load_config() {
@@ -1872,6 +1902,7 @@ derive_paths() {
 		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
 		KAS_FILES_ARG="$(compose_kas_files)"
 		derive_volume_names
+		project_select_resolution_note
 		return 0
 	fi
 
@@ -1943,6 +1974,28 @@ derive_paths() {
 	derive_volume_names
 
 	validate_nfs_mirror_paths
+
+	project_select_resolution_note
+}
+
+# One line to stderr the moment #78's tier-3 derivation is what put a project
+# in force -- naming the project, what it was derived from, and the three
+# volume names it resolved to, so a build run from inside a workspace never
+# silently mounts a different project's volumes without SOME visible trace.
+#
+# At most once per PROCESS even though derive_paths() runs more than once per
+# invocation (adopt/setup recompute after picking a stem): PROJECT_SELECT_
+# NOTE_SHOWN latches after the first call. Never for `status`, which reports
+# the very same facts in its own "project selected" section instead, and
+# never for any --help path -- those never call load_config at all, so
+# PROJECT_SELECT_SOURCE is still empty by the time this runs.
+project_select_resolution_note() {
+	[ "$PROJECT_SELECT_SOURCE" = "derived from \$PWD" ] || return 0
+	[ "$PROJECT_SELECT_NOTE_SHOWN" -eq 0 ] || return 0
+	[ "${SCRIPT_SUBCOMMAND:-}" != "status" ] || return 0
+	PROJECT_SELECT_NOTE_SHOWN=1
+	printf 'mackas: selected project '"'"'%s'"'"', derived from $PWD -- volumes: %s, %s, %s\n' \
+		"$PROJECT_SELECTED" "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" >&2
 }
 
 # The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
@@ -5881,12 +5934,13 @@ ${C_BLD}OPTIONS${C_RST}
   an unattended run.
 
   "Keep" (asked, defaulted, or --keep-volumes given) is REFUSED outright
-  when a DIFFERENT project's --project/\$MACKAS_PROJECT_SELECT is active and
-  that project's own config does not explicitly pin a stem: the current
-  \$MACKAS_VOLUME_NAME would then be only that OTHER project's own derived
-  name, not anything this checkout actually built with -- drop the selector
-  and re-run, or pass --derive-volumes (which never looks at the ambient
-  value at all).
+  when a DIFFERENT project's selection is active -- --project/
+  \$MACKAS_PROJECT_SELECT, or one derived from \$PWD -- and that project's own
+  config does not explicitly pin a stem: the current \$MACKAS_VOLUME_NAME
+  would then be only that OTHER project's own derived name, not anything
+  this checkout actually built with -- drop or unset the selector (or run
+  from outside its workspace, for a derived one) and re-run, or pass
+  --derive-volumes (which never looks at the ambient value at all).
 
   Omitting --url/--branch and --from entirely pins <name> with no checkout
   configured yet, same as an unconfigured 'setup' -- fill in
@@ -6079,7 +6133,7 @@ cmd_project_add() {
 			keep=0
 		elif [ "$keep_unsafe" -eq 1 ]; then
 			die "cannot tell what '$name' was already built with -- '$MACKAS_VOLUME_NAME' is only the derived stem for the currently selected '$PROJECT_SELECTED', not necessarily this checkout's" \
-				"drop '--project $PROJECT_SELECTED' and re-run, or pass --derive-volumes to switch '$name' to mackas-$name-* explicitly"
+				"$(project_select_drop_hint) and re-run, or pass --derive-volumes to switch '$name' to mackas-$name-* explicitly"
 		elif [ -n "$keep_flag" ]; then
 			keep=1
 		elif [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ ! -t 0 ]; then
@@ -9737,6 +9791,11 @@ cmd_status() {
 	# the file, it is not read out of one), so the loop below never shows it.
 	if [ -n "$PROJECT_SELECTED" ]; then
 		show "project selected"   "$PROJECT_SELECTED"
+		# A separate line, not appended to the one above: the compatibility
+		# contract (tests/implicit_select_compat.bats) matches "project
+		# selected" against an exact value with nothing trailing it, for
+		# every explicit-selector case that predates #78.
+		show "selected via"       "$PROJECT_SELECT_SOURCE"
 		status_project_volume_note
 	fi
 	local n
@@ -10138,7 +10197,7 @@ refuse_shared_volume() {
 	[ -n "$others" ] || return 0
 	other_list="$(printf '%s' "$others" | tr '\n' ' ')"
 	other_list="${other_list% }"
-	die "'$vol' ($label) is shared with $other_list -- refusing to touch it under '--project $PROJECT_SELECTED'" \
+	die "'$vol' ($label) is shared with $other_list -- refusing to touch it under $(project_select_description)" \
 		"to act on it anyway, name it directly: $SCRIPT_CMD volume destroy $vol"
 }
 
