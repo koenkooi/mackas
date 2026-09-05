@@ -545,6 +545,7 @@ rec_runtime_args_value() {
 
 @test "selector: a wrapper written under --project replays that project into the live recompute" {
 	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
 	cd "$TESTDIR"
 	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
@@ -554,6 +555,7 @@ rec_runtime_args_value() {
 
 @test "selector: an exported \$MACKAS_PROJECT_SELECT cannot re-aim a wrapper built for another project" {
 	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
 	cd "$TESTDIR"
 	out="$( (MACKAS_PROJECT_SELECT=proj-b "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
@@ -576,12 +578,33 @@ rec_runtime_args_value() {
 	[ "$sel_b" -eq 0 ]
 }
 
+# #78 tier 3: a `mackas setup` run from inside a workspace that derivation
+# alone selected must NOT freeze that selection into the wrapper -- the whole
+# point of derivation is that it is recomputed per invocation from wherever
+# the shell happens to stand, so baking today's answer in would replay it
+# from every OTHER directory too. write_kas_wrapper() only bakes an EXPLICIT
+# tier-1/2 selector (PROJECT_SELECT_SOURCE "--project" or
+# "$MACKAS_PROJECT_SELECT"); anything else -- this derived case included --
+# gets an empty pin, same as no selection at all.
+@test "selector: a wrapper written under a DERIVED selection also passes an EMPTY selector" {
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="derived from \$PWD"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
 @test "selector: a project name with a shell metacharacter is baked in inert" {
 	# PROJECT_SELECTED reaches the generated file through shq(), like every
 	# other interpolated value. validate_project_select refuses this name at
 	# the CLI; the point here is that write_kas_wrapper does not depend on
 	# that check to keep the generated file from executing what it embeds.
 	PROJECT_SELECTED="a'\$(touch $TESTDIR/pwned)b"
+	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
 	cd "$TESTDIR"
 	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
