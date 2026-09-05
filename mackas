@@ -1860,6 +1860,11 @@ never creates one. '$SCRIPT_CMD project add NAME' does that.
 Read-only, and it reads by GREPPING each file rather than sourcing it: a
 config is shell, and listing a directory of them must not run any of them.
 
+Flags a pin as stale when its MACKAS_ROOT is gone, or when MACKAS_ROOT/work/
+NAME is gone -- the directory implicit (\$PWD-derived) project selection keys
+off. The fix either way is to move the checkout back or drop the pin; mackas
+never re-derives an identity from whatever happens to be on disk.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
 though this reads only and never prompts.
 EOF
@@ -12631,6 +12636,7 @@ ${C_BLD}CONFIGURATION${C_RST}
   Which file, first match wins:
     --config FILE  /  \$MACKAS_CONF            (a path, named outright)
     --project NAME /  \$MACKAS_PROJECT_SELECT  (~/.config/mackas/projects/)
+    derived from \$PWD, or a hand-typed kas chain (same directory, no flag)
     ~/.config/mackas/config
     ~/.mackas.conf
 
@@ -12639,6 +12645,20 @@ ${C_BLD}CONFIGURATION${C_RST}
   says which command drops the one you did not mean. The selector picks WHICH
   file is sourced; it is not a fifth precedence rung. An empty value is refused
   either way: --config= behaves like --config \"\", --project= like --project \"\".
+
+  With no explicit selector or path, mackas still tries a pinned project
+  first: if \$PWD (resolved physically, so a ~/oe-style symlink matches either
+  way) sits inside a pinned project's own <MACKAS_ROOT>/work/<name>, that
+  project is selected exactly as --project NAME would select it -- and,
+  standing in work/ itself, a hand-typed 'kas-container build <chain>' gives
+  the wrapper's own file list as the same kind of hint. Zero matches falls
+  straight through to the search path below, unchanged; more than one is
+  refused, listing every candidate, rather than guessed. This is a THIRD
+  SELECTOR TIER, not a fifth precedence rung either: it only ever picks among
+  projects you already pinned by hand, never invents one from what is on
+  disk. '$SCRIPT_CMD status' reports which tier actually fired ('selected
+  via'), and every other command prints a one-line stderr note the first
+  time a derived selection is what put a project in force.
 
   '$SCRIPT_CMD --project NAME setup' pins NAME into the generated kas-container
   wrapper, so a hand-typed 'kas-container ...' recomputes --runtime-args
