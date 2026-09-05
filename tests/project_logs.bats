@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 #
-# M5 (#79), item 3: per-project logs/<name>/.
+# M5 (#79): the per-project log directory, logs/<name>/.
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -9,8 +9,8 @@
 # select_pinned_project() for --project / $MACKAS_PROJECT_SELECT / #78's tier-3
 # derivation, all three), MACKAS_LOGS becomes <base>/logs/<name> instead of
 # the flat <base>/logs, using the exact same gate derive_paths() already
-# applies to MACKAS_ENV_SH (M5 item 1) and MACKAS_KAS_FRAGMENT_SRC (M5 item
-# 2). Every call site that touches MACKAS_LOGS -- dump's output path, the
+# applies to MACKAS_ENV_SH and MACKAS_KAS_FRAGMENT_SRC. Every call site that
+# touches MACKAS_LOGS -- dump's output path, the
 # smoketest rung log, status's "Recent logs" listing, and bare `clean`'s
 # rm -rf/mkdir -p pair -- is a pure read of that one variable, so this one
 # gate scopes all four for free; tests/project_logs_cli.bats covers dump/
