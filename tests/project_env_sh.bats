@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 #
-# M5 (#79), item 1: per-project env-<name>.sh.
+# M5 (#79): the per-project generated env file, env-<name>.sh.
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later

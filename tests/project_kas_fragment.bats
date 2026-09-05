@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 #
-# M5 (#79), item 2: per-project macos-<name>.yml canonical kas fragment.
+# M5 (#79): the per-project canonical kas fragment, macos-<name>.yml.
 #
 # Copyright (C) 2026 Koen Kooi <koen@dominion.thruhere.net>
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -148,10 +148,9 @@ teardown() {
 }
 
 @test "setup_kas_fragment: content is unaffected by selection, only the filename differs" {
-	# #79's own text: "the generated fragment content itself is unchanged by
-	# this slice -- only where the canonical copy lives and what it is
-	# called." Strip the one line that legitimately differs (it names its own
-	# path) and the rest must be byte-identical.
+	# This slice moves the canonical copy and renames it; it changes nothing
+	# about what is in it. Strip the one line that legitimately differs (it
+	# names its own path) and the rest must be byte-identical.
 	mkdir -p "$MACKAS_PROJECT/.git"
 	setup_kas_fragment >/dev/null 2>&1
 	unselected="$(grep -v '^# Canonical copy:' "$TESTDIR/kas/macos.yml")"
