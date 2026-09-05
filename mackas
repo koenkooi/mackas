@@ -1126,6 +1126,25 @@ wrapper_identity_hint() {
 	printf 'To build the other project, use its own generated kas-container.\n'
 }
 
+# The wrapper's replayed pin (tier 2, $MACKAS_PROJECT_SELECT) and the
+# directory (or kas chain) this call actually runs from name two different
+# pinned projects. Same shape as wrapper_identity_hint()/selector_conflict_
+# hint(): name both, and give the fix for each -- re-aim the wrapper for
+# good, or use mackas's own project-aware commands instead of the hand-typed
+# kas-container for just this one build.
+wrapper_pin_conflict_hint() {
+	local pinned="$1" other="$2" other_src="$3"
+	printf 'the wrapper replays the project it was generated for, and %s names a different one -- mackas will not rank them for you.\n' "$other_src"
+	printf '\n'
+	printf '    %-24s %s\n' "wrapper pinned to" "$pinned"
+	printf '    %-24s %s\n' "$other_src" "$other"
+	printf '\n'
+	printf 'To make this wrapper build %s from here on:\n' "$other"
+	printf '    %s --project %s setup\n' "$SCRIPT_CMD" "$other"
+	printf 'To build %s for just this one command, use %s'"'"'s own commands instead of the hand-typed kas-container:\n' "$pinned" "$SCRIPT_CMD"
+	printf '    %s --project %s shell   (or smoketest)\n' "$SCRIPT_CMD" "$pinned"
+}
+
 selector_conflict_hint() {
 	local sel_src="$1" sel="$2" path_src="$3" path="$4"
 	printf 'these are mutually exclusive -- one picks a pinned project, the other names a path outright -- and mackas will not rank them for you.\n'
@@ -10355,6 +10374,51 @@ cmd_runtime_args() {
 	if [ -n "$expect_work" ] && [ "$expect_work" != "$MACKAS_WORK" ]; then
 		die "this wrapper was generated for a different configuration" \
 			"$(wrapper_identity_hint "$expect_work")"
+	fi
+
+	# #78: the wrapper replays the pin it was generated under (tier 2, via
+	# $MACKAS_PROJECT_SELECT) -- exactly what lets M3's `project add` put more
+	# than one project under one root sharing a single generated wrapper. If
+	# the directory this call actually runs from (or the chain hint the
+	# wrapper's own leading-options scan found) derives a DIFFERENT single
+	# project, this wrapper is about to hand that build another project's
+	# ext4 volumes while its work dir and gitconfig stay pinned to the one it
+	# was generated for -- refuse rather than silently obey whichever one
+	# PROJECT_SELECT_SOURCE happened to rank first.
+	#
+	# Only checked when tier 2 is what is actually in force: an explicit
+	# --project always wins outright (there is nothing to "replay" and
+	# disagree with), and tier 3 having already run IS this same question,
+	# already answered load_config's own way. An AMBIGUOUS cwd or chain (more
+	# than one candidate from single_candidate_winner) says nothing here --
+	# tier 2 already won, and an ambiguous derivation is not a confident "no"
+	# to check it against, so guessing at a conflict would be exactly the
+	# kind of guess #78 refuses to make.
+	if [ "$PROJECT_SELECT_SOURCE" = "\$MACKAS_PROJECT_SELECT" ]; then
+		local rt_pwd rt_n=0 rt_winner="" rt_chain_component rt_chain_n=0 rt_chain_winner=""
+		local rt_effective="" rt_effective_src=""
+		rt_pwd="$(pwd -P)"
+		single_candidate_winner "$rt_pwd"
+		rt_n="$CANDIDATE_COUNT"; rt_winner="$CANDIDATE_WINNER"
+		if [ "$rt_n" -eq 1 ]; then
+			rt_effective="$rt_winner"; rt_effective_src="derived from \$PWD"
+		elif [ "$rt_n" -eq 0 ]; then
+			# The chain hint is only worth consulting once $PWD alone found
+			# NOTHING -- see load_config's own tier 3 for why a $PWD match
+			# always forecloses the chain ever naming something else.
+			rt_chain_component="$(kas_chain_first_component "$kas_files")"
+			if [ -n "$rt_chain_component" ]; then
+				single_candidate_winner "$rt_pwd/$rt_chain_component"
+				rt_chain_n="$CANDIDATE_COUNT"; rt_chain_winner="$CANDIDATE_WINNER"
+				if [ "$rt_chain_n" -eq 1 ]; then
+					rt_effective="$rt_chain_winner"; rt_effective_src="derived from the kas chain"
+				fi
+			fi
+		fi
+		if [ -n "$rt_effective" ] && [ "$rt_effective" != "$PROJECT_SELECTED" ]; then
+			die "this wrapper is pinned to '$PROJECT_SELECTED', but $rt_effective_src names a different pinned project: '$rt_effective'" \
+				"$(wrapper_pin_conflict_hint "$PROJECT_SELECTED" "$rt_effective" "$rt_effective_src")"
+		fi
 	fi
 
 	# Before printing, never after: a caller that refuses on a held volume must
