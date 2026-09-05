@@ -271,3 +271,51 @@ run_wrapper() {
 	[ -e "$KREC" ]
 	assert_volume_names oe-build
 }
+
+# ---------------------------------------------------------------------------
+# The pin-vs-cwd disagreement guard (cmd_runtime_args(), next to
+# --expect-work): a wrapper is per ROOT, and M3's `project add` puts several
+# projects in one root sharing that ONE generated wrapper -- so a wrapper
+# pinned to A (because 'mackas --project A setup' ran last) must refuse
+# rather than silently hand a hand-typed build standing in work/B A's
+# volumes with B's sources. Regenerates the SAME $KAS_CONTAINER_BIN with an
+# EXPLICIT tier-1/2 pin baked in (PROJECT_SELECT_SOURCE "--project", exactly
+# as write_kas_wrapper()'s own q_projsel branch requires before it bakes
+# anything at all -- see that function's own comment for why a derived
+# selection never reaches here), matching kas_wrapper.bats's own "selector:"
+# tests' shape for regenerating the wrapper mid-test.
+# ---------------------------------------------------------------------------
+
+@test "pin-vs-cwd guard: a wrapper pinned to meta-qcom refuses when standing in poky's own workspace" {
+	PROJECT_SELECTED="meta-qcom"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR/work/poky"
+	run_wrapper build kas/base.yml
+	[ "$rc" -ne 0 ]
+	[ ! -e "$KREC" ]
+	printf '%s\n' "$out" | grep -qF 'meta-qcom'
+	printf '%s\n' "$out" | grep -qF 'poky'
+}
+
+@test "pin-vs-cwd guard: the SAME wrapper still launches normally from meta-qcom's own workspace" {
+	PROJECT_SELECTED="meta-qcom"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR/work/meta-qcom"
+	run_wrapper build kas/base.yml
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	assert_volume_names mackas-meta-qcom
+}
+
+@test "pin-vs-cwd guard: the SAME wrapper still launches normally standing in work/ with no chain at all" {
+	PROJECT_SELECTED="meta-qcom"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR/work"
+	run_wrapper build foo.yml
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	assert_volume_names mackas-meta-qcom
+}
