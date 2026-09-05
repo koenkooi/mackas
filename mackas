@@ -2191,7 +2191,17 @@ derive_paths() {
 	# kas fragment, as seen from the project checkout (kas rewrites paths
 	# under the repo dir to /repo/... inside the container, so the fragment
 	# has to physically live inside the checkout).
+	# Selected -> macos-<name>.yml, so two pinned projects on one MACKAS_ROOT
+	# never share a canonical fragment (same rule, same gate as MACKAS_ENV_SH
+	# just above). Unselected, this must stay exactly $MACKAS_KAS/macos.yml --
+	# #79's backward-compatibility rule. The in-checkout copy
+	# (MACKAS_KAS_FRAGMENT_REPO) does NOT get a project component: each
+	# project has its own private checkout under MACKAS_PROJECT, so there is
+	# no naming collision to resolve there.
 	MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos.yml"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos-$PROJECT_SELECTED.yml"
+	fi
 	MACKAS_KAS_FRAGMENT_REPO="$MACKAS_PROJECT/kas/macos-local.yml"
 	KAS_FILES_ARG="$(compose_kas_files)"
 
@@ -7002,7 +7012,9 @@ kas_shell_ro() {
 	# a directly-driven kas-container per project under work/ -- never runs
 	# 'setup' again for each newly-cloned project. So KAS_FILES_ARG's
 	# always-appended kas/macos-local.yml (compose_kas_files) may simply not
-	# exist yet for THIS project even though the shared kas/macos.yml does.
+	# exist yet for THIS project even though the canonical copy at
+	# MACKAS_KAS_FRAGMENT_SRC (macos.yml, or macos-<name>.yml once a project
+	# is selected -- #79) already does.
 	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
 	# regenerating unconditionally, and setup_kas_fragment() already honours
 	# --dry-run itself (prints the plan, writes nothing). Redirected to

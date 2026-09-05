@@ -87,7 +87,8 @@ Everything lives under `MACKAS_ROOT` (reached through the short-link alias
 ```
 $MACKAS_ROOT/
 ├── bin/          the docker->container shim, kas-container, GNU realpath
-├── kas/          the canonical generated tuning fragment (macos.yml)
+├── kas/          the canonical generated tuning fragment (macos.yml;
+│                 macos-NAME.yml once a project is selected)
 ├── logs/         smoketest/build logs
 ├── env.sh        generated; source this
 ├── gitconfig     generated; forwarded as GITCONFIG_FILE
