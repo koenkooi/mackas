@@ -942,6 +942,25 @@ kas is configured to reset to.
   --branch BRANCH | --from <checkout>]` is `adopt`'s in-root sibling: it pins
   a *project workspace* under this Mac's own root (`$MACKAS_WORK/<name>/`)
   instead of a whole separate root.
+- **Implicit selection**: with no explicit `--project`/`--config` flag or
+  `$MACKAS_PROJECT_SELECT`/`$MACKAS_CONF` env var, mackas still selects a
+  pinned project when the cwd sits inside one of its `work/<name>/`
+  workspaces (or, standing in `work/` itself, when a hand-typed
+  `kas-container` file-list's leading component names one). You can tell it
+  happened: `mackas status`'s "selected via" line says "derived from `$PWD`"
+  / "derived from the kas chain" instead of `--project`, and every other
+  command prints a one-line stderr note the first time (project, source, the
+  three volume names) — read that note or the status line before assuming
+  which project's volumes a command is about to touch. To force a different
+  project (or the plain search path), pass `--project NAME`/`--config` on
+  that command explicitly; derivation is a fallback, never a competitor to an
+  explicit selector. Two dies are specific to this: standing somewhere that
+  matches more than one pinned project's workspace (a pathological nested
+  layout — pass `--project NAME` to pick one), and a hand-typed
+  `kas-container` run through a project's generated wrapper from a *different*
+  pinned project's workspace (the wrapper replays the project it was set up
+  under; fix by re-running `setup` under the right project, or using that
+  project's own `mackas` commands instead of the hand-typed one).
 - Most destructive commands are two-phase: they scan for real (even under
   `--dry-run`), report what they would reclaim, and only act after confirmation
   or `-y`.

@@ -48,11 +48,13 @@ fetches. mackas orchestrates these; it does not vouch for them.
   `--device` and `--network host` rather than guessing a translation.
 - **Input/config safety.** A config file is *sourced as shell*, so one mackas
   finds or derives on its own — the search path (`~/.config/mackas/config`,
-  `~/.mackas.conf`) and the `--project NAME` /`$MACKAS_PROJECT_SELECT`
-  selector, which resolves to `~/.config/mackas/projects/NAME.conf` — is
-  executed only if it is a regular file owned by you (or root) and not
-  group/world-writable, file and directory both (`config_file_is_safe`) —
-  graded on what is really there, never on a symlink standing in for it, since
+  `~/.mackas.conf`), the `--project NAME` /`$MACKAS_PROJECT_SELECT`
+  selector, which resolves to `~/.config/mackas/projects/NAME.conf`, and the
+  implicit selection derived from `$PWD` (or a hand-typed kas chain), which
+  resolves to that same directory — is executed only if it is a regular file
+  owned by you (or root) and not group/world-writable, file and directory
+  both (`config_file_is_safe`) — graded on what is really there, never on a
+  symlink standing in for it, since
   `ln -s` applies the umask (measured: `022` → `755`, `002` → `775`,
   `000` → `777`, `077` → `700`), so a link's own mode records the umask and
   nothing about its target, and grading the link would accept a config sitting
@@ -66,12 +68,23 @@ fetches. mackas orchestrates these; it does not vouch for them.
   the ambient umask, so a `umask 002` login cannot bootstrap a project config
   that the very same check then refuses. `mackas projects` lists the pinned
   configs by **grepping** them, never sourcing — listing a directory of shell
-  files must not run any of them. `./mackas.conf` is *not* in the search path at all, for
-  the same reason: a cwd-relative config any untrusted tree could drop in was
-  code execution needing no exploit. Every value written into a generated
-  file is validated first (`validate_settings` rejects `"`, backticks and control
-  characters) so a value cannot break out of the shell or YAML it lands in —
-  including the undocumented `MACKAS_BREW_BIN` test seam, which is not a
+  files must not run any of them, and implicit selection applies the same
+  rule while it *enumerates* candidates: every pinned config's `MACKAS_ROOT`
+  is read with the same grep, and only the single eventual winner is ever
+  sourced, only after the same `config_file_is_safe` check. A pinned config
+  this enumeration cannot even read is treated as an unanswerable "maybe",
+  not a silent "no" — it dies naming the file rather than risk skipping past
+  the real match. The one place a hand-typed build's file list feeds this is
+  an explicit `--kas-files` flag mackas passes to itself, one process to the
+  next — never an environment variable the ambient shell could set instead,
+  which would reopen exactly the ambient-env ambush class the selector
+  distinction above exists to close. `./mackas.conf` is *not* in the search
+  path at all, for the same reason: a cwd-relative config any untrusted tree
+  could drop in was code execution needing no exploit. Every value written
+  into a generated file is validated first (`validate_settings` rejects `"`,
+  backticks and control characters) so a value cannot break out of the shell
+  or YAML it lands in — including the undocumented `MACKAS_BREW_BIN` test
+  seam, which is not a
   setting but is still an input, and reaches both generated shell files. The
   git "dubious ownership" workaround is scoped to a generated `GITCONFIG_FILE`,
   never applied globally, and never silently changes one you set — if your own
