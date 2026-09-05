@@ -73,6 +73,14 @@ those would make kas bind-mount an APFS directory over the ext4 volumes
 ([why](docs/architecture.md#how-they-get-mounted-and-why-kas_build_dir-must-stay-unset)).
 It lives at `~/oe/env.sh` once `setup` has made the short symlink, or in
 `MACKAS_ROOT` if you set `MACKAS_SHORT_LINK=`; `./mackas status` prints where.
+With a project selected it is `env-NAME.sh` instead, so two pinned projects
+on one `MACKAS_ROOT` never share a generated file. *Any* selection counts,
+including the derived one — standing in a pinned workspace is enough, the
+same rung the [selector table](#configuration) lists third — so run
+`./mackas status` from where you build and source the `env.sh` line it
+prints rather than assuming. That file also exports `MACKAS_PROJECT_SELECT`
+for you, guarded the same way `GITCONFIG_FILE` is — a value your shell
+already has always wins over the one this file was generated for.
 
 ### Directory layout
 
@@ -82,9 +90,12 @@ Everything lives under `MACKAS_ROOT` (reached through the short-link alias
 ```
 $MACKAS_ROOT/
 ├── bin/          the docker->container shim, kas-container, GNU realpath
-├── kas/          the canonical generated tuning fragment (macos.yml)
-├── logs/         smoketest/build logs
-├── env.sh        generated; source this
+├── kas/          the canonical generated tuning fragment (macos.yml;
+│                 macos-NAME.yml once a project is selected)
+├── logs/         smoketest/build logs (logs/NAME/ once a project is
+│                 selected, so two pinned projects never share one)
+├── env.sh        generated; source this (env-NAME.sh once a
+│                 project is selected)
 ├── gitconfig     generated; forwarded as GITCONFIG_FILE
 └── work/         <- every layer checkout lives HERE, as a sibling
     ├── meta-angstrom/
@@ -100,6 +111,14 @@ re-cloned. `bin/`, `kas/` and `logs/` do not participate; only `work/` is
 what kas sees. A real multi-layer BSP — a dozen `meta-*` repos, not just the
 single project `setup` clones — goes under `work/` as siblings; see
 [Driving kas directly](#driving-kas-directly).
+
+Selecting a project migrates nothing. Anything already sitting flat from
+before a project was ever selected on this root stays exactly where it was
+written: an older `dump-*.yml` or `smoketest-*.log` under `logs/`, and — the
+one that bites — the flat `env.sh` and `kas/macos.yml`. The first selected
+run writes `env-NAME.sh` beside the old `env.sh` rather than over it, so a
+shell that already sourced the old one keeps the old, selector-free
+environment until you source the new file.
 
 ## Commands
 
@@ -118,14 +137,14 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `buildhistory` | `buildhistory analyze [PATH] [--from REV] [--to REV] [--detail] [--json]` summarises what changed between two builds — recipes added/removed/upgraded, the biggest PKGSIZE movers, per-image size/content deltas. `mackas buildhistory --help`. |
 | `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days; `sstate push` publishes new ones to a mirror over rsync/ssh. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. Exits 0 on a build that succeeded, 1 on one that failed, 2 when no bridge is reachable — a usable scripted probe. |
-| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. `downloads`/`sstate` refuse a volume another pinned project shares (see [below](#pinning-a-project-workspace)). |
+| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/) and clear the log dir — the selected project's own `logs/NAME/`, or, with none selected, the whole flat `logs/` including every `logs/NAME/` under it. Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. `downloads`/`sstate` refuse a volume another pinned project shares (see [below](#pinning-a-project-workspace)). |
 | `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. Refuses a downloads/sstate volume another pinned project shares. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
 | `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. (The plural, read-only sibling of `project add`, which creates one.) |
 | `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
-| `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
+| `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml` (`logs/NAME/` once a project is selected), a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
 
 Options: `--config FILE`, `--project NAME`, `--set NAME=VALUE`, `--dry-run`,
 `-y/--yes` (or `-f/--force`), `-v/--verbose`, `--version`, `--help`.
@@ -142,7 +161,8 @@ fallback if your kas config has no sensible bare default.
 [mackas.conf.example](mackas.conf.example) ships meta-ai's ladder, commented
 out, as a worked example (smallest native recipe → same recipe
 cross-compiled → the real targets, **hours** cold). Each rung streams to
-`$MACKAS_ROOT/logs/` and stops the ladder on failure. See
+`$MACKAS_ROOT/logs/` (`logs/NAME/` once a project is selected) and stops the
+ladder on failure. See
 [testing.md](docs/testing.md#the-smoketest-ladder). `smoketest` and `shell`
 obey the **one-VM rule** like everything else: if another build already holds
 one of the three volumes, they refuse by name up front instead of letting
@@ -544,7 +564,7 @@ volume-relocation symlink already belongs to a different live project,
 | `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-buildhistory-analyze` (`buildhistory analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller), `mackas-ext4-dirty-bit` (the superblock dirty-bit probe `check` runs). |
 | `tests/`, `run-tests.sh`, `Makefile` | bats test suite and its entry points (`./run-tests.sh` or `make test`). See [testing.md](docs/testing.md). |
 | `COPYING` | GPLv3. |
-| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`. |
+| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`; `env-NAME.sh` once a project is selected. |
 | `$MACKAS_BASE/gitconfig` | **Generated**: forwarded as `GITCONFIG_FILE` so git can operate on `/repo` despite the virtiofs ownership quirk ([architecture.md](docs/architecture.md#git-dubious-ownership--the-blocker)). Never written over a `GITCONFIG_FILE` you already export. |
 
 ## Configuration
@@ -683,6 +703,19 @@ same as always. `./mackas status` notes it, once and only informationally,
 whenever an explicit value disagrees with what the selector would have
 derived — keeping `oe-build-*` with no data move is a fully supported
 choice, never something the note suggests fixing.
+
+The three generated files split the same way, on the same condition (a
+project is selected, by any of the three rungs above — the derived one
+included) and with the same goal of two pinned projects never writing over
+each other: `env.sh` becomes `env-NAME.sh`, the canonical kas fragment
+`kas/macos.yml` becomes `kas/macos-NAME.yml`, and `logs/` becomes
+`logs/NAME/`, which carries `dump`'s output, the smoketest logs, `status`'s
+"Recent logs" listing and bare `clean`'s wipe with it. The in-checkout
+fragment copy keeps its plain `kas/macos-local.yml` name either way: each
+project has its own checkout, so there is nothing to collide with there.
+Nothing is migrated (see [Directory layout](#directory-layout)), and the
+isolation is one-way — a bare `clean` with *no* project selected still
+clears the whole flat `logs/`, every `logs/NAME/` under it included.
 
 Every setting is also an environment variable of the same name, and
 `--set NAME=VALUE` overrides both for the one command it rides along with.
