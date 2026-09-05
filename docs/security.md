@@ -85,7 +85,15 @@ fetches. mackas orchestrates these; it does not vouch for them.
   backticks and control characters) so a value cannot break out of the shell
   or YAML it lands in — including the undocumented `MACKAS_BREW_BIN` test
   seam, which is not a
-  setting but is still an input, and reaches both generated shell files. The
+  setting but is still an input, and reaches both generated shell files. Two
+  non-settings reach a generated file: that seam, and the selected project
+  name, which `env-NAME.sh` exports as `MACKAS_PROJECT_SELECT`. The selector
+  is deliberately not a setting (it chooses *which* config file loads, so it
+  cannot be one), so `validate_settings` never sees it;
+  `validate_project_select` grades it instead, and harder — a single path
+  component of `[A-Za-z0-9._-]`, no leading `-`, no `..` — because the same
+  name is pasted into `env-NAME.sh`, `kas/macos-NAME.yml`, `logs/NAME/` and a
+  config path. It is `shq`-quoted into the heredoc on top of that. The
   git "dubious ownership" workaround is scoped to a generated `GITCONFIG_FILE`,
   never applied globally, and never silently changes one you set — if your own
   `GITCONFIG_FILE` is missing, or lacks `safe.directory = *`, `setup` asks
