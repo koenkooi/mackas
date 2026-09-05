@@ -238,6 +238,34 @@ assert_volume_names() {
 	printf '%s\n' "$output" | grep -qF -- '--project'
 }
 
+@test "derive: the ambiguity die's candidate list ends before the instruction, not inside a path" {
+	# The list and the "pass --project NAME" sentence after it are one hint
+	# string; the list's own trailing newline is what keeps the LAST
+	# candidate's directory from being printed as '<dir>pass --project NAME
+	# ...', which reads as part of the path itself and sends the user
+	# looking for a directory that does not exist.
+	rootA="$TESTDIR/rootA"
+	rootB="$rootA/work/foo"
+	mkdir -p "$rootB/work/bar/sub"
+	pin foo <<-EOF
+	MACKAS_ROOT="$rootA"
+	EOF
+	pin bar <<-EOF
+	MACKAS_ROOT="$rootB"
+	EOF
+	cd "$rootB/work/bar/sub"
+	run "$MACKAS" status
+	[ "$status" -ne 0 ]
+	# Every candidate on a line of its own, ENDING at its own directory --
+	# the paths are compared loosely (make_tmpdir hands out a /var/folders
+	# path whose physically-resolved form has a /private prefix), because
+	# what is under test is the line boundary, not the prefix.
+	printf '%s\n' "$output" | grep -qE '^  next: +bar -> .*/work/foo/work/bar$'
+	printf '%s\n' "$output" | grep -qE '^ +foo -> .*/rootA/work/foo$'
+	# ...and the instruction on a line of its own after them.
+	printf '%s\n' "$output" | grep -q '^pass --project NAME '
+}
+
 # ---------------------------------------------------------------------------
 # An unreadable pinned config: fail closed, but only while tier 3 is actually
 # being evaluated -- an explicit selector skips it entirely.
@@ -254,6 +282,34 @@ assert_volume_names() {
 	[ "$rc" -ne 0 ]
 	printf '%s\n' "$output" | grep -qF 'proj.conf'
 	printf '%s\n' "$output" | grep -qi 'cannot tell'
+}
+
+@test "derive: an unreadable pinned config does NOT stop 'projects', the repair surface the die points at" {
+	# The die above tells the user to fix the file's permissions, and
+	# select_pinned_project()'s own die points at '$SCRIPT_CMD projects' by
+	# name -- so `projects` itself must keep working while the directory is
+	# in exactly that state. It lists every pin whatever the selection turns
+	# out to be, so it derives leniently and marks the broken entry rather
+	# than refusing to print anything at all.
+	pin proj <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	pin other <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	mkdir -p "$ROOT/work/proj" "$ROOT/work/other"
+	chmod 000 "$PROJDIR/proj.conf"
+	cd "$ROOT/work/other"
+	run "$MACKAS" projects
+	local rc="$status"
+	chmod 600 "$PROJDIR/proj.conf"
+	[ "$rc" -eq 0 ]
+	# Both pins listed, the unreadable one flagged as such.
+	printf '%s\n' "$output" | grep -qE '^  proj$'
+	printf '%s\n' "$output" | grep -qE '^  other'
+	printf '%s\n' "$output" | grep -qi 'unreadable'
+	# And the readable pin $PWD really is standing in still gets selected.
+	printf '%s\n' "$output" | grep -qF 'selected for this command'
 }
 
 @test "derive: an unreadable pinned config does NOT die when --project is given -- tier 3 is never evaluated" {
