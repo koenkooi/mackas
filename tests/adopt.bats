@@ -304,12 +304,17 @@ mk() {
 	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai'" "$TESTDIR/newconfig.conf"
 }
 
-@test "adopt: an unreadable pinned config is a silent miss for the probe, not a crash" {
-	# adopt_unique_volume_name() already documents itself as collision-
-	# avoidance, not a guarantee (no per-root ownership record exists) --
-	# unlike the DESTRUCTIVE shared-volume guard, a probe picking a NAME has
-	# nothing to fail closed about, so it must simply carry on: pick the
-	# plain name, same as if the unreadable file were not there at all.
+@test "adopt: an unreadable pinned config is a silent miss for adopt_unique_volume_name()'s OWN probe (#78 tier-3 refuses the whole command first)" {
+	# adopt_unique_volume_name() itself already documents its probe as
+	# collision-avoidance, not a guarantee -- an unreadable config is still a
+	# silent miss FOR THAT PROBE, unchanged by #78. But #78's tier-3
+	# derivation is a separate gate in load_config(), evaluated for every
+	# command (including this bare 'adopt', which names no explicit
+	# --project/--config) before adopt's own logic ever runs, and IT fails
+	# closed on the very same unreadable file: it might have named a
+	# candidate workspace $PWD sits under, and unreadable means unknowable.
+	# So the command as a whole now refuses -- earlier, and for a different
+	# reason -- rather than reaching adopt_unique_volume_name() at all.
 	make_foreign_root_with_project
 	mkdir -p "$HOME/.config/mackas/projects"
 	cat > "$HOME/.config/mackas/projects/other.conf" <<-'EOF'
@@ -319,8 +324,9 @@ mk() {
 	mk adopt "$FOREIGN" --write-config "$TESTDIR/newconfig.conf"
 	local rc="$status"
 	chmod 600 "$HOME/.config/mackas/projects/other.conf"
-	[ "$rc" -eq 0 ]
-	grep -qxF "MACKAS_VOLUME_NAME='mackas-meta-ai'" "$TESTDIR/newconfig.conf"
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'other.conf'
+	[ ! -e "$TESTDIR/newconfig.conf" ]
 }
 
 @test "adopt: derives a distinct MACKAS_SHORT_LINK from the project name" {
