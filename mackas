@@ -1486,13 +1486,27 @@ load_config() {
 	# a pinned MACKAS_ROOT recorded as the link, the physical target, or
 	# anything in between all resolve to the same candidate, and $PWD reached
 	# through the link or directly both resolve to the same physical string.
-	local pwd_phys n_candidates=0 winner_name=""
+	#
+	# `projects` derives LENIENTLY (see derive_project_candidates()'s MODE):
+	# it is the repair surface both fail-closed dies below point AT ("fix its
+	# permissions ... then re-run", "$SCRIPT_CMD projects  (lists the pinned
+	# ones)"), so it must never be a command those dies refuse -- a listing
+	# that cannot run while one entry is broken cannot show you which entry
+	# is broken. It also never needs the strict answer: it lists every pinned
+	# config whatever the selection turns out to be, and marks the unreadable
+	# one itself (cmd_projects's own "unreadable" line).
+	local pwd_phys n_candidates=0 winner_name="" derive_mode="strict"
+	[ "${SCRIPT_SUBCOMMAND:-}" != "projects" ] || derive_mode="lenient"
 	pwd_phys="$(pwd -P)"
-	single_candidate_winner "$pwd_phys"
+	single_candidate_winner "$pwd_phys" "$derive_mode"
 	n_candidates="$CANDIDATE_COUNT"; winner_name="$CANDIDATE_WINNER"
 	if [ "$n_candidates" -gt 1 ]; then
+		# CANDIDATE_LIST_TEXT keeps its own trailing newline, so the last
+		# candidate does not run into the sentence after it -- a "$(...)"
+		# around it would strip that newline and print the final path as
+		# '<dir>pass --project NAME ...', which reads as part of the path.
 		die "\$PWD ($pwd_phys) matches more than one pinned project's workspace" \
-			"$(printf '%s' "$CANDIDATE_LIST_TEXT")pass --project NAME to pick one of the above"
+			"${CANDIDATE_LIST_TEXT}pass --project NAME to pick one of the above"
 	fi
 	if [ "$n_candidates" -eq 1 ]; then
 		select_pinned_project "$winner_name" "derived from \$PWD" 0
@@ -1523,11 +1537,11 @@ load_config() {
 	chain_component="$(kas_chain_first_component "$RUNTIME_ARGS_KAS_FILES")"
 	if [ -n "$chain_component" ]; then
 		chain_path="$pwd_phys/$chain_component"
-		single_candidate_winner "$chain_path"
+		single_candidate_winner "$chain_path" "$derive_mode"
 		n_chain="$CANDIDATE_COUNT"; chain_winner="$CANDIDATE_WINNER"
 		if [ "$n_chain" -gt 1 ]; then
 			die "the kas chain's workspace ($chain_path) matches more than one pinned project's workspace" \
-				"$(printf '%s' "$CANDIDATE_LIST_TEXT")pass --project NAME to pick one of the above"
+				"${CANDIDATE_LIST_TEXT}pass --project NAME to pick one of the above"
 		fi
 		if [ "$n_chain" -eq 1 ]; then
 			select_pinned_project "$chain_winner" "derived from the kas chain" 0
@@ -1865,6 +1879,12 @@ NAME is gone -- the directory implicit (\$PWD-derived) project selection keys
 off. The fix either way is to move the checkout back or drop the pin; mackas
 never re-derives an identity from whatever happens to be on disk.
 
+Flags a pin this process cannot READ too -- and keeps working while one is in
+that state, unlike every other command, whose \$PWD-derived selection fails
+closed on it (an unreadable pin could have been the match). This listing is
+the repair surface those refusals point at, so it has to be the one command
+that still runs.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
 though this reads only and never prompts.
 EOF
@@ -1894,6 +1914,17 @@ cmd_projects() {
 				printf '    %-26s %s\n' "$s" "$v"
 			fi
 		done
+		# Why this listing shows nothing but the name for such an entry --
+		# every setting above came from config_grep_setting, which cannot
+		# read it either. Said out loud because #78's tier-3 derivation
+		# fails CLOSED on exactly this file for every OTHER command (it
+		# could have been the match, and unreadable means unknowable), so
+		# this line is the whole diagnosis for a machine where mackas has
+		# suddenly started refusing everything.
+		if [ ! -r "$f" ]; then
+			printf '    %s%-26s %s%s\n' "$C_YEL" "unreadable" \
+				"cannot be read -- its settings are unknown, and \$PWD-derived selection refuses to pick ANY project while it stays this way; fix its permissions, or remove it if it is stale" "$C_RST"
+		fi
 		if [ -n "$root" ] && [ ! -d "$root" ]; then
 			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
 				"its MACKAS_ROOT does not exist -- moved, or on an unmounted disk" "$C_RST"
