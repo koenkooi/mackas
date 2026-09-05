@@ -4925,8 +4925,21 @@ write_kas_wrapper() {
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
 	q_scriptname="$(shq "$SCRIPT_NAME")"
-	# Empty unless this setup ran under --project/$MACKAS_PROJECT_SELECT.
-	q_projsel="$(shq "$PROJECT_SELECTED")"
+	# Empty unless this setup ran under an EXPLICIT --project/
+	# $MACKAS_PROJECT_SELECT (#78 tier 1/2). A #78 tier-3 selection derived
+	# from $PWD must NOT be baked in here: the whole point of derivation is
+	# that it is recomputed per invocation from wherever the shell happens to
+	# stand, and freezing today's answer into the wrapper would replay it
+	# from every OTHER directory too -- exactly the stale-pin ambush
+	# wrapper_identity_hint()/--expect-work already exist to catch, just
+	# self-inflicted at generation time instead of caught at build time.
+	# Leaving it empty here keeps derivation live: MACKAS_PROJECT_PIN="" makes
+	# load_config treat $MACKAS_PROJECT_SELECT as absent (same as never set),
+	# so the wrapper's own subprocess re-derives from ITS inherited cwd.
+	case "$PROJECT_SELECT_SOURCE" in
+		--project|"\$MACKAS_PROJECT_SELECT") q_projsel="$(shq "$PROJECT_SELECTED")" ;;
+		*) q_projsel="$(shq "")" ;;
+	esac
 
 	run mkdir -p "$MACKAS_BIN"
 	cat > "$KAS_CONTAINER_BIN" <<EOF
