@@ -2168,7 +2168,16 @@ derive_paths() {
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
 	MACKAS_PROJECT="$(strip_trailing_slash "$MACKAS_WORK/$MACKAS_PROJECT_DIR")"
+	# Selected -> env-<name>.sh, so two pinned projects on one MACKAS_ROOT never
+	# share a generated env file. Unselected, this must stay exactly
+	# $MACKAS_BASE/env.sh -- #79's backward-compatibility rule -- so gate on
+	# PROJECT_SELECTED itself, not on anything that could be non-empty without
+	# it (PROJECT_SELECTED is validated by validate_project_select() the
+	# moment it is set, so it is already safe to paste into a filename here).
 	MACKAS_ENV_SH="$MACKAS_BASE/env.sh"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_ENV_SH="$MACKAS_BASE/env-$PROJECT_SELECTED.sh"
+	fi
 	# See setup_gitconfig() for why this file exists at all.
 	MACKAS_GITCONFIG="$MACKAS_BASE/gitconfig"
 	KAS_CONTAINER_BIN="$MACKAS_BIN/kas-container"
@@ -4466,7 +4475,7 @@ setup_shim_and_env() {
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
-	local q_fragrepo q_autofrag q_autoproj q_brew
+	local q_fragrepo q_autofrag q_autoproj q_brew q_projsel
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -4490,6 +4499,24 @@ setup_shim_and_env() {
 	q_fragrepo="$(shq "$MACKAS_KAS_FRAGMENT_REPO")"
 	q_autofrag="$(shq "$MACKAS_KAS_AUTO_FRAGMENT")"
 	q_autoproj="$(shq "$MACKAS_KAS_AUTO_PROJECT")"
+
+	# Only when a project is selected -- MACKAS_ENV_SH is $MACKAS_BASE/env.sh,
+	# unchanged, for an unselected run, and this stays empty so that file's
+	# generated text is untouched (#79 backward-compatibility rule). Selected,
+	# it becomes the tail of the MACKAS_KAS_AUTO_PROJECT export line below,
+	# with its own leading newline, rather than a standalone line -- so an
+	# unselected env.sh gets not so much as an extra blank line out of this.
+	local projsel_export=""
+	if [ -n "$PROJECT_SELECTED" ]; then
+		q_projsel="$(shq "$PROJECT_SELECTED")"
+		projsel_export="
+# ':-' so a value already exported in THIS shell wins, exactly like
+# MACKAS_KAS_AUTO_FRAGMENT/_AUTO_PROJECT above. A bare assignment would
+# silently override a MACKAS_PROJECT_SELECT you (or an earlier sourced
+# env-<name>.sh, in the same shell) already set, with whichever project this
+# file happened to be generated for -- see PROJECT_SELECTED in $SCRIPT_NAME.
+export MACKAS_PROJECT_SELECT=\${MACKAS_PROJECT_SELECT:-$q_projsel}"
+	fi
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_ENV_SH" "$C_RST"
@@ -4581,7 +4608,7 @@ export MACKAS_KAS_FRAGMENT_REPO=$q_fragrepo
 # 'MACKAS_KAS_AUTO_PROJECT=0' set in a shell rc BEFORE env.sh is sourced,
 # which is a perfectly reasonable way to turn either of these off.
 export MACKAS_KAS_AUTO_FRAGMENT=\${MACKAS_KAS_AUTO_FRAGMENT:-$q_autofrag}
-export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}
+export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}$projsel_export
 
 # _mackas_derive_project needs this to tell "cwd is work/" from "cwd is a
 # checkout under work/". Same value as KAS_WORK_DIR above, under the name the
