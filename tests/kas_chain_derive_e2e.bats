@@ -319,3 +319,40 @@ run_wrapper() {
 	[ -e "$KREC" ]
 	assert_volume_names mackas-meta-qcom
 }
+
+# ---------------------------------------------------------------------------
+# Regression: the pin-vs-cwd guard's own cwd/chain check must not resurrect
+# tier 3's fail-closed-on-unreadable rule for a selector that is already
+# settled. An UNRELATED pinned config elsewhere in projects_dir() going
+# unreadable (someone else's broken permissions, a bad restore, ...) must
+# not turn into a fresh refusal for a build this guard would otherwise have
+# waved straight through -- that would be strictly WORSE than mackas before
+# this guard existed at all, which is exactly what the backward-compat
+# contract for "any invocation carrying a tier-1/2 selector" rules out.
+# ---------------------------------------------------------------------------
+
+@test "pin-vs-cwd guard: an unrelated unreadable pinned config does not break a matching build" {
+	PROJECT_SELECTED="meta-qcom"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	chmod 000 "$PROJDIR/poky.conf"
+	cd "$TESTDIR/work/meta-qcom"
+	run_wrapper build kas/base.yml
+	chmod 600 "$PROJDIR/poky.conf"
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	assert_volume_names mackas-meta-qcom
+}
+
+@test "pin-vs-cwd guard: an unrelated unreadable pinned config does not break a neutral-cwd build either" {
+	PROJECT_SELECTED="meta-qcom"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	chmod 000 "$PROJDIR/poky.conf"
+	cd "$TESTDIR/work"
+	run_wrapper build foo.yml
+	chmod 600 "$PROJDIR/poky.conf"
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	assert_volume_names mackas-meta-qcom
+}
