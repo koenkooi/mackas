@@ -1242,12 +1242,30 @@ select_pinned_project() {
 # evaluated, i.e. when the caller (load_config) has already established that
 # no explicit --project/$MACKAS_PROJECT_SELECT/--config/$MACKAS_CONF was
 # given -- an explicit selector never reaches this function at all.
+#
+# MODE (optional, default "strict") is the one exception to that last
+# sentence: cmd_runtime_args's pin-vs-cwd guard (#78) also calls this
+# function while an explicit tier-2 selector IS already in force, purely to
+# double-check it against $PWD/the kas chain -- a consultative second
+# opinion, not a selection. Fail-closed is right when derivation is
+# CHOOSING a project (an unreadable file really could have been the
+# answer), but wrong here: it would mean an unrelated broken pinned config
+# ANYWHERE in projects_dir() breaks every OTHER project's hand-typed build
+# under its own wrapper, a regression the backward-compat contract this
+# guard sits next to explicitly rules out ("any invocation carrying a
+# tier-1/2 selector" must stay byte-identical). MODE=lenient skips an
+# unreadable file exactly like a malformed name -- worst case the guard
+# misses a real disagreement, exactly as it would have before this guard
+# existed at all, never worse.
 derive_project_candidates() {
-	local pwd_phys="$1" dir f name root cand
+	local pwd_phys="$1" mode="${2:-strict}" dir f name root cand
 	dir="$(projects_dir)"
 	for f in "$dir"/*.conf; do
 		[ -f "$f" ] || continue
 		if [ ! -r "$f" ]; then
+			if [ "$mode" = "lenient" ]; then
+				continue
+			fi
 			die "cannot tell whether \$PWD names a pinned project: $f is not readable, and it could have been the match" \
 				"fix its permissions (or remove it if stale) in $(projects_dir), then re-run -- or pass --project NAME/--config to bypass derivation entirely"
 		fi
@@ -1282,23 +1300,27 @@ derive_project_candidates() {
 	done
 }
 
-# single_candidate_winner PWD_PATH -- run derive_project_candidates(PWD_PATH)
-# and reduce it to the three globals every caller below actually wants:
-# CANDIDATE_COUNT (how many lines it printed), CANDIDATE_WINNER (the last
-# one's name -- meaningful only when CANDIDATE_COUNT is 1), and
-# CANDIDATE_LIST_TEXT (every "name -> dir" line, indented, for a caller that
-# is about to die() listing them all). Never dies on more than one itself --
-# load_config's tier 3 and cmd_runtime_args's pin-vs-cwd guard disagree on
-# what "more than one" MEANS (one is a selection and must refuse rather than
-# guess; the other is a live pin already in force and an ambiguous
-# derivation is not a confident "no" to check it against, so it says nothing
-# instead) -- so each reads CANDIDATE_COUNT itself and decides.
+# single_candidate_winner PWD_PATH [MODE] -- run
+# derive_project_candidates(PWD_PATH, MODE) and reduce it to the three
+# globals every caller below actually wants: CANDIDATE_COUNT (how many
+# lines it printed), CANDIDATE_WINNER (the last one's name -- meaningful
+# only when CANDIDATE_COUNT is 1), and CANDIDATE_LIST_TEXT (every "name ->
+# dir" line, indented, for a caller that is about to die() listing them
+# all). Never dies on more than one itself -- load_config's tier 3 and
+# cmd_runtime_args's pin-vs-cwd guard disagree on what "more than one"
+# MEANS (one is a selection and must refuse rather than guess; the other is
+# a live pin already in force and an ambiguous derivation is not a
+# confident "no" to check it against, so it says nothing instead) -- so
+# each reads CANDIDATE_COUNT itself and decides. MODE is passed straight
+# through to derive_project_candidates() -- see that function's own comment
+# for why the pin-vs-cwd guard passes "lenient" here while load_config's own
+# tier 3 leaves it at the "strict" default.
 single_candidate_winner() {
-	local pwd_path="$1" candidates cname cdir
+	local pwd_path="$1" mode="${2:-strict}" candidates cname cdir
 	CANDIDATE_COUNT=0
 	CANDIDATE_WINNER=""
 	CANDIDATE_LIST_TEXT=""
-	candidates="$(derive_project_candidates "$pwd_path")"
+	candidates="$(derive_project_candidates "$pwd_path" "$mode")"
 	[ -n "$candidates" ] || return 0
 	while IFS="$(printf '\t')" read -r cname cdir; do
 		[ -n "$cname" ] || continue
@@ -10403,11 +10425,20 @@ cmd_runtime_args() {
 	# tier 2 already won, and an ambiguous derivation is not a confident "no"
 	# to check it against, so guessing at a conflict would be exactly the
 	# kind of guess #78 refuses to make.
+	#
+	# MODE "lenient": this is a consultative second opinion on a selection
+	# already settled, not a selection itself -- an unrelated pinned config
+	# elsewhere in projects_dir() that happens to be unreadable must not
+	# turn into a fresh refusal for a build this guard would otherwise have
+	# waved through (see derive_project_candidates()'s own comment). Fail
+	# closed is for CHOOSING a project; this only ever downgrades a "yes,
+	# they agree" to "cannot be sure", which is exactly the same "say
+	# nothing" answer an ambiguous derivation already gets below.
 	if [ "$PROJECT_SELECT_SOURCE" = "\$MACKAS_PROJECT_SELECT" ]; then
 		local rt_pwd rt_n=0 rt_winner="" rt_chain_component rt_chain_n=0 rt_chain_winner=""
 		local rt_effective="" rt_effective_src=""
 		rt_pwd="$(pwd -P)"
-		single_candidate_winner "$rt_pwd"
+		single_candidate_winner "$rt_pwd" lenient
 		rt_n="$CANDIDATE_COUNT"; rt_winner="$CANDIDATE_WINNER"
 		if [ "$rt_n" -eq 1 ]; then
 			rt_effective="$rt_winner"; rt_effective_src="derived from \$PWD"
@@ -10417,7 +10448,7 @@ cmd_runtime_args() {
 			# always forecloses the chain ever naming something else.
 			rt_chain_component="$(kas_chain_first_component "$kas_files")"
 			if [ -n "$rt_chain_component" ]; then
-				single_candidate_winner "$rt_pwd/$rt_chain_component"
+				single_candidate_winner "$rt_pwd/$rt_chain_component" lenient
 				rt_chain_n="$CANDIDATE_COUNT"; rt_chain_winner="$CANDIDATE_WINNER"
 				if [ "$rt_chain_n" -eq 1 ]; then
 					rt_effective="$rt_chain_winner"; rt_effective_src="derived from the kas chain"
