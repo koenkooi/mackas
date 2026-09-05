@@ -2167,8 +2167,30 @@ derive_paths() {
 	MACKAS_WORK="$MACKAS_BASE/work"
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
+	# Selected -> logs/<name>, so two pinned projects on one MACKAS_ROOT never
+	# share a log directory. Every one of dump's output, the smoketest log,
+	# status's "Recent logs" listing and bare `clean`'s wipe reads this single
+	# variable, so this one gate scopes all four for free. Unselected, this
+	# must stay exactly $MACKAS_BASE/logs, flat -- #79's
+	# backward-compatibility rule, same gate as MACKAS_ENV_SH/
+	# MACKAS_KAS_FRAGMENT_SRC below. That compatibility cuts one way only:
+	# an unselected bare `clean` still wipes the whole flat logs/, per-project
+	# subdirectories included, because it wipes MACKAS_LOGS and that IS the
+	# flat dir when nothing is selected -- see clean_usage().
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_LOGS="$MACKAS_BASE/logs/$PROJECT_SELECTED"
+	fi
 	MACKAS_PROJECT="$(strip_trailing_slash "$MACKAS_WORK/$MACKAS_PROJECT_DIR")"
+	# Selected -> env-<name>.sh, so two pinned projects on one MACKAS_ROOT never
+	# share a generated env file. Unselected, this must stay exactly
+	# $MACKAS_BASE/env.sh -- #79's backward-compatibility rule -- so gate on
+	# PROJECT_SELECTED itself, not on anything that could be non-empty without
+	# it (PROJECT_SELECTED is validated by validate_project_select() the
+	# moment it is set, so it is already safe to paste into a filename here).
 	MACKAS_ENV_SH="$MACKAS_BASE/env.sh"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_ENV_SH="$MACKAS_BASE/env-$PROJECT_SELECTED.sh"
+	fi
 	# See setup_gitconfig() for why this file exists at all.
 	MACKAS_GITCONFIG="$MACKAS_BASE/gitconfig"
 	KAS_CONTAINER_BIN="$MACKAS_BIN/kas-container"
@@ -2182,7 +2204,17 @@ derive_paths() {
 	# kas fragment, as seen from the project checkout (kas rewrites paths
 	# under the repo dir to /repo/... inside the container, so the fragment
 	# has to physically live inside the checkout).
+	# Selected -> macos-<name>.yml, so two pinned projects on one MACKAS_ROOT
+	# never share a canonical fragment (same rule, same gate as MACKAS_ENV_SH
+	# just above). Unselected, this must stay exactly $MACKAS_KAS/macos.yml --
+	# #79's backward-compatibility rule. The in-checkout copy
+	# (MACKAS_KAS_FRAGMENT_REPO) does NOT get a project component: each
+	# project has its own private checkout under MACKAS_PROJECT, so there is
+	# no naming collision to resolve there.
 	MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos.yml"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos-$PROJECT_SELECTED.yml"
+	fi
 	MACKAS_KAS_FRAGMENT_REPO="$MACKAS_PROJECT/kas/macos-local.yml"
 	KAS_FILES_ARG="$(compose_kas_files)"
 
@@ -4466,7 +4498,7 @@ setup_shim_and_env() {
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
-	local q_fragrepo q_autofrag q_autoproj q_brew
+	local q_fragrepo q_autofrag q_autoproj q_brew q_projsel
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -4490,6 +4522,24 @@ setup_shim_and_env() {
 	q_fragrepo="$(shq "$MACKAS_KAS_FRAGMENT_REPO")"
 	q_autofrag="$(shq "$MACKAS_KAS_AUTO_FRAGMENT")"
 	q_autoproj="$(shq "$MACKAS_KAS_AUTO_PROJECT")"
+
+	# Only when a project is selected -- MACKAS_ENV_SH is $MACKAS_BASE/env.sh,
+	# unchanged, for an unselected run, and this stays empty so that file's
+	# generated text is untouched (#79 backward-compatibility rule). Selected,
+	# it becomes the tail of the MACKAS_KAS_AUTO_PROJECT export line below,
+	# with its own leading newline, rather than a standalone line -- so an
+	# unselected env.sh gets not so much as an extra blank line out of this.
+	local projsel_export=""
+	if [ -n "$PROJECT_SELECTED" ]; then
+		q_projsel="$(shq "$PROJECT_SELECTED")"
+		projsel_export="
+# ':-' so a value already exported in THIS shell wins, exactly like
+# MACKAS_KAS_AUTO_FRAGMENT/_AUTO_PROJECT above. A bare assignment would
+# silently override a MACKAS_PROJECT_SELECT you (or an earlier sourced
+# env-<name>.sh, in the same shell) already set, with whichever project this
+# file happened to be generated for -- see PROJECT_SELECTED in $SCRIPT_NAME.
+export MACKAS_PROJECT_SELECT=\${MACKAS_PROJECT_SELECT:-$q_projsel}"
+	fi
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_ENV_SH" "$C_RST"
@@ -4581,7 +4631,7 @@ export MACKAS_KAS_FRAGMENT_REPO=$q_fragrepo
 # 'MACKAS_KAS_AUTO_PROJECT=0' set in a shell rc BEFORE env.sh is sourced,
 # which is a perfectly reasonable way to turn either of these off.
 export MACKAS_KAS_AUTO_FRAGMENT=\${MACKAS_KAS_AUTO_FRAGMENT:-$q_autofrag}
-export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}
+export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}$projsel_export
 
 # _mackas_derive_project needs this to tell "cwd is work/" from "cwd is a
 # checkout under work/". Same value as KAS_WORK_DIR above, under the name the
@@ -6975,7 +7025,9 @@ kas_shell_ro() {
 	# a directly-driven kas-container per project under work/ -- never runs
 	# 'setup' again for each newly-cloned project. So KAS_FILES_ARG's
 	# always-appended kas/macos-local.yml (compose_kas_files) may simply not
-	# exist yet for THIS project even though the shared kas/macos.yml does.
+	# exist yet for THIS project even though the canonical copy at
+	# MACKAS_KAS_FRAGMENT_SRC (macos.yml, or macos-<name>.yml once a project
+	# is selected -- #79) already does.
 	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
 	# regenerating unconditionally, and setup_kas_fragment() already honours
 	# --dry-run itself (prints the plan, writes nothing). Redirected to
@@ -7718,7 +7770,7 @@ Runs \`kas-container dump --skip repos_checkout --skip repos_apply_patches
 config and saves the resolved YAML it prints to
 \$MACKAS_LOGS/dump-<timestamp>.yml -- every env var, every local override
 and every repo ref resolved to its exact value, a reproducibility record
-next to a build's own logs (see item 13 in TODO.md). Purely read-only:
+next to a build's own logs. Purely read-only:
 kas dump writes nothing into the checkout itself -- the two --skip flags are
 load-bearing for that claim, not decorative. Resolving a branch/tag still
 needs kas to know the repo (cloning one that is missing, same as a real
@@ -10130,6 +10182,10 @@ cmd_status() {
 	show "project checkout"   "$MACKAS_PROJECT"
 	show "kas files"          "$KAS_FILES_ARG"
 	show "env.sh"             "$MACKAS_ENV_SH"
+	# Worth a line of its own now that a selected project moves it to
+	# logs/<name>: "Recent logs" below prints bare filenames, so this is the
+	# only place that says which directory they came out of.
+	show "logs"               "$MACKAS_LOGS"
 	show "shim"               "$SHIM_DIR/docker"
 
 	hdr "Present?"
@@ -10267,7 +10323,10 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD clean [TARGET...]
 
 Bare '$SCRIPT_CMD clean' (no target) deletes and recreates the WHOLE TMPDIR
-volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. That drops everything
+volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. With a project selected
+that is only that project's own logs/<name>, never a sibling's; with none
+selected it is the flat logs/, and clearing that takes every project's
+logs/<name> sitting under it along with it. That drops everything
 under TOPDIR, not just tmp/: deploy, buildhistory (if the project inherits
 it), conf/ and cache/ all go too. DL_DIR and SSTATE_DIR are never touched --
 having them in separate volumes is exactly why this works. Only prompts once
