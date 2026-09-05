@@ -651,6 +651,31 @@ pin() {
 	printf '%s\n' "$output" | grep -qi 'stale'
 }
 
+# #78: MACKAS_ROOT itself is fine, but <root>/work/<name> -- the directory
+# tier-3 derivation actually keys off -- is missing (moved, renamed, or never
+# created). "identity is never re-minted": the fix is to move the checkout
+# back or drop the pin, never for mackas to guess a replacement.
+@test "projects flags a pin whose MACKAS_ROOT exists but <root>/work/<name> does not" {
+	mkdir -p "$TESTDIR/oe/work"
+	pin meta-ai <<-EOF
+	MACKAS_ROOT='$TESTDIR/oe'
+	EOF
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi 'stale'
+	printf '%s\n' "$output" | grep -qF "$TESTDIR/oe/work/meta-ai"
+}
+
+@test "projects does NOT flag a pin whose <root>/work/<name> exists" {
+	mkdir -p "$TESTDIR/oe/work/meta-ai"
+	pin meta-ai <<-EOF
+	MACKAS_ROOT='$TESTDIR/oe'
+	EOF
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi 'stale'
+}
+
 @test "projects with nothing pinned says so instead of printing nothing" {
 	rm -rf "$HOME/.config"
 	run "$MACKAS" projects
