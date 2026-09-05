@@ -176,6 +176,17 @@ OVERHEAD_OUT=""
 # `${FOO_ARGS+...}` is safe under `set -u` when that command never ran.
 VOLUME_ARGS=()
 RUNTIME_ARGS_ARGS=()
+
+# #78: the hand-typed kas chain `mackas runtime-args --kas-files` was given
+# (the generated wrapper's own hint at the file list a hand-typed
+# `kas-container build/shell/checkout <files>` was just called with), or
+# empty when there is none. main() peels this out of RUNTIME_ARGS_ARGS
+# BEFORE load_config runs (see the pre-scan next to the runtime-args case in
+# main()'s flag loop) so tier 3 can see it while deciding which config to
+# source -- load_config reads this global directly rather than taking a new
+# parameter, the same way it already reads $MACKAS_PROJECT_SELECT straight
+# out of the environment.
+RUNTIME_ARGS_KAS_FILES=""
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
 BUILDHISTORY_ARGS=()
@@ -1252,6 +1263,85 @@ derive_project_candidates() {
 	done
 }
 
+# single_candidate_winner PWD_PATH -- run derive_project_candidates(PWD_PATH)
+# and reduce it to the three globals every caller below actually wants:
+# CANDIDATE_COUNT (how many lines it printed), CANDIDATE_WINNER (the last
+# one's name -- meaningful only when CANDIDATE_COUNT is 1), and
+# CANDIDATE_LIST_TEXT (every "name -> dir" line, indented, for a caller that
+# is about to die() listing them all). Never dies on more than one itself --
+# load_config's tier 3 and cmd_runtime_args's pin-vs-cwd guard disagree on
+# what "more than one" MEANS (one is a selection and must refuse rather than
+# guess; the other is a live pin already in force and an ambiguous
+# derivation is not a confident "no" to check it against, so it says nothing
+# instead) -- so each reads CANDIDATE_COUNT itself and decides.
+single_candidate_winner() {
+	local pwd_path="$1" candidates cname cdir
+	CANDIDATE_COUNT=0
+	CANDIDATE_WINNER=""
+	CANDIDATE_LIST_TEXT=""
+	candidates="$(derive_project_candidates "$pwd_path")"
+	[ -n "$candidates" ] || return 0
+	while IFS="$(printf '\t')" read -r cname cdir; do
+		[ -n "$cname" ] || continue
+		CANDIDATE_COUNT=$((CANDIDATE_COUNT + 1))
+		CANDIDATE_WINNER="$cname"
+		CANDIDATE_LIST_TEXT="$CANDIDATE_LIST_TEXT    $cname -> $cdir"$'\n'
+	done <<EOF
+$candidates
+EOF
+}
+
+# kas_chain_first_component CHAIN -- the shared leading path component of
+# every colon-separated entry in CHAIN (kas's own file-list argument, exactly
+# as a hand-typed `kas-container build/shell/checkout <files>` gave it), or
+# nothing at all when there is no such hint to give:
+#
+#   * CHAIN is empty (no --kas-files hint reached us at all)
+#   * any entry is absolute -- it already names a real path outright, so
+#     there is nothing to derive relative to $PWD
+#   * a sibling-spanning chain whose entries disagree on their first
+#     component (env.sh's own _mackas_derive_project applies the identical
+#     rule, for the identical reason spelled out in its own comment: cwd
+#     sits inside ONE checkout, so two different leading components can
+#     never both be "the workspace this call runs from")
+#   * an entry with no '/' at all -- nothing names a workspace directory
+#   * the resulting component fails the same character class
+#     validate_project_select() enforces on every name pasted into a path
+#     (derive_project_candidates() already treats a malformed pinned config
+#     NAME the same way -- silently not a candidate, never a die, since a
+#     bad name here is not evidence of anything, just not a hint)
+#
+# Deliberately never dies: an invalid or absent hint is exactly as good as
+# no hint at all, and the caller's own candidate matching (never this
+# function) is what decides whether the resulting path names anything real.
+kas_chain_first_component() {
+	local files="$1" rest entry component proj=""
+	[ -n "$files" ] || return 0
+	rest="$files"
+	while [ -n "$rest" ]; do
+		entry="${rest%%:*}"
+		case "$rest" in
+			*:*) rest="${rest#*:}" ;;
+			*) rest="" ;;
+		esac
+		[ -n "$entry" ] || return 0
+		case "$entry" in
+			/*) return 0 ;;
+			*/*) component="${entry%%/*}" ;;
+			*) return 0 ;;
+		esac
+		if [ -z "$proj" ]; then
+			proj="$component"
+		elif [ "$proj" != "$component" ]; then
+			return 0
+		fi
+	done
+	case "$proj" in
+		""|-*|.|..|*..*|*[!A-Za-z0-9._-]*) return 0 ;;
+	esac
+	printf '%s\n' "$proj"
+}
+
 # How PROJECT_SELECTED came to be in force, as a clause for a message that
 # already names it -- "... under X". Every #78 tier gets a truthful phrasing
 # here, not just the explicit --project case these messages predate.
@@ -1259,6 +1349,7 @@ project_select_description() {
 	case "$PROJECT_SELECT_SOURCE" in
 		--project) printf -- "--project %s" "$PROJECT_SELECTED" ;;
 		"\$MACKAS_PROJECT_SELECT") printf '$MACKAS_PROJECT_SELECT=%s' "$PROJECT_SELECTED" ;;
+		"derived from the kas chain") printf "the project '%s', derived from the kas chain" "$PROJECT_SELECTED" ;;
 		*) printf "the project '%s', derived from \$PWD" "$PROJECT_SELECTED" ;;
 	esac
 }
@@ -1266,13 +1357,15 @@ project_select_description() {
 # The escape hatch for "this selection is not what you want here". An
 # explicit --project/$MACKAS_PROJECT_SELECT selector is something the caller
 # typed and can drop or unset; a #78 tier-3 derivation was never typed at
-# all, so the only real escapes are to stand somewhere else or to name a
-# project explicitly instead -- telling a derived selection to "drop
-# --project NAME" would be a lie: there is no such flag to drop.
+# all, so the only real escapes are to stand somewhere else (or without a
+# kas chain that names a workspace) or to name a project explicitly instead
+# -- telling a derived selection to "drop --project NAME" would be a lie:
+# there is no such flag to drop.
 project_select_drop_hint() {
 	case "$PROJECT_SELECT_SOURCE" in
 		--project) printf "drop '--project %s'" "$PROJECT_SELECTED" ;;
 		"\$MACKAS_PROJECT_SELECT") printf 'unset $MACKAS_PROJECT_SELECT' ;;
+		"derived from the kas chain") printf 'run without a kas chain naming this workspace, or pass --project/--config explicitly' ;;
 		*) printf 'run from outside this workspace, or pass --project/--config explicitly' ;;
 	esac
 }
@@ -1352,24 +1445,53 @@ load_config() {
 	# a pinned MACKAS_ROOT recorded as the link, the physical target, or
 	# anything in between all resolve to the same candidate, and $PWD reached
 	# through the link or directly both resolve to the same physical string.
-	local pwd_phys candidates n_candidates=0 winner_name="" list="" cname cdir
+	local pwd_phys n_candidates=0 winner_name=""
 	pwd_phys="$(pwd -P)"
-	candidates="$(derive_project_candidates "$pwd_phys")"
-	if [ -n "$candidates" ]; then
-		while IFS="$(printf '\t')" read -r cname cdir; do
-			[ -n "$cname" ] || continue
-			n_candidates=$((n_candidates + 1))
-			winner_name="$cname"
-			list="$list    $cname -> $cdir"$'\n'
-		done <<EOF
-$candidates
-EOF
-		if [ "$n_candidates" -gt 1 ]; then
-			die "\$PWD ($pwd_phys) matches more than one pinned project's workspace" \
-				"$(printf '%s' "$list")pass --project NAME to pick one of the above"
-		fi
+	single_candidate_winner "$pwd_phys"
+	n_candidates="$CANDIDATE_COUNT"; winner_name="$CANDIDATE_WINNER"
+	if [ "$n_candidates" -gt 1 ]; then
+		die "\$PWD ($pwd_phys) matches more than one pinned project's workspace" \
+			"$(printf '%s' "$CANDIDATE_LIST_TEXT")pass --project NAME to pick one of the above"
+	fi
+	if [ "$n_candidates" -eq 1 ]; then
 		select_pinned_project "$winner_name" "derived from \$PWD" 0
 		return 0
+	fi
+
+	# #78's kas-chain special case: standing in work/ itself and hand-typing
+	# `kas-container build meta-qcom/kas/base.yml:...` cannot be derived from
+	# $PWD alone above -- $PWD there is work/, the parent of every checkout,
+	# not any one project's own directory -- so try the wrapper's own
+	# --kas-files hint (main() peeled it out of RUNTIME_ARGS_ARGS before this
+	# ran; see RUNTIME_ARGS_KAS_FILES's own comment) next, forming the SAME
+	# candidate path a real cd into that checkout would have.
+	#
+	# Only ever reached when $PWD alone matched NOTHING above, and that is
+	# not merely an ordering choice: whenever $PWD DOES match a project, the
+	# match means $PWD already sits inside (or at) that project's own
+	# candidate directory, and the chain-derived path is, by construction,
+	# always exactly one path component DEEPER than $PWD -- so it is
+	# necessarily inside that same project's tree too (prefix containment is
+	# transitive) and would either re-confirm the very same project or, if a
+	# second project's workspace happens to be nested there too, join the
+	# "more than one" die above instead. A clean disagreement between $PWD
+	# and the chain (two DIFFERENT single winners, neither ambiguous) is
+	# therefore not a case that can occur here; there is nothing left for a
+	# separate die to catch.
+	local chain_component chain_path n_chain=0 chain_winner=""
+	chain_component="$(kas_chain_first_component "$RUNTIME_ARGS_KAS_FILES")"
+	if [ -n "$chain_component" ]; then
+		chain_path="$pwd_phys/$chain_component"
+		single_candidate_winner "$chain_path"
+		n_chain="$CANDIDATE_COUNT"; chain_winner="$CANDIDATE_WINNER"
+		if [ "$n_chain" -gt 1 ]; then
+			die "the kas chain's workspace ($chain_path) matches more than one pinned project's workspace" \
+				"$(printf '%s' "$CANDIDATE_LIST_TEXT")pass --project NAME to pick one of the above"
+		fi
+		if [ "$n_chain" -eq 1 ]; then
+			select_pinned_project "$chain_winner" "derived from the kas chain" 0
+			return 0
+		fi
 	fi
 
 	# ./mackas.conf is deliberately NOT in this list.
@@ -1982,6 +2104,9 @@ derive_paths() {
 # in force -- naming the project, what it was derived from, and the three
 # volume names it resolved to, so a build run from inside a workspace never
 # silently mounts a different project's volumes without SOME visible trace.
+# Fires identically whichever tier-3 SOURCE won -- $PWD alone or the kas
+# chain -- since PROJECT_SELECT_SOURCE already reads naturally either way
+# ("derived from $PWD" / "derived from the kas chain").
 #
 # At most once per PROCESS even though derive_paths() runs more than once per
 # invocation (adopt/setup recompute after picking a stem): PROJECT_SELECT_
@@ -1990,12 +2115,15 @@ derive_paths() {
 # never for any --help path -- those never call load_config at all, so
 # PROJECT_SELECT_SOURCE is still empty by the time this runs.
 project_select_resolution_note() {
-	[ "$PROJECT_SELECT_SOURCE" = "derived from \$PWD" ] || return 0
+	case "$PROJECT_SELECT_SOURCE" in
+		"derived from \$PWD"|"derived from the kas chain") ;;
+		*) return 0 ;;
+	esac
 	[ "$PROJECT_SELECT_NOTE_SHOWN" -eq 0 ] || return 0
 	[ "${SCRIPT_SUBCOMMAND:-}" != "status" ] || return 0
 	PROJECT_SELECT_NOTE_SHOWN=1
-	printf 'mackas: selected project '"'"'%s'"'"', derived from $PWD -- volumes: %s, %s, %s\n' \
-		"$PROJECT_SELECTED" "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" >&2
+	printf 'mackas: selected project '"'"'%s'"'"', %s -- volumes: %s, %s, %s\n' \
+		"$PROJECT_SELECTED" "$PROJECT_SELECT_SOURCE" "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" >&2
 }
 
 # The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
@@ -5039,6 +5167,62 @@ for _mackas_kas_arg in "\$@"; do
 	esac
 done
 
+# #78's kas-chain hint: standing in work/ itself and hand-typing
+# 'kas-container build meta-qcom/kas/base.yml:...' cannot be derived from
+# \$PWD alone -- \$PWD there is work/, the parent of every checkout, not any
+# one project's own directory -- so \$SCRIPT_NAME's own tier-3 selection
+# needs the file list's leading path component as a fallback hint. Only
+# build/shell/checkout take that argument shape (dump/menu have a different
+# positional -- see env.sh's own kas-container() function for the fuller
+# story); the leading-options scan below is the SAME shape as that
+# function's own (a boolean flag, a value flag consuming its own next
+# token, or backing off entirely at an unknown option) so the two can never
+# derive a different answer for the same invocation.
+#
+# Defined as a NAMED FUNCTION, called from inside a command substitution,
+# rather than a bare \`case\` written directly inside "\$(...)" -- the two look
+# equivalent but are not: Apple's own /bin/sh (bash 3.2's POSIX-mode
+# personality, confirmed live) mis-parses a \`case\`/\`esac\` block written
+# INLINE inside a command substitution, reading its lines back out as
+# literal text instead of executing them. Wrapping the SAME logic in a
+# function sidesteps that parser bug entirely (a function body is read by
+# the normal top-level parser, not whatever "\$(...)" uses to find its own
+# end), and gets the "\$@" isolation this needs as a side effect of ordinary
+# POSIX function scoping anyway: a function's own positional parameters
+# shadow the caller's, so its \`shift\`s never touch the real "\$@" this
+# script still needs whole, further down, for the final exec.
+#
+# The raw chain is handed to \`runtime-args\` UNPARSED: only \$SCRIPT_NAME
+# itself (never this POSIX wrapper) is allowed to validate a name before it
+# is pasted into a path (#78's whole security framing) -- this is nothing
+# more than "here is the file list you were given", exactly like
+# --expect-work is "here is the work dir I was generated for".
+_mackas_kas_files_scan() {
+	case "\${1:-}" in
+		build|shell|checkout)
+			shift
+			while [ \$# -gt 0 ]; do
+				case "\$1" in
+					-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
+						shift ;;
+					--skip=*|--target=*|--cmd=*|--task=*|--provenance=*)
+						shift ;;
+					--skip|--target|-c|--cmd|--task|--provenance)
+						shift
+						[ \$# -gt 0 ] && shift
+						;;
+					-*)
+						break ;;
+					*)
+						printf '%s' "\$1"
+						break ;;
+				esac
+			done
+			;;
+	esac
+}
+_mackas_kas_files="\$(_mackas_kas_files_scan "\$@")"
+
 # Live recompute: ask $SCRIPT_NAME itself for today's --runtime-args string,
 # so a setting change (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a
 # MACKAS_VOLUME_NAME override, ...) reaches a hand-typed 'kas-container ...'
@@ -5063,7 +5247,11 @@ done
 # below could explain itself, and it also keeps the exit status, which a
 # bare assignment discards.
 _mackas_rt_rc=0
-rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK")" || _mackas_rt_rc=\$?
+if [ -n "\$_mackas_kas_files" ]; then
+	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK" --kas-files "\$_mackas_kas_files")" || _mackas_rt_rc=\$?
+else
+	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK")" || _mackas_rt_rc=\$?
+fi
 
 # FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
 # computing this string is a safety guard -- a held volume, two volume names
@@ -10051,7 +10239,7 @@ mounts, mirror mounts if enabled, the live-progress-bridge args if
 MACKAS_MONITOR=1) and nothing else.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR]
+  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR] [--kas-files CHAIN]
 
 Not something you normally run directly: the generated \`kas-container\`
 wrapper calls this itself, once per invocation, so a setting that
@@ -10068,6 +10256,15 @@ gitconfig stay frozen in it, so a config naming another root would mount
 another project's ext4 volumes under this project's sources. Comparing
 identities rather than freezing the config path keeps an ambient
 \$MACKAS_CONF usable whenever it agrees, and refuses only when it does not.
+
+${C_BLD}--kas-files CHAIN${C_RST} is plumbing too: the generated wrapper's own hint at the
+file list a hand-typed \`kas-container build/shell/checkout <files>\` was just
+called with, forwarded here so tier-3 project selection (#78) can derive a
+project from the chain's own leading path component when \$PWD alone (e.g.
+standing in work/ itself) derives nothing. Only ever consulted as a
+fallback -- \$PWD always wins when it derives anything on its own -- and only
+ever after the same validation any other name gets before it is pasted into
+a path.
 
 ${C_BLD}--require-volumes-free${C_RST} applies the one-VM rule first and prints nothing
 if it fails: refuse, naming the volume, when a running container already
@@ -10123,13 +10320,15 @@ EOF
 # the wrapper starts the container runtime before it gets here, because
 # volume_in_use() short-circuits to "not in use" with the daemon down.
 cmd_runtime_args() {
-	local want_help=0 require_free=0 expect_work=""
+	local want_help=0 require_free=0 expect_work="" kas_files=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
 			--require-volumes-free) require_free=1; shift ;;
 			--expect-work) expect_work="${2:-}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift 2 ;;
 			--expect-work=*) expect_work="${1#*=}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift ;;
+			--kas-files) kas_files="${2:-}"; [ -n "$kas_files" ] || die "--kas-files needs a CHAIN"; shift 2 ;;
+			--kas-files=*) kas_files="${1#*=}"; [ -n "$kas_files" ] || die "--kas-files needs a CHAIN"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
@@ -12579,6 +12778,30 @@ main() {
 	done
 
 	SCRIPT_SUBCOMMAND="${cmd:-check}"
+
+	# #78: pull --kas-files out of RUNTIME_ARGS_ARGS BEFORE load_config runs.
+	# load_config's tier 3 needs the wrapper's kas-chain hint while deciding
+	# WHICH config to source, which happens long before cmd_runtime_args ever
+	# gets to parse its own argv -- so this is a small, deliberate, EARLY peek
+	# at the same array cmd_runtime_args() parses properly (and validates)
+	# once dispatch actually reaches it below. Lenient on purpose: a
+	# malformed or duplicated flag here just means load_config sees no hint
+	# (or the last one), and cmd_runtime_args's own parser is what gives a
+	# real user-facing error for a genuinely bad invocation.
+	if [ "${cmd:-}" = "runtime-args" ]; then
+		local _mackas_prescan_arg="" _mackas_prescan_prev=""
+		for _mackas_prescan_arg in ${RUNTIME_ARGS_ARGS+"${RUNTIME_ARGS_ARGS[@]}"}; do
+			if [ "$_mackas_prescan_prev" = "--kas-files" ]; then
+				RUNTIME_ARGS_KAS_FILES="$_mackas_prescan_arg"
+				_mackas_prescan_prev=""
+				continue
+			fi
+			case "$_mackas_prescan_arg" in
+				--kas-files=*) RUNTIME_ARGS_KAS_FILES="${_mackas_prescan_arg#*=}" ;;
+				--kas-files) _mackas_prescan_prev="--kas-files" ;;
+			esac
+		done
+	fi
 
 	snapshot_env
 	set_defaults

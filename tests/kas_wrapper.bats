@@ -622,3 +622,84 @@ rec_runtime_args_value() {
 @test "the generated wrapper passes --expect-work with its frozen MACKAS_WORK" {
 	grep -qF -- '--expect-work "$MACKAS_WORK"' "$MACKAS_BIN/kas-container"
 }
+
+# ---------------------------------------------------------------------------
+# #78: the kas-chain hint. Standing in work/ itself, a hand-typed
+# 'kas-container build meta-qcom/kas/a.yml:...' cannot be derived from $PWD
+# alone -- so the wrapper's own leading-options scan (mirroring env.sh's
+# kas-container() function) finds the file-list argument and forwards it,
+# raw, as '--kas-files' on the SAME live-recompute call that already carries
+# --require-volumes-free/--expect-work. Unit-level: a fake MACKAS_SELF
+# records its own argv, so these assert WHAT THE WRAPPER FORWARDS without
+# needing a real 'mackas' behind it -- tests/kas_chain_derive_e2e.bats is the
+# companion file that drives a REAL mackas through this same wrapper end to
+# end, per #78's own coverage requirement.
+# ---------------------------------------------------------------------------
+
+@test "kas-files hint: a plain 'build <chain>' forwards the chain verbatim" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build meta-qcom/kas/a.yml:meta-qcom/kas/b.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml:meta-qcom/kas/b.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: 'shell' is scanned the same way as 'build'" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" shell meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: leading --skip VALUE and -k are skipped to find the chain" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build --skip repos_checkout -k meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: -c/--cmd's own VALUE (a string with a space) does not get mistaken for the chain" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" shell -c "bitbake -p" meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: an absolute file list is forwarded raw too -- validation is mackas's job, not the wrapper's" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build /abs/path/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files /abs/path/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: an unknown leading option makes the wrapper back off -- no hint forwarded" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build --some-unknown-flag meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	! grep -qF -- '--kas-files' "$SELF_REC"
+}
+
+@test "kas-files hint: 'dump' is not scanned -- its positional is not a kas file list" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" dump meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	! grep -qF -- '--kas-files' "$SELF_REC"
+}
+
+@test "kas-files hint: with no positional at all (bare 'build'), nothing is forwarded" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	! grep -qF -- '--kas-files' "$SELF_REC"
+}
+
+@test "kas-files hint: the scan runs in a subshell -- \$@ reaching the final exec is untouched" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build --skip repos_checkout -k meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	rec_argv | grep -qxF 'build'
+	rec_argv | grep -qxF -- '--skip'
+	rec_argv | grep -qxF 'repos_checkout'
+	rec_argv | grep -qxF -- '-k'
+	rec_argv | grep -qxF 'meta-qcom/kas/a.yml'
+}
