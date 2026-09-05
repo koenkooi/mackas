@@ -89,7 +89,8 @@ $MACKAS_ROOT/
 ├── bin/          the docker->container shim, kas-container, GNU realpath
 ├── kas/          the canonical generated tuning fragment (macos.yml;
 │                 macos-NAME.yml once a project is selected)
-├── logs/         smoketest/build logs
+├── logs/         smoketest/build logs (logs/NAME/ once a project is
+│                 selected, so two pinned projects never share one)
 ├── env.sh        generated; source this
 ├── gitconfig     generated; forwarded as GITCONFIG_FILE
 └── work/         <- every layer checkout lives HERE, as a sibling
@@ -106,6 +107,10 @@ re-cloned. `bin/`, `kas/` and `logs/` do not participate; only `work/` is
 what kas sees. A real multi-layer BSP — a dozen `meta-*` repos, not just the
 single project `setup` clones — goes under `work/` as siblings; see
 [Driving kas directly](#driving-kas-directly).
+
+Selecting a project does not move anything already sitting flat under
+`logs/` from before a project was ever selected on this root — an older
+`dump-*.yml` or `smoketest-*.log` stays exactly where it was written.
 
 ## Commands
 
@@ -131,7 +136,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. (The plural, read-only sibling of `project add`, which creates one.) |
 | `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
-| `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
+| `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml` (`logs/NAME/` once a project is selected), a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
 
 Options: `--config FILE`, `--project NAME`, `--set NAME=VALUE`, `--dry-run`,
 `-y/--yes` (or `-f/--force`), `-v/--verbose`, `--version`, `--help`.
@@ -148,7 +153,8 @@ fallback if your kas config has no sensible bare default.
 [mackas.conf.example](mackas.conf.example) ships meta-ai's ladder, commented
 out, as a worked example (smallest native recipe → same recipe
 cross-compiled → the real targets, **hours** cold). Each rung streams to
-`$MACKAS_ROOT/logs/` and stops the ladder on failure. See
+`$MACKAS_ROOT/logs/` (`logs/NAME/` once a project is selected) and stops the
+ladder on failure. See
 [testing.md](docs/testing.md#the-smoketest-ladder). `smoketest` and `shell`
 obey the **one-VM rule** like everything else: if another build already holds
 one of the three volumes, they refuse by name up front instead of letting

@@ -587,10 +587,12 @@ the `volume fsck <name>` fix hint right next to the affected volume
 ### Cleaning
 
 `mackas clean` with **no target** deletes and recreates the *whole* TMPDIR
-volume and clears the logs dir. That drops everything under `TOPDIR`, not just
-`tmp/` — deploy, **buildhistory**, `conf/` and `cache/` all go with it,
-silently, with no warning that buildhistory is included. `DL_DIR`/`SSTATE_DIR`
-are separate volumes and are never touched.
+volume and clears the logs dir (`logs/<name>` under an active `--project`
+selector — never a sibling project's own `logs/<other>`, and never the flat
+`logs/` a run with no project selected still uses). That drops everything
+under `TOPDIR`, not just `tmp/` — deploy, **buildhistory**, `conf/` and
+`cache/` all go with it, silently, with no warning that buildhistory is
+included. `DL_DIR`/`SSTATE_DIR` are separate volumes and are never touched.
 
 `mackas clean <target>` (repeatable, order irrelevant, each independently
 confirmed):
