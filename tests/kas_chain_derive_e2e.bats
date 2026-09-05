@@ -296,6 +296,13 @@ run_wrapper() {
 	[ ! -e "$KREC" ]
 	printf '%s\n' "$out" | grep -qF 'meta-qcom'
 	printf '%s\n' "$out" | grep -qF 'poky'
+	# Both one-off escapes must name the project the DIRECTORY says, not the
+	# wrapper's pin: someone who cd'd into work/poky and typed kas-container
+	# wants poky built, so "$SCRIPT_CMD --project meta-qcom shell" answers a
+	# question they did not ask, and leaves the one they did ask unanswered.
+	printf '%s\n' "$out" | grep -qF -- '--project poky shell'
+	printf '%s\n' "$out" | grep -qF -- '--project poky setup'
+	! printf '%s\n' "$out" | grep -qF -- '--project meta-qcom shell'
 }
 
 @test "pin-vs-cwd guard: the SAME wrapper still launches normally from meta-qcom's own workspace" {
