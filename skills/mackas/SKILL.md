@@ -59,6 +59,10 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
 
 ```sh
 source ~/oe/env.sh     # or $MACKAS_ROOT/env.sh if MACKAS_SHORT_LINK is empty
+                       # -- env-<name>.sh instead once ANY selection pins a project:
+                       #    --project, $MACKAS_PROJECT_SELECT, or just standing in a
+                       #    pinned workspace. `mackas status` prints the real path;
+                       #    read it there rather than guessing.
 mackas status          # or ./mackas status from wherever you cloned mackas
 ```
 
@@ -585,10 +589,17 @@ the `volume fsck <name>` fix hint right next to the affected volume
 ### Cleaning
 
 `mackas clean` with **no target** deletes and recreates the *whole* TMPDIR
-volume and clears the logs dir. That drops everything under `TOPDIR`, not just
-`tmp/` — deploy, **buildhistory**, `conf/` and `cache/` all go with it,
-silently, with no warning that buildhistory is included. `DL_DIR`/`SSTATE_DIR`
-are separate volumes and are never touched.
+volume and clears the logs dir. Which dir that is follows the selector, and
+the isolation runs one way only: with a project selected it is that
+project's own `logs/<name>`, never a sibling's `logs/<other>` and never the
+flat `logs/`; with **no** project selected it is the flat `logs/` — and
+clearing that takes every `logs/<name>` sitting under it along with it.
+Check `mackas status`'s `logs` line before running it if that matters.
+
+That drops everything
+under `TOPDIR`, not just `tmp/` — deploy, **buildhistory**, `conf/` and
+`cache/` all go with it, silently, with no warning that buildhistory is
+included. `DL_DIR`/`SSTATE_DIR` are separate volumes and are never touched.
 
 `mackas clean <target>` (repeatable, order irrelevant, each independently
 confirmed):
