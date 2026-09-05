@@ -944,6 +944,12 @@ CONFIG_FILE_USED=""
 # in one, so the four-rung precedence chain is untouched by it.
 PROJECT_SELECTED=""
 
+# How PROJECT_SELECTED got chosen -- "--project", "$MACKAS_PROJECT_SELECT" or
+# "derived from $PWD" (#78 tier 3) -- for `status` to report and for the
+# resolution note below. Empty whenever PROJECT_SELECTED is, so nothing extra
+# has to check both.
+PROJECT_SELECT_SOURCE=""
+
 # Where a project's pinned, standalone config lives. `adopt` already writes one
 # here; `--project NAME` reads exactly this path back.
 projects_dir() { printf '%s/.config/mackas/projects' "$HOME"; }
@@ -1128,6 +1134,119 @@ selector_conflict_hint() {
 	fi
 }
 
+# Source pinned project NAME's config exactly as strictly as --project always
+# has: validate the name before it is pasted into a path, allow a not-yet-
+# written file through only for set/get/unset (ALLOW_MISSING, mirroring the
+# typed-path leg just below in load_config), require config_file_is_safe()
+# rather than warn-and-continue (this path is one mackas built for itself out
+# of a bare name in a fixed, guessable place -- the search path's warn-and-
+# skip is not strict enough for that), then source it and record the
+# selection. SRC is both the die() attribution (validate_project_select) and
+# what ends up in PROJECT_SELECT_SOURCE for `status` and the resolution note.
+#
+# Shared by load_config's tier 1/2 (--project / $MACKAS_PROJECT_SELECT) and
+# tier 3 (#78's derivation from $PWD) so the two can never drift apart on how
+# strictly a pinned config gets graded before it runs as shell.
+select_pinned_project() {
+	local sel="$1" sel_src="$2" allow_missing="${3:-0}" f
+	validate_project_select "$sel" "$sel_src"
+	f="$(projects_dir)/$sel.conf"
+	if [ ! -r "$f" ]; then
+		# Same allowance the typed paths get below: `set` on a project
+		# nobody has pinned yet is how its config gets written.
+		if [ "$allow_missing" -eq 1 ] && [ ! -e "$f" ]; then
+			PROJECT_SELECTED="$sel"
+			CONFIG_FILE_USED="$f"
+			PROJECT_SELECT_SOURCE="$sel_src"
+			return 0
+		fi
+		die "no pinned project '$sel': $f is not readable" \
+			"$SCRIPT_CMD projects  (lists the pinned ones)"
+	fi
+	# A directory (or a fifo) here is readable, and a 0755 directory of
+	# ours passes the grade below untouched -- it would reach `. "$f"`
+	# and come back out as a raw shell error. -f follows symlinks, so a
+	# config kept as a link to a real file still qualifies.
+	[ -f "$f" ] || die "not a config file: $f is not a regular file" \
+		"$SCRIPT_CMD projects  (lists the pinned ones)"
+	# STRICTER than the typed paths below, deliberately. mackas built this
+	# path itself out of a bare name, in a fixed and entirely guessable
+	# place -- that is the ambush shape the search path is guarded against,
+	# not the request shape --config is. Refuse rather than fall through to
+	# the search path: the caller asked for THIS project, and silently
+	# loading a different one is worse than stopping.
+	if ! config_file_is_safe "$f"; then
+		die "refusing to source $f: it (or the directory it really lives in) is owned by someone else or writable by group/other" \
+			"chmod go-w $(printf '%q' "$f") $(printf '%q' "$(projects_dir)")"
+	fi
+	# shellcheck disable=SC1090
+	. "$f"
+	PROJECT_SELECTED="$sel"
+	CONFIG_FILE_USED="$f"
+	PROJECT_SELECT_SOURCE="$sel_src"
+}
+
+# derive_project_candidates PWD_PHYS -- print "name<TAB>workspace-dir" for
+# every pinned project (projects_dir()/*.conf) whose MACKAS_ROOT/work/<name>
+# -- resolved physically, exactly as PWD_PHYS itself must already be -- names
+# PWD_PHYS itself or a directory beneath it. Zero lines is a legitimate
+# answer (nothing on disk claims this directory), not an error.
+#
+# #78's security framing: a derived path under a predictable, name-guessable
+# location ($HOME/.config/mackas/projects/*.conf) is an ambush surface, not a
+# request. So every candidate's MACKAS_ROOT is GREPPED (config_grep_setting),
+# never sourced, while enumerating -- only the single eventual winner is ever
+# sourced, by select_pinned_project(), and only after config_file_is_safe().
+#
+# Fails CLOSED on a pinned config this process cannot read: it could have
+# been the match, and grepping it is the only way to find out, so the
+# question "does anything here match $PWD" is unanswerable rather than "no"
+# -- die naming the file rather than silently treating it as a non-candidate
+# (the same rule pinned_configs_unreadable()'s callers apply to destroy/
+# clean's shared-volume refusal). This can only fire while tier 3 is being
+# evaluated, i.e. when the caller (load_config) has already established that
+# no explicit --project/$MACKAS_PROJECT_SELECT/--config/$MACKAS_CONF was
+# given -- an explicit selector never reaches this function at all.
+derive_project_candidates() {
+	local pwd_phys="$1" dir f name root cand
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		if [ ! -r "$f" ]; then
+			die "cannot tell whether \$PWD names a pinned project: $f is not readable, and it could have been the match" \
+				"fix its permissions (or remove it if stale) in $(projects_dir), then re-run -- or pass --project NAME/--config to bypass derivation entirely"
+		fi
+		name="$(basename "$f" .conf)"
+		# The same character class validate_project_select() enforces on
+		# every name that gets pasted into a path, applied here silently
+		# rather than through that function's die(): a file in this
+		# directory with an odd name is simply not a candidate, not a
+		# reason to abort an unrelated command run from an unrelated
+		# directory. select_pinned_project() re-validates the eventual
+		# winner's name regardless, so nothing unsafe reaches a path
+		# through this shortcut.
+		case "$name" in
+			""|-*|.|..|*..*|*[!A-Za-z0-9._-]*) continue ;;
+		esac
+		root="$(config_grep_setting "$f" MACKAS_ROOT)" || continue
+		# #78: a MACKAS_ROOT that is not an absolute path (relative, '~',
+		# '$HOME', a command substitution -- config_grep_setting prints
+		# those raw) is simply not a candidate. Never eval or expand it.
+		case "$root" in
+			/*) ;;
+			*) continue ;;
+		esac
+		# resolve_path is physical and tolerates a target that does not
+		# exist (a stale or renamed root just prints its input back,
+		# unresolved -- which then simply fails to prefix-match a real,
+		# resolved PWD_PHYS, exactly as it should).
+		cand="$(resolve_path "$(strip_trailing_slash "$root")/work/$name")"
+		case "$pwd_phys" in
+			"$cand"|"$cand"/*) printf '%s\t%s\n' "$name" "$cand" ;;
+		esac
+	done
+}
+
 load_config() {
 	local explicit="${1:-}" allow_missing="${2:-0}" select="${3:-}"
 	local f
@@ -1160,39 +1279,7 @@ load_config() {
 	fi
 
 	if [ -n "$sel" ]; then
-		validate_project_select "$sel" "$sel_src"
-		f="$(projects_dir)/$sel.conf"
-		if [ ! -r "$f" ]; then
-			# Same allowance the typed paths get below: `set` on a project
-			# nobody has pinned yet is how its config gets written.
-			if [ "$allow_missing" -eq 1 ] && [ ! -e "$f" ]; then
-				PROJECT_SELECTED="$sel"
-				CONFIG_FILE_USED="$f"
-				return 0
-			fi
-			die "no pinned project '$sel': $f is not readable" \
-				"$SCRIPT_CMD projects  (lists the pinned ones)"
-		fi
-		# A directory (or a fifo) here is readable, and a 0755 directory of
-		# ours passes the grade below untouched -- it would reach `. "$f"`
-		# and come back out as a raw shell error. -f follows symlinks, so a
-		# config kept as a link to a real file still qualifies.
-		[ -f "$f" ] || die "not a config file: $f is not a regular file" \
-			"$SCRIPT_CMD projects  (lists the pinned ones)"
-		# STRICTER than the typed paths below, deliberately. mackas built this
-		# path itself out of a bare name, in a fixed and entirely guessable
-		# place -- that is the ambush shape the search path is guarded against,
-		# not the request shape --config is. Refuse rather than fall through to
-		# the search path: the caller asked for THIS project, and silently
-		# loading a different one is worse than stopping.
-		if ! config_file_is_safe "$f"; then
-			die "refusing to source $f: it (or the directory it really lives in) is owned by someone else or writable by group/other" \
-				"chmod go-w $(printf '%q' "$f") $(printf '%q' "$(projects_dir)")"
-		fi
-		# shellcheck disable=SC1090
-		. "$f"
-		PROJECT_SELECTED="$sel"
-		CONFIG_FILE_USED="$f"
+		select_pinned_project "$sel" "$sel_src" "$allow_missing"
 		return 0
 	fi
 
@@ -1221,6 +1308,37 @@ load_config() {
 		# shellcheck disable=SC1090  # user-supplied config, path known at runtime only
 		. "$path"
 		CONFIG_FILE_USED="$path"
+		return 0
+	fi
+
+	# Tier 3 (#78): neither an explicit selector nor an explicit path named a
+	# file. Before falling back to the default search path, see whether $PWD's
+	# PHYSICAL location names, unambiguously, one of the projects already
+	# pinned by name -- inference selects among identities the user already
+	# pinned, it never creates one, and filesystem shape alone (a work/foo
+	# directory with no foo.conf) never decides anything.
+	#
+	# `pwd -P` on both sides is what defuses a ~/oe-style short-link symlink:
+	# a pinned MACKAS_ROOT recorded as the link, the physical target, or
+	# anything in between all resolve to the same candidate, and $PWD reached
+	# through the link or directly both resolve to the same physical string.
+	local pwd_phys candidates n_candidates=0 winner_name="" list="" cname cdir
+	pwd_phys="$(pwd -P)"
+	candidates="$(derive_project_candidates "$pwd_phys")"
+	if [ -n "$candidates" ]; then
+		while IFS="$(printf '\t')" read -r cname cdir; do
+			[ -n "$cname" ] || continue
+			n_candidates=$((n_candidates + 1))
+			winner_name="$cname"
+			list="$list    $cname -> $cdir"$'\n'
+		done <<EOF
+$candidates
+EOF
+		if [ "$n_candidates" -gt 1 ]; then
+			die "\$PWD ($pwd_phys) matches more than one pinned project's workspace" \
+				"$(printf '%s' "$list")pass --project NAME to pick one of the above"
+		fi
+		select_pinned_project "$winner_name" "derived from \$PWD" 0
 		return 0
 	fi
 

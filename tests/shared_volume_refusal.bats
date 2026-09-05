@@ -304,9 +304,18 @@ mk() {
 	exists_now mackas-foo-dl
 }
 
-@test "destroy: an unreadable pinned config does not block an UNSELECTED destroy" {
-	# The guard is gated on PROJECT_SELECTED at all -- an unreadable stray
-	# file must not turn into a new failure mode for the pre-M3 default path.
+@test "destroy: an unreadable pinned config does not block an UNSELECTED destroy via refuse_shared_volume's OWN gate (#78 tier-3 refuses it first instead)" {
+	# refuse_shared_volume()'s OWN gate is on PROJECT_SELECTED at all: with no
+	# selector, it never even looks at pinned_configs_unreadable() -- that
+	# part is unchanged. But #78's tier-3 derivation is a SEPARATE gate,
+	# evaluated in load_config() for every command naming no explicit
+	# --project/--config, and it fails closed on this very same unreadable
+	# file for a different reason: it might have named a candidate workspace
+	# this $PWD sits under, and unreadable means unknowable, not "no". So the
+	# overall command still refuses -- just earlier, and for a different
+	# stated reason -- rather than reaching destroy's own logic at all.
+	# tests/project_derive.bats covers tier-3's own die in isolation, and
+	# that an explicit --project/--config bypasses it entirely.
 	pin foo <<-'EOF'
 	EOF
 	chmod 000 "$PROJDIR/foo.conf"
@@ -317,8 +326,9 @@ mk() {
 	mk destroy
 	local rc="$status"
 	chmod 600 "$PROJDIR/foo.conf"
-	[ "$rc" -eq 0 ]
-	assert_fails exists_now oe-build-dl
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'foo.conf'
+	exists_now oe-build-dl
 }
 
 # ---------------------------------------------------------------------------
