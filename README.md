@@ -73,6 +73,11 @@ those would make kas bind-mount an APFS directory over the ext4 volumes
 ([why](docs/architecture.md#how-they-get-mounted-and-why-kas_build_dir-must-stay-unset)).
 It lives at `~/oe/env.sh` once `setup` has made the short symlink, or in
 `MACKAS_ROOT` if you set `MACKAS_SHORT_LINK=`; `./mackas status` prints where.
+With a project selected (`--project NAME` / `$MACKAS_PROJECT_SELECT`), it is
+`env-NAME.sh` instead, so two pinned projects on one `MACKAS_ROOT` never
+share a generated file; that file also exports `MACKAS_PROJECT_SELECT` for
+you, guarded the same way `GITCONFIG_FILE` is — a value your shell already
+has always wins over the one this file was generated for.
 
 ### Directory layout
 
@@ -544,7 +549,7 @@ volume-relocation symlink already belongs to a different live project,
 | `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-buildhistory-analyze` (`buildhistory analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller), `mackas-ext4-dirty-bit` (the superblock dirty-bit probe `check` runs). |
 | `tests/`, `run-tests.sh`, `Makefile` | bats test suite and its entry points (`./run-tests.sh` or `make test`). See [testing.md](docs/testing.md). |
 | `COPYING` | GPLv3. |
-| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`. |
+| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`; `env-NAME.sh` once a project is selected. |
 | `$MACKAS_BASE/gitconfig` | **Generated**: forwarded as `GITCONFIG_FILE` so git can operate on `/repo` despite the virtiofs ownership quirk ([architecture.md](docs/architecture.md#git-dubious-ownership--the-blocker)). Never written over a `GITCONFIG_FILE` you already export. |
 
 ## Configuration

@@ -59,6 +59,8 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
 
 ```sh
 source ~/oe/env.sh     # or $MACKAS_ROOT/env.sh if MACKAS_SHORT_LINK is empty
+                       # -- env-<name>.sh instead, once --project/$MACKAS_PROJECT_SELECT
+                       #    pins a project; `mackas status` prints the real name
 mackas status          # or ./mackas status from wherever you cloned mackas
 ```
 
