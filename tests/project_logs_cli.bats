@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 #
-# M5 (#79), item 4: the dump retrofit and clean's log wipe, scoped to the
+# M5 (#79): the dump retrofit and clean's log wipe, scoped to the
 # selected project -- end to end, as a real subprocess, with real filesystem
 # checks. tests/project_logs.bats covers the derive_paths()/smoketest_rung()
 # half at the library level; this file is the other half: `mackas dump`,
@@ -135,6 +135,13 @@ mkp() {
 		--set MACKAS_RELOCATE_VOLUMES=0 "$@"
 }
 
+# Same, with no project selected at all -- the legacy side of the asymmetry.
+mk() {
+	run "$MACKAS" -y --set "MACKAS_ROOT=$ROOT" \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 "$@"
+}
+
 @test "dump (selected): writes to the project's own logs/<name>/dump-<ts>.yml, not the flat path" {
 	pin meta-qcom
 	MACKAS_DUMP_TS=20260901000000 mkp meta-qcom dump
@@ -182,4 +189,47 @@ mkp() {
 	# The confirmation text names the directory it actually removed.
 	printf '%s\n' "$output" | grep -qF "$ROOT/logs/meta-qcom"
 	! printf '%s\n' "$output" | grep -qF "$ROOT/logs/meta-angstrom"
+}
+
+# The isolation above is deliberately one-way, and that is worth pinning
+# rather than leaving as an accident: an UNSELECTED bare `clean` wipes
+# MACKAS_LOGS, which with nothing selected is the flat logs/ -- so every
+# project's logs/<name> under it goes too. Narrowing it would break the
+# backward-compatibility contract in tests/generated_paths_compat.bats
+# (bare clean has always cleared the whole logs dir); widening the selected
+# case would break the sibling isolation above. `clean --help` says so.
+@test "clean (unselected): wipes the whole flat logs/, per-project subdirs included" {
+	pin meta-qcom
+	have_volumes oe-build-tmp oe-build-dl oe-build-sstate
+
+	mkdir -p "$ROOT/logs/meta-qcom"
+	echo "qcom" > "$ROOT/logs/meta-qcom/dump-old.yml"
+	echo "legacy" > "$ROOT/logs/legacy-flat.yml"
+
+	mk clean
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/logs" ]
+	[ -z "$(ls -A "$ROOT/logs")" ]
+	[ ! -e "$ROOT/logs/meta-qcom" ]
+}
+
+@test "clean --help: says the flat wipe takes every project's logs/<name> with it" {
+	mk clean --help
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "never a sibling's"
+	printf '%s\n' "$output" | grep -qF "logs/<name> sitting under it along with it"
+}
+
+# status's "Recent logs" prints bare filenames, so "Derived paths" is the
+# only place that says which directory they came out of -- which now moves
+# with the selector.
+@test "status: Derived paths names the log directory, per-project when selected" {
+	pin meta-qcom
+	mkp meta-qcom status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE "^  logs +$ROOT/logs/meta-qcom\$"
+
+	mk status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE "^  logs +$ROOT/logs\$"
 }
