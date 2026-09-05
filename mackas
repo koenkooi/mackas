@@ -1870,6 +1870,15 @@ cmd_projects() {
 		if [ -n "$root" ] && [ ! -d "$root" ]; then
 			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
 				"its MACKAS_ROOT does not exist -- moved, or on an unmounted disk" "$C_RST"
+		elif [ -n "$root" ] && [ ! -d "$root/work/$name" ]; then
+			# #78 tier 3: MACKAS_ROOT is fine, but the workspace derivation
+			# would key off (<root>/work/<name>) is gone -- a moved/renamed
+			# checkout, or one never created at all. "identity is never
+			# re-minted": the fix is to move the directory back, or drop
+			# this pin -- never for mackas to guess a new one from whatever
+			# IS on disk.
+			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
+				"$root/work/$name does not exist -- \$PWD derivation will never select this pin until it does; move the checkout back, or remove this pin if it is gone for good" "$C_RST"
 		fi
 		# The same test --project applies before sourcing, reported here
 		# instead of at the moment it would refuse.
