@@ -2167,6 +2167,16 @@ derive_paths() {
 	MACKAS_WORK="$MACKAS_BASE/work"
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
+	# Selected -> logs/<name>, so two pinned projects on one MACKAS_ROOT never
+	# share a log directory. Every one of dump's output, the smoketest log,
+	# status's "Recent logs" listing and bare `clean`'s wipe reads this single
+	# variable, so this one gate scopes all four for free -- see #79 item 3/4.
+	# Unselected, this must stay exactly $MACKAS_BASE/logs, flat -- #79's
+	# backward-compatibility rule, same gate as MACKAS_ENV_SH/
+	# MACKAS_KAS_FRAGMENT_SRC above.
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_LOGS="$MACKAS_BASE/logs/$PROJECT_SELECTED"
+	fi
 	MACKAS_PROJECT="$(strip_trailing_slash "$MACKAS_WORK/$MACKAS_PROJECT_DIR")"
 	# Selected -> env-<name>.sh, so two pinned projects on one MACKAS_ROOT never
 	# share a generated env file. Unselected, this must stay exactly
@@ -7757,7 +7767,7 @@ Runs \`kas-container dump --skip repos_checkout --skip repos_apply_patches
 config and saves the resolved YAML it prints to
 \$MACKAS_LOGS/dump-<timestamp>.yml -- every env var, every local override
 and every repo ref resolved to its exact value, a reproducibility record
-next to a build's own logs (see item 13 in TODO.md). Purely read-only:
+next to a build's own logs. Purely read-only:
 kas dump writes nothing into the checkout itself -- the two --skip flags are
 load-bearing for that claim, not decorative. Resolving a branch/tag still
 needs kas to know the repo (cloning one that is missing, same as a real
