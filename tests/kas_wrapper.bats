@@ -33,12 +33,12 @@
 # unprotected".
 #
 # The wrapper's LIVE --runtime-args recompute (MACKAS_SELF, "mackas
-# runtime-args") and its GENERATION-TIME frozen fallback (kas_runtime_args(),
-# called directly by write_kas_wrapper() to bake MACKAS_FROZEN_RUNTIME_ARGS)
-# are controlled INDEPENDENTLY of each other here: a fake MACKAS_SELF stub
-# answers the former; overriding the kas_runtime_args shell function itself
-# (before calling the real write_kas_wrapper()) controls the latter. Both
-# default to a real, valid string; individual tests force one or both bad.
+# runtime-args --require-volumes-free") is the wrapper's ONLY source for that
+# string since issue #96 -- there is no frozen fallback baked into the
+# generated file any more, so a fake MACKAS_SELF stub is the only knob these
+# tests need. It defaults to a real, valid string and a zero exit; individual
+# tests make it fail the way a real 'mackas' would when a guard refuses
+# (message on stderr, non-zero exit, nothing on stdout).
 #
 # NOTE: bats' own `run` must not be used here -- mackas defines its own run()
 # and sourcing it shadows bats' version. Explicit subshells with manually
@@ -90,6 +90,13 @@ lib_setup() {
 	KREC="$TESTDIR/kas.rec"
 	export KREC
 
+	# The MACKAS_SELF stub's own argv log -- unlike KREC this one IS
+	# pre-created, since tests read it for the flags the wrapper passed rather
+	# than asserting it never came into existence.
+	SELF_REC="$TESTDIR/self.rec"
+	export SELF_REC
+	: > "$SELF_REC"
+
 	write_self_stub "$(kas_runtime_args)" 0
 	write_recorder
 	write_container_mock
@@ -108,33 +115,32 @@ teardown() {
 # Harness helpers
 # ---------------------------------------------------------------------------
 
-# write_self_stub OUTPUT EXITCODE -- (re)write the fake MACKAS_SELF binary:
-# answers "runtime-args" with OUTPUT and exits EXITCODE, refuses anything
-# else. This controls the wrapper's LIVE recompute independently of the
-# FROZEN fallback (force_frozen_fallback, below). Does NOT regenerate the
-# wrapper -- MACKAS_SELF is a fixed path baked in once; only its CONTENT
-# changes here.
+# write_self_stub OUTPUT EXITCODE [STDERR] -- (re)write the fake MACKAS_SELF
+# binary: answers "runtime-args" with OUTPUT on stdout, STDERR (if given) on
+# stderr, and exits EXITCODE; refuses anything else. Every call's argv, and
+# the $MACKAS_PROJECT_SELECT it was handed, are appended to $SELF_REC, so a
+# test can assert WHICH flags and WHICH project the wrapper passed. The
+# '<unset>' marker keeps "never passed" distinguishable from "passed empty",
+# which is the whole difference between inheriting the calling shell's
+# selector and overriding it.
+# Does NOT regenerate the wrapper -- MACKAS_SELF is a fixed path baked in
+# once; only its CONTENT changes here.
 write_self_stub() {
-	local output="$1" exitcode="${2:-0}"
+	local output="$1" exitcode="${2:-0}" errmsg="${3:-}"
 	{
 		printf '#!/usr/bin/env bash\n'
+		printf 'printf "ARGV:%%s\\n" "$*" >> "$SELF_REC"\n'
+		printf 'printf "SEL:%%s\\n" "${MACKAS_PROJECT_SELECT-<unset>}" >> "$SELF_REC"\n'
 		printf 'if [ "$1" = "runtime-args" ]; then\n'
+		if [ -n "$errmsg" ]; then
+			printf '\tprintf "%%s\\n" %s >&2\n' "$(printf '%q' "$errmsg")"
+		fi
 		printf '\tprintf %%s %s\n' "$(printf '%q' "$output")"
 		printf '\texit %s\n' "$exitcode"
 		printf 'fi\n'
 		printf 'exit 1\n'
 	} > "$SELF_STUB"
 	chmod +x "$SELF_STUB"
-}
-
-# force_frozen_fallback OUTPUT -- override kas_runtime_args() itself, the
-# function write_kas_wrapper() calls DIRECTLY (never through MACKAS_SELF) to
-# bake MACKAS_FROZEN_RUNTIME_ARGS at generation time. The caller must re-run
-# (the real) write_kas_wrapper after this for it to take effect.
-force_frozen_fallback() {
-	FROZEN_FAKE="$1"
-	# shellcheck disable=SC2317  # invoked indirectly by write_kas_wrapper()
-	kas_runtime_args() { printf '%s' "$FROZEN_FAKE"; }
 }
 
 # write_container_mock -- a fake `container` on $PATH answering "system
@@ -287,15 +293,48 @@ rec_runtime_args_value() {
 }
 
 # ---------------------------------------------------------------------------
-# 6-7: refusal on empty/unusable computed args. A multi-hour build with no
-# protected storage attached is strictly worse than failing fast before it
-# ever starts -- the recorder must NEVER be created in either case.
+# 6-7: refusal on a failed or unusable live recompute. A multi-hour build
+# with no protected storage attached -- or with SOMEONE ELSE'S storage
+# attached, which is what reusing setup-time values can mean once volume
+# names are configurable (M1) or derived (M3) -- is strictly worse than
+# failing fast before it ever starts. The recorder must NEVER be created.
 # ---------------------------------------------------------------------------
 
-@test "refusal: empty live recompute AND empty frozen fallback refuses to launch, recorder never created" {
-	write_self_stub "" 1
-	force_frozen_fallback ""
-	write_kas_wrapper
+@test "refusal: a failed live recompute is FATAL, not a fallback -- recorder never created (issue #96)" {
+	# Exactly how a real 'mackas' refuses: its die() message on stderr, a
+	# non-zero exit, nothing on stdout. The wrapper used to warn and build on
+	# the frozen copy; there is no frozen copy any more, and this is the test
+	# that keeps one from coming back.
+	write_self_stub "" 1 "mackas: error: volume 'oe-build-dl' is attached to a running container"
+	[ ! -e "$KREC" ]
+
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	# mackas's own message reaches the terminal verbatim -- the wrapper adds
+	# context, it never swallows or paraphrases the diagnosis.
+	printf '%s\n' "$out" | grep -qF "volume 'oe-build-dl' is attached to a running container"
+	printf '%s\n' "$out" | grep -qi 'refusing to launch'
+	printf '%s\n' "$out" | grep -qi 'not falling back'
+	[ ! -e "$KREC" ]
+}
+
+@test "refusal: the live recompute is asked for the one-VM check, not just the args string (issue #96)" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	# Both flags, on ONE recompute: the one-VM check and the identity check
+	# ride the same call. The work dir varies per test dir, so match the shape.
+	grep -qE '^ARGV:runtime-args --require-volumes-free --expect-work /' "$SELF_REC"
+}
+
+@test "refusal: a partial args string (limits present, no volume mounts) refuses to launch, recorder never created" {
+	# A live recompute that SUCCEEDS but answers something plausible-but-
+	# incomplete: cpu/memory limits present, none of the three ext4 mounts --
+	# a stale/incompatible mackas, which a non-zero exit status cannot catch.
+	# This exercises the substring-validation case statements specifically; a
+	# totally-empty answer would already be caught by the plain "-z" check.
+	write_self_stub "-c 4 -m 8g" 0
 	[ ! -e "$KREC" ]
 
 	cd "$TESTDIR"
@@ -306,23 +345,23 @@ rec_runtime_args_value() {
 	[ ! -e "$KREC" ]
 }
 
-@test "refusal: a partial args string (limits present, no volume mounts) refuses to launch, recorder never created" {
-	# Live fails (forcing the fallback to be consulted at all), and the
-	# fallback itself is plausible-but-incomplete: cpu/memory limits present,
-	# none of the three ext4 mounts. This exercises the substring-validation
-	# case statements specifically -- a totally-empty $rt (test 6, above)
-	# would already be caught by the plain "-z" check alone.
-	write_self_stub "" 1
-	force_frozen_fallback "-c 4 -m 8g"
-	write_kas_wrapper
+@test "refusal: an empty answer with a ZERO exit status still refuses, recorder never created" {
+	write_self_stub "" 0
 	[ ! -e "$KREC" ]
 
 	cd "$TESTDIR"
 	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
 	[ "$rc" -ne 0 ]
 	printf '%s\n' "$out" | grep -qi 'refusing to launch'
-	printf '%s\n' "$out" | grep -qF 'mackas setup'
 	[ ! -e "$KREC" ]
+}
+
+@test "no frozen fallback: the generated wrapper bakes in no --runtime-args string at all (issue #96)" {
+	# A source-level pin, not a behavioural one: as long as the setup-time
+	# string is not IN the file, no future edit can quietly start using it
+	# again. The volume names are the part that must not be frozen.
+	assert_fails grep -q 'MACKAS_FROZEN_RUNTIME_ARGS' "$KAS_CONTAINER_BIN"
+	assert_fails grep -qF -- "-v $MACKAS_VOL_TMP:/build" "$KAS_CONTAINER_BIN"
 }
 
 # ---------------------------------------------------------------------------
@@ -489,4 +528,178 @@ rec_runtime_args_value() {
 		"$SHIM_DIR:$BREW_BIN:"*) ;;
 		*) echo "BREW_BIN did not survive generation intact: $got" >&2; return 1 ;;
 	esac
+}
+
+# ---------------------------------------------------------------------------
+# 12: the selector propagates into the live recompute.
+#
+# The wrapper freezes MACKAS_WORK/KAS_IMAGE/MACKAS_GITCONFIG from whatever
+# config `setup` ran against, but recomputes --runtime-args on every call. If
+# that recompute resolves a DIFFERENT config, the build gets one project's
+# ext4 volumes beside another project's work dir -- on the hand-typed
+# kas-container path, which is the primary real-world workflow. So the
+# generated wrapper replays the project it was built for, and passes it
+# EXPLICITLY even when empty, so an exported $MACKAS_PROJECT_SELECT in the
+# calling shell cannot re-aim a wrapper at a project it was never built for.
+# ---------------------------------------------------------------------------
+
+@test "selector: a wrapper written under --project replays that project into the live recompute" {
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+@test "selector: an exported \$MACKAS_PROJECT_SELECT cannot re-aim a wrapper built for another project" {
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( (MACKAS_PROJECT_SELECT=proj-b "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+	sel_b="$(grep -c '^SEL:proj-b$' "$SELF_REC" || true)"
+	[ "$sel_b" -eq 0 ]
+}
+
+@test "selector: a wrapper written with no project passes an EMPTY selector, not the caller's" {
+	# lib_setup left PROJECT_SELECTED empty, i.e. the default search path.
+	# The recompute must still see an empty selector rather than inheriting
+	# whatever the calling shell exported -- otherwise the same mismatch
+	# appears in the other direction.
+	cd "$TESTDIR"
+	out="$( (MACKAS_PROJECT_SELECT=proj-b "$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_b="$(grep -c '^SEL:proj-b$' "$SELF_REC" || true)"
+	[ "$sel_b" -eq 0 ]
+}
+
+# #78 tier 3: a `mackas setup` run from inside a workspace that derivation
+# alone selected must NOT freeze that selection into the wrapper -- the whole
+# point of derivation is that it is recomputed per invocation from wherever
+# the shell happens to stand, so baking today's answer in would replay it
+# from every OTHER directory too. write_kas_wrapper() only bakes an EXPLICIT
+# tier-1/2 selector (PROJECT_SELECT_SOURCE "--project" or
+# "$MACKAS_PROJECT_SELECT"); anything else -- this derived case included --
+# gets an empty pin, same as no selection at all.
+@test "selector: a wrapper written under a DERIVED selection also passes an EMPTY selector" {
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="derived from \$PWD"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
+@test "selector: a project name with a shell metacharacter is baked in inert" {
+	# PROJECT_SELECTED reaches the generated file through shq(), like every
+	# other interpolated value. validate_project_select refuses this name at
+	# the CLI; the point here is that write_kas_wrapper does not depend on
+	# that check to keep the generated file from executing what it embeds.
+	PROJECT_SELECTED="a'\$(touch $TESTDIR/pwned)b"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ ! -e "$TESTDIR/pwned" ]
+	grep -qxF "SEL:a'\$(touch $TESTDIR/pwned)b" "$SELF_REC"
+}
+
+# The wrapper freezes MACKAS_WORK/KAS_IMAGE/gitconfig but recomputes volumes
+# LIVE, so a config resolving a different root would hand this build another
+# project's ext4 volumes while its sources stay put. Identity is compared
+# rather than the config path being frozen, so an ambient $MACKAS_CONF keeps
+# working whenever it agrees and is refused only when it does not.
+
+@test "the generated wrapper passes --expect-work with its frozen MACKAS_WORK" {
+	grep -qF -- '--expect-work "$MACKAS_WORK"' "$MACKAS_BIN/kas-container"
+}
+
+# ---------------------------------------------------------------------------
+# #78: the kas-chain hint. Standing in work/ itself, a hand-typed
+# 'kas-container build meta-qcom/kas/a.yml:...' cannot be derived from $PWD
+# alone -- so the wrapper's own leading-options scan (mirroring env.sh's
+# kas-container() function) finds the file-list argument and forwards it,
+# raw, as '--kas-files' on the SAME live-recompute call that already carries
+# --require-volumes-free/--expect-work. Unit-level: a fake MACKAS_SELF
+# records its own argv, so these assert WHAT THE WRAPPER FORWARDS without
+# needing a real 'mackas' behind it -- tests/kas_chain_derive_e2e.bats is the
+# companion file that drives a REAL mackas through this same wrapper end to
+# end, per #78's own coverage requirement.
+# ---------------------------------------------------------------------------
+
+@test "kas-files hint: a plain 'build <chain>' forwards the chain verbatim" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build meta-qcom/kas/a.yml:meta-qcom/kas/b.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml:meta-qcom/kas/b.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: 'shell' is scanned the same way as 'build'" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" shell meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: leading --skip VALUE and -k are skipped to find the chain" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build --skip repos_checkout -k meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: -c/--cmd's own VALUE (a string with a space) does not get mistaken for the chain" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" shell -c "bitbake -p" meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files meta-qcom/kas/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: an absolute file list is forwarded raw too -- validation is mackas's job, not the wrapper's" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build /abs/path/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--kas-files /abs/path/a.yml' "$SELF_REC"
+}
+
+@test "kas-files hint: an unknown leading option makes the wrapper back off -- no hint forwarded" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build --some-unknown-flag meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	! grep -qF -- '--kas-files' "$SELF_REC"
+}
+
+@test "kas-files hint: 'dump' is not scanned -- its positional is not a kas file list" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" dump meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	! grep -qF -- '--kas-files' "$SELF_REC"
+}
+
+@test "kas-files hint: with no positional at all (bare 'build'), nothing is forwarded" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	! grep -qF -- '--kas-files' "$SELF_REC"
+}
+
+@test "kas-files hint: the scan runs in a subshell -- \$@ reaching the final exec is untouched" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build --skip repos_checkout -k meta-qcom/kas/a.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	rec_argv | grep -qxF 'build'
+	rec_argv | grep -qxF -- '--skip'
+	rec_argv | grep -qxF 'repos_checkout'
+	rec_argv | grep -qxF -- '-k'
+	rec_argv | grep -qxF 'meta-qcom/kas/a.yml'
 }

@@ -11,6 +11,35 @@
 #
 # Or point at one directly:  mackas --config /path/to/conf
 #
+# ...or select a PINNED PROJECT by name, which resolves to
+# ~/.config/mackas/projects/<name>.conf -- the standalone config `mackas
+# adopt` or `mackas project add <name>` writes there. `project add` is
+# adopt's in-root sibling: it pins a project workspace under THIS Mac's own
+# root ($MACKAS_WORK/<name>/) instead of a whole separate foreign root; see
+# `mackas project add --help` and the README.
+#
+#   mackas --project meta-ai status      # one command
+#   export MACKAS_PROJECT_SELECT=meta-ai # a whole shell
+#   mackas projects                      # what is pinned
+#
+# That is a SELECTOR, not a fifth precedence rung: it decides which single
+# file is sourced, never a value inside one, so the order below is unchanged.
+# MACKAS_PROJECT_SELECT is for that reason not a setting -- it does not appear
+# below, `mackas set` refuses it, and writing it into a config file selects
+# nothing (a selector inside the file it selects is circular).
+#
+# Naming a path (--config/$MACKAS_CONF) and selecting a project
+# (--project/$MACKAS_PROJECT_SELECT) are mutually exclusive. mackas refuses
+# the combination rather than ranking it: quietly ignoring either one is how
+# a build ends up pointed at a project nobody asked for.
+#
+# A --project file gets the ownership check the searched paths get (below),
+# and is refused outright when it fails. --config stays exempt. The asymmetry
+# is the point: mackas builds the --project path itself out of a bare name, in
+# a fixed and entirely guessable place, which is the ambush shape -- a path
+# you typed is a request. Project names are checked before they become a path:
+# letters, digits, '.', '_' and '-' only, no '/', no '..', no leading '-'.
+#
 # This file is SOURCED AS SHELL. You can compute values, but anything you
 # execute here runs with your privileges -- keep it to assignments.
 #
@@ -180,7 +209,50 @@
 # The stem must not contain whitespace: kas-container word-splits
 # --runtime-args, so a space would split one mount into two arguments. setup
 # refuses a name with one rather than mounting something absurd.
+#
+# Once a pinned project is selected (--project NAME / $MACKAS_PROJECT_SELECT),
+# the default here changes to "mackas-NAME" instead of "oe-build" -- but only
+# as a DEFAULT: setting MACKAS_VOLUME_NAME explicitly, here or anywhere else
+# in the precedence chain, always wins, exactly like today. Keeping an
+# explicit "oe-build" under a selector (`mackas project add --from
+# --keep-volumes`) is a fully supported end state, not a mistake -- `mackas
+# status` notes the disagreement once, informationally, never as an error.
 #MACKAS_VOLUME_NAME="oe-build"
+
+# The downloads and sstate volumes can be named outright instead of derived
+# from the stem. Empty (the default) derives them, which is what every mackas
+# install does unless told otherwise.
+#
+# What this makes possible: two mackas configs naming the SAME volume here
+# share that cache. Both caches are safe to share -- downloads are checksum-
+# verified upstream tarballs, sstate is keyed by task-input hash -- but safe
+# is not the same as worthwhile: an ext4 image may be mounted by exactly ONE
+# VM at a time (see docs/architecture.md), so a shared volume means whoever
+# names it queues on each other's builds. That trade is yours to make, per
+# config; nothing here recommends it, and nothing shares by default.
+#
+# A shared volume has to exist before it can be mounted, and seeding it from
+# an existing cache is what `mackas volume duplicate` is for. There is no
+# equivalent knob for TMPDIR: two builds in one /build is corruption, not
+# contention.
+#
+# Same whitespace rule as the stem, for the same reason. The three volumes
+# must also resolve to three DIFFERENT names: they are all attached to one
+# container, so naming two of them alike would mount a single ext4 image twice
+# into the same VM. That is refused outright, not warned about.
+#
+# Under a pinned project (--project NAME) these two are what you would set
+# to opt one project's downloads/sstate into sharing with another's -- both
+# already default private per project (mackas-NAME-dl/-sstate) with nothing
+# set here, and sharing stays exactly as optional and unrecommended as it
+# always was. Because a shared cache volume can then legitimately belong to
+# more than one pinned project, `mackas destroy` and `mackas clean
+# downloads`/`clean sstate` refuse to touch one that a DIFFERENT project's
+# own config also names, while a selector is active -- naming the other
+# project(s) rather than guessing which one "wins". `mackas volume destroy
+# <name>` is the explicit way through that refusal.
+#MACKAS_VOLUME_DL_NAME="mackas-shared-dl"
+#MACKAS_VOLUME_SSTATE_NAME="mackas-shared-sstate"
 
 # The three caps. Digits, optionally followed by t/tb/tib, g/gb/gib or
 # m/mb/mib (case-insensitive) -- e.g. 1T, 200G, 512M; bare digits mean GiB.
@@ -420,6 +492,30 @@
 #   printf 'machine linux-computer.local\n  login builder\n  password ...\n' > ~/.netrc
 #   chmod 600 ~/.netrc
 #   export NETRC_FILE=~/.netrc
+
+
+# --- Publishing sstate to a mirror (opt-in) ----------------------------------
+
+# Everything above is the READ direction. `mackas sstate push` is the write
+# one: it publishes new sstate objects to the directory a mirror server
+# serves, over rsync/ssh.
+#
+# The destination is an rsync/ssh target, never an HTTP URL -- mackas-mirrord
+# serves read-only on purpose, so the write path is authenticated out of band
+# over ssh instead. Empty by default: push does nothing until you name one,
+# and --dest overrides it for a single run.
+#MACKAS_SSTATE_PUSH_DEST="mirror@linux-computer.local:/srv/mackas/sstate"
+
+# Where the objects are staged and VERIFIED on the host before anything is
+# transferred (the manifest check only exists on a host-side copy, and it
+# exists because a real >18G artifact was once copied with the right size and
+# the wrong content). Empty means $MACKAS_BASE/sstate-push. Point it at a
+# roomier filesystem if the first push of a warm cache would not fit next to
+# $MACKAS_BASE: staging costs a second copy of every NEW object, transiently.
+#MACKAS_SSTATE_PUSH_STAGE="$MACKAS_BASE/sstate-push"
+#
+# Push before you prune: once an object is on the mirror, pruning it locally
+# costs an HTTP refetch instead of a rebuild. See docs/storage.md.
 
 
 # --- NFS mirrors (opt-in) ----------------------------------------------------

@@ -47,17 +47,53 @@ fetches. mackas orchestrates these; it does not vouch for them.
   (it is dropped before the call reaches Apple `container`), and hard-refuses
   `--device` and `--network host` rather than guessing a translation.
 - **Input/config safety.** A config file is *sourced as shell*, so one mackas
-  finds on its own (`~/.config/mackas/config`, `~/.mackas.conf`) is executed
-  only if it is owned by you (or root) and not group/world-writable — file and
-  directory both (`config_file_is_safe`); one you name yourself with
+  finds or derives on its own — the search path (`~/.config/mackas/config`,
+  `~/.mackas.conf`), the `--project NAME` /`$MACKAS_PROJECT_SELECT`
+  selector, which resolves to `~/.config/mackas/projects/NAME.conf`, and the
+  implicit selection derived from `$PWD` (or a hand-typed kas chain), which
+  resolves to that same directory — is executed only if it is a regular file
+  owned by you (or root) and not group/world-writable, file and directory
+  both (`config_file_is_safe`) — graded on what is really there, never on a
+  symlink standing in for it, since
+  `ln -s` applies the umask (measured: `022` → `755`, `002` → `775`,
+  `000` → `777`, `077` → `700`), so a link's own mode records the umask and
+  nothing about its target, and grading the link would accept a config sitting
+  in a world-writable directory the link points at; one you name yourself with
   `--config` or `$MACKAS_CONF` is deliberately exempt, being a request rather
-  than an ambush. `./mackas.conf` is *not* in the search path at all, for the
-  same reason: a cwd-relative config any untrusted tree could drop in was code
-  execution needing no exploit. Every value written into a generated
-  file is validated first (`validate_settings` rejects `"`, backticks and control
-  characters) so a value cannot break out of the shell or YAML it lands in —
-  including the undocumented `MACKAS_BREW_BIN` test seam, which is not a
-  setting but is still an input, and reaches both generated shell files. The
+  than an ambush. A project name is validated before it becomes a path (no
+  path separator, no `..`, no leading `-`, a restricted character class), and
+  an unsafe project file is *refused*, never quietly replaced by the next
+  search-path candidate. When `mackas set` has to create
+  `~/.config/mackas/projects/` it does so at mode `700` rather than inheriting
+  the ambient umask, so a `umask 002` login cannot bootstrap a project config
+  that the very same check then refuses. `mackas projects` lists the pinned
+  configs by **grepping** them, never sourcing — listing a directory of shell
+  files must not run any of them, and implicit selection applies the same
+  rule while it *enumerates* candidates: every pinned config's `MACKAS_ROOT`
+  is read with the same grep, and only the single eventual winner is ever
+  sourced, only after the same `config_file_is_safe` check. A pinned config
+  this enumeration cannot even read is treated as an unanswerable "maybe",
+  not a silent "no" — it dies naming the file rather than risk skipping past
+  the real match. The one place a hand-typed build's file list feeds this is
+  an explicit `--kas-files` flag mackas passes to itself, one process to the
+  next — never an environment variable the ambient shell could set instead,
+  which would reopen exactly the ambient-env ambush class the selector
+  distinction above exists to close. `./mackas.conf` is *not* in the search
+  path at all, for the same reason: a cwd-relative config any untrusted tree
+  could drop in was code execution needing no exploit. Every value written
+  into a generated file is validated first (`validate_settings` rejects `"`,
+  backticks and control characters) so a value cannot break out of the shell
+  or YAML it lands in — including the undocumented `MACKAS_BREW_BIN` test
+  seam, which is not a
+  setting but is still an input, and reaches both generated shell files. Two
+  non-settings reach a generated file: that seam, and the selected project
+  name, which `env-NAME.sh` exports as `MACKAS_PROJECT_SELECT`. The selector
+  is deliberately not a setting (it chooses *which* config file loads, so it
+  cannot be one), so `validate_settings` never sees it;
+  `validate_project_select` grades it instead, and harder — a single path
+  component of `[A-Za-z0-9._-]`, no leading `-`, no `..` — because the same
+  name is pasted into `env-NAME.sh`, `kas/macos-NAME.yml`, `logs/NAME/` and a
+  config path. It is `shq`-quoted into the heredoc on top of that. The
   git "dubious ownership" workaround is scoped to a generated `GITCONFIG_FILE`,
   never applied globally, and never silently changes one you set — if your own
   `GITCONFIG_FILE` is missing, or lacks `safe.directory = *`, `setup` asks

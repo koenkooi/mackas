@@ -1,6 +1,6 @@
 ---
 name: mackas
-description: Drive OpenEmbedded builds on macOS through mackas (the kas-container wrapper for Apple's `container` runtime), and inspect what a build produced. Use when asked to build a recipe, image or machine for any OE layer set from a Mac; to look at buildhistory, deploy, logs or buildstats from a mackas build; or to manage the ext4 build volumes (fstrim, resize, clean, sstate prune). Covers the safe way to run one-off queries (`mackas exec`), the repo-reset and patch-skipping footguns of hand-typed `kas-container` calls, and the one-VM rule.
+description: Drive OpenEmbedded builds on macOS through mackas (the kas-container wrapper for Apple's `container` runtime), and inspect what a build produced. Use when asked to build a recipe, image or machine for any OE layer set from a Mac; to look at buildhistory, deploy, logs or buildstats from a mackas build; or to manage the ext4 build volumes (fstrim, resize, clean, sstate prune/push). Covers the safe way to run one-off queries (`mackas exec`), the repo-reset and patch-skipping footguns of hand-typed `kas-container` calls, and the one-VM rule.
 ---
 
 # Building and inspecting OpenEmbedded projects with mackas
@@ -37,19 +37,32 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
   plain directory there is on the case-insensitive drive and is exactly the
   corruption the image exists to prevent.
 - Build output lives in three ext4 volumes (names stem from
-  `MACKAS_VOLUME_NAME`, default `oe-build`):
-  - `oe-build-tmp` → `/build` (`KAS_BUILD_DIR`/`TOPDIR`) → `TMPDIR` =
+  `MACKAS_VOLUME_NAME`, default `oe-build` — or `mackas-<name>` once
+  `--project <name>`/`$MACKAS_PROJECT_SELECT` selects a pinned project and
+  nothing explicit overrides it):
+  - `${stem}-tmp` → `/build` (`KAS_BUILD_DIR`/`TOPDIR`) → `TMPDIR` =
     `/build/tmp`, and `BUILDHISTORY_DIR` defaulting to `/build/buildhistory`
-  - `oe-build-dl` → `/downloads` (`DL_DIR`)
-  - `oe-build-sstate` → `/sstate` (`SSTATE_DIR`)
+  - `${stem}-dl` → `/downloads` (`DL_DIR`)
+  - `${stem}-sstate` → `/sstate` (`SSTATE_DIR`)
 
-  Details: [architecture.md](../../docs/architecture.md#the-ext4-volumes),
-  [storage.md](../../docs/storage.md).
+  The last two can be named outright with `MACKAS_VOLUME_DL_NAME` /
+  `MACKAS_VOLUME_SSTATE_NAME`, so check `mackas status` rather than assuming
+  the stem — an explicit name always wins over the derived one, and `status`
+  notes it (once, informationally) whenever the two disagree. All three
+  default **private** to a pinned project; sharing the dl/sstate volumes
+  across projects is opt-in via those same two settings, never automatic and
+  never the recommendation (#72). Details:
+  [architecture.md](../../docs/architecture.md#the-ext4-volumes),
+  [storage.md](../../docs/storage.md#naming-the-cache-volumes-outright).
 
 ## Preflight (every session)
 
 ```sh
 source ~/oe/env.sh     # or $MACKAS_ROOT/env.sh if MACKAS_SHORT_LINK is empty
+                       # -- env-<name>.sh instead once ANY selection pins a project:
+                       #    --project, $MACKAS_PROJECT_SELECT, or just standing in a
+                       #    pinned workspace. `mackas status` prints the real path;
+                       #    read it there rather than guessing.
 mackas status          # or ./mackas status from wherever you cloned mackas
 ```
 
@@ -58,7 +71,7 @@ three volumes exist, and `docker resolves to` the shim under
 `$MACKAS_ROOT/bin/docker` — **not** `/usr/local/bin/docker`. If anything is
 off, `mackas check` names the fix for each item.
 
-**Prefer the sourced shell function, but a bypass is no longer dangerous.** `env.sh` defines a `kas-container` shell function that appends the generated tuning fragment and derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG`, then hands off to `$MACKAS_BIN/kas-container` — a generated protection wrapper *script*, not the raw upstream binary, that computes `--runtime-args` (the three volumes, the `-c`/`-m` limits) live and blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side so kas's own bind-mount logic stays out of the way. Because that wrapper script is what `$PATH` itself resolves `kas-container` to, `command kas-container`, an absolute path, `nohup`, `env`, `xargs`, or an unsourced shell all still reach it with the correct ext4 volumes, `-c`/`-m` limits and blanked dir vars — the only things such a bypass loses are the auto-appended tuning fragment and the `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation, both shell-function-only conveniences, not safety-critical. So `mackas smoketest`/`mackas shell`, or a properly sourced shell, is still the recommended, fully-featured way to work. If a build needs to be backgrounded, prefer redirecting in a sourced shell anyway — `kas-container build ... > log 2>&1 &` runs the function in the current shell and backgrounds the job, so the fragment and project derivation still happen. The one separate, still-real concern: a pipx/pip-installed kas sitting earlier on `PATH` than `$MACKAS_BIN` makes a bare `kas-container` resolve to a *different* kas-container script entirely, at whatever version that install happens to be. **`mackas check` does not catch that**: it verifies the file at `$MACKAS_BIN/kas-container` is present and is still a generated wrapper rather than the raw upstream script, but it never resolves the name through `$PATH`. Check that yourself — `command -v kas-container` must print `$MACKAS_BIN/kas-container`.
+**Prefer the sourced shell function, but a bypass is no longer dangerous.** `env.sh` defines a `kas-container` shell function that appends the generated tuning fragment and derives `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG`, then hands off to `$MACKAS_BIN/kas-container` — a generated protection wrapper *script*, not the raw upstream binary, that computes `--runtime-args` (the three volumes, the `-c`/`-m` limits) live and blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side so kas's own bind-mount logic stays out of the way. That live call (`mackas runtime-args --require-volumes-free`) also applies the one-VM rule, and the wrapper **dies** if it fails instead of falling back to anything baked in at `setup` time — a hand-typed build gets the same refusals `mackas shell` would give it. Because that wrapper script is what `$PATH` itself resolves `kas-container` to, `command kas-container`, an absolute path, `nohup`, `env`, `xargs`, or an unsourced shell all still reach it with the correct ext4 volumes, `-c`/`-m` limits and blanked dir vars — the only things such a bypass loses are the auto-appended tuning fragment and the `MACKAS_PROJECT_DIR`/`MACKAS_KAS_CONFIG` derivation, both shell-function-only conveniences, not safety-critical. So `mackas smoketest`/`mackas shell`, or a properly sourced shell, is still the recommended, fully-featured way to work. If a build needs to be backgrounded, prefer redirecting in a sourced shell anyway — `kas-container build ... > log 2>&1 &` runs the function in the current shell and backgrounds the job, so the fragment and project derivation still happen. The one separate, still-real concern: a pipx/pip-installed kas sitting earlier on `PATH` than `$MACKAS_BIN` makes a bare `kas-container` resolve to a *different* kas-container script entirely, at whatever version that install happens to be. **`mackas check` does not catch that**: it verifies the file at `$MACKAS_BIN/kas-container` is present and is still a generated wrapper rather than the raw upstream script, but it never resolves the name through `$PATH`. Check that yourself — `command -v kas-container` must print `$MACKAS_BIN/kas-container`.
 
 Before this wrapper existed (issue #27), a bypass reached kas-container's *raw upstream* script directly, completely skipping `env.sh`'s function — with no error or warning to distinguish it from a real mackas-driven build until much later. The build still ran, but unprotected: no ext4 volumes, Apple's bare 4 CPU / 1 GB defaults, and — because `KAS_BUILD_DIR` was genuinely unset rather than pointed at `/build` — kas fell back to `KAS_WORK_DIR/build` on the virtiofs bind mount, where `bitbake-server`'s control sockets got permanently stuck (a fresh `bind()` still works, but every later `stat`/`unlink` on that socket file fails with `OSError: [Errno 95] Operation not supported`, so a later restart just fails the identical way) — exactly what hit a real multi-machine batch build backgrounded with `nohup kas-container build ... &`, each run silently unprotected. Full writeup: [issue #27](https://github.com/koenkooi/mackas/issues/27).
 
@@ -576,10 +589,17 @@ the `volume fsck <name>` fix hint right next to the affected volume
 ### Cleaning
 
 `mackas clean` with **no target** deletes and recreates the *whole* TMPDIR
-volume and clears the logs dir. That drops everything under `TOPDIR`, not just
-`tmp/` — deploy, **buildhistory**, `conf/` and `cache/` all go with it,
-silently, with no warning that buildhistory is included. `DL_DIR`/`SSTATE_DIR`
-are separate volumes and are never touched.
+volume and clears the logs dir. Which dir that is follows the selector, and
+the isolation runs one way only: with a project selected it is that
+project's own `logs/<name>`, never a sibling's `logs/<other>` and never the
+flat `logs/`; with **no** project selected it is the flat `logs/` — and
+clearing that takes every `logs/<name>` sitting under it along with it.
+Check `mackas status`'s `logs` line before running it if that matters.
+
+That drops everything
+under `TOPDIR`, not just `tmp/` — deploy, **buildhistory**, `conf/` and
+`cache/` all go with it, silently, with no warning that buildhistory is
+included. `DL_DIR`/`SSTATE_DIR` are separate volumes and are never touched.
 
 `mackas clean <target>` (repeatable, order irrelevant, each independently
 confirmed):
@@ -599,6 +619,13 @@ confirmed):
 
 **Prefer `mackas retrieve buildhistory` first, or `mackas clean tmp+deploy`
 instead, whenever the buildhistory record still matters.**
+
+Under an active `--project` selector, `clean downloads`/`clean sstate` (and
+bare `mackas destroy`) refuse a volume a *different* pinned project's config
+also names, rather than deleting a cache that project relies on — the
+refusal names the other project(s). Naming the volume directly, `mackas
+volume destroy <name>`, is the explicit way through when that is really what
+you want.
 
 ### Pruning sstate by age
 
@@ -620,6 +647,38 @@ stamps still reference — use openembedded-core's own
 `scripts/sstate-cache-management.py`; `sstate prune` solves the coarser
 "nothing has touched this in months" case.
 
+### Publishing sstate to a mirror
+
+`mackas sstate push` uploads sstate objects to the directory a mirror server
+serves, over rsync/ssh. It needs a destination — `MACKAS_SSTATE_PUSH_DEST`, or
+`--dest` for one run — and nothing else:
+
+```sh
+mackas sstate push                # only what is newer than the last push
+mackas sstate push --full         # ignore the stamp, offer everything again
+mackas --dry-run sstate push      # show the shape, transfer nothing
+```
+
+What to know when driving it:
+
+- **Push before you prune.** Once an object is on the mirror, pruning it
+  locally costs an HTTP refetch instead of a rebuild.
+- It refuses while a build holds the sstate volume, like every other volume
+  operation here.
+- Objects are staged to a host directory and checksum-verified there before
+  anything is transferred, so a push needs transient room for everything it
+  offers (`MACKAS_SSTATE_PUSH_STAGE` moves that elsewhere). Size that for the
+  **reuse** set: the cutoff is mtime and bitbake touches an object every time
+  it reuses one, so a push after a big build offers what that build reused as
+  well as what it wrote. Nothing is missed either way, and re-offering costs
+  nothing on the wire.
+- Re-running is always safe: everything is sent `--ignore-existing`, and the
+  stamp only advances after a clean transfer *and* a scan that provably
+  finished. An interrupted push, a broken probe or a lost stamp all cost a
+  rescan, never a wrong result.
+- The destination is an ssh target, not a URL. The mirror's HTTP side is
+  read-only by design.
+
 ## The `--skip` flag family
 
 Everything here is about **hand-typed `kas-container build/shell`
@@ -628,7 +687,83 @@ unconditionally, so for one-off commands there is no flag to remember or to get
 wrong. Full mechanism:
 [architecture.md](../../docs/architecture.md#-k-bundles-five-steps-and-dropping-it-resets-repos).
 
-### When it is needed: sibling layers with local-only commits
+### Decide with this procedure, not from memory
+
+The two failure modes below pull in opposite directions, and both are silent.
+Do not decide from habit or from what the last build in this shell needed —
+the answer depends on **this** composition, and it is cheap to check.
+
+**Step 1 — list the repos this composition declares, and what each resolves to.**
+
+```sh
+mackas dump                     # writes $MACKAS_LOGS/dump-<timestamp>.yml
+```
+
+Read the `repos:` block of that file. kas only checks out or patches repos it
+declares, so a layer that is merely present under `work/` but absent from this
+block cannot be touched by this build, whatever flags you pass. `--resolve-refs`
+(part of what `mackas dump` always passes) has already turned each repo's
+`branch:`/`tag:`/`commit:` into the exact commit kas would check out for it —
+written back as `commit:` for a repo pinned by branch, tag or commit, or
+`refspec:` for one still on the legacy field. **That resolved value, not the
+branch name, is what Step 2 compares against** — and reading it costs nothing
+extra: resolving it is what `mackas dump` was already doing, without touching
+the checkout (see "`mackas` commands never reset repos", below — this is the
+one thing that section's `--skip repos_checkout` on `dump` itself protects).
+
+**Step 2 — for each declared repo, ask whether it carries commits that resolved commit's checkout would discard.**
+
+```sh
+git -C "$MACKAS_BASE/work/<repo>" log --oneline <commit-from-step-1>..HEAD
+```
+
+Use the exact commit (or `refspec`) Step 1 resolved for **this** repo — never
+`@{u}`. `@{u}` names whatever this branch happens to track, which on a repo
+kas itself checked out is routinely nothing at all: a detached HEAD has no
+branch to have an upstream (`fatal: HEAD does not point to a branch`), and a
+local branch kas created rarely has one configured either (`fatal: no
+upstream configured for branch`) — `@{u}` dies outright on exactly the states
+kas leaves a checkout in, right when this step needs an answer most. Plain
+`HEAD` and a literal commit from Step 1 need neither a branch nor a tracking
+ref, so this works unchanged whichever of those states the repo is in.
+
+Non-empty output means that repo is **at risk**: kas resets a clean repo to
+the resolved commit from Step 1, and commits do not protect a repo the way
+uncommitted tracked changes do. This also covers **sibling-repo branch
+drift** (below) without a separate check: a repo sitting on some other
+branch entirely still shows up here, because whatever it carries that the
+resolved commit's history does not is exactly what `<commit-from-step-1>..HEAD`
+lists — drift is just local-only commits by another name. A repo that is
+merely *behind* (`HEAD` an ancestor of the resolved commit) prints nothing:
+kas moving it forward loses nothing that was only local.
+
+**Step 3 — read the answer off this table. Do not interpolate.**
+
+| Local-only commits? | Touching `patches:`? | Do this |
+|---|---|---|
+| no | no | **no `--skip` flags** |
+| no | yes | **no `--skip` flags** |
+| yes | no | `--skip repos_checkout --skip repos_apply_patches` |
+| yes | yes | **conflict — resolve it, do not guess** (below) |
+
+The last row is a genuine conflict: the pair is what protects your commits, and
+also what blocks the new patch. Resolve it explicitly — land the patch by
+building once without the flags and re-applying your commits afterwards, or
+carry the change as a commit in the repo instead of a `patches:` entry. Do not
+run the build hoping one of the two wins.
+
+**Step 4 — if a `patches:` entry was involved at all, verify it applied.**
+Mandatory, not advisory: a suppressed patch fails with the *original pre-patch
+error*, which is indistinguishable from the patch being wrong.
+
+```sh
+grep 'Patch applied.*<your patch file name>' <build log>
+```
+
+No match means the patch did not apply, whatever else the log says. The same
+blind spot applies to `mackas exec`, which always skips that step.
+
+### Why: kas resets clean repos, and commits do not protect them
 
 **kas force-resets clean repos to the configured branch head at build start.**
 This is kas behaviour, not mackas's. Uncommitted modified *tracked* files
@@ -642,8 +777,7 @@ moment ago and protected the build is, the instant you `git commit` or `git am`
 that fix, clean-but-ahead — and clean-but-ahead is not protected. A freshly
 `git am`'d fix survives *zero* `kas-container` invocations before being reset,
 with no error and no warning beyond an easy-to-miss "Repository X checked out
-to `<old sha>`" log line. **Pass the pair proactively while any repo in the
-composition carries local-only commits — do not wait to notice the loss.**
+to `<old sha>`" log line.
 
 ```sh
 cd "$MACKAS_BASE/work"
@@ -664,11 +798,7 @@ effect under `-k`. Use the explicit `--skip` pair, which is surgical. A
 hand-typed `kas-container ... -k ...` through `env.sh` now prints a one-line
 stderr heads-up about this rather than staying silent about it.
 
-### When it backfires: blocking fresh patches
-
-**Only pass the `--skip` pair when the *active* composition actually includes a
-repo that needs it. Do not carry it over reflexively from other work in the same
-session.**
+### Why: the pair also blocks patches you *want*
 
 `--skip repos_apply_patches` does not only protect already-patched repos from
 re-patching: it blocks kas from applying **any** `patches:` block for **every**
@@ -678,17 +808,8 @@ Observed failure mode: after adding a new `patches:` entry for a repo with no
 local commits, building with the habitual `--skip` pair silently used the
 *pristine, unpatched* checkout. The patch was simply never applied, and bitbake
 failed with exactly the original pre-patch error — **indistinguishable from "the
-patch doesn't work"**, with no hint the skip flags were the cause.
-
-kas only resets/patches repos actually declared in the *composed* config's
-`repos:` block, so a fragment that never pulls in a given layer was not going to
-touch it regardless — the pair buys no protection there and costs the new patch.
-Check which repos the current composition declares before deciding whether
-`--skip` is needed at all. **After adding a `patches:` entry, do at least one
-build with no `--skip` flags** (or grep the log for
-`Patch applied.*<new patch name>`) to confirm it really applied before trusting
-the result. The same blind spot applies to `mackas exec`, which always skips
-that step.
+patch doesn't work"**, with no hint the skip flags were the cause. That is why
+step 4 is mandatory rather than a suggestion.
 
 (For what a `patches:` entry looks like in practice, meta-angstrom's
 `kas/angstrom.yml` on `wrynose` carries one against `openembedded-core`, sourced
@@ -710,8 +831,18 @@ deliberately *not* wrapped in the repo-preserving skips — and kas's own lock
 plugin skips only `setup_dir`/`repos_apply_patches`/`setup_environ`/
 `write_bbconfig`, leaving `repos_checkout` to run. Treat it like a build, not
 like a query: run it when you actually want a fresh lock, and not while a
-sibling layer carries local-only commits. `mackas dump` (resolved config to
-`$MACKAS_LOGS/dump-<timestamp>.yml`) writes nothing into the checkout.
+sibling layer carries local-only commits.
+
+`mackas dump` (resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`) writes
+nothing into the checkout either, but not for free: `--resolve-refs` turns a
+floating `branch:`/`tag:` into its exact current commit, which needs kas to
+actually know the repo — the same `repos_checkout` task a build runs, which
+would force-reset a clean repo exactly like a build does. `mackas dump`
+passes `--skip repos_checkout --skip repos_apply_patches` itself (not via
+`kas_shell_ro` — those two flags are enough, since `setup_dir`/
+`finish_setup_repos` still need to run so a repo that isn't cloned yet gets
+cloned and its ref resolved). This is why Step 1 of the `--skip` decision
+procedure below is safe to run before Step 2 has looked at a repo at all.
 
 If a `retrieve`/`exec` call ever *does* reset a repo, treat
 it as a signal that the mackas checkout is outdated or the fix regressed, and
@@ -726,8 +857,11 @@ holds the lost commits as recoverable entries).
 is the expected symptom of the **one-VM-per-volume rule** being violated.
 Virtualization.framework refuses a second attach of the same ext4 image
 outright, so this is an ugly refusal rather than a corrupted build — mackas's
-own guard exists to turn it into a clear message first, but that guard only runs
-when the operation goes through a `mackas` command.
+own guard exists to turn it into a clear message first. That guard covers
+hand-typed `kas-container` calls too: the generated wrapper asks `mackas
+runtime-args --require-volumes-free` on every invocation, so it refuses by name
+rather than letting the raw VZ error happen. Seeing this message means the
+attach came from something that never went through the wrapper at all.
 
 Two distinct root causes give the identical message:
 
@@ -784,11 +918,19 @@ the working tree with no error. If a build behaves as though branch-specific
 fixes are simply missing, check `git -C work/<layer> branch -r` for a remote
 branch the config does not reference, not just the working-tree state.
 
+This is the same risk Step 2 of the `--skip` decision procedure (above) checks
+for *before* a build, not just after one — `<commit-from-step-1>..HEAD` is
+non-empty for a repo drifted onto another branch exactly as it is for one
+carrying local-only commits, because from kas's own checkout's point of view
+they are the same thing: work that only exists on `HEAD`, not on the commit
+kas is configured to reset to.
+
 ## Notes and gotchas
 
-- Only **one VM** may hold an ext4 volume at a time. `retrieve`, `clean`,
-  `exec`, `sstate prune` and every `volume` operation refuse while a build or
-  `mackas shell` still has it attached. Stop the build first.
+- Only **one VM** may hold an ext4 volume at a time. Every mackas command that
+  touches a volume refuses while another one holds it — `smoketest` and `shell`
+  included, so a second build is a clear refusal naming the volume rather than
+  a VZError. Stop the first one first.
 - `DL_DIR`/`SSTATE_DIR` are shared across every machine's build under the same
   two volumes — never point them at anything machine- or layer-specific.
 - kas printing "Repo <x> is dirty - no checkout" is **expected and harmless**
@@ -797,10 +939,39 @@ branch the config does not reference, not just the working-tree state.
   `--version`) are always safe **before** the subcommand, and that placement
   is recommended; every subcommand, including `setup` and `adopt`, also
   accepts them after its own command word (e.g. `mackas setup <root>
-  --dry-run` works the same as `mackas --dry-run setup <root>`). `--config`
-  and `--set` are the exception: they are resolved before any subcommand
-  runs, so they only work **before** the subcommand word — placed after,
-  they die with a redirect to the correct order.
+  --dry-run` works the same as `mackas --dry-run setup <root>`). `--config`,
+  `--project` and `--set` are the exception: they are resolved before any
+  subcommand runs, so they only work **before** the subcommand word — placed
+  after, they die with a redirect to the correct order.
+- `--project <name>` (or `$MACKAS_PROJECT_SELECT`) sources
+  `~/.config/mackas/projects/<name>.conf` — the standalone config `mackas
+  adopt` or `mackas project add <name>` writes — instead of searching.
+  `mackas projects` lists what is pinned; `mackas status` names the one in
+  effect. It cannot be combined with `--config`/`$MACKAS_CONF`: naming a path
+  and selecting a project are two answers to the same question and mackas
+  refuses rather than ranks them. `mackas project add <name> [--url URL
+  --branch BRANCH | --from <checkout>]` is `adopt`'s in-root sibling: it pins
+  a *project workspace* under this Mac's own root (`$MACKAS_WORK/<name>/`)
+  instead of a whole separate root.
+- **Implicit selection**: with no explicit `--project`/`--config` flag or
+  `$MACKAS_PROJECT_SELECT`/`$MACKAS_CONF` env var, mackas still selects a
+  pinned project when the cwd sits inside one of its `work/<name>/`
+  workspaces (or, standing in `work/` itself, when a hand-typed
+  `kas-container` file-list's leading component names one). You can tell it
+  happened: `mackas status`'s "selected via" line says "derived from `$PWD`"
+  / "derived from the kas chain" instead of `--project`, and every other
+  command prints a one-line stderr note the first time (project, source, the
+  three volume names) — read that note or the status line before assuming
+  which project's volumes a command is about to touch. To force a different
+  project (or the plain search path), pass `--project NAME`/`--config` on
+  that command explicitly; derivation is a fallback, never a competitor to an
+  explicit selector. Two dies are specific to this: standing somewhere that
+  matches more than one pinned project's workspace (a pathological nested
+  layout — pass `--project NAME` to pick one), and a hand-typed
+  `kas-container` run through a project's generated wrapper from a *different*
+  pinned project's workspace (the wrapper replays the project it was set up
+  under; fix by re-running `setup` under the right project, or using that
+  project's own `mackas` commands instead of the hand-typed one).
 - Most destructive commands are two-phase: they scan for real (even under
   `--dry-run`), report what they would reclaim, and only act after confirmation
   or `-y`.

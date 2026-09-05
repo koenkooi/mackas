@@ -16,6 +16,7 @@ setup() {
 	unset MACKAS_CONF MACKAS_MEMORY MACKAS_CPUS MACKAS_ROOT MACKAS_KAS_CONFIG
 	unset MACKAS_PROJECT_URL MACKAS_PROJECT_BRANCH MACKAS_PROJECT_DIR MACKAS_SMOKETEST_TARGETS
 	unset MACKAS_USE_NFS_MIRRORS MACKAS_SSTATE_MIRROR_PATH MACKAS_DL_MIRROR_PATH
+	unset MACKAS_VOLUME_NAME MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME
 	# HOME, not a real one: ~/.mackas.conf is the default target when nothing
 	# was already loaded, and the real home directory's own config (if any)
 	# must never leak into these tests either way.
@@ -86,6 +87,89 @@ CONF
 	conf | grep -qF '$HOME'
 	run "$MACKAS" get MACKAS_ROOT
 	[ "$output" = "/Volumes/My Disk/o'brien \$HOME" ]
+}
+
+# ---------------------------------------------------------------------------
+# set-time validation (issue #106): refuse_unwritable_setting_value() above
+# only catches characters that would corrupt the file itself (", `, control
+# chars) -- it does NOT run the per-setting shape checks validate_settings()
+# enforces on every other command (no whitespace in a volume name, integer-
+# only CPUS/MONITOR_PORT, the MEMORY/VOLUME_SIZE_* size shape). Before this
+# fix, a value that failed one of THOSE checks still wrote successfully, and
+# every LATER mackas invocation -- including `unset`, the only in-tool way
+# back -- died in main()'s unconditional validate_settings before dispatch
+# ever reached it. cmd_set now runs that same validation before writing, so
+# a bad value is refused up front and there is nothing left to be locked out
+# of.
+# ---------------------------------------------------------------------------
+
+@test "set: refuses a volume name with whitespace and writes nothing (issue #106)" {
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME "a b"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'contains whitespace'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: a refused value never locks a later command out, including unset (issue #106)" {
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME "a b"
+	[ "$status" -ne 0 ]
+
+	# This is the lockout the issue describes: before the fix, the write
+	# above would have succeeded, and both of these would then die in
+	# validate_settings instead of running normally.
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+
+	run "$MACKAS" unset MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'nothing to do'
+}
+
+@test "set: refuses a non-integer MACKAS_CPUS" {
+	run "$MACKAS" set MACKAS_CPUS abc
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a positive integer'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: refuses a malformed MACKAS_MEMORY" {
+	run "$MACKAS" set MACKAS_MEMORY 8x
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a size like 8g, 512m or 16'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: refuses a non-integer MACKAS_MONITOR_PORT" {
+	run "$MACKAS" set MACKAS_MONITOR_PORT abc
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a positive integer'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: refuses a malformed MACKAS_VOLUME_SIZE_TMP" {
+	run "$MACKAS" set MACKAS_VOLUME_SIZE_TMP big
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'is not a size like 1T, 200G or 512M'
+	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set: valid values for every newly-checked setting still succeed" {
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME mackas-shared-dl
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_CPUS 8
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_MEMORY 48g
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_MONITOR_PORT 9001
+	[ "$status" -eq 0 ]
+	run "$MACKAS" set MACKAS_VOLUME_SIZE_TMP 200G
+	[ "$status" -eq 0 ]
+
+	conf | grep -qF "MACKAS_VOLUME_DL_NAME='mackas-shared-dl'"
+	conf | grep -qF "MACKAS_CPUS='8'"
+	conf | grep -qF "MACKAS_MEMORY='48g'"
+	conf | grep -qF "MACKAS_MONITOR_PORT='9001'"
+	conf | grep -qF "MACKAS_VOLUME_SIZE_TMP='200G'"
 }
 
 @test "set --dry-run changes nothing on disk" {
@@ -171,6 +255,45 @@ CONF
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qF 'nothing to do'
 	[ ! -f "$HOME/.mackas.conf" ]
+}
+
+@test "set/get/unset: MACKAS_VOLUME_DL_NAME round-trips and unsets back to the derived default" {
+	# Registering a setting is a four-place operation; missing SETTING_NAMES
+	# is what makes set/get/unset reject it outright.
+	run "$MACKAS" set MACKAS_VOLUME_DL_NAME mackas-shared-dl
+	[ "$status" -eq 0 ]
+	conf | grep -qF "MACKAS_VOLUME_DL_NAME='mackas-shared-dl'"
+
+	run "$MACKAS" get MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "mackas-shared-dl" ]
+
+	run "$MACKAS" unset MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	assert_fails grep -qF 'MACKAS_VOLUME_DL_NAME' "$HOME/.mackas.conf"
+
+	# Empty again: the default is "derive from MACKAS_VOLUME_NAME".
+	run "$MACKAS" get MACKAS_VOLUME_DL_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "" ]
+}
+
+@test "set/get/unset: MACKAS_VOLUME_SSTATE_NAME round-trips and unsets back to the derived default" {
+	run "$MACKAS" set MACKAS_VOLUME_SSTATE_NAME mackas-shared-sstate
+	[ "$status" -eq 0 ]
+	conf | grep -qF "MACKAS_VOLUME_SSTATE_NAME='mackas-shared-sstate'"
+
+	run "$MACKAS" get MACKAS_VOLUME_SSTATE_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "mackas-shared-sstate" ]
+
+	run "$MACKAS" unset MACKAS_VOLUME_SSTATE_NAME
+	[ "$status" -eq 0 ]
+	assert_fails grep -qF 'MACKAS_VOLUME_SSTATE_NAME' "$HOME/.mackas.conf"
+
+	run "$MACKAS" get MACKAS_VOLUME_SSTATE_NAME
+	[ "$status" -eq 0 ]
+	[ "$output" = "" ]
 }
 
 @test "unset: does not remove a DIFFERENT setting whose name shares a suffix" {

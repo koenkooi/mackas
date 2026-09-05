@@ -19,6 +19,7 @@ setup() {
 	# Likewise, make sure the caller's environment cannot leak in.
 	unset MACKAS_CONF MACKAS_MEMORY MACKAS_CPUS MACKAS_ROOT MACKAS_KAS_CONFIG
 	unset MACKAS_VOLUME_SIZE_TMP MACKAS_OVERHEAD MACKAS_OVERHEAD_INTERVAL
+	unset MACKAS_VOLUME_NAME MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME
 	unset MACKAS_PROJECT_URL MACKAS_PROJECT_BRANCH MACKAS_PROJECT_DIR MACKAS_SMOKETEST_TARGETS
 	# Point HOME at the throwaway dir so ~/.config/mackas/config and
 	# ~/.mackas.conf cannot be picked up from the real home directory.
@@ -53,6 +54,13 @@ teardown() {
 # Read one setting out of `mackas status` output.
 setting() {
 	printf '%s\n' "$output" | awk -v k="$1" '$1 == k { $1=""; sub(/^ +/,""); print; exit }'
+}
+
+# The volume names `status` reports in its "ext4 volumes" section, in order.
+# The fake `container` above answers "running" with an empty volume list, so
+# every line is the "[ no]" form; both forms are matched anyway.
+ext4_volume_names() {
+	printf '%s\n' "$output" | sed -n 's/^  \[[ a-z]*\] \([^ ]*\) .*/\1/p'
 }
 
 # ---------------------------------------------------------------------------
@@ -283,6 +291,70 @@ setting() {
 	run "$MACKAS" status
 	[ "$status" -eq 0 ]
 	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+}
+
+@test "a searched config that is a symlink is graded by the file it points at" {
+	# `ln -s` applies the umask, so the link's own mode is only a record of
+	# that umask -- measured on macOS: 022 -> 755, 002 -> 775, 000 -> 777,
+	# 077 -> 700 -- and 755 is inside what the check accepts. Grading the
+	# link therefore accepts whatever it aims at. Built under an explicit
+	# umask so the fixture pins the measured 755 rather than the suite's.
+	echo 'MACKAS_KAS_CONFIG="from-elsewhere"' > "$TESTDIR/real.conf"
+	chmod 666 "$TESTDIR/real.conf"
+	( umask 022 && ln -s "$TESTDIR/real.conf" "$HOME/.mackas.conf" )
+	[ "$(stat -f '%Lp' "$HOME/.mackas.conf")" = "755" ]
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a searched config in a SYMLINKED world-writable directory is ignored" {
+	# The directory side. ~/.config/mackas is a link; the 0777 directory it
+	# points at is what anyone can drop a config into, and it is reached
+	# only by resolving the link.
+	mkdir -p "$TESTDIR/shared"
+	chmod 777 "$TESTDIR/shared"
+	echo 'MACKAS_KAS_CONFIG="from-shared"' > "$TESTDIR/shared/config"
+	chmod 600 "$TESTDIR/shared/config"
+	mkdir -p "$HOME/.config"
+	( umask 022 && ln -s "$TESTDIR/shared" "$HOME/.config/mackas" )
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a config kept as a symlink into a safe directory is still used" {
+	# The other side: the ordinary dotfiles setup must survive the check
+	# above, or it is just a blanket refusal of symlinks.
+	mkdir -p "$TESTDIR/dotfiles"
+	chmod 755 "$TESTDIR/dotfiles"
+	echo 'MACKAS_KAS_CONFIG="from-dotfiles"' > "$TESTDIR/dotfiles/real.conf"
+	chmod 644 "$TESTDIR/dotfiles/real.conf"
+	( umask 022 && ln -s "$TESTDIR/dotfiles/real.conf" "$HOME/.mackas.conf" )
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-dotfiles" ]
+}
+
+@test "a DIRECTORY at a searched path is skipped, and the search goes on" {
+	# Readable and ours, so it passes the safety grade untouched and used to
+	# reach `. "$f"` -- a raw shell error that aborted the whole run under
+	# set -e, taking the perfectly good next candidate with it.
+	mkdir -p "$HOME/.config/mackas/config"
+	echo 'MACKAS_KAS_CONFIG="from-home"' > "$HOME/.mackas.conf"
+	chmod 644 "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-home" ]
+}
+
+@test "a DIRECTORY named by \$MACKAS_CONF is refused with a clear message" {
+	mkdir -p "$TESTDIR/adir"
+	MACKAS_CONF="$TESTDIR/adir" run "$MACKAS" status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'not a regular file'
 }
 
 @test "an explicit --config is used even when group-writable" {
@@ -661,6 +733,64 @@ MOCK
 	printf '%s\n' "$output" | grep -qi 'MACKAS_VOLUME_NAME'
 }
 
+@test "MACKAS_VOLUME_DL_NAME with a space is refused, not word-split" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_DL_NAME=shared dl' status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_DL_NAME'
+	printf '%s\n' "$output" | grep -qi 'whitespace'
+}
+
+@test "MACKAS_VOLUME_SSTATE_NAME with a space is refused, not word-split" {
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_SSTATE_NAME=shared sstate' status
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_SSTATE_NAME'
+	printf '%s\n' "$output" | grep -qi 'whitespace'
+}
+
+@test "an empty MACKAS_VOLUME_DL_NAME is accepted -- empty is how you say 'derive it'" {
+	# The stem refuses empty; these two must not, or the documented default
+	# would be un-settable.
+	MACKAS_ROOT="/tmp/mackas test dir" \
+		run "$MACKAS" --set 'MACKAS_VOLUME_DL_NAME=' status
+	[ "$status" -eq 0 ]
+	[ -z "$(setting MACKAS_VOLUME_DL_NAME)" ]
+}
+
+@test "both volume-name overrides are listed in the resolved configuration, empty by default" {
+	MACKAS_ROOT="/tmp/mackas test dir" run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_DL_NAME'
+	printf '%s\n' "$output" | grep -qF 'MACKAS_VOLUME_SSTATE_NAME'
+	[ -z "$(setting MACKAS_VOLUME_DL_NAME)" ]
+	[ -z "$(setting MACKAS_VOLUME_SSTATE_NAME)" ]
+}
+
+@test "the overrides reach status with the same names whether MACKAS_ROOT is set or not" {
+	# derive_paths() has TWO branches -- an early return for an unset
+	# MACKAS_ROOT, and the main one. `status`, `help` and `volume list` on a
+	# machine with no root configured go through the FIRST, so deriving in
+	# only one makes mackas PRINT one set of names and OPERATE on another.
+	run "$MACKAS" --set MACKAS_VOLUME_DL_NAME=shared-dl \
+		--set MACKAS_VOLUME_SSTATE_NAME=shared-sstate status
+	[ "$status" -eq 0 ]
+	# Prove this really was the no-root branch, not a $PWD fallback.
+	printf '%s\n' "$output" | grep -qF 'MACKAS_ROOT is not set'
+	local noroot; noroot="$(ext4_volume_names)"
+
+	MACKAS_ROOT="$TESTDIR/oe" run "$MACKAS" --set MACKAS_VOLUME_DL_NAME=shared-dl \
+		--set MACKAS_VOLUME_SSTATE_NAME=shared-sstate status
+	[ "$status" -eq 0 ]
+	local withroot; withroot="$(ext4_volume_names)"
+
+	[ -n "$noroot" ]
+	[ "$noroot" = "$withroot" ]
+	[ "$noroot" = "oe-build-tmp
+shared-dl
+shared-sstate" ]
+}
+
 @test "a garbage MACKAS_VOLUME_SIZE_TMP dies before reaching the container CLI" {
 	MACKAS_ROOT="/tmp/mackas test dir" \
 		run "$MACKAS" --set MACKAS_VOLUME_SIZE_TMP=lol status
@@ -688,4 +818,64 @@ MOCK
 	MACKAS_ROOT="/tmp/mackas test dir" run "$MACKAS" status
 	[ "$status" -eq 0 ]
 	[ "$(setting MACKAS_FSTRIM_AUTO)" = "1" ]
+}
+
+@test "a symlink CHAIN with a world-writable hop in the middle is refused" {
+	# The final link and the final file both grade safe on their own -- the
+	# hole is only reachable by resolving through it, so a check that grades
+	# just the endpoints (as opposed to every hop) would miss this entirely.
+	echo 'MACKAS_KAS_CONFIG="from-end"' > "$TESTDIR/real.conf"
+	chmod 600 "$TESTDIR/real.conf"
+	mkdir -p "$TESTDIR/open"
+	chmod 777 "$TESTDIR/open"
+	( umask 022 && ln -s "$TESTDIR/real.conf" "$TESTDIR/open/mid.conf" )
+	( umask 022 && ln -s "$TESTDIR/open/mid.conf" "$HOME/.mackas.conf" )
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a RELATIVE symlink target is graded relative to the link's own directory, accept side" {
+	mkdir -p "$TESTDIR/rel"
+	chmod 755 "$TESTDIR/rel"
+	echo 'MACKAS_KAS_CONFIG="from-rel-safe"' > "$TESTDIR/rel/safe.conf"
+	chmod 644 "$TESTDIR/rel/safe.conf"
+	( cd "$TESTDIR/rel" && umask 022 && ln -s safe.conf rel-safe.conf )
+	rm -f "$HOME/.mackas.conf"
+	ln -s "$TESTDIR/rel/rel-safe.conf" "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-rel-safe" ]
+}
+
+@test "a RELATIVE symlink target is graded relative to the link's own directory, refuse side" {
+	mkdir -p "$TESTDIR/rel"
+	chmod 755 "$TESTDIR/rel"
+	echo 'MACKAS_KAS_CONFIG="from-rel-unsafe"' > "$TESTDIR/rel/unsafe.conf"
+	chmod 666 "$TESTDIR/rel/unsafe.conf"
+	( cd "$TESTDIR/rel" && umask 022 && ln -s unsafe.conf rel-unsafe.conf )
+	rm -f "$HOME/.mackas.conf"
+	ln -s "$TESTDIR/rel/rel-unsafe.conf" "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "" ]
+	printf '%s\n' "$output" | grep -qi 'ignoring'
+}
+
+@test "a config reached through a SYMLINKED but genuinely safe directory is still used" {
+	# The directory-side accept case. path_is_owned_and_unwritable_by_others
+	# refuses a symlinked directory outright -- so this path only works
+	# because config_file_is_safe resolves the link to the REAL directory
+	# first and grades that, rather than grading the link itself.
+	mkdir -p "$TESTDIR/dotfiles"
+	chmod 755 "$TESTDIR/dotfiles"
+	echo 'MACKAS_KAS_CONFIG="from-linked-dir"' > "$TESTDIR/dotfiles/real.conf"
+	chmod 644 "$TESTDIR/dotfiles/real.conf"
+	( umask 022 && ln -s "$TESTDIR/dotfiles" "$TESTDIR/link" )
+	rm -f "$HOME/.mackas.conf"
+	ln -s "$TESTDIR/link/real.conf" "$HOME/.mackas.conf"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	[ "$(setting MACKAS_KAS_CONFIG)" = "from-linked-dir" ]
 }

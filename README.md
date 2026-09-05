@@ -73,6 +73,14 @@ those would make kas bind-mount an APFS directory over the ext4 volumes
 ([why](docs/architecture.md#how-they-get-mounted-and-why-kas_build_dir-must-stay-unset)).
 It lives at `~/oe/env.sh` once `setup` has made the short symlink, or in
 `MACKAS_ROOT` if you set `MACKAS_SHORT_LINK=`; `./mackas status` prints where.
+With a project selected it is `env-NAME.sh` instead, so two pinned projects
+on one `MACKAS_ROOT` never share a generated file. *Any* selection counts,
+including the derived one — standing in a pinned workspace is enough, the
+same rung the [selector table](#configuration) lists third — so run
+`./mackas status` from where you build and source the `env.sh` line it
+prints rather than assuming. That file also exports `MACKAS_PROJECT_SELECT`
+for you, guarded the same way `GITCONFIG_FILE` is — a value your shell
+already has always wins over the one this file was generated for.
 
 ### Directory layout
 
@@ -82,9 +90,12 @@ Everything lives under `MACKAS_ROOT` (reached through the short-link alias
 ```
 $MACKAS_ROOT/
 ├── bin/          the docker->container shim, kas-container, GNU realpath
-├── kas/          the canonical generated tuning fragment (macos.yml)
-├── logs/         smoketest/build logs
-├── env.sh        generated; source this
+├── kas/          the canonical generated tuning fragment (macos.yml;
+│                 macos-NAME.yml once a project is selected)
+├── logs/         smoketest/build logs (logs/NAME/ once a project is
+│                 selected, so two pinned projects never share one)
+├── env.sh        generated; source this (env-NAME.sh once a
+│                 project is selected)
 ├── gitconfig     generated; forwarded as GITCONFIG_FILE
 └── work/         <- every layer checkout lives HERE, as a sibling
     ├── meta-angstrom/
@@ -101,6 +112,14 @@ what kas sees. A real multi-layer BSP — a dozen `meta-*` repos, not just the
 single project `setup` clones — goes under `work/` as siblings; see
 [Driving kas directly](#driving-kas-directly).
 
+Selecting a project migrates nothing. Anything already sitting flat from
+before a project was ever selected on this root stays exactly where it was
+written: an older `dump-*.yml` or `smoketest-*.log` under `logs/`, and — the
+one that bites — the flat `env.sh` and `kas/macos.yml`. The first selected
+run writes `env-NAME.sh` beside the old `env.sh` rather than over it, so a
+shell that already sourced the old one keeps the old, selector-free
+environment until you source the new file.
+
 ## Commands
 
 | Command | Does |
@@ -108,6 +127,7 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `check` | Preflight only. PASS/WARN/FAIL, each with the remediation command. **Default.** |
 | `setup` | Full setup, idempotent. Safe to re-run after a crash or Ctrl-C. Takes an optional root path and `--tmpdir-size`/`--sstate-size`/`--downloads-size`; asks interactively for whichever is still unconfigured. |
 | `adopt` | Bring a `MACKAS_ROOT` set up by another Mac back to a working build here — see [below](#adopting-a-root-from-another-mac). |
+| `project add` | Pin a project workspace under *this* Mac's own root — the in-root sibling of `adopt` — see [below](#pinning-a-project-workspace). |
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
@@ -115,18 +135,19 @@ single project `setup` clones — goes under `work/` as siblings; see
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
 | `buildhistory` | `buildhistory analyze [PATH] [--from REV] [--to REV] [--detail] [--json]` summarises what changed between two builds — recipes added/removed/upgraded, the biggest PKGSIZE movers, per-image size/content deltas. `mackas buildhistory --help`. |
-| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days. `mackas sstate --help`. |
+| `sstate` | `sstate prune --older-than N[d]` deletes sstate objects bitbake hasn't reused in N days; `sstate push` publishes new ones to a mirror over rsync/ssh. `mackas sstate --help`. |
 | `monitor` | `monitor [--port N] [--once] [--notify]` prints live bitbake progress from a build started with `MACKAS_MONITOR=1`. Exits 0 on a build that succeeded, 1 on one that failed, 2 when no bridge is reachable — a usable scripted probe. |
-| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/). Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. |
-| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. |
+| `clean` | Drop the TMPDIR volume (recreated empty; also drops deploy, buildhistory and conf/) and clear the log dir — the selected project's own `logs/NAME/`, or, with none selected, the whole flat `logs/` including every `logs/NAME/` under it. Keeps the downloads/sstate volumes and the checkout. Or one narrower target: `clean tmp+deploy` (keeps buildhistory/conf), `clean downloads`, `clean sstate` — `mackas clean --help`. `downloads`/`sstate` refuse a volume another pinned project shares (see [below](#pinning-a-project-workspace)). |
+| `destroy` | Remove all four volumes (including a rarely-present legacy one), `$MACKAS_ROOT`, the symlink. Makes you type `DESTROY`. Refuses a downloads/sstate volume another pinned project shares. |
 | `volume` | Manage the ext4 volumes: `list`, `fstrim` (`all`/`--all`/`-a` for every active volume), `duplicate`, `destroy` one or all (`--all`/`-a`), `move`, `resize` (grow), `fsck` (repair ext4 corruption after a crash), `recover`. |
 | `set` / `get` / `unset` | Persist, read back, or remove one setting in the config file — see [Configuration](#configuration). |
-| `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The `env.sh` wrapper calls it itself on every hand-typed `kas-container`; you rarely type it, except to check what a setting did. |
+| `projects` | List the pinned per-project configs under `~/.config/mackas/projects/` that `--project` selects between, by *grepping* each one — never sourcing it. (The plural, read-only sibling of `project add`, which creates one.) |
+| `runtime-args` | Plumbing: prints the effective `--runtime-args` string. The generated `kas-container` wrapper calls it itself on every hand-typed invocation (with `--require-volumes-free`, which applies the one-VM rule first and prints nothing if a volume is held); you rarely type it, except to check what a setting did. |
 | `lock` | `kas lock` against the project's kas config — pins every declared repo to its exact current commit, written into the checkout. |
-| `dump` | `kas dump --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml`, a reproducibility record next to a build's own logs. |
+| `dump` | `kas dump --skip repos_checkout --skip repos_apply_patches --resolve-env --resolve-local --resolve-refs` — saves the fully-resolved config to `$MACKAS_LOGS/dump-<timestamp>.yml` (`logs/NAME/` once a project is selected), a reproducibility record next to a build's own logs. The two `--skip` flags keep it from resetting a clean sibling repo the way resolving a floating branch/tag otherwise would. |
 
-Options: `--config FILE`, `--set NAME=VALUE`, `--dry-run`, `-y/--yes` (or
-`-f/--force`), `-v/--verbose`, `--version`, `--help`.
+Options: `--config FILE`, `--project NAME`, `--set NAME=VALUE`, `--dry-run`,
+`-y/--yes` (or `-f/--force`), `-v/--verbose`, `--version`, `--help`.
 
 ### The smoketest ladder
 
@@ -140,8 +161,12 @@ fallback if your kas config has no sensible bare default.
 [mackas.conf.example](mackas.conf.example) ships meta-ai's ladder, commented
 out, as a worked example (smallest native recipe → same recipe
 cross-compiled → the real targets, **hours** cold). Each rung streams to
-`$MACKAS_ROOT/logs/` and stops the ladder on failure. See
-[testing.md](docs/testing.md#the-smoketest-ladder).
+`$MACKAS_ROOT/logs/` (`logs/NAME/` once a project is selected) and stops the
+ladder on failure. See
+[testing.md](docs/testing.md#the-smoketest-ladder). `smoketest` and `shell`
+obey the **one-VM rule** like everything else: if another build already holds
+one of the three volumes, they refuse by name up front instead of letting
+Virtualization.framework reject the second attach mid-run.
 
 ### Getting build outputs off the volume
 
@@ -258,6 +283,47 @@ stamps still reference — use openembedded-core's own
 age-based pruning, `mackas clean sstate` deletes and recreates the whole
 volume.
 
+### Publishing sstate to a mirror
+
+`mackas sstate push` is the write half of the mirror story: the read half
+(`MACKAS_USE_HTTP_MIRRORS`, `mackas-mirrord`) has always been there, but
+nothing put objects *on* a mirror. Set `MACKAS_SSTATE_PUSH_DEST` to an
+rsync/ssh target — `mirror@host:/srv/mackas/sstate`, the directory
+`mackas-mirrord` serves — and run it after a build:
+
+```sh
+mackas set MACKAS_SSTATE_PUSH_DEST mirror@linux-computer.local:/srv/mackas/sstate
+mackas sstate push
+```
+
+Objects newer than this volume+destination's own stamp are copied out of the
+ext4 volume into a host staging directory and **verified there** with the
+same checksum manifest `mackas retrieve` uses — a real >18 GB artifact was
+once copied with the right size and the wrong content, and a shared mirror is
+the last place to skip that check. Only then is the volume released and the
+transfer made, as two `rsync --ignore-existing` passes: every object first,
+the `.siginfo` files second, so a consumer reading the mirror mid-push never
+finds a signature whose object is missing. Nothing is ever sent with
+`--inplace`; published objects are immutable and the first writer wins, which
+is also why two machines pushing at once need no locking. The stamp advances
+only after rsync exits clean — and only when the scan that produced it
+provably ran and provably matched nothing, so a probe that broke costs a
+rescan rather than silently dropping objects below the cutoff. An interrupted
+push simply re-offers the same objects next time.
+
+The cutoff is mtime, and bitbake touches an sstate object every time it
+*reuses* one, so a push offers what recent builds wrote **or reused**. It
+never misses; it does mean the staging directory wants room for the reuse
+set, not just the new one.
+
+**Push before you prune.** Once an object is on the mirror, pruning it locally
+downgrades from "forced rebuild" to "HTTP refetch".
+
+The destination is an ssh target rather than an HTTP upload on purpose:
+`mackas-mirrord` is read-only, and that is a security property worth keeping.
+`--full` ignores the stamp; `--dry-run` shows the shape without transferring.
+Details: [storage.md](docs/storage.md#publishing-sstate-mackas-sstate-push).
+
 ### Watching a build live
 
 A build inside the container is invisible to macOS in real time beyond
@@ -329,8 +395,10 @@ hands off to `$MACKAS_BIN/kas-container`, the generated protection wrapper
 script, and that wrapper — not the function — is what supplies
 `--runtime-args` (the ext4 volumes, CPU/memory limits, and the
 live-progress-bridge args when `MACKAS_MONITOR=1`, recomputed live per call
-via `mackas runtime-args`, not frozen at `setup` time, so exporting a setting
-takes effect on the very next hand-typed build), points `GITCONFIG_FILE` at
+via `mackas runtime-args --require-volumes-free`, never frozen at `setup`
+time, so exporting a setting takes effect on the very next hand-typed build,
+and a build that mackas refuses — a held volume, colliding volume names —
+is refused here too rather than run on stale values), points `GITCONFIG_FILE` at
 the generated `safe.directory` config, and blanks
 `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR`.
 `MACKAS_KAS_AUTO_FRAGMENT=0` / `MACKAS_KAS_AUTO_PROJECT=0` disable the two
@@ -380,6 +448,78 @@ yourself with `type -a kas-container`
 > is what's left for the case `exec` cannot help with — a sibling-layer
 > chain, driven from `work/` directly (see above).
 
+## Pinning a project workspace
+
+`mackas adopt` pins a whole *foreign* root. `mackas project add <name>` is
+its in-root sibling: it pins a project workspace *inside this Mac's own*
+`MACKAS_ROOT`, so a second (or third) layer set builds alongside the first
+with its own `work/<name>/` and, once selected, its own volumes — see
+[Configuration](#configuration) for the selector itself and how the volume
+stem derives from it.
+
+```sh
+./mackas project add meta-qcom --url https://example.com/meta-qcom.git --branch main
+./mackas --project meta-qcom setup     # clones it, then builds out the rest
+```
+
+Both write the same kind of artifact `adopt` does: a standalone config at
+`~/.config/mackas/projects/<name>.conf`, seeded from whatever settings are
+in effect right now (`MACKAS_ROOT`, the checkout's URL/branch, and any
+volume-name override already explicit in this invocation — sizes, CPUs/
+memory and mirror settings are deliberately left out, so the file stays
+readable and does not freeze today's machine-wide defaults into every future
+project). `project add` only **pins**; it never clones or builds — that is
+what `setup`, run afterwards under `--project <name>`, still does.
+
+**A first-level directory under `work/` is a project workspace if and only
+if a pinned config for that name exists** (#72). A plain, unpinned
+`work/<name>/` — a checkout put there some other way — is just a checkout;
+`project add <name>` refuses it outright rather than silently adopting it.
+`--from <checkout>` is the deliberate opt-in: it converts that *exact*
+`work/<name>/` entry in place, reading its remote URL and current branch
+instead of asking for `--url`/`--branch`. It never renames or moves
+anything — pointing `--from` at a *different* directory than `<name>` is
+refused, not "fixed up" for you.
+
+`--from` also asks the one question the design's migration path B depends
+on: keep the checkout's existing volumes explicitly (`--keep-volumes`, e.g.
+staying on `oe-build-*`, no data ever moved) or switch it to
+`mackas-<name>-*` going forward (`--derive-volumes`; the old volumes are
+left exactly as they are, not deleted). Interactively, with neither flag,
+it asks; non-interactively (no tty, or `-y`) it keeps — the answer that
+changes nothing and can never invalidate an existing download/sstate cache.
+
+An already-pinned `<name>` is offered for overwrite, exactly like `adopt`
+does for its own config file. `mackas project add --help` has the full flag
+list; `mackas project --help` for the command family; `mackas projects`
+lists what is already pinned.
+
+Once selected, a pinned project's three volumes default to
+`mackas-<name>-tmp`/`-dl`/`-sstate` — see [Configuration](#configuration) for
+exactly how that derivation and its precedence-and-warn rule work. **All
+three are private to the project by default.** `TMPDIR` has no sharing knob
+at all — two builds in one `/build` is corruption, not contention — but the
+two caches genuinely are safe to share (downloads are checksum-verified,
+sstate is hash-keyed), so `MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME`
+*can* point two projects at the same volume. Nothing here does that for you:
+sharing is opt-in per project, never the default and never the
+recommendation — an ext4 volume can be mounted by only one VM at a time, so
+sharing trades disk against sibling projects queuing on each other; an
+[HTTP mirror](docs/storage.md#http-mirrors--optional-and-not-just-an-nfs-bridge)
+buys the cross-project hit rate without that contention. Because of this,
+`mackas destroy` and `mackas clean downloads`/`clean sstate` refuse to touch
+a volume more than one pinned project references, naming the other
+project(s) instead; the explicit way through is `mackas volume destroy
+<name>`, which acts on a volume by its literal name regardless of who else
+points at it. See [storage.md](docs/storage.md#naming-the-cache-volumes-outright)
+for the full reasoning.
+
+Two supported end states, and nobody is forced to move off the first one:
+**(A) do nothing** — stay on `oe-build-*` indefinitely, fully supported, not
+deprecated — or **(B) pin it** with `project add --from`, keeping
+`oe-build-*` explicitly (`--keep-volumes`, no data ever moved) or deriving
+`mackas-<name>-*` instead (`--derive-volumes`).
+
 ## Adopting a root from another Mac
 
 `MACKAS_ROOT` is portable — an external SSD, or a disk image on a share, can
@@ -399,7 +539,9 @@ outright** if the path is already this Mac's own root (that is
 `~/.config/mackas/projects/<name>.conf`, or wherever `--write-config FILE`
 says (note: `--write-config`, not the global `--config`, which loads an
 *existing* file); from then on, drive that project with
-`mackas --config <that file> ...`. adopt then runs `volume recover` (so a
+`mackas --project <name> ...` — the default location is what makes the short
+form work, and `mackas --config <that file> ...` always does too. adopt then
+runs `volume recover` (so a
 relocated volume Spotlight can find is re-pointed before `setup` would
 create a fresh empty one over it), checks for `work/` files owned by the
 other Mac's account and offers a recursive `chown` if the drive isn't
@@ -422,7 +564,7 @@ volume-relocation symlink already belongs to a different live project,
 | `tools/` | Host-side helpers, stdlib Python: `mackas-buildstats-analyze` (`buildstats analyze`), `mackas-buildhistory-analyze` (`buildhistory analyze`), `mackas-overhead` (per-rung host CPU/RSS sampler), `mackas-monitor` (the `mackas monitor` poller), `mackas-ext4-dirty-bit` (the superblock dirty-bit probe `check` runs). |
 | `tests/`, `run-tests.sh`, `Makefile` | bats test suite and its entry points (`./run-tests.sh` or `make test`). See [testing.md](docs/testing.md). |
 | `COPYING` | GPLv3. |
-| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`. |
+| `$MACKAS_BASE/env.sh` | **Generated**, not shipped: the environment to `source` before building — shim on `PATH`, `KAS_*`, `BB_NUMBER_THREADS`/`PARALLEL_MAKE`, the `kas-container` wrapper function. Defaults to `~/oe/env.sh`; `env-NAME.sh` once a project is selected. |
 | `$MACKAS_BASE/gitconfig` | **Generated**: forwarded as `GITCONFIG_FILE` so git can operate on `/repo` despite the virtiofs ownership quirk ([architecture.md](docs/architecture.md#git-dubious-ownership--the-blocker)). Never written over a `GITCONFIG_FILE` you already export. |
 
 ## Configuration
@@ -433,22 +575,157 @@ Precedence, lowest to highest:
 built-in defaults  ->  config file  ->  environment  ->  command-line flags
 ```
 
-Config file, first match wins: `$MACKAS_CONF`, then
-`~/.config/mackas/config`, then `~/.mackas.conf`. `./mackas.conf` is
-deliberately **not** searched: the config is sourced as shell, so a cwd
-config would let any untrusted tree you `cd` into (an unpacked tarball, a
-cloned repo) run code the moment you invoke `mackas`. To use a per-project
-config, name it out loud — `mackas --config ./mackas.conf ...` — and keep
-the file to assignments.
+Which file gets sourced, first match wins:
+
+| | |
+|---|---|
+| `--config FILE` / `$MACKAS_CONF` | a path, named outright |
+| `--project NAME` / `$MACKAS_PROJECT_SELECT` | `~/.config/mackas/projects/NAME.conf` |
+| *(derived from `$PWD`, or from a hand-typed kas chain)* | whichever pinned project's workspace you are standing in |
+| `~/.config/mackas/config` | |
+| `~/.mackas.conf` | |
+
+Naming a path and selecting a project are mutually exclusive — two answers to
+the same question — so mackas refuses rather than ranking them, and the refusal
+prints both resolved values plus the command to drop whichever one you did not
+mean. An empty value is refused too: `--config=` and `--config ""` behave
+identically, as do `--project=` and `--project ""`, so an explicit-but-empty
+override can never quietly resolve to a different file.
+
+`./mackas.conf` is deliberately **not** searched: the config is sourced as
+shell, so a cwd config would let any untrusted tree you `cd` into (an
+unpacked tarball, a cloned repo) run code the moment you invoke `mackas`. To
+use a per-project config, name it out loud — `mackas --config ./mackas.conf
+...` — and keep the file to assignments.
+
+`--project NAME` selects a *pinned* project: the standalone config `mackas
+adopt` or `mackas project add` writes under `~/.config/mackas/projects/`.
+`mackas projects` lists them. It is a **selector, not a fifth precedence
+rung** — it decides which single file is sourced, never a value in one, so
+the chain above is unchanged. `MACKAS_PROJECT_SELECT` is therefore not a
+setting: `mackas set` will not write it, and it takes no part in the config
+file's own resolution. Naming a path and selecting a project are mutually
+exclusive; combining them is refused rather than ranked, because silently
+ignoring either one is how you build against a project you did not mean.
+
+When neither an explicit selector nor an explicit path names a file, mackas
+tries one more thing before falling back to the search path: it derives a
+selection from where you are standing. It takes the *physical* `$PWD`
+(`pwd -P`, so a symlinked short link such as `~/oe` resolves the same way on
+both sides), and for every already-pinned project's config it **greps** —
+never sources — the file for `MACKAS_ROOT`, forming
+`<that root>/work/<the config's own name>` (the config's filename, not
+whatever `MACKAS_PROJECT_DIR` it sets — volume identity keys off the selector
+name alone) and resolving *that* physically too. If `$PWD` equals or sits
+under exactly one such candidate, that project is selected through the exact
+same strict path `--project` uses (the ownership check below included) —
+inference only ever picks among identities you already pinned, it never
+invents one, and a bare `work/foo` directory with no `foo.conf` decides
+nothing. Zero matches falls straight through to the search path, byte-
+identical to a build with no derivation at all. More than one match — only
+reachable by deliberately nesting one pinned root's `work/` inside another's —
+is refused, listing every candidate and pointing at `--project NAME` to break
+the tie; it is never guessed. A `MACKAS_ROOT` that is not an absolute path
+(relative, `~`, `$HOME`, a command substitution) is simply not a candidate —
+it is printed by the grep, never evaluated or expanded. And a pinned config
+this process cannot even read is *not* silently skipped while a selection is
+being made: it could have been the match, so mackas dies naming the file
+rather than guess "no". A derived path under a predictable, guessable
+location is an ambush surface, not a request — the same reasoning that makes
+`--project` itself stricter than `--config` below.
+
+Standing in `work/` itself and hand-typing a `kas-container build
+<layer>/kas/base.yml:...` defeats derivation from `$PWD` alone — `$PWD` there
+is `work/`, the parent of every checkout, not any one project's own
+directory. For exactly that case the generated wrapper also hands mackas the
+chain's own leading path component (only when every colon-separated entry is
+relative and agrees on it), and mackas tries `<physical $PWD>/<that
+component>` as a second candidate the same way, only once `$PWD` alone found
+nothing.
+
+Whenever this derivation is what selects a project, mackas prints one line to
+stderr the first time — naming the project, what it was derived from, and the
+three resolved volume names — so a build run from inside a workspace never
+mounts a different project's volumes with no visible trace. `./mackas status`
+shows the same fact in its own "selected via" line (`--project`,
+`$MACKAS_PROJECT_SELECT`, "derived from `$PWD`", or "derived from the kas
+chain"), and `./mackas projects` flags a pin whose `work/<name>` has gone
+missing — moved or renamed — the same way it flags a pin whose `MACKAS_ROOT`
+itself is gone: identity is never re-minted from whatever *is* on disk, so
+the fix is to move the checkout back or drop the pin, never for mackas to
+guess a new one.
+
+A workspace renamed or moved after being pinned simply stops matching — it
+falls through to tier 4 exactly as an unpinned checkout always has, never
+re-derived from the new name. And the generated `kas-container` wrapper
+itself replays the pin it was built under (via `$MACKAS_PROJECT_SELECT`) so
+that more than one in-root project can share one wrapper; if the directory
+(or kas chain) a hand-typed build actually runs from derives a *different*
+single pinned project than the one the wrapper was built for, mackas refuses
+rather than silently handing that build the wrong project's volumes under the
+wrapper's own frozen work dir — naming both projects and how to fix it
+(re-run `setup` under the right one, or use that project's own `mackas`
+commands instead of the hand-typed `kas-container`). A derived selection is
+also never baked into a *generated* wrapper: `mackas setup` run from inside a
+derived workspace still creates that project's volumes, but leaves the
+wrapper's own pin empty, so derivation keeps deciding on every call rather
+than freezing to whatever directory `setup` happened to run from.
+
+A `--project` file is held to the same ownership check a *searched* config
+is (a regular file, yours or root's, not group/world-writable, file and
+directory both — and graded through symlinks, on the file that would really
+be sourced and the directory it really sits in, because `ln -s` applies the
+umask and a link's own mode therefore says nothing about its target), and
+refused outright if it fails — deliberately stricter than `--config`, which
+is exempt. mackas derives the `--project` path itself from a bare name in a
+fixed, guessable place; a path you typed is a request, a path mackas guessed
+is an ambush surface. Names are validated before they become a path: no path
+separators, no `..`, no leading `-`, letters/digits/`.`/`_`/`-` only. When
+`mackas set` has to create `~/.config/mackas/projects/` it does so at mode
+`700` regardless of your umask, so a `umask 002` login cannot produce a
+directory the same check then refuses.
+
+`mackas --project NAME setup` also bakes the selector into the generated
+`kas-container` wrapper. The wrapper recomputes `--runtime-args` on every
+call, and it replays `NAME` into that recompute — so a hand-typed
+`kas-container build ...` gets the volumes belonging to the project whose
+work dir and gitconfig the wrapper was built with, not whatever the default
+search path happens to find. The selector is passed explicitly even when
+empty, so an exported `$MACKAS_PROJECT_SELECT` cannot re-aim one project's
+wrapper at another project's volumes.
+
+When a project is selected, the volume stem also defaults to
+`mackas-<name>` (`mackas-<name>-tmp`/`-dl`/`-sstate`) instead of
+`oe-build` — a **default, not a new rung**: `MACKAS_VOLUME_NAME` /
+`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME` set in the
+project's own config, the environment, or `--set` still win outright, the
+same as always. `./mackas status` notes it, once and only informationally,
+whenever an explicit value disagrees with what the selector would have
+derived — keeping `oe-build-*` with no data move is a fully supported
+choice, never something the note suggests fixing.
+
+The three generated files split the same way, on the same condition (a
+project is selected, by any of the three rungs above — the derived one
+included) and with the same goal of two pinned projects never writing over
+each other: `env.sh` becomes `env-NAME.sh`, the canonical kas fragment
+`kas/macos.yml` becomes `kas/macos-NAME.yml`, and `logs/` becomes
+`logs/NAME/`, which carries `dump`'s output, the smoketest logs, `status`'s
+"Recent logs" listing and bare `clean`'s wipe with it. The in-checkout
+fragment copy keeps its plain `kas/macos-local.yml` name either way: each
+project has its own checkout, so there is nothing to collide with there.
+Nothing is migrated (see [Directory layout](#directory-layout)), and the
+isolation is one-way — a bare `clean` with *no* project selected still
+clears the whole flat `logs/`, every `logs/NAME/` under it included.
 
 Every setting is also an environment variable of the same name, and
 `--set NAME=VALUE` overrides both for the one command it rides along with.
 For a *persistent* override use `mackas set MACKAS_MEMORY 48g` / `get`
 (resolved through the full precedence chain) / `unset`. These operate on
 whatever config file the invocation is pointed at, including one that does
-not exist yet — `mackas --config ~/other-project.conf set ...` is how you
-bootstrap a new per-project config. `./mackas status` prints what is in
-effect and which config file (if any) was used.
+not exist yet — `mackas --config ~/other-project.conf set ...`, or
+`mackas --project newthing set ...`, is how you bootstrap a new per-project
+config. `./mackas status` prints what is in effect, which config file (if
+any) was used, and which project was selected.
 
 The settings a new user actually needs:
 
@@ -456,7 +733,9 @@ The settings a new user actually needs:
 |---|---|---|
 | `MACKAS_ROOT` | *(none; falls back to `$PWD` with a warning)* | Where everything lives. Must be a dir on a case-sensitive volume — `setup` refuses otherwise; see below. |
 | `MACKAS_SHORT_LINK` | `$HOME/oe` | Short, space-free symlink to `MACKAS_ROOT`. |
-| `MACKAS_VOLUME_NAME` | `oe-build` | Stem for the three ext4 volumes (`-tmp`, `-dl`, `-sstate`). Must be space-free. |
+| `MACKAS_VOLUME_NAME` | `oe-build` (`mackas-<name>` once `--project NAME` is selected, unless set explicitly) | Stem for the three ext4 volumes (`-tmp`, `-dl`, `-sstate`). Must be space-free. |
+| `MACKAS_VOLUME_DL_NAME` | *(empty: `${MACKAS_VOLUME_NAME}-dl`)* | Names the downloads volume outright instead of deriving it. Must be space-free. |
+| `MACKAS_VOLUME_SSTATE_NAME` | *(empty: `${MACKAS_VOLUME_NAME}-sstate`)* | Names the sstate volume outright instead of deriving it. Must be space-free. |
 | `MACKAS_VOLUME_SIZE_TMP` | `120G` | Cap on the TMPDIR volume. |
 | `MACKAS_VOLUME_SIZE_DL` | `40G` | Cap on the downloads volume. |
 | `MACKAS_VOLUME_SIZE_SSTATE` | `40G` | Cap on the sstate volume. |
@@ -470,6 +749,11 @@ The settings a new user actually needs:
 | `MACKAS_SMOKETEST_TARGETS` | *(empty)* | Space-separated smoketest build targets after the parse rung. Empty: one build rung with no `--target`. |
 | `MACKAS_MONITOR` | `0` | Opt builds into the live progress bridge ([above](#watching-a-build-live)). |
 | `MACKAS_WORKSPACE_IMAGE` | *(empty)* | The workspace image mounted at `work/`, once one exists. Written by `setup`, not by you: it is the record that gets `work/` reattached after a reboot. |
+
+`MACKAS_PROJECT_SELECT` is deliberately **absent** from that table and from
+every other list of settings: it chooses which file is read, so it cannot be
+one of the things read out of it. `mackas set`/`get`/`unset` refuse it, and
+it never participates in the precedence chain.
 
 [mackas.conf.example](mackas.conf.example) is the authoritative, annotated
 full list — mirrors, the host-overhead sampler, auto-`fstrim`, buildstats

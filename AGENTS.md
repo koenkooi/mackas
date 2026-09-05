@@ -8,10 +8,11 @@ break by accident.
 
 ## What this repo is
 
-- `mackas` — the whole tool, one ~10,500-line **bash 3.2** script. Subcommands:
-  `check`, `setup`, `adopt`, `smoketest`, `status`, `shell`, `exec`,
+- `mackas` — the whole tool, one ~13,100-line **bash 3.2** script. Subcommands:
+  `check`, `setup`, `adopt`, `project`, `smoketest`, `status`, `shell`, `exec`,
   `retrieve`, `buildstats`, `buildhistory`, `sstate`, `monitor`, `clean`,
-  `destroy`, `volume`, `set`, `get`, `unset`, `runtime-args`, `lock`, `dump`.
+  `destroy`, `volume`, `set`, `get`, `unset`, `projects`, `runtime-args`, `lock`,
+  `dump`.
 - `bin/docker` — a shim that translates the `docker` CLI calls kas-container v5.4
   makes into Apple `container` calls. Nothing more.
 - `mirror-server/mackas-mirrord` — optional HTTP mirror server. **Python 3.7+,
@@ -26,7 +27,7 @@ break by accident.
   progress as JSON over HTTP; `bitbake` is a wrapper bind-mounted directly over
   the checkout's own `bin/bitbake` for the lifetime of one container run (a
   PATH shadow does not work — see the file's own header for why).
-- `tests/` — 40 `*.bats` files + 7 `test_*.py` files.
+- `tests/` — 54 `*.bats` files + 7 `test_*.py` files.
 - `docs/` — architecture, storage, homebrew, testing, mirror-server,
   performance, security, monitor-app.
 - `skills/mackas/SKILL.md` — an operational playbook for *using* mackas to
@@ -133,7 +134,11 @@ a partial run.
    Preserve that order.
 5. **Never source or write files unsafely.** A config file is sourced only if it
    passes `config_file_is_safe` (owned by us or root, not group/world-writable —
-   file *and* directory). Interpolated settings are checked by `validate_settings`
+   file *and* directory), and only if it is a regular file. Both sides are graded
+   through symlinks, never on the link: `ln -s` applies the umask, so a link is
+   mode 755 at the usual one (measured: 022 → 755, 002 → 775, 000 → 777,
+   077 → 700) and would sail through the check while pointing anywhere at all.
+   Interpolated settings are checked by `validate_settings`
    (reject `"`, backtick, control chars) before being written into the generated
    `env.sh` / gitconfig / kas fragment.
 6. **The shim's scope is fixed:** it covers what kas-container v5.4 issues plus
@@ -158,12 +163,17 @@ a partial run.
 
 ## Workflow conventions
 
-- **CI runs on every push to main and every pull request.**
-  `.github/workflows/ci.yml` triggers on `push`/`pull_request`/
-  `workflow_dispatch`. This is free: public-repo standard GitHub-hosted
-  runners, including macOS, are unmetered — confirmed against GitHub's own
-  billing docs, still true after the 2026-01-01 Actions repricing. Keep it
-  that way: re-confirm `koenkooi/mackas` is still public
+- **CI runs on every push to `main` or `multi-project`, and every pull
+  request.** `.github/workflows/ci.yml` triggers on `push`/`pull_request`/
+  `workflow_dispatch`. `pull_request` is deliberately unfiltered, so a PR is
+  gated whatever its base — which is what lets the multi-project epic take
+  PRs against its own integration branch. `push` is filtered, so an
+  integration branch must be listed there too or it gets no post-merge run;
+  note that for `push` events GitHub reads the workflow from the pushed ref,
+  so that listing has to exist **on** the branch. This is free: public-repo
+  standard GitHub-hosted runners, including macOS, are unmetered — confirmed
+  against GitHub's own billing docs, still true after the 2026-01-01 Actions
+  repricing. Keep it that way: re-confirm `koenkooi/mackas` is still public
   (`gh repo view --json visibility`) before ever touching the `on:` block,
   since a private repo bills macOS runners at a 10x multiplier against the
   account's included-minutes quota. `./run-tests.sh` runs the identical

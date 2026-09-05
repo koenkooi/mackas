@@ -33,6 +33,11 @@ SCRIPT_NAME="$(basename "$0")"
 # from a checkout, "mackas" if on PATH, an absolute path if run that way.
 # SCRIPT_NAME stays the bare program label ("mackas: error: ...").
 SCRIPT_CMD="$0"
+# The subcommand main() settled on, for hints that must name it back to the
+# user from code shared by several: run_kas() serves both 'shell' and
+# 'smoketest' and cannot tell them apart otherwise. Empty when this file is
+# sourced as a library (MACKAS_LIB_ONLY=1), which never reaches those hints.
+SCRIPT_SUBCOMMAND=""
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 SCRIPT_VERSION="0.1.4"
 
@@ -110,6 +115,8 @@ SETTING_NAMES="
 MACKAS_ROOT
 MACKAS_SHORT_LINK
 MACKAS_VOLUME_NAME
+MACKAS_VOLUME_DL_NAME
+MACKAS_VOLUME_SSTATE_NAME
 MACKAS_VOLUME_SIZE_TMP
 MACKAS_VOLUME_SIZE_DL
 MACKAS_VOLUME_SIZE_SSTATE
@@ -126,6 +133,8 @@ MACKAS_DL_MIRROR_PATH
 MACKAS_USE_HTTP_MIRRORS
 MACKAS_HTTP_MIRROR_SSTATE
 MACKAS_HTTP_MIRROR_DL
+MACKAS_SSTATE_PUSH_DEST
+MACKAS_SSTATE_PUSH_STAGE
 MACKAS_PROJECT_URL
 MACKAS_PROJECT_BRANCH
 MACKAS_PROJECT_DIR
@@ -161,17 +170,30 @@ ASSUME_YES=0
 OVERHEAD_PID=""
 OVERHEAD_OUT=""
 
-# The `volume`/`retrieve`/`buildstats`/`sstate`/`monitor` subcommands' tails (everything after
-# the command word), captured verbatim by main()'s flag loop and handed to the
-# matching cmd_*(). Declared empty here so `${FOO_ARGS+...}` is safe under
-# `set -u` when that command never ran.
+# The `volume`/`retrieve`/`buildstats`/`sstate`/`monitor`/`runtime-args`
+# subcommands' tails (everything after the command word), captured verbatim by
+# main()'s flag loop and handed to the matching cmd_*(). Declared empty here so
+# `${FOO_ARGS+...}` is safe under `set -u` when that command never ran.
 VOLUME_ARGS=()
+RUNTIME_ARGS_ARGS=()
+
+# #78: the hand-typed kas chain `mackas runtime-args --kas-files` was given
+# (the generated wrapper's own hint at the file list a hand-typed
+# `kas-container build/shell/checkout <files>` was just called with), or
+# empty when there is none. main() peels this out of RUNTIME_ARGS_ARGS
+# BEFORE load_config runs (see the pre-scan next to the runtime-args case in
+# main()'s flag loop) so tier 3 can see it while deciding which config to
+# source -- load_config reads this global directly rather than taking a new
+# parameter, the same way it already reads $MACKAS_PROJECT_SELECT straight
+# out of the environment.
+RUNTIME_ARGS_KAS_FILES=""
 RETRIEVE_ARGS=()
 BUILDSTATS_ARGS=()
 BUILDHISTORY_ARGS=()
 SSTATE_ARGS=()
 MONITOR_ARGS=()
 ADOPT_ARGS=()
+PROJECT_ARGS=()
 SET_ARGS=()
 GET_ARGS=()
 UNSET_ARGS=()
@@ -379,6 +401,36 @@ setting_is_explicit() {
 	eval "[ \"\${__EXPLICIT_$1:-0}\" = 1 ]"
 }
 
+# config_pinned_setting NAME -- true if NAME was actually assigned by
+# whatever is currently loaded: the environment, --set, OR the config file
+# CONFIG_FILE_USED names. Everything but the config-file leg is exactly
+# setting_is_explicit(); the config-file leg exists because
+# mark_explicit_from_config() cannot always be trusted for it.
+#
+# The gap: mark_explicit_from_config() only ever compares the FINAL VALUE
+# against the factory default (__FACTORY_NAME, captured by snapshot_defaults()
+# right after set_defaults()) -- it has no memory of whether a line was
+# actually present in the sourced file. That is indistinguishable from
+# "never touched" for any setting whose factory default is itself a
+# non-empty string one might legitimately also choose on purpose.
+# MACKAS_VOLUME_NAME is exactly that setting: its factory default is
+# "oe-build" (set_defaults(), not empty like MACKAS_VOLUME_DL_NAME/
+# _SSTATE_NAME), and a pinned project config that explicitly writes
+# MACKAS_VOLUME_NAME="oe-build" -- migration path B of #72, "keep oe-build-*,
+# no data moves" -- produces a value byte-identical to the untouched
+# default. Trusting __EXPLICIT_MACKAS_VOLUME_NAME alone would read that
+# deliberate choice as "unset" and silently override it.
+#
+# So when the flag alone says "no", fall back to grepping the actual
+# sourced file for the line -- read-only, via config_grep_setting(), never
+# a second `.`/source -- which answers "was this line present" directly
+# instead of inferring it from a value comparison.
+config_pinned_setting() {
+	setting_is_explicit "$1" && return 0
+	[ -n "$CONFIG_FILE_USED" ] || return 1
+	config_grep_setting "$CONFIG_FILE_USED" "$1" >/dev/null
+}
+
 # --set NAME=VALUE overrides, collected during arg parsing and applied last so
 # that command-line flags beat the environment (and everything else).
 CLI_OVERRIDES=()
@@ -394,13 +446,13 @@ is_setting_name() {
 # die_on_misplaced_global_flag ARG CMD -- every verb-object command
 # (volume/retrieve/buildstats/sstate/monitor/set/get/unset) owns everything after its own
 # command word, captured verbatim by main() before cmd_CMD ever runs -- so
-# --config/--set typed AFTER the command word are silently never seen by the
+# --config/--project/--set typed AFTER the command word are silently never seen by the
 # code that would act on them (main()'s own arg loop, and load_config/
 # apply_cli_overrides, already ran). Falling through to a generic "unknown
 # option" would leave that invisible; this redirects to the fix instead.
 die_on_misplaced_global_flag() {
 	case "$1" in
-		--config|--config=*|--set|--set=*)
+		--config|--config=*|--project|--project=*|--set|--set=*)
 			die "'$1' must come BEFORE '$2', not after -- it is resolved before '$2' runs" \
 				"$SCRIPT_CMD $1 ... $2 ..."
 			;;
@@ -424,8 +476,11 @@ apply_cli_overrides() {
 }
 
 # Settings that get interpolated into something this script GENERATES -- the
-# shell of env.sh, the /bin/sh of the kas-container wrapper, or the YAML of the
-# kas fragment.
+# shell of env.sh, the /bin/sh of the kas-container wrapper, the YAML of the
+# kas fragment -- or into an argv it builds from them: the host side of a
+# `-v` bind mount, an rsync target. Registering a setting is a four-place
+# edit (SETTING_NAMES, a default, this list, the docs); leaving it off here
+# is what makes an unvalidated value reach one of those.
 #
 # BREW_BIN is the odd one out: not a name in SETTING_NAMES, but the value the
 # MACKAS_BREW_BIN seam feeds into both generated shell files, so it belongs
@@ -437,6 +492,8 @@ BREW_BIN
 MACKAS_ROOT
 MACKAS_SHORT_LINK
 MACKAS_VOLUME_NAME
+MACKAS_VOLUME_DL_NAME
+MACKAS_VOLUME_SSTATE_NAME
 KAS_IMAGE
 MACKAS_CPUS
 MACKAS_MEMORY
@@ -445,6 +502,8 @@ MACKAS_SSTATE_MIRROR_PATH
 MACKAS_DL_MIRROR_PATH
 MACKAS_HTTP_MIRROR_SSTATE
 MACKAS_HTTP_MIRROR_DL
+MACKAS_SSTATE_PUSH_DEST
+MACKAS_SSTATE_PUSH_STAGE
 MACKAS_PROJECT_URL
 MACKAS_PROJECT_BRANCH
 MACKAS_PROJECT_DIR
@@ -530,16 +589,7 @@ validate_settings() {
 				"set MACKAS_MONITOR_PORT to a whole port number (no spaces) in $(config_hint)"
 			;;
 	esac
-	# MACKAS_VOLUME_NAME is word-split into --runtime-args the same way (it
-	# names the -v host source for each volume mount). setup_volumes() checks
-	# it again right before use, since bats exercises that function directly,
-	# but every other command reaches this check first.
-	case "$MACKAS_VOLUME_NAME" in
-		*[[:space:]]*|"")
-			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
-				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
-			;;
-	esac
+	validate_volume_names
 	# MACKAS_VOLUME_SIZE_* goes straight into `container volume create -s` and
 	# the resize/budgeting math (size_to_gb/size_to_bytes) -- pin it to what
 	# those actually parse so a typo or stray unit dies here with a clear
@@ -548,6 +598,32 @@ validate_settings() {
 		eval "v=\"\${$n}\""
 		valid_size_shape "$v" || die "$n='$v' is not a size like 1T, 200G or 512M" \
 			"set $n to digits optionally followed by t, g or m (or tb/gb/mb, tib/gib/mib) in $(config_hint)"
+	done
+}
+
+# Every volume name lands unquoted in the --runtime-args string kas-container
+# word-splits, as the -v source of a mount, so whitespace in one silently
+# becomes two arguments and mounts something absurd. validate_settings() calls
+# this for every command; setup_volumes() calls it again right before use,
+# since bats exercises that function directly. The stem is also required to be
+# non-empty; the two per-volume overrides mean "derive from the stem" when
+# empty, so for those only whitespace is a problem.
+validate_volume_names() {
+	local n v
+	case "$MACKAS_VOLUME_NAME" in
+		*[[:space:]]*|"")
+			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
+				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
+			;;
+	esac
+	for n in MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
+		eval "v=\"\${$n}\""
+		case "$v" in
+			*[[:space:]]*)
+				die "$n='$v' contains whitespace" \
+					"set $n to a space-free volume name in $(config_hint), or leave it empty to derive the name from MACKAS_VOLUME_NAME"
+				;;
+		esac
 	done
 }
 
@@ -636,6 +712,17 @@ set_defaults() {
 	# whitespace; setup refuses one that does.
 	MACKAS_VOLUME_NAME="oe-build"
 
+	# Per-volume overrides of the stem, for downloads and sstate only. Empty
+	# means derive from MACKAS_VOLUME_NAME, which is what every existing
+	# install does. Naming one explicitly is what makes two mackas configs
+	# able to point at the SAME cache volume -- possible, deliberately not a
+	# default and not advice: an ext4 image takes exactly one VM at a time,
+	# so a shared volume is a serialization point between whoever names it.
+	# There is no equivalent for TMPDIR: two builds sharing one /build is
+	# corruption, not contention.
+	MACKAS_VOLUME_DL_NAME=""       # derived from MACKAS_VOLUME_NAME if empty
+	MACKAS_VOLUME_SSTATE_NAME=""   # derived from MACKAS_VOLUME_NAME if empty
+
 	# Three separately-sized volumes, not one. TMPDIR is the churny, throwaway
 	# one -- `clean` drops it -- while downloads and sstate are the expensive
 	# caches worth keeping across a TMPDIR wipe. They total 200G, which is the
@@ -679,6 +766,17 @@ set_defaults() {
 	MACKAS_USE_HTTP_MIRRORS=0
 	MACKAS_HTTP_MIRROR_SSTATE="http://linux-computer.local:8100/sstate"
 	MACKAS_HTTP_MIRROR_DL="http://linux-computer.local:8100/downloads"
+
+	# Where 'sstate push' publishes to, and where it stages first. Both empty
+	# by default: push is explicit and does nothing until a destination is
+	# named. The destination is an rsync/ssh target ('user@host:/srv/.../
+	# sstate'), never an HTTP URL -- mackas-mirrord's read path is anonymous
+	# and read-only on purpose, so the write path goes over ssh instead.
+	# The staging directory is a real host path (it is the only place the
+	# manifest verification can run), so it wants room for every NEW object
+	# one push carries; empty means $MACKAS_BASE/sstate-push.
+	MACKAS_SSTATE_PUSH_DEST=""
+	MACKAS_SSTATE_PUSH_STAGE=""    # derived from MACKAS_BASE if empty
 
 	# The project to build. Empty here on purpose -- there is no baked-in
 	# default project. meta-ai (github.com/qualcomm-linux/meta-ai, branch
@@ -850,6 +948,83 @@ set_defaults() {
 
 CONFIG_FILE_USED=""
 
+# The pinned project `--project NAME` / $MACKAS_PROJECT_SELECT settled on, for
+# `status` to report back. Deliberately NOT in SETTING_NAMES: a selector
+# written into the file it selects is circular, and it must not ride the
+# snapshot/restore machinery -- it picks WHICH file is sourced, never a value
+# in one, so the four-rung precedence chain is untouched by it.
+PROJECT_SELECTED=""
+
+# How PROJECT_SELECTED got chosen -- "--project", "$MACKAS_PROJECT_SELECT" or
+# "derived from $PWD" (#78 tier 3) -- for `status` to report and for the
+# resolution note below. Empty whenever PROJECT_SELECTED is, so nothing extra
+# has to check both.
+PROJECT_SELECT_SOURCE=""
+
+# project_select_resolution_note() fires at most once per process even though
+# derive_paths() (which is where volume names are final) runs more than once
+# per invocation -- see that function's own comment.
+PROJECT_SELECT_NOTE_SHOWN=0
+
+# Where a project's pinned, standalone config lives. `adopt` already writes one
+# here; `--project NAME` reads exactly this path back.
+projects_dir() { printf '%s/.config/mackas/projects' "$HOME"; }
+
+# Refuse a project name before it is ever pasted into a path. The name becomes
+# <projects_dir>/<name>.conf, so a '/' or a '..' inside it aims that path
+# somewhere else entirely, and a leading '-' makes the value read as a flag to
+# whatever later passes it along. The allowed class is the one `adopt` already
+# produces (it tr's a checkout name down to [A-Za-z0-9-]), widened by '.' and
+# '_' only.
+validate_project_select() {
+	local name="$1" src="$2" hint
+	hint="$SCRIPT_CMD projects  (lists the pinned ones)"
+	case "$name" in
+		# Both callers reject an empty name before getting here; kept so the
+		# function is safe standalone, since "" would name <dir>/.conf -- a
+		# perfectly legal hidden file.
+		"") die "$src needs a project name" "$hint" ;;
+		-*) die "$src: a project name cannot start with '-': $name" "$hint" ;;
+		.|..|*..*) die "$src: a project name cannot be '.' or contain '..': $name" "$hint" ;;
+		*[!A-Za-z0-9._-]*)
+			die "$src: a project name may only contain letters, digits, '.', '_' and '-': $name" \
+				"$hint" ;;
+	esac
+}
+
+# Print FILE's value for setting NAME by GREPPING it, never sourcing it.
+# `projects` reads every pinned config in the directory at once, and sourcing a
+# directory's worth of them is exactly the code execution the search-path
+# restriction exists to prevent -- an unsafe one would have run before anything
+# could grade it.
+#
+# Understands the shq() single-quoted form config_write_setting emits plus a
+# hand-written double-quoted or bare value. Anything cleverer -- a $-expansion,
+# a command substitution -- is printed raw rather than resolved, because
+# resolving it means running it. Returns 1 when NAME is not in the file.
+config_grep_setting() {
+	local file="$1" name="$2" line v
+	line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$name=" "$file" 2>/dev/null | tail -1 || true)"
+	[ -n "$line" ] || return 1
+	v="${line#*=}"
+	# Trailing whitespace is not part of the value, and leaving it on would
+	# stop a quoted value from matching its own closing quote below.
+	while [ "$v" != "${v%[[:space:]]}" ]; do v="${v%[[:space:]]}"; done
+	case "$v" in
+		"'"*"'")
+			v="${v#\'}"; v="${v%\'}"
+			# shq() renders an embedded apostrophe as the four characters
+			# '\'' -- undo that, or a value `$SCRIPT_NAME set` wrote itself
+			# reads back mangled here.
+			case "$v" in *\'*) v="$(printf '%s' "$v" | sed "s/'\\\\''/'/g")" ;; esac ;;
+		'"'*'"') v="${v#\"}"; v="${v%\"}" ;;
+		# Unquoted: a shell assignment's bare value ends at the first
+		# whitespace, so a trailing '# comment' is shell, not value.
+		*) v="${v%%[[:space:]]*}" ;;
+	esac
+	printf '%s\n' "$v"
+}
+
 # Is $1 safe to source without being asked to?
 #
 # A config file is SHELL, not data: sourcing one runs whatever is in it with
@@ -860,19 +1035,48 @@ CONFIG_FILE_USED=""
 # is exactly as good as being able to edit it -- and a group-writable $HOME is
 # a real configuration, not a hypothetical one.
 #
+# Both sides are graded on what is REALLY there, never on a symlink standing
+# in for it. `ln -s` applies the umask, so a link's mode records only what the
+# umask was when it was made -- measured here: 022 -> 755, 002 -> 775,
+# 000 -> 777, 077 -> 700 -- and the usual 755 sails straight through
+# path_is_owned_and_unwritable_by_others(). Grading a link therefore grades
+# nothing: a config in a symlinked, world-writable projects directory would be
+# sourced with the directory it actually sits in never looked at. So resolve
+# the directory (`resolve_path` is physical), and walk a symlinked file to the
+# bytes that would really run -- grading, at every hop, the directory the link
+# itself sits in, since whoever can write that can re-aim it.
+#
 # This is deliberately NOT applied to --config or $MACKAS_CONF: those are the
 # user naming a file on purpose, and refusing them would break the legitimate
 # case of a config kept on a shared volume.
 config_file_is_safe() {
-	local f="$1" d
+	local f="$1" d target hops=0
+	while [ -L "$f" ]; do
+		# A chain this long is a loop or an attack, not a dotfiles setup.
+		hops=$((hops + 1))
+		[ "$hops" -le 16 ] || return 1
+		d="$(resolve_path "$(dirname "$f")")"
+		path_is_owned_and_unwritable_by_others "$d" || return 1
+		# Flagless readlink only -- BSD and GNU agree on that one form
+		# (see check's own readlink note).
+		target="$(readlink "$f")" || return 1
+		case "$target" in
+			/*) f="$target" ;;
+			*)  f="$d/$target" ;;
+		esac
+	done
 	path_is_owned_and_unwritable_by_others "$f" || return 1
-	d="$(dirname "$f")"
+	d="$(resolve_path "$(dirname "$f")")"
 	path_is_owned_and_unwritable_by_others "$d" || return 1
 	return 0
 }
 
 path_is_owned_and_unwritable_by_others() {
 	local p="$1" owner mode grp oth
+	# stat(1) below is lstat, and a symlink's own mode is only the umask that
+	# made it (022 -> 755), which says nothing about what it points at. Refuse
+	# rather than grade a meaningless number: callers resolve first.
+	if [ -L "$p" ]; then return 1; fi
 	# BSD stat: %u = owner uid, %Lp = the low 3 octal permission digits.
 	owner="$(stat -f '%u' "$p" 2>/dev/null)" || return 1
 	mode="$(stat -f '%Lp' "$p" 2>/dev/null)" || return 1
@@ -885,12 +1089,373 @@ path_is_owned_and_unwritable_by_others() {
 	return 0
 }
 
-load_config() {
-	local explicit="${1:-}" allow_missing="${2:-0}"
-	local candidates f
+# Both selectors named a config file. Printed as die()'s hint, so it follows
+# root_hint()'s shape: one command per line, copy-pasteable.
+#
+# Worth the length because of WHERE this fires. The common case is not a user
+# passing both by hand -- it is a --project wrapper meeting a $MACKAS_CONF the
+# caller exported in a shell rc, so the selector named in the error is one the
+# user never set, and a bare "drop one" tells them to unset something they have
+# never heard of. Show both resolved values, and give the escape for whichever
+# one they actually control.
+# The wrapper's frozen work dir disagrees with the one the config now in
+# effect resolves. Name both, and say which knob to drop -- the same shape as
+# selector_conflict_hint(), because it is the same class of mistake: something
+# ambient re-aiming a build the user thought was pinned.
+wrapper_identity_hint() {
+	local expect="$1" src=""
+	if [ -n "${MACKAS_CONF:-}" ]; then src="\$MACKAS_CONF"; fi
+	printf 'the wrapper'"'"'s frozen work directory and the config now in effect disagree, so the volumes about to be mounted are not this project'"'"'s.\n'
+	printf '\n'
+	printf '    %-22s %s\n' "wrapper built for" "$expect"
+	printf '    %-22s %s\n' "config now resolves" "$MACKAS_WORK"
+	if [ -n "$src" ]; then
+		printf '    %-22s %s\n' "chosen by" "$src = ${MACKAS_CONF}"
+	fi
+	printf '\n'
+	if [ -n "$src" ]; then
+		printf 'To build this project, for one command:\n'
+		printf '    MACKAS_CONF= <your command>\n'
+		printf 'or for the rest of this shell:\n'
+		printf '    unset MACKAS_CONF\n'
+	else
+		printf 'Re-run setup if this root moved:\n'
+		printf '    %s setup %s\n' "$SCRIPT_CMD" "$MACKAS_ROOT"
+	fi
+	printf '\n'
+	printf 'To build the other project, use its own generated kas-container.\n'
+}
 
+# The wrapper's replayed pin (tier 2, $MACKAS_PROJECT_SELECT) and the
+# directory (or kas chain) this call actually runs from name two different
+# pinned projects. Same shape as wrapper_identity_hint()/selector_conflict_
+# hint(): name both, then give a fix for each of the two things the user
+# could have meant.
+#
+# Both one-off escapes name OTHER, not the pin. Getting here means the
+# caller cd'd into OTHER's workspace (or typed a chain naming it) and then
+# ran a hand-typed kas-container -- so building OTHER is overwhelmingly the
+# intent, and offering only "$SCRIPT_CMD --project $pinned shell" answers a
+# question nobody standing there asked. Re-running `setup` is the heavier of
+# the two fixes (it re-does the whole root), so the cheap one comes first.
+wrapper_pin_conflict_hint() {
+	local pinned="$1" other="$2" other_src="$3"
+	printf 'the wrapper replays the project it was generated for, and %s names a different one -- mackas will not rank them for you.\n' "$other_src"
+	printf '\n'
+	printf '    %-24s %s\n' "wrapper pinned to" "$pinned"
+	printf '    %-24s %s\n' "$other_src" "$other"
+	printf '\n'
+	printf 'To build %s right now, leaving the wrapper as it is -- use %s'"'"'s own commands rather than the hand-typed kas-container:\n' "$other" "$SCRIPT_CMD"
+	printf '    %s --project %s shell   (or smoketest)\n' "$SCRIPT_CMD" "$other"
+	printf 'To make this wrapper build %s from here on:\n' "$other"
+	printf '    %s --project %s setup\n' "$SCRIPT_CMD" "$other"
+	printf 'If %s is what you meant instead, run the hand-typed kas-container from ITS own workspace: this refuses only where the pin and the directory disagree.\n' "$pinned"
+}
+
+selector_conflict_hint() {
+	local sel_src="$1" sel="$2" path_src="$3" path="$4"
+	printf 'these are mutually exclusive -- one picks a pinned project, the other names a path outright -- and mackas will not rank them for you.\n'
+	printf '\n'
+	printf '    %-24s %s\n' "$sel_src" "$sel"
+	printf '    %-24s %s\n' "$path_src" "$path"
+	printf '\n'
+	if [ "$path_src" = "\$MACKAS_CONF" ]; then
+		printf 'To keep the project and ignore the path, for one command:\n'
+		printf '    MACKAS_CONF= <your command>\n'
+		printf 'or for the rest of this shell:\n'
+		printf '    unset MACKAS_CONF\n'
+	else
+		printf 'To keep the project instead, drop the %s flag.\n' "$path_src"
+	fi
+	printf '\n'
+	if [ "$sel_src" = "\$MACKAS_PROJECT_SELECT" ]; then
+		printf 'To keep the path instead:\n'
+		printf '    unset MACKAS_PROJECT_SELECT\n'
+	else
+		printf 'To keep the path instead, drop the %s flag.\n' "$sel_src"
+	fi
+}
+
+# Source pinned project NAME's config exactly as strictly as --project always
+# has: validate the name before it is pasted into a path, allow a not-yet-
+# written file through only for set/get/unset (ALLOW_MISSING, mirroring the
+# typed-path leg just below in load_config), require config_file_is_safe()
+# rather than warn-and-continue (this path is one mackas built for itself out
+# of a bare name in a fixed, guessable place -- the search path's warn-and-
+# skip is not strict enough for that), then source it and record the
+# selection. SRC is both the die() attribution (validate_project_select) and
+# what ends up in PROJECT_SELECT_SOURCE for `status` and the resolution note.
+#
+# Shared by load_config's tier 1/2 (--project / $MACKAS_PROJECT_SELECT) and
+# tier 3 (#78's derivation from $PWD) so the two can never drift apart on how
+# strictly a pinned config gets graded before it runs as shell.
+select_pinned_project() {
+	local sel="$1" sel_src="$2" allow_missing="${3:-0}" f
+	validate_project_select "$sel" "$sel_src"
+	f="$(projects_dir)/$sel.conf"
+	if [ ! -r "$f" ]; then
+		# Same allowance the typed paths get below: `set` on a project
+		# nobody has pinned yet is how its config gets written.
+		if [ "$allow_missing" -eq 1 ] && [ ! -e "$f" ]; then
+			PROJECT_SELECTED="$sel"
+			CONFIG_FILE_USED="$f"
+			PROJECT_SELECT_SOURCE="$sel_src"
+			return 0
+		fi
+		die "no pinned project '$sel': $f is not readable" \
+			"$SCRIPT_CMD projects  (lists the pinned ones)"
+	fi
+	# A directory (or a fifo) here is readable, and a 0755 directory of
+	# ours passes the grade below untouched -- it would reach `. "$f"`
+	# and come back out as a raw shell error. -f follows symlinks, so a
+	# config kept as a link to a real file still qualifies.
+	[ -f "$f" ] || die "not a config file: $f is not a regular file" \
+		"$SCRIPT_CMD projects  (lists the pinned ones)"
+	# STRICTER than the typed paths below, deliberately. mackas built this
+	# path itself out of a bare name, in a fixed and entirely guessable
+	# place -- that is the ambush shape the search path is guarded against,
+	# not the request shape --config is. Refuse rather than fall through to
+	# the search path: the caller asked for THIS project, and silently
+	# loading a different one is worse than stopping.
+	if ! config_file_is_safe "$f"; then
+		die "refusing to source $f: it (or the directory it really lives in) is owned by someone else or writable by group/other" \
+			"chmod go-w $(printf '%q' "$f") $(printf '%q' "$(projects_dir)")"
+	fi
+	# shellcheck disable=SC1090
+	. "$f"
+	PROJECT_SELECTED="$sel"
+	CONFIG_FILE_USED="$f"
+	PROJECT_SELECT_SOURCE="$sel_src"
+}
+
+# derive_project_candidates PWD_PHYS -- print "name<TAB>workspace-dir" for
+# every pinned project (projects_dir()/*.conf) whose MACKAS_ROOT/work/<name>
+# -- resolved physically, exactly as PWD_PHYS itself must already be -- names
+# PWD_PHYS itself or a directory beneath it. Zero lines is a legitimate
+# answer (nothing on disk claims this directory), not an error.
+#
+# #78's security framing: a derived path under a predictable, name-guessable
+# location ($HOME/.config/mackas/projects/*.conf) is an ambush surface, not a
+# request. So every candidate's MACKAS_ROOT is GREPPED (config_grep_setting),
+# never sourced, while enumerating -- only the single eventual winner is ever
+# sourced, by select_pinned_project(), and only after config_file_is_safe().
+#
+# Fails CLOSED on a pinned config this process cannot read: it could have
+# been the match, and grepping it is the only way to find out, so the
+# question "does anything here match $PWD" is unanswerable rather than "no"
+# -- die naming the file rather than silently treating it as a non-candidate
+# (the same rule pinned_configs_unreadable()'s callers apply to destroy/
+# clean's shared-volume refusal). This can only fire while tier 3 is being
+# evaluated, i.e. when the caller (load_config) has already established that
+# no explicit --project/$MACKAS_PROJECT_SELECT/--config/$MACKAS_CONF was
+# given -- an explicit selector never reaches this function at all.
+#
+# MODE (optional, default "strict") is the one exception to that last
+# sentence: cmd_runtime_args's pin-vs-cwd guard (#78) also calls this
+# function while an explicit tier-2 selector IS already in force, purely to
+# double-check it against $PWD/the kas chain -- a consultative second
+# opinion, not a selection. Fail-closed is right when derivation is
+# CHOOSING a project (an unreadable file really could have been the
+# answer), but wrong here: it would mean an unrelated broken pinned config
+# ANYWHERE in projects_dir() breaks every OTHER project's hand-typed build
+# under its own wrapper, a regression the backward-compat contract this
+# guard sits next to explicitly rules out ("any invocation carrying a
+# tier-1/2 selector" must stay byte-identical). MODE=lenient skips an
+# unreadable file exactly like a malformed name -- worst case the guard
+# misses a real disagreement, exactly as it would have before this guard
+# existed at all, never worse.
+derive_project_candidates() {
+	local pwd_phys="$1" mode="${2:-strict}" dir f name root cand
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		if [ ! -r "$f" ]; then
+			if [ "$mode" = "lenient" ]; then
+				continue
+			fi
+			die "cannot tell whether \$PWD names a pinned project: $f is not readable, and it could have been the match" \
+				"fix its permissions (or remove it if stale) in $(projects_dir), then re-run -- or pass --project NAME/--config to bypass derivation entirely"
+		fi
+		name="$(basename "$f" .conf)"
+		# The same character class validate_project_select() enforces on
+		# every name that gets pasted into a path, applied here silently
+		# rather than through that function's die(): a file in this
+		# directory with an odd name is simply not a candidate, not a
+		# reason to abort an unrelated command run from an unrelated
+		# directory. select_pinned_project() re-validates the eventual
+		# winner's name regardless, so nothing unsafe reaches a path
+		# through this shortcut.
+		case "$name" in
+			""|-*|.|..|*..*|*[!A-Za-z0-9._-]*) continue ;;
+		esac
+		root="$(config_grep_setting "$f" MACKAS_ROOT)" || continue
+		# #78: a MACKAS_ROOT that is not an absolute path (relative, '~',
+		# '$HOME', a command substitution -- config_grep_setting prints
+		# those raw) is simply not a candidate. Never eval or expand it.
+		case "$root" in
+			/*) ;;
+			*) continue ;;
+		esac
+		# resolve_path is physical and tolerates a target that does not
+		# exist (a stale or renamed root just prints its input back,
+		# unresolved -- which then simply fails to prefix-match a real,
+		# resolved PWD_PHYS, exactly as it should).
+		cand="$(resolve_path "$(strip_trailing_slash "$root")/work/$name")"
+		case "$pwd_phys" in
+			"$cand"|"$cand"/*) printf '%s\t%s\n' "$name" "$cand" ;;
+		esac
+	done
+}
+
+# single_candidate_winner PWD_PATH [MODE] -- run
+# derive_project_candidates(PWD_PATH, MODE) and reduce it to the three
+# globals every caller below actually wants: CANDIDATE_COUNT (how many
+# lines it printed), CANDIDATE_WINNER (the last one's name -- meaningful
+# only when CANDIDATE_COUNT is 1), and CANDIDATE_LIST_TEXT (every "name ->
+# dir" line, indented, for a caller that is about to die() listing them
+# all). Never dies on more than one itself -- load_config's tier 3 and
+# cmd_runtime_args's pin-vs-cwd guard disagree on what "more than one"
+# MEANS (one is a selection and must refuse rather than guess; the other is
+# a live pin already in force and an ambiguous derivation is not a
+# confident "no" to check it against, so it says nothing instead) -- so
+# each reads CANDIDATE_COUNT itself and decides. MODE is passed straight
+# through to derive_project_candidates() -- see that function's own comment
+# for why the pin-vs-cwd guard passes "lenient" here while load_config's own
+# tier 3 leaves it at the "strict" default.
+single_candidate_winner() {
+	local pwd_path="$1" mode="${2:-strict}" candidates cname cdir
+	CANDIDATE_COUNT=0
+	CANDIDATE_WINNER=""
+	CANDIDATE_LIST_TEXT=""
+	candidates="$(derive_project_candidates "$pwd_path" "$mode")"
+	[ -n "$candidates" ] || return 0
+	while IFS="$(printf '\t')" read -r cname cdir; do
+		[ -n "$cname" ] || continue
+		CANDIDATE_COUNT=$((CANDIDATE_COUNT + 1))
+		CANDIDATE_WINNER="$cname"
+		CANDIDATE_LIST_TEXT="$CANDIDATE_LIST_TEXT    $cname -> $cdir"$'\n'
+	done <<EOF
+$candidates
+EOF
+}
+
+# kas_chain_first_component CHAIN -- the shared leading path component of
+# every colon-separated entry in CHAIN (kas's own file-list argument, exactly
+# as a hand-typed `kas-container build/shell/checkout <files>` gave it), or
+# nothing at all when there is no such hint to give:
+#
+#   * CHAIN is empty (no --kas-files hint reached us at all)
+#   * any entry is absolute -- it already names a real path outright, so
+#     there is nothing to derive relative to $PWD
+#   * a sibling-spanning chain whose entries disagree on their first
+#     component (env.sh's own _mackas_derive_project applies the identical
+#     rule, for the identical reason spelled out in its own comment: cwd
+#     sits inside ONE checkout, so two different leading components can
+#     never both be "the workspace this call runs from")
+#   * an entry with no '/' at all -- nothing names a workspace directory
+#   * the resulting component fails the same character class
+#     validate_project_select() enforces on every name pasted into a path
+#     (derive_project_candidates() already treats a malformed pinned config
+#     NAME the same way -- silently not a candidate, never a die, since a
+#     bad name here is not evidence of anything, just not a hint)
+#
+# Deliberately never dies: an invalid or absent hint is exactly as good as
+# no hint at all, and the caller's own candidate matching (never this
+# function) is what decides whether the resulting path names anything real.
+kas_chain_first_component() {
+	local files="$1" rest entry component proj=""
+	[ -n "$files" ] || return 0
+	rest="$files"
+	while [ -n "$rest" ]; do
+		entry="${rest%%:*}"
+		case "$rest" in
+			*:*) rest="${rest#*:}" ;;
+			*) rest="" ;;
+		esac
+		[ -n "$entry" ] || return 0
+		case "$entry" in
+			/*) return 0 ;;
+			*/*) component="${entry%%/*}" ;;
+			*) return 0 ;;
+		esac
+		if [ -z "$proj" ]; then
+			proj="$component"
+		elif [ "$proj" != "$component" ]; then
+			return 0
+		fi
+	done
+	case "$proj" in
+		""|-*|.|..|*..*|*[!A-Za-z0-9._-]*) return 0 ;;
+	esac
+	printf '%s\n' "$proj"
+}
+
+# How PROJECT_SELECTED came to be in force, as a clause for a message that
+# already names it -- "... under X". Every #78 tier gets a truthful phrasing
+# here, not just the explicit --project case these messages predate.
+project_select_description() {
+	case "$PROJECT_SELECT_SOURCE" in
+		--project) printf -- "--project %s" "$PROJECT_SELECTED" ;;
+		"\$MACKAS_PROJECT_SELECT") printf '$MACKAS_PROJECT_SELECT=%s' "$PROJECT_SELECTED" ;;
+		"derived from the kas chain") printf "the project '%s', derived from the kas chain" "$PROJECT_SELECTED" ;;
+		*) printf "the project '%s', derived from \$PWD" "$PROJECT_SELECTED" ;;
+	esac
+}
+
+# The escape hatch for "this selection is not what you want here". An
+# explicit --project/$MACKAS_PROJECT_SELECT selector is something the caller
+# typed and can drop or unset; a #78 tier-3 derivation was never typed at
+# all, so the only real escapes are to stand somewhere else (or without a
+# kas chain that names a workspace) or to name a project explicitly instead
+# -- telling a derived selection to "drop --project NAME" would be a lie:
+# there is no such flag to drop.
+project_select_drop_hint() {
+	case "$PROJECT_SELECT_SOURCE" in
+		--project) printf "drop '--project %s'" "$PROJECT_SELECTED" ;;
+		"\$MACKAS_PROJECT_SELECT") printf 'unset $MACKAS_PROJECT_SELECT' ;;
+		"derived from the kas chain") printf 'run without a kas chain naming this workspace, or pass --project/--config explicitly' ;;
+		*) printf 'run from outside this workspace, or pass --project/--config explicitly' ;;
+	esac
+}
+
+load_config() {
+	local explicit="${1:-}" allow_missing="${2:-0}" select="${3:-}"
+	local f
+	local sel="" sel_src="" path="" path_src="" path_hint=""
+
+	# Two ways to name a file outright, two ways to select a pinned project by
+	# name. The flag beats the environment WITHIN each pair, exactly as
+	# --config has always beaten $MACKAS_CONF. Mixing the pairs is refused
+	# rather than ranked: a name and a path are two different answers to "which
+	# file", and quietly preferring one hides the other in precisely the
+	# invocation that meant it.
+	if [ -n "$select" ]; then
+		sel="$select"; sel_src="--project"
+	elif [ -n "${MACKAS_PROJECT_SELECT:-}" ]; then
+		sel="$MACKAS_PROJECT_SELECT"; sel_src="\$MACKAS_PROJECT_SELECT"
+	fi
 	if [ -n "$explicit" ]; then
-		if [ ! -r "$explicit" ]; then
+		path="$explicit"; path_src="--config"
+		path_hint="check the path passed to --config"
+	elif [ -n "${MACKAS_CONF:-}" ]; then
+		path="${MACKAS_CONF}"; path_src="\$MACKAS_CONF"
+		# Same readability check as --config gets. Without it this lands on
+		# the `.` below and prints a raw, localized "No such file or
+		# directory" with no hint about which knob caused it.
+		path_hint="check \$MACKAS_CONF, or unset it to use the default search path"
+	fi
+	if [ -n "$sel" ] && [ -n "$path" ]; then
+		die "$sel_src and $path_src both choose a config file" \
+			"$(selector_conflict_hint "$sel_src" "$sel" "$path_src" "$path")"
+	fi
+
+	if [ -n "$sel" ]; then
+		select_pinned_project "$sel" "$sel_src" "$allow_missing"
+		return 0
+	fi
+
+	if [ -n "$path" ]; then
+		if [ ! -r "$path" ]; then
 			# set/get/unset (allow_missing=1, passed by main only for those
 			# three) may legitimately target a config file that does not
 			# exist yet -- 'set' is exactly the command that creates one,
@@ -901,38 +1466,94 @@ load_config() {
 			# fresh start. A file that exists but is unreadable (permissions,
 			# not absence) is refused either way -- 'set' writing there would
 			# only fail the same way moments later with a worse message.
-			if [ "$allow_missing" -eq 1 ] && [ ! -e "$explicit" ]; then
-				CONFIG_FILE_USED="$explicit"
+			if [ "$allow_missing" -eq 1 ] && [ ! -e "$path" ]; then
+				CONFIG_FILE_USED="$path"
 				return 0
 			fi
-			die "config file not readable: $explicit" \
-				"check the path passed to --config"
+			die "config file not readable: $path" "$path_hint"
 		fi
-		candidates="$explicit"
-	else
-		candidates=""
-		if [ -n "${MACKAS_CONF:-}" ]; then
-			candidates="${MACKAS_CONF}"
-			# Same readability check as --config gets. Without it this lands on
-			# the `.` below and prints a raw, localized "No such file or
-			# directory" with no hint about which knob caused it.
-			if [ ! -r "$candidates" ]; then
-				if [ "$allow_missing" -eq 1 ] && [ ! -e "$candidates" ]; then
-					CONFIG_FILE_USED="$candidates"
-					return 0
-				fi
-				die "config file not readable: $candidates" \
-					"check \$MACKAS_CONF, or unset it to use the default search path"
-			fi
-		fi
+		# Same reason as the selector's check above: `.` on a directory is a
+		# raw shell error, and a typed path is the likeliest place to land on
+		# one (a tab-completed directory name).
+		[ -f "$path" ] || die "not a config file: $path is not a regular file" "$path_hint"
+		# shellcheck disable=SC1090  # user-supplied config, path known at runtime only
+		. "$path"
+		CONFIG_FILE_USED="$path"
+		return 0
 	fi
 
-	if [ -n "$candidates" ]; then
-		f="$candidates"
-		# shellcheck disable=SC1090  # user-supplied config, path known at runtime only
-		. "$f"
-		CONFIG_FILE_USED="$f"
+	# Tier 3 (#78): neither an explicit selector nor an explicit path named a
+	# file. Before falling back to the default search path, see whether $PWD's
+	# PHYSICAL location names, unambiguously, one of the projects already
+	# pinned by name -- inference selects among identities the user already
+	# pinned, it never creates one, and filesystem shape alone (a work/foo
+	# directory with no foo.conf) never decides anything.
+	#
+	# `pwd -P` on both sides is what defuses a ~/oe-style short-link symlink:
+	# a pinned MACKAS_ROOT recorded as the link, the physical target, or
+	# anything in between all resolve to the same candidate, and $PWD reached
+	# through the link or directly both resolve to the same physical string.
+	#
+	# `projects` derives LENIENTLY (see derive_project_candidates()'s MODE):
+	# it is the repair surface both fail-closed dies below point AT ("fix its
+	# permissions ... then re-run", "$SCRIPT_CMD projects  (lists the pinned
+	# ones)"), so it must never be a command those dies refuse -- a listing
+	# that cannot run while one entry is broken cannot show you which entry
+	# is broken. It also never needs the strict answer: it lists every pinned
+	# config whatever the selection turns out to be, and marks the unreadable
+	# one itself (cmd_projects's own "unreadable" line).
+	local pwd_phys n_candidates=0 winner_name="" derive_mode="strict"
+	[ "${SCRIPT_SUBCOMMAND:-}" != "projects" ] || derive_mode="lenient"
+	pwd_phys="$(pwd -P)"
+	single_candidate_winner "$pwd_phys" "$derive_mode"
+	n_candidates="$CANDIDATE_COUNT"; winner_name="$CANDIDATE_WINNER"
+	if [ "$n_candidates" -gt 1 ]; then
+		# CANDIDATE_LIST_TEXT keeps its own trailing newline, so the last
+		# candidate does not run into the sentence after it -- a "$(...)"
+		# around it would strip that newline and print the final path as
+		# '<dir>pass --project NAME ...', which reads as part of the path.
+		die "\$PWD ($pwd_phys) matches more than one pinned project's workspace" \
+			"${CANDIDATE_LIST_TEXT}pass --project NAME to pick one of the above"
+	fi
+	if [ "$n_candidates" -eq 1 ]; then
+		select_pinned_project "$winner_name" "derived from \$PWD" 0
 		return 0
+	fi
+
+	# #78's kas-chain special case: standing in work/ itself and hand-typing
+	# `kas-container build meta-qcom/kas/base.yml:...` cannot be derived from
+	# $PWD alone above -- $PWD there is work/, the parent of every checkout,
+	# not any one project's own directory -- so try the wrapper's own
+	# --kas-files hint (main() peeled it out of RUNTIME_ARGS_ARGS before this
+	# ran; see RUNTIME_ARGS_KAS_FILES's own comment) next, forming the SAME
+	# candidate path a real cd into that checkout would have.
+	#
+	# Only ever reached when $PWD alone matched NOTHING above, and that is
+	# not merely an ordering choice: whenever $PWD DOES match a project, the
+	# match means $PWD already sits inside (or at) that project's own
+	# candidate directory, and the chain-derived path is, by construction,
+	# always exactly one path component DEEPER than $PWD -- so it is
+	# necessarily inside that same project's tree too (prefix containment is
+	# transitive) and would either re-confirm the very same project or, if a
+	# second project's workspace happens to be nested there too, join the
+	# "more than one" die above instead. A clean disagreement between $PWD
+	# and the chain (two DIFFERENT single winners, neither ambiguous) is
+	# therefore not a case that can occur here; there is nothing left for a
+	# separate die to catch.
+	local chain_component chain_path n_chain=0 chain_winner=""
+	chain_component="$(kas_chain_first_component "$RUNTIME_ARGS_KAS_FILES")"
+	if [ -n "$chain_component" ]; then
+		chain_path="$pwd_phys/$chain_component"
+		single_candidate_winner "$chain_path" "$derive_mode"
+		n_chain="$CANDIDATE_COUNT"; chain_winner="$CANDIDATE_WINNER"
+		if [ "$n_chain" -gt 1 ]; then
+			die "the kas chain's workspace ($chain_path) matches more than one pinned project's workspace" \
+				"${CANDIDATE_LIST_TEXT}pass --project NAME to pick one of the above"
+		fi
+		if [ "$n_chain" -eq 1 ]; then
+			select_pinned_project "$chain_winner" "derived from the kas chain" 0
+			return 0
+		fi
 	fi
 
 	# ./mackas.conf is deliberately NOT in this list.
@@ -951,9 +1572,11 @@ load_config() {
 		"$HOME/.config/mackas/config" \
 		"$HOME/.mackas.conf"
 	do
-		if [ -r "$f" ]; then
+		# -f as well as -r: a directory at either name is readable but would
+		# reach `. "$f"` as a raw shell error. Not a match, so keep looking.
+		if [ -f "$f" ] && [ -r "$f" ]; then
 			if ! config_file_is_safe "$f"; then
-				warn "ignoring $f: it (or its directory) is owned by someone else or writable by group/other"
+				warn "ignoring $f: it (or the directory it really lives in) is owned by someone else or writable by group/other"
 				warn "  mackas SOURCES this file as shell. To use it: chmod go-w $(printf '%q' "$f")"
 				continue
 			fi
@@ -977,9 +1600,10 @@ load_config() {
 # so they get the verb-object shape everything else here uses (see `volume`).
 
 # The file `set`/`unset` write to: whatever config file THIS invocation
-# actually loaded (--config, $MACKAS_CONF, or the first match of the normal
-# search path), or -- nothing loaded yet, the common first-use case -- the
-# same default `load_config` would have picked had one existed.
+# actually loaded (--config, $MACKAS_CONF, --project/$MACKAS_PROJECT_SELECT,
+# or the first match of the normal search path), or -- nothing loaded yet, the
+# common first-use case -- the same default `load_config` would have picked
+# had one existed.
 set_target_config_file() {
 	if [ -n "$CONFIG_FILE_USED" ]; then
 		printf '%s' "$CONFIG_FILE_USED"
@@ -1107,7 +1731,7 @@ cmd_set() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" set ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" set ;;
 			# Bare 'help' means "show usage" only in NAME's position -- 'set'
 			# is the one command here with a free-text positional (VALUE), and
 			# VALUE may legitimately BE the literal string "help" (a target
@@ -1126,7 +1750,39 @@ cmd_set() {
 		"$SCRIPT_CMD status lists the valid names"
 	refuse_unwritable_setting_value "$value"
 
+	# Reject a value that fails the SAME per-setting checks every other
+	# command enforces (whitespace-free volume names, integer CPUS/PORT, the
+	# MEMORY/VOLUME_SIZE_* shapes...) before writing it, not after. Without
+	# this, a bad `set` writes the value successfully, and every LATER
+	# invocation -- including `unset`, the only in-tool way back -- dies in
+	# main()'s own validate_settings before it ever reaches dispatch, since
+	# that call happens unconditionally ahead of cmd_set/cmd_unset alike
+	# (issue #106). Reuse validate_settings() itself rather than duplicate
+	# its logic here: assign the candidate to $name and run it inside a
+	# command-substitution subshell, so its die() (which calls exit) only
+	# aborts the SUBSHELL -- $name keeps its real, already-validated value in
+	# this live process either way, and the message it would have printed
+	# comes back as this command substitution's captured output.
+	local validate_output
+	if ! validate_output="$(eval "$name=\"\$value\""; validate_settings 2>&1)"; then
+		printf '%s\n' "$validate_output" >&2
+		exit 1
+	fi
+
 	local file; file="$(set_target_config_file)"
+	# The target may sit in a directory that does not exist yet -- writing the
+	# first pinned project's config under ~/.config/mackas/projects/ is exactly
+	# that case, and config_write_setting's mv would fail on it.
+	#
+	# Created under umask 077, never the ambient one: --project holds this
+	# directory to config_file_is_safe(), and under a `umask 002` login (a real
+	# configuration, not a hypothetical one) an inherited umask would make the
+	# directory group-writable -- so bootstrapping a project config here would
+	# produce one --project then refuses to source. The subshell keeps the
+	# umask off everything else; run() is a plain function, with no state to
+	# lose across it.
+	local dir; dir="$(dirname "$file")"
+	[ -d "$dir" ] || ( umask 077 && run mkdir -p "$dir" ) || die "could not create $dir"
 	config_write_setting "$file" "$name" "$value"
 	if [ "$DRY_RUN" -eq 1 ]; then
 		info "  would write $name=$value to $file"
@@ -1149,7 +1805,7 @@ cmd_get() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help|help) want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" get ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" get ;;
 			*)              args+=("$a") ;;
 		esac
 	done
@@ -1172,7 +1828,7 @@ cmd_unset() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help|help) want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" unset ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" unset ;;
 			*)             args+=("$a") ;;
 		esac
 	done
@@ -1200,6 +1856,175 @@ cmd_unset() {
 	else
 		info "$name is not persisted in $file -- nothing to do"
 	fi
+}
+
+# ---------------------------------------------------------------------------
+# projects -- list the pinned per-project configs, without running any of them
+# ---------------------------------------------------------------------------
+
+projects_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD projects${C_RST} -- list the pinned per-project configs.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD projects
+
+Lists $(projects_dir)/*.conf -- the standalone
+configs '$SCRIPT_CMD adopt' and '$SCRIPT_CMD project add' write -- and, for
+each, the settings that say where that project's build lives. Select one for
+a single command with '$SCRIPT_CMD --project NAME ...', or for a whole shell
+with \$MACKAS_PROJECT_SELECT=NAME.
+
+Note the singular sibling: this command LISTS what is already pinned; it
+never creates one. '$SCRIPT_CMD project add NAME' does that.
+
+Read-only, and it reads by GREPPING each file rather than sourcing it: a
+config is shell, and listing a directory of them must not run any of them.
+
+Flags a pin as stale when its MACKAS_ROOT is gone, or when MACKAS_ROOT/work/
+NAME is gone -- the directory implicit (\$PWD-derived) project selection keys
+off. The fix either way is to move the checkout back or drop the pin; mackas
+never re-derives an identity from whatever happens to be on disk.
+
+Flags a pin this process cannot READ too -- and keeps working while one is in
+that state, unlike every other command, whose \$PWD-derived selection fails
+closed on it (an unreadable pin could have been the match). This listing is
+the repair surface those refusals point at, so it has to be the one command
+that still runs.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
+though this reads only and never prompts.
+EOF
+}
+
+cmd_projects() {
+	local dir name f v s root found=0
+	dir="$(projects_dir)"
+	hdr "Pinned projects"
+	show "directory" "$dir"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		found=1
+		name="$(basename "$f" .conf)"
+		info ""
+		if [ "$f" = "$CONFIG_FILE_USED" ]; then
+			printf '  %s%s%s  (selected for this command)\n' "$C_BLD" "$name" "$C_RST"
+		else
+			printf '  %s%s%s\n' "$C_BLD" "$name" "$C_RST"
+		fi
+		root=""
+		for s in MACKAS_ROOT MACKAS_PROJECT_DIR MACKAS_VOLUME_NAME \
+		         MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
+			v="$(config_grep_setting "$f" "$s")" || v=""
+			if [ "$s" = "MACKAS_ROOT" ]; then root="$v"; fi
+			if [ -n "$v" ]; then
+				printf '    %-26s %s\n' "$s" "$v"
+			fi
+		done
+		# Why this listing shows nothing but the name for such an entry --
+		# every setting above came from config_grep_setting, which cannot
+		# read it either. Said out loud because #78's tier-3 derivation
+		# fails CLOSED on exactly this file for every OTHER command (it
+		# could have been the match, and unreadable means unknowable), so
+		# this line is the whole diagnosis for a machine where mackas has
+		# suddenly started refusing everything.
+		if [ ! -r "$f" ]; then
+			printf '    %s%-26s %s%s\n' "$C_YEL" "unreadable" \
+				"cannot be read -- its settings are unknown, and \$PWD-derived selection refuses to pick ANY project while it stays this way; fix its permissions, or remove it if it is stale" "$C_RST"
+		fi
+		if [ -n "$root" ] && [ ! -d "$root" ]; then
+			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
+				"its MACKAS_ROOT does not exist -- moved, or on an unmounted disk" "$C_RST"
+		elif [ -n "$root" ] && [ ! -d "$root/work/$name" ]; then
+			# #78 tier 3: MACKAS_ROOT is fine, but the workspace derivation
+			# would key off (<root>/work/<name>) is gone -- a moved/renamed
+			# checkout, or one never created at all. "identity is never
+			# re-minted": the fix is to move the directory back, or drop
+			# this pin -- never for mackas to guess a new one from whatever
+			# IS on disk.
+			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
+				"$root/work/$name does not exist -- \$PWD derivation will never select this pin until it does; move the checkout back, or remove this pin if it is gone for good" "$C_RST"
+		fi
+		# The same test --project applies before sourcing, reported here
+		# instead of at the moment it would refuse.
+		if ! config_file_is_safe "$f"; then
+			printf '    %s%-26s %s%s\n' "$C_YEL" "unsafe" \
+				"owned by someone else or group/other-writable -- --project refuses it" "$C_RST"
+		fi
+		printf '    %-26s %s --project %s ...\n' "select with" "$SCRIPT_CMD" "$name"
+	done
+	if [ "$found" -eq 0 ]; then
+		info ""
+		info "  none pinned yet."
+		info "  '$SCRIPT_CMD adopt <root>' writes a standalone config here."
+	fi
+}
+
+# pinned_config_volume_names FILE NAME -- print FILE's resolved tmp/dl/sstate
+# volume names, one per line, in that order. NAME is FILE's own basename
+# (minus .conf) -- the name --project/$MACKAS_PROJECT_SELECT would select it
+# by. Applies the exact same derivation derive_volume_names() applies at
+# runtime: an explicit override wins when FILE sets one, otherwise the stem
+# defaults to mackas-NAME and dl/sstate fall out of the stem (#77 slice 1).
+# Read-only: every value comes from config_grep_setting -- GREPPING FILE,
+# never sourcing it, same rule cmd_projects() already follows for this whole
+# directory.
+pinned_config_volume_names() {
+	local file="$1" name="$2" stem dl sstate
+	stem="$(config_grep_setting "$file" MACKAS_VOLUME_NAME)" || stem=""
+	[ -n "$stem" ] || stem="mackas-$name"
+	dl="$(config_grep_setting "$file" MACKAS_VOLUME_DL_NAME)" || dl=""
+	[ -n "$dl" ] || dl="${stem}-dl"
+	sstate="$(config_grep_setting "$file" MACKAS_VOLUME_SSTATE_NAME)" || sstate=""
+	[ -n "$sstate" ] || sstate="${stem}-sstate"
+	printf '%s\n%s\n%s\n' "${stem}-tmp" "$dl" "$sstate"
+}
+
+# pinned_projects_referencing_volume NAME -- print, one per line, every
+# pinned project (projects_dir()/*.conf, minus the .conf suffix) whose tmp,
+# dl OR sstate volume resolves to NAME. Empty output when nobody does,
+# including when projects_dir() holds zero or one config -- "shared" needs a
+# SECOND claimant, so those cases can never produce output no matter what
+# NAME is (the glob below is the same defensive `[ -f "$f" ] || continue`
+# shape cmd_projects() already uses, so a directory with no configs at all,
+# or none yet, is silent rather than iterating a literal unexpanded glob).
+#
+# Shared by three callers that all need the same answer to "who else claims
+# this volume": adopt_unique_volume_name()'s collision probe (a candidate
+# claimed only by a pinned-but-unbuilt project's override has no volume to
+# find with volume_exists()), and destroy/clean's shared-volume refusal.
+pinned_projects_referencing_volume() {
+	local target="$1" dir f name
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		name="$(basename "$f" .conf)"
+		if pinned_config_volume_names "$f" "$name" | grep -qxF "$target"; then
+			printf '%s\n' "$name"
+		fi
+	done
+}
+
+# pinned_configs_unreadable -- print, one per line, the basename (minus
+# .conf) of every projects_dir()/*.conf that EXISTS as a regular file but
+# this process could not read (permission denied, a stale ACL, an NFS
+# hiccup while the handle is open...). This is NOT the same case as a
+# missing setting: config_grep_setting has no way to tell "the file has no
+# such line" from "grep could not open the file at all" -- both come back
+# as its ordinary return-1, so pinned_projects_referencing_volume() reads an
+# unreadable config exactly like an innocent one that references nothing.
+# That default is fine for a probe that already documents itself as
+# collision-avoidance, not a guarantee (adopt_unique_volume_name()) -- it is
+# the wrong default for a DESTRUCTIVE one. refuse_shared_volume() calls this
+# first and fails CLOSED when it is non-empty, the same "cannot tell must
+# never read as no" rule config_file_is_safe() exists for around sourcing.
+pinned_configs_unreadable() {
+	local dir f
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		[ -r "$f" ] || basename "$f" .conf
+	done
 }
 
 # The kas files kas-container is actually given: the project's own config
@@ -1291,10 +2116,8 @@ derive_paths() {
 		KAS_CONTAINER_BIN=""; KAS_CONTAINER_REAL=""; SHIM_DIR=""
 		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
 		KAS_FILES_ARG="$(compose_kas_files)"
-		MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
-		MACKAS_VOL_DL="${MACKAS_VOLUME_NAME}-dl"
-		MACKAS_VOL_SSTATE="${MACKAS_VOLUME_NAME}-sstate"
-		MACKAS_VOL_LEGACY="$MACKAS_VOLUME_NAME"
+		derive_volume_names
+		project_select_resolution_note
 		return 0
 	fi
 
@@ -1344,8 +2167,30 @@ derive_paths() {
 	MACKAS_WORK="$MACKAS_BASE/work"
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
+	# Selected -> logs/<name>, so two pinned projects on one MACKAS_ROOT never
+	# share a log directory. Every one of dump's output, the smoketest log,
+	# status's "Recent logs" listing and bare `clean`'s wipe reads this single
+	# variable, so this one gate scopes all four for free. Unselected, this
+	# must stay exactly $MACKAS_BASE/logs, flat -- #79's
+	# backward-compatibility rule, same gate as MACKAS_ENV_SH/
+	# MACKAS_KAS_FRAGMENT_SRC below. That compatibility cuts one way only:
+	# an unselected bare `clean` still wipes the whole flat logs/, per-project
+	# subdirectories included, because it wipes MACKAS_LOGS and that IS the
+	# flat dir when nothing is selected -- see clean_usage().
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_LOGS="$MACKAS_BASE/logs/$PROJECT_SELECTED"
+	fi
 	MACKAS_PROJECT="$(strip_trailing_slash "$MACKAS_WORK/$MACKAS_PROJECT_DIR")"
+	# Selected -> env-<name>.sh, so two pinned projects on one MACKAS_ROOT never
+	# share a generated env file. Unselected, this must stay exactly
+	# $MACKAS_BASE/env.sh -- #79's backward-compatibility rule -- so gate on
+	# PROJECT_SELECTED itself, not on anything that could be non-empty without
+	# it (PROJECT_SELECTED is validated by validate_project_select() the
+	# moment it is set, so it is already safe to paste into a filename here).
 	MACKAS_ENV_SH="$MACKAS_BASE/env.sh"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_ENV_SH="$MACKAS_BASE/env-$PROJECT_SELECTED.sh"
+	fi
 	# See setup_gitconfig() for why this file exists at all.
 	MACKAS_GITCONFIG="$MACKAS_BASE/gitconfig"
 	KAS_CONTAINER_BIN="$MACKAS_BIN/kas-container"
@@ -1359,22 +2204,123 @@ derive_paths() {
 	# kas fragment, as seen from the project checkout (kas rewrites paths
 	# under the repo dir to /repo/... inside the container, so the fragment
 	# has to physically live inside the checkout).
+	# Selected -> macos-<name>.yml, so two pinned projects on one MACKAS_ROOT
+	# never share a canonical fragment (same rule, same gate as MACKAS_ENV_SH
+	# just above). Unselected, this must stay exactly $MACKAS_KAS/macos.yml --
+	# #79's backward-compatibility rule. The in-checkout copy
+	# (MACKAS_KAS_FRAGMENT_REPO) does NOT get a project component: each
+	# project has its own private checkout under MACKAS_PROJECT, so there is
+	# no naming collision to resolve there.
 	MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos.yml"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_KAS_FRAGMENT_SRC="$MACKAS_KAS/macos-$PROJECT_SELECTED.yml"
+	fi
 	MACKAS_KAS_FRAGMENT_REPO="$MACKAS_PROJECT/kas/macos-local.yml"
 	KAS_FILES_ARG="$(compose_kas_files)"
 
-	# The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
-	# filesystem semantics, and none of them may be a host (APFS) directory --
-	# see kas_runtime_args() for why they are volumes rather than bind mounts.
+	derive_volume_names
+
+	validate_nfs_mirror_paths
+
+	project_select_resolution_note
+}
+
+# One line to stderr the moment #78's tier-3 derivation is what put a project
+# in force -- naming the project, what it was derived from, and the three
+# volume names it resolved to, so a build run from inside a workspace never
+# silently mounts a different project's volumes without SOME visible trace.
+# Fires identically whichever tier-3 SOURCE won -- $PWD alone or the kas
+# chain -- since PROJECT_SELECT_SOURCE already reads naturally either way
+# ("derived from $PWD" / "derived from the kas chain").
+#
+# At most once per PROCESS even though derive_paths() runs more than once per
+# invocation (adopt/setup recompute after picking a stem): PROJECT_SELECT_
+# NOTE_SHOWN latches after the first call. Never for `status`, which reports
+# the very same facts in its own "project selected" section instead, and
+# never for any --help path -- those never call load_config at all, so
+# PROJECT_SELECT_SOURCE is still empty by the time this runs.
+project_select_resolution_note() {
+	case "$PROJECT_SELECT_SOURCE" in
+		"derived from \$PWD"|"derived from the kas chain") ;;
+		*) return 0 ;;
+	esac
+	[ "$PROJECT_SELECT_NOTE_SHOWN" -eq 0 ] || return 0
+	[ "${SCRIPT_SUBCOMMAND:-}" != "status" ] || return 0
+	PROJECT_SELECT_NOTE_SHOWN=1
+	printf 'mackas: selected project '"'"'%s'"'"', %s -- volumes: %s, %s, %s\n' \
+		"$PROJECT_SELECTED" "$PROJECT_SELECT_SOURCE" "$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" >&2
+}
+
+# The three ext4 volumes. TMPDIR, downloads and sstate all need real Linux
+# filesystem semantics, and none of them may be a host (APFS) directory -- see
+# kas_runtime_args() for why they are volumes rather than bind mounts.
+#
+# Called from BOTH of derive_paths()' branches. `status`, `help` and `volume
+# list` on a machine with no MACKAS_ROOT go through the early-return one, so
+# deriving in only one branch makes mackas PRINT one set of names and OPERATE
+# on another.
+#
+# The overrides are read here rather than written back into
+# MACKAS_VOLUME_DL_NAME/_SSTATE_NAME: derive_paths() runs more than once per
+# invocation (adopt re-derives after picking a new stem), and backfilling
+# would pin the caches to the stem that was current the first time round.
+#
+# Same reasoning applies to the selector-derived stem default just below:
+# it is recomputed from PROJECT_SELECTED + config_pinned_setting() on every
+# call, and never written into __EXPLICIT_MACKAS_VOLUME_NAME, so it stays a
+# pure, idempotent default -- exactly like set_defaults()' own output,
+# losable to config/env/--set, not layered on top of them (#72's core rule:
+# a default, never a fifth precedence rung).
+derive_volume_names() {
+	# When a project is selected (--project / $MACKAS_PROJECT_SELECT settled
+	# on a pinned config) and nothing above the defaults rung pinned
+	# MACKAS_VOLUME_NAME to a value of its own, the stem defaults to
+	# mackas-<selected name> instead of the factory "oe-build" -- #72/#77's
+	# per-project volume naming. This can never trip validate_volume_names()'s
+	# empty/whitespace check below: validate_project_select() already
+	# restricts PROJECT_SELECTED to [A-Za-z0-9._-], and the literal prefix
+	# "mackas-" added here introduces none either.
+	#
+	# config_pinned_setting(), not setting_is_explicit() alone -- see its own
+	# comment for why: MACKAS_VOLUME_NAME's factory default is the non-empty
+	# "oe-build", so a project config that explicitly pins that exact value
+	# (migration path B of #72, "keep oe-build-*, no data moves") would
+	# otherwise read as "untouched" and get silently overridden here.
+	if [ -n "$PROJECT_SELECTED" ] && ! config_pinned_setting MACKAS_VOLUME_NAME; then
+		MACKAS_VOLUME_NAME="mackas-$PROJECT_SELECTED"
+	fi
+
 	MACKAS_VOL_TMP="${MACKAS_VOLUME_NAME}-tmp"
-	MACKAS_VOL_DL="${MACKAS_VOLUME_NAME}-dl"
-	MACKAS_VOL_SSTATE="${MACKAS_VOLUME_NAME}-sstate"
+	MACKAS_VOL_DL="${MACKAS_VOLUME_DL_NAME:-${MACKAS_VOLUME_NAME}-dl}"
+	MACKAS_VOL_SSTATE="${MACKAS_VOLUME_SSTATE_NAME:-${MACKAS_VOLUME_NAME}-sstate}"
 	# The single volume mackas used to create, before the split into three.
 	# Nothing uses it any more; `check` and `status` report it so it does not
 	# sit there silently eating disk.
 	MACKAS_VOL_LEGACY="$MACKAS_VOLUME_NAME"
 
-	validate_nfs_mirror_paths
+	# Two of the three resolving to one name is invariant 3 violated from
+	# INSIDE a single container: kas_runtime_args() would emit `-v x:/downloads
+	# -v x:/sstate`, attaching one ext4 image twice to the same VM. Nothing
+	# downstream catches it -- require_volumes_free() only asks what OTHER
+	# running containers hold, and setup_volumes() would create the name twice
+	# at two different sizes and report success -- so the first sign would be a
+	# corrupt filesystem mid-build. Before these two knobs existed the three
+	# names were one stem plus three fixed suffixes and could not collide;
+	# refuse here, where every caller resolves them.
+	if [ "$MACKAS_VOL_DL" = "$MACKAS_VOL_TMP" ]; then
+		die_volume_collision "$MACKAS_VOL_DL" "the build volume and the downloads volume"
+	fi
+	if [ "$MACKAS_VOL_SSTATE" = "$MACKAS_VOL_TMP" ]; then
+		die_volume_collision "$MACKAS_VOL_SSTATE" "the build volume and the sstate volume"
+	fi
+	if [ "$MACKAS_VOL_DL" = "$MACKAS_VOL_SSTATE" ]; then
+		die_volume_collision "$MACKAS_VOL_DL" "the downloads volume and the sstate volume"
+	fi
+}
+
+die_volume_collision() {
+	die "$2 both resolve to '$1'" \
+		"the three volumes are attached to one container, so they must have three distinct names; set MACKAS_VOLUME_DL_NAME / MACKAS_VOLUME_SSTATE_NAME to differ from each other and from \${MACKAS_VOLUME_NAME}-tmp in $(config_hint)"
 }
 
 # kas-container WORD-SPLITS the string it gets from --runtime-args, so every
@@ -3552,7 +4498,7 @@ setup_shim_and_env() {
 	# must.
 	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
-	local q_fragrepo q_autofrag q_autoproj q_brew
+	local q_fragrepo q_autofrag q_autoproj q_brew q_projsel
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -3576,6 +4522,24 @@ setup_shim_and_env() {
 	q_fragrepo="$(shq "$MACKAS_KAS_FRAGMENT_REPO")"
 	q_autofrag="$(shq "$MACKAS_KAS_AUTO_FRAGMENT")"
 	q_autoproj="$(shq "$MACKAS_KAS_AUTO_PROJECT")"
+
+	# Only when a project is selected -- MACKAS_ENV_SH is $MACKAS_BASE/env.sh,
+	# unchanged, for an unselected run, and this stays empty so that file's
+	# generated text is untouched (#79 backward-compatibility rule). Selected,
+	# it becomes the tail of the MACKAS_KAS_AUTO_PROJECT export line below,
+	# with its own leading newline, rather than a standalone line -- so an
+	# unselected env.sh gets not so much as an extra blank line out of this.
+	local projsel_export=""
+	if [ -n "$PROJECT_SELECTED" ]; then
+		q_projsel="$(shq "$PROJECT_SELECTED")"
+		projsel_export="
+# ':-' so a value already exported in THIS shell wins, exactly like
+# MACKAS_KAS_AUTO_FRAGMENT/_AUTO_PROJECT above. A bare assignment would
+# silently override a MACKAS_PROJECT_SELECT you (or an earlier sourced
+# env-<name>.sh, in the same shell) already set, with whichever project this
+# file happened to be generated for -- see PROJECT_SELECTED in $SCRIPT_NAME.
+export MACKAS_PROJECT_SELECT=\${MACKAS_PROJECT_SELECT:-$q_projsel}"
+	fi
 
 	if [ "$DRY_RUN" -eq 1 ]; then
 		printf '%s+ write %s%s\n' "$C_DIM" "$MACKAS_ENV_SH" "$C_RST"
@@ -3646,15 +4610,14 @@ fi
 # derive MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG and append the macos-local.yml
 # fragment, both before handing off to that wrapper.
 #
-# This is the value at the moment 'setup' generated this file -- conceptually
-# the same FROZEN FALLBACK the $KAS_CONTAINER_BIN wrapper script bakes into
-# its own MACKAS_FROZEN_RUNTIME_ARGS (see write_kas_wrapper()), computed
-# independently there rather than read from this export. The kas-container()
-# function below no longer consults this variable at all -- it delegates
-# --runtime-args (live value AND fallback) entirely to the wrapper now.
-# Kept exported anyway, unchanged, so a shell that already sourced an older
-# env.sh keeps seeing the name it had -- removing it out from under an
-# already-sourced shell is the breaking change, not keeping an unread export.
+# This is the value at the moment 'setup' generated this file, and nothing
+# reads it: the kas-container() function below delegates --runtime-args
+# entirely to the wrapper, which recomputes it live on every call and
+# REFUSES rather than fall back if that fails (issue #96). Kept exported
+# anyway, unchanged, so a shell that already sourced an older env.sh keeps
+# seeing the name it had -- removing it out from under an already-sourced
+# shell is the breaking change, not keeping an unread export. Never treat it
+# as a fallback: a stale copy of these values is exactly what #96 removed.
 export MACKAS_RUNTIME_ARGS=$q_runtime_args
 
 # Absolute path to the generated fragment (empty project -> a path that
@@ -3668,7 +4631,7 @@ export MACKAS_KAS_FRAGMENT_REPO=$q_fragrepo
 # 'MACKAS_KAS_AUTO_PROJECT=0' set in a shell rc BEFORE env.sh is sourced,
 # which is a perfectly reasonable way to turn either of these off.
 export MACKAS_KAS_AUTO_FRAGMENT=\${MACKAS_KAS_AUTO_FRAGMENT:-$q_autofrag}
-export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}
+export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}$projsel_export
 
 # _mackas_derive_project needs this to tell "cwd is work/" from "cwd is a
 # checkout under work/". Same value as KAS_WORK_DIR above, under the name the
@@ -3826,8 +4789,8 @@ kas-container() {
 	# Hand off to $KAS_CONTAINER_BIN, the protection wrapper SCRIPT
 	# write_kas_wrapper() generates in $SCRIPT_NAME (see q_kasbin's own
 	# assignment above for why this must stay the wrapper, never .real). IT
-	# now computes --runtime-args live (falling back to a frozen copy the same
-	# way this function used to), blanks KAS_BUILD_DIR/DL_DIR/SSTATE_DIR,
+	# computes --runtime-args live and refuses to launch if that fails,
+	# applies the one-VM rule, blanks KAS_BUILD_DIR/DL_DIR/SSTATE_DIR,
 	# prepends the shim dir to PATH, and sets up the container
 	# engine/image/gitconfig -- none of that belongs here anymore.
 	# MACKAS_KAS_FRAGMENT_DONE=1 tells it the fragment-append above already
@@ -4118,19 +5081,11 @@ ensure_volume() {
 }
 
 setup_volumes() {
-	step "ext4 volumes: ${MACKAS_VOLUME_NAME}-{tmp,dl,sstate} ($(total_volume_gb) GiB total)"
+	step "ext4 volumes: $MACKAS_VOL_TMP, $MACKAS_VOL_DL, $MACKAS_VOL_SSTATE ($(total_volume_gb) GiB total)"
 
-	# kas-container word-splits --runtime-args, so a volume name with a space
-	# in it would silently become two arguments and mount something absurd.
-	# validate_settings() already checked this for every command; repeated
-	# here as a backstop for callers (tests included) that reach this
-	# function directly without going through main()'s validation first.
-	case "$MACKAS_VOLUME_NAME" in
-		*[[:space:]]*|"")
-			die "MACKAS_VOLUME_NAME='$MACKAS_VOLUME_NAME' is empty or contains whitespace" \
-				"set MACKAS_VOLUME_NAME to a non-empty, space-free name in $(config_hint)"
-			;;
-	esac
+	# Backstop for callers (tests included) that reach this function directly
+	# without going through main()'s validate_settings first.
+	validate_volume_names
 
 	ensure_volume "$MACKAS_VOL_TMP"    "$MACKAS_VOLUME_SIZE_TMP"    "TMPDIR -> /build"
 	ensure_volume "$MACKAS_VOL_DL"     "$MACKAS_VOLUME_SIZE_DL"     "DL_DIR -> /downloads"
@@ -4230,8 +5185,9 @@ write_kas_wrapper() {
 	# spelled out in setup_shim_and_env(): the raw form was an injection.
 	# BREW_BIN is on this list because it used to be a hardcoded literal --
 	# turning it into a variable put it straight back inside a raw "..." until
-	# this line existed.
-	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_rtargs q_scriptname
+	# this line existed. No q_rtargs: the frozen --runtime-args string is gone
+	# from the generated file entirely (issue #96) -- there is nothing to quote.
+	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_scriptname q_projsel
 	q_real="$(shq "$KAS_CONTAINER_REAL")"
 	q_shim="$(shq "$SHIM_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -4239,8 +5195,22 @@ write_kas_wrapper() {
 	q_work="$(shq "$MACKAS_WORK")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
-	q_rtargs="$(shq "$(kas_runtime_args)")"
 	q_scriptname="$(shq "$SCRIPT_NAME")"
+	# Empty unless this setup ran under an EXPLICIT --project/
+	# $MACKAS_PROJECT_SELECT (#78 tier 1/2). A #78 tier-3 selection derived
+	# from $PWD must NOT be baked in here: the whole point of derivation is
+	# that it is recomputed per invocation from wherever the shell happens to
+	# stand, and freezing today's answer into the wrapper would replay it
+	# from every OTHER directory too -- exactly the stale-pin ambush
+	# wrapper_identity_hint()/--expect-work already exist to catch, just
+	# self-inflicted at generation time instead of caught at build time.
+	# Leaving it empty here keeps derivation live: MACKAS_PROJECT_PIN="" makes
+	# load_config treat $MACKAS_PROJECT_SELECT as absent (same as never set),
+	# so the wrapper's own subprocess re-derives from ITS inherited cwd.
+	case "$PROJECT_SELECT_SOURCE" in
+		--project|"\$MACKAS_PROJECT_SELECT") q_projsel="$(shq "$PROJECT_SELECTED")" ;;
+		*) q_projsel="$(shq "")" ;;
+	esac
 
 	run mkdir -p "$MACKAS_BIN"
 	cat > "$KAS_CONTAINER_BIN" <<EOF
@@ -4269,11 +5239,31 @@ MACKAS_WORK=$q_work
 KAS_IMAGE=$q_image
 MACKAS_GITCONFIG=$q_gitconfig
 SCRIPT_NAME=$q_scriptname
-# The --runtime-args string in effect when '$SCRIPT_NAME setup' generated
-# this file -- the FALLBACK used only if live recomputation below fails (a
-# stale/incompatible $SCRIPT_NAME binary, or a setting this shell has since
-# broken). Normal calls never use this frozen copy.
-MACKAS_FROZEN_RUNTIME_ARGS=$q_rtargs
+
+# Which pinned project's config every value above was frozen from, empty for
+# the default search path. Replayed into the live recompute below: without it,
+# a wrapper written by '$SCRIPT_NAME --project A setup' would recompute
+# --runtime-args off whatever the default search path finds, and hand another
+# project's ext4 volumes to a build whose work dir and gitconfig are A's.
+# Passed explicitly even when empty, which also stops an exported
+# \$MACKAS_PROJECT_SELECT in the calling shell from re-aiming this wrapper at
+# a project it was not built for.
+#
+# This pins the SELECTOR only, not \$MACKAS_CONF -- so it does NOT guarantee
+# the recompute resolves the same config this file was generated from. With
+# this pin empty, an exported \$MACKAS_CONF still re-aims the recompute at
+# another config's volume names while the values above stay frozen to the
+# first: the same hazard, through the other door. Freezing a typed path into
+# a generated file is a separate design call (a path is a per-invocation
+# request and can go stale), tracked in issue #96 -- do not read this pin as
+# closing that case.
+MACKAS_PROJECT_PIN=$q_projsel
+
+# There is deliberately NO frozen copy of --runtime-args in this file any
+# more (issue #96). It used to be the fallback for a failed live recompute,
+# which made every guard $SCRIPT_NAME applies while computing that string --
+# a volume-name collision, a held volume, an ambiguous project -- degrade to
+# a warning plus a build on setup-time values through this path alone.
 
 # Re-entry guard. KAS_CONTAINER_REAL must never lead back to this wrapper --
 # a symlink loop, or .real somehow replaced by a copy of this file -- would
@@ -4320,29 +5310,113 @@ for _mackas_kas_arg in "\$@"; do
 	esac
 done
 
+# #78's kas-chain hint: standing in work/ itself and hand-typing
+# 'kas-container build meta-qcom/kas/base.yml:...' cannot be derived from
+# \$PWD alone -- \$PWD there is work/, the parent of every checkout, not any
+# one project's own directory -- so \$SCRIPT_NAME's own tier-3 selection
+# needs the file list's leading path component as a fallback hint. Only
+# build/shell/checkout take that argument shape (dump/menu have a different
+# positional -- see env.sh's own kas-container() function for the fuller
+# story); the leading-options scan below is the SAME shape as that
+# function's own (a boolean flag, a value flag consuming its own next
+# token, or backing off entirely at an unknown option) so the two can never
+# derive a different answer for the same invocation.
+#
+# Defined as a NAMED FUNCTION, called from inside a command substitution,
+# rather than a bare \`case\` written directly inside "\$(...)" -- the two look
+# equivalent but are not: Apple's own /bin/sh (bash 3.2's POSIX-mode
+# personality, confirmed live) mis-parses a \`case\`/\`esac\` block written
+# INLINE inside a command substitution, reading its lines back out as
+# literal text instead of executing them. Wrapping the SAME logic in a
+# function sidesteps that parser bug entirely (a function body is read by
+# the normal top-level parser, not whatever "\$(...)" uses to find its own
+# end), and gets the "\$@" isolation this needs as a side effect of ordinary
+# POSIX function scoping anyway: a function's own positional parameters
+# shadow the caller's, so its \`shift\`s never touch the real "\$@" this
+# script still needs whole, further down, for the final exec.
+#
+# The raw chain is handed to \`runtime-args\` UNPARSED: only \$SCRIPT_NAME
+# itself (never this POSIX wrapper) is allowed to validate a name before it
+# is pasted into a path (#78's whole security framing) -- this is nothing
+# more than "here is the file list you were given", exactly like
+# --expect-work is "here is the work dir I was generated for".
+_mackas_kas_files_scan() {
+	case "\${1:-}" in
+		build|shell|checkout)
+			shift
+			while [ \$# -gt 0 ]; do
+				case "\$1" in
+					-k|--keep-config-unchanged|--force-checkout|--update|-E|--preserve-env)
+						shift ;;
+					--skip=*|--target=*|--cmd=*|--task=*|--provenance=*)
+						shift ;;
+					--skip|--target|-c|--cmd|--task|--provenance)
+						shift
+						[ \$# -gt 0 ] && shift
+						;;
+					-*)
+						break ;;
+					*)
+						printf '%s' "\$1"
+						break ;;
+				esac
+			done
+			;;
+	esac
+}
+_mackas_kas_files="\$(_mackas_kas_files_scan "\$@")"
+
 # Live recompute: ask $SCRIPT_NAME itself for today's --runtime-args string,
 # so a setting change (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a
 # MACKAS_VOLUME_NAME override, ...) reaches a hand-typed 'kas-container ...'
 # the same way it already reaches '$SCRIPT_NAME smoketest'/'shell', not just
 # after the next '$SCRIPT_NAME setup'.
 #
-# '|| true' matters here for the same reason it matters in env.sh's own
-# _mackas_runtime_args(): under 'set -e', a failing command substitution
-# would abort before the fallback below ever runs, handing kas-container an
-# EMPTY --runtime-args -- no volumes, no limits, no warning -- instead of
-# degrading to the frozen copy above.
-rt="\$("\$MACKAS_SELF" runtime-args 2>/dev/null)" || true
-
-if [ -z "\$rt" ]; then
-	echo "\$SCRIPT_NAME: could not recompute --runtime-args live; using the value baked in at setup time (re-run: \$SCRIPT_NAME setup)" >&2
-	rt="\$MACKAS_FROZEN_RUNTIME_ARGS"
+# --require-volumes-free asks that same call for run_kas()'s one-VM check
+# too: a hand-typed 'kas-container build' is a second, independent way into
+# the very hazard that guard exists to close, and only \$SCRIPT_NAME can
+# answer it (see cmd_runtime_args() for why the check rides on this call
+# rather than being reimplemented here or asked for separately). It runs
+# after the daemon start above on purpose -- the query reads "nothing holds
+# it" with the runtime down.
+#
+# stderr is NOT redirected: whatever \$SCRIPT_NAME says -- a die() naming the
+# held volume or the colliding names, a warning that MACKAS_MONITOR=1 could
+# not be wired up -- is the diagnosis, and it belongs in front of the person
+# who typed the command, verbatim and in order.
+#
+# '|| _mackas_rt_rc=\$?' rather than a bare assignment: under 'set -e' a
+# failing command substitution would abort this script before the refusal
+# below could explain itself, and it also keeps the exit status, which a
+# bare assignment discards.
+_mackas_rt_rc=0
+if [ -n "\$_mackas_kas_files" ]; then
+	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK" --kas-files "\$_mackas_kas_files")" || _mackas_rt_rc=\$?
+else
+	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK")" || _mackas_rt_rc=\$?
 fi
 
-# Validate whichever string is about to be used, live or fallback: it must
-# be non-empty and name all three ext4 volumes kas_runtime_args() always
-# emits. Refusing here, rather than exec'ing anyway, is deliberate -- a
-# multi-hour build with no protected storage attached is strictly worse
-# than failing fast before it ever starts.
+# FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
+# computing this string is a safety guard -- a held volume, two volume names
+# resolving to one, a project that cannot be derived unambiguously -- and
+# each of them means the setup-time values are no longer known to be right,
+# which is exactly when quietly reusing them does the damage. Failing here
+# is the same outcome the equivalent '\$SCRIPT_NAME shell' would produce; a
+# wrapper that is more permissive than the command it wraps is a bypass, not
+# a convenience.
+if [ "\$_mackas_rt_rc" -ne 0 ]; then
+	echo "\$SCRIPT_NAME: refusing to launch kas-container -- '\$SCRIPT_NAME runtime-args' exited \$_mackas_rt_rc (its message is above)" >&2
+	echo "\$SCRIPT_NAME: not falling back to the values baked in at setup time: they may name volumes this build must not touch" >&2
+	exit 1
+fi
+
+# Validate the string that is about to be used: it must be non-empty and
+# name all three ext4 volumes kas_runtime_args() always emits. This catches
+# what a zero exit status cannot -- a truncated or empty answer from a
+# stale/incompatible \$SCRIPT_NAME that still returns success. Refusing here,
+# rather than exec'ing anyway, is deliberate -- a multi-hour build with no
+# protected storage attached is strictly worse than failing fast before it
+# ever starts.
 _mackas_kas_ok=1
 case "\$rt" in
 	*":/build"*) ;;
@@ -4358,6 +5432,7 @@ case "\$rt" in
 esac
 if [ -z "\$rt" ] || [ "\$_mackas_kas_ok" != "1" ]; then
 	echo "\$SCRIPT_NAME: refusing to launch kas-container -- --runtime-args is empty or missing an ext4 volume (/build, /downloads, /sstate); this would build with NO protected storage attached" >&2
+	echo "\$SCRIPT_NAME: next: \$SCRIPT_NAME setup   # reinstalls the wrapper against this \$SCRIPT_NAME" >&2
 	exit 1
 fi
 
@@ -4720,7 +5795,7 @@ cmd_setup() {
 			-y|-f|--yes|--force)  ASSUME_YES=1; shift; continue ;;
 			-v|--verbose)  VERBOSE=1; shift; continue ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" setup ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" setup ;;
 			--tmpdir-size|--sstate-size|--downloads-size)
 				a="$1"; val="${2:-}"
 				[ -n "$val" ] || die "$a needs a value" "$SCRIPT_CMD setup --help"
@@ -4840,7 +5915,9 @@ ${C_BLD}OPTIONS${C_RST}
                        than one exists (or none can be found automatically).
   --write-config FILE  Where to persist the new, per-project config (NOT
                        the global --config, which loads an EXISTING one).
-                       Default: derived under ~/.config/mackas/projects/.
+                       Default: derived under ~/.config/mackas/projects/,
+                       which is what makes it reachable later as
+                       '$SCRIPT_CMD --project <name>' ('$SCRIPT_CMD projects').
 
 Ends by handing off to '$SCRIPT_CMD setup', with the new config in scope, for
 everything setup already does correctly on its own (project checkout,
@@ -4902,14 +5979,36 @@ adopt_introspect_project() {
 }
 
 # adopt_unique_volume_name BASE -- BASE disambiguated against every volume
-# name already in use for something else, machine-wide (no per-root ownership
-# record exists to check against, so collision-avoidance, not "is this
-# already mine", is the honest guarantee here).
+# name already in use for something else, machine-wide: MATERIALIZED, real
+# container volumes (volume_exists), AND names already CLAIMED by a
+# pinned-but-not-yet-built project's config.
+#
+# The second half is the fix: this probe was written when the three volume
+# names were one stem plus three fixed suffixes and could not be aimed
+# anywhere else, so "does <candidate>-dl exist" and "is stem <candidate>
+# taken" were the same question. M1's MACKAS_VOLUME_DL_NAME/_SSTATE_NAME
+# broke that equivalence in both directions: a pinned project can claim a
+# literal "mackas-foo-dl" through an override while its OWN stem is
+# something unrelated (volume_exists() alone would miss it -- nothing has
+# been built yet, so there is no volume to find), and a pinned project named
+# literally "foo" that has simply never built leaves "mackas-foo-dl" looking
+# just as free. pinned_projects_referencing_volume() answers the question
+# volume_exists() cannot: it reverse-GREPS every pinned config -- never
+# sources one -- applying each file's own derivation rule the same way
+# derive_volume_names() would once that file were selected.
+#
+# Still no per-root OWNERSHIP record exists (nothing here can tell "this
+# candidate is already MINE" from "someone else's", only "is this literal
+# string spoken for by ANYTHING") -- collision-avoidance, not "is this
+# already mine", remains the honest guarantee.
 adopt_unique_volume_name() {
 	local base="$1" n=2
 	local candidate="mackas-$base"
 	while volume_exists "${candidate}-tmp" || volume_exists "${candidate}-dl" \
-	   || volume_exists "${candidate}-sstate"; do
+	   || volume_exists "${candidate}-sstate" \
+	   || [ -n "$(pinned_projects_referencing_volume "${candidate}-tmp")" ] \
+	   || [ -n "$(pinned_projects_referencing_volume "${candidate}-dl")" ] \
+	   || [ -n "$(pinned_projects_referencing_volume "${candidate}-sstate")" ]; do
 		candidate="mackas-$base-$n"
 		n=$((n + 1))
 	done
@@ -4993,7 +6092,7 @@ cmd_adopt() {
 				[ -n "$config_opt" ] || die "--write-config needs a value" "$SCRIPT_CMD adopt --help"
 				shift 2 ;;
 			--write-config=*) config_opt="${1#*=}"; shift ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" adopt ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" adopt ;;
 			-*) die "unknown option for 'adopt': $1" "$SCRIPT_CMD adopt --help" ;;
 			*)
 				[ -z "$path" ] || die "'adopt' takes one path" "$SCRIPT_CMD adopt --help"
@@ -5053,7 +6152,7 @@ cmd_adopt() {
 	info "  volume name: $derived_name"
 	info "  short link : $derived_link"
 
-	local config_file="${config_opt:-$HOME/.config/mackas/projects/$base_name.conf}"
+	local config_file="${config_opt:-$(projects_dir)/$base_name.conf}"
 	if [ -f "$config_file" ]; then
 		confirm "  $config_file already exists -- overwrite its settings with this adoption?" \
 			|| die "declined -- nothing written" \
@@ -5103,6 +6202,479 @@ cmd_adopt() {
 	hdr "Adopted"
 	info "  config file : $config_file"
 	info "  from now on : $SCRIPT_CMD --config $(printf '%q' "$config_file") ..."
+	if [ "$config_file" = "$(projects_dir)/$base_name.conf" ]; then
+		info "                or, pinned as it is: $SCRIPT_CMD --project $base_name ..."
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# project add -- pin a project workspace under THIS Mac's own MACKAS_ROOT.
+# The in-root sibling of `adopt` (which pins a whole FOREIGN root instead):
+# both write the same kind of artifact, a standalone config at
+# ~/.config/mackas/projects/<name>.conf. See #72/#77.
+# ---------------------------------------------------------------------------
+
+project_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD project${C_RST} -- pin a project workspace under THIS Mac's own
+MACKAS_ROOT. The in-root sibling of '$SCRIPT_CMD adopt' (which pins a whole
+FOREIGN root instead): both write the same artifact, a standalone config at
+~/.config/mackas/projects/<name>.conf.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD project add <name> [--url URL --branch BRANCH | --from <checkout>]
+
+${C_BLD}SUBCOMMANDS${C_RST}
+  add <name>   Pin a project. '$SCRIPT_CMD project add --help' for the full
+               flag list.
+
+Note the plural sibling: '$SCRIPT_CMD projects' LISTS the projects already
+pinned (by either 'project add' or 'adopt'); this singular command instead
+CREATES one. '$SCRIPT_CMD projects --help' has the reading side.
+EOF
+}
+
+project_add_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD project add${C_RST} -- pin <name> as a project workspace under
+this Mac's own MACKAS_ROOT: creates \$MACKAS_WORK/<name>/ (that project's
+entire KAS_WORK_DIR -- the checkout and whatever siblings kas clones next to
+it, private to <name>; see #72) and writes a standalone config to
+~/.config/mackas/projects/<name>.conf, seeded from the settings in effect
+right now. It PINS; it does not build -- run
+'$SCRIPT_CMD --project <name> setup' afterwards for that.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD project add <name> --url URL --branch BRANCH
+  $SCRIPT_CMD project add <name> --from <checkout>
+  $SCRIPT_CMD project add <name>
+
+${C_BLD}OPTIONS${C_RST}
+  --url URL            The project's git remote. Needs --branch too. Nothing
+                       is cloned yet -- that is what 'setup' does next.
+  --branch BRANCH      The branch to build. Needs --url too.
+  --from <checkout>    Convert an EXISTING checkout already at
+                       \$MACKAS_WORK/<name>/ into a pinned project, in place --
+                       reads its remote URL and current branch instead of
+                       asking for --url/--branch. Mutually exclusive with
+                       --url/--branch. <checkout> must name that very
+                       directory (bare '<name>', 'work/<name>', or a path
+                       resolving to it) -- 'project add' never renames or
+                       moves a checkout to make names line up.
+  --keep-volumes       With --from only: keep building against whatever
+                       volumes the checkout already used (e.g. oe-build-*),
+                       explicitly -- migration path B from the multi-project
+                       design (#72): a fully supported end state, no data
+                       ever moved.
+  --derive-volumes     With --from only: the opposite -- switch this project
+                       to mackas-<name>-* going forward. The OLD volumes are
+                       left exactly as they are, not moved or deleted; only a
+                       FUTURE build reads/writes the new ones.
+
+  Neither --keep-volumes nor --derive-volumes given, --from used, and this is
+  running interactively: asked as a yes/no question. Non-interactive (no
+  tty, or -y) and neither given: keeps the existing volumes -- the choice
+  that changes nothing and never invalidates a cache is the safe default for
+  an unattended run.
+
+  "Keep" (asked, defaulted, or --keep-volumes given) is REFUSED outright
+  when a DIFFERENT project's selection is active -- --project/
+  \$MACKAS_PROJECT_SELECT, or one derived from \$PWD -- and that project's own
+  config does not explicitly pin a stem: the current \$MACKAS_VOLUME_NAME
+  would then be only that OTHER project's own derived name, not anything
+  this checkout actually built with -- drop or unset the selector (or run
+  from outside its workspace, for a derived one) and re-run, or pass
+  --derive-volumes (which never looks at the ambient value at all).
+
+  Omitting --url/--branch and --from entirely pins <name> with no checkout
+  configured yet, same as an unconfigured 'setup' -- fill in
+  MACKAS_PROJECT_URL/_BRANCH later with '$SCRIPT_CMD --project <name> set
+  MACKAS_PROJECT_URL ...'.
+
+'project add <name>' refuses outright if \$MACKAS_WORK/<name>/ already exists
+and --from was not given -- a plain checkout that happens to share the name
+is not automatically adopted (#72: filesystem shape alone never decides
+anything). An already-pinned <name> is offered for overwrite, exactly like
+'$SCRIPT_CMD adopt' does for its own config file.
+
+Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
+put them before or after 'project add'.
+
+See also: '$SCRIPT_CMD projects' lists what is already pinned; '$SCRIPT_CMD
+adopt' pins a whole FOREIGN root instead of a project inside this one.
+EOF
+}
+
+cmd_project_add() {
+	local name="" url="" branch="" from="" keep_flag="" derive_flag="" want_help=0
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help|help) want_help=1; shift ;;
+			--url)     url="${2:-}"
+				[ -n "$url" ] || die "--url needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--url=*)   url="${1#*=}"; shift ;;
+			--branch)  branch="${2:-}"
+				[ -n "$branch" ] || die "--branch needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--branch=*) branch="${1#*=}"; shift ;;
+			--from)    from="${2:-}"
+				[ -n "$from" ] || die "--from needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--from=*)  from="${1#*=}"; shift ;;
+			--keep-volumes)   keep_flag=1; shift ;;
+			--derive-volumes) derive_flag=1; shift ;;
+			-*) die "unknown option for 'project add': $1" "$SCRIPT_CMD project add --help" ;;
+			*)
+				[ -z "$name" ] || die "'project add' takes one name" "$SCRIPT_CMD project add --help"
+				name="$1"; shift ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		project_add_usage
+		return 0
+	fi
+
+	[ -n "$name" ] || die "'project add' needs a name" "$SCRIPT_CMD project add <name> --help"
+	validate_project_select "$name" "project add"
+
+	# --from vs --url/--branch: two different ways to answer "what does this
+	# project check out", never both.
+	if [ -n "$from" ] && { [ -n "$url" ] || [ -n "$branch" ]; }; then
+		die "'--from' and '--url'/'--branch' are mutually exclusive" \
+			"pick one way to give '$name' its checkout"
+	fi
+	if [ -n "$url" ] && [ -z "$branch" ]; then
+		die "'--url' needs '--branch' too" "$SCRIPT_CMD project add --help"
+	fi
+	if [ -n "$branch" ] && [ -z "$url" ]; then
+		die "'--branch' needs '--url' too" "$SCRIPT_CMD project add --help"
+	fi
+	if [ -n "$keep_flag" ] && [ -n "$derive_flag" ]; then
+		die "'--keep-volumes' and '--derive-volumes' are mutually exclusive" \
+			"$SCRIPT_CMD project add --help"
+	fi
+	if { [ -n "$keep_flag" ] || [ -n "$derive_flag" ]; } && [ -z "$from" ]; then
+		die "'--keep-volumes'/'--derive-volumes' only apply to a '--from' conversion" \
+			"a freshly added project has no prior volumes to keep or leave behind"
+	fi
+
+	# Mutating: it creates a directory inside work/. Same gate 'setup' and
+	# 'adopt's own hand-off to setup use.
+	require_mackas_root
+
+	hdr "mackas project add: $name"
+
+	local config_file; config_file="$(projects_dir)/$name.conf"
+	local workspace_dir; workspace_dir="$MACKAS_WORK/$name"
+
+	local proj_url="" proj_branch=""
+	if [ -n "$from" ]; then
+		# --from converts THAT VERY ENTRY in place -- #72's own wording for the
+		# work/-collision-refusal rule below. Accepting an arbitrary OTHER
+		# directory here would mean either silently renaming/moving a checkout
+		# (never -- see #72) or minting a project whose pinned
+		# MACKAS_PROJECT_DIR points at a directory with a different name than
+		# the project itself, for no benefit -- work/<name>/ IS the workspace
+		# (#72). So the value is accepted in the forms a user is likely to
+		# type (a bare name, 'work/<name>', a path) purely to give a typo a
+		# clear message, not to allow converting anything other than
+		# work/<name> itself.
+		local from_resolved
+		case "$from" in
+			/*)  from_resolved="$(resolve_path "$from")" ;;
+			*/*) from_resolved="$(resolve_path "$MACKAS_ROOT/$from")" ;;
+			*)   from_resolved="$(resolve_path "$MACKAS_WORK/$from")" ;;
+		esac
+		local workspace_resolved; workspace_resolved="$(resolve_path "$workspace_dir")"
+		if [ "$from_resolved" != "$workspace_resolved" ]; then
+			die "'--from $from' does not name $workspace_dir" \
+				"'project add' converts an existing checkout in place -- it never renames or moves one; use '$SCRIPT_CMD project add $name --from $name'"
+		fi
+		[ -d "$workspace_dir" ] || die "no checkout to convert: $workspace_dir does not exist" \
+			"drop --from to create a fresh workspace, or check the directory name"
+
+		# adopt_introspect_project itself dies with a clear message if
+		# $workspace_dir/.git turns out not to exist -- same check, same
+		# wording, reused rather than duplicated.
+		local introspected
+		introspected="$(adopt_introspect_project "$MACKAS_BASE" "$name")"
+		proj_url="$(printf '%s\n' "$introspected" | sed -n '2p')"
+		proj_branch="$(printf '%s\n' "$introspected" | sed -n '3p')"
+		info "  converting : $workspace_dir"
+		info "    url      : ${proj_url:-<none: no 'origin' remote>}"
+		info "    branch   : ${proj_branch:-<none: detached HEAD>}"
+	else
+		# The collision refusal (#72): a first-level directory under work/ is
+		# a project workspace IFF a pinned config for that name exists.
+		# work/<name>/ existing already, with no --from, means it is just an
+		# ordinary checkout that happens to share the name -- filesystem
+		# shape alone never decides anything.
+		#
+		# EXCEPT when it is empty: 'run mkdir -p "$workspace_dir"' below is the
+		# very first mutation this command performs, strictly before the config
+		# file is written -- so an interrupted or partially-failed prior run
+		# (Ctrl-C, a full disk, anything dying between that mkdir and the last
+		# config_write_setting call) can leave exactly an empty work/<name>/
+		# behind with no pinned config to show for it. Refusing THAT unchanged
+		# would make on_interrupt()'s own promise ("nothing is left half-written
+		# that a re-run won't fix") false for this one command: a plain retry
+		# would hit this refusal, and the --from retry it suggests would in turn
+		# refuse too (adopt_introspect_project requires a real .git, which an
+		# empty directory never has) -- stranding the name with no way through
+		# except an out-of-band 'rmdir'. An empty directory carries no content
+		# that could be silently folded in or lost, so it is safe to treat as
+		# "nothing here yet" and proceed; anything containing so much as a
+		# stray file still refuses, unchanged.
+		if [ -d "$workspace_dir" ] && [ -n "$(ls -A "$workspace_dir" 2>/dev/null)" ]; then
+			die "'$workspace_dir' already exists and is not being converted" \
+				"pin it in place with '$SCRIPT_CMD project add $name --from $name', or pick a different name"
+		fi
+		proj_url="$url"
+		proj_branch="$branch"
+	fi
+
+	if [ -f "$config_file" ]; then
+		confirm "  $config_file already exists -- overwrite its settings with this project?" \
+			|| die "declined -- nothing written" \
+				"pick a different name, or edit $config_file directly"
+	fi
+
+	# THE MIGRATION QUESTION (#72 path B), --from only: a checkout that
+	# already existed before being pinned may already have built against
+	# whatever $MACKAS_VOLUME_NAME currently resolves to (oe-build, on an
+	# untouched install). Ask once whether to keep that explicitly, or switch
+	# to mackas-<name>-* going forward -- either way nothing on disk moves; a
+	# fresh project (no --from) has no prior volumes to have this opinion
+	# about at all.
+	#
+	# "Keep" can only be trusted when $MACKAS_VOLUME_NAME's current value
+	# actually says something about what THIS checkout built with: either
+	# nothing above the defaults rung pinned it at all (a plain machine-wide
+	# default/override, true regardless of any selector), or it IS genuinely
+	# pinned (config/env/--set -- a deliberate choice, safe to propagate).
+	# It stops being trustworthy the moment a DIFFERENT project's selector is
+	# the only reason it holds its current value: PROJECT_SELECTED naming
+	# some OTHER project, with nothing explicit behind it, is purely THAT
+	# project's own selector-derived default (#77 slice 1) -- it says
+	# nothing about this checkout. Confirmed by hand while reviewing #77:
+	# 'project add newname --from --keep-volumes', run while a different
+	# project was selected, silently pinned newname's config to that OTHER
+	# project's own mackas-<other>-* volumes -- an undetected collision
+	# between two projects sharing nothing, exactly what the M3
+	# shared-volume work (destroy/clean's refusal, adopt's reverse-grep)
+	# exists to prevent, just via a code path neither of those touches.
+	local keep_unsafe=0
+	if [ -n "$PROJECT_SELECTED" ] && [ "$PROJECT_SELECTED" != "$name" ] \
+	   && ! config_pinned_setting MACKAS_VOLUME_NAME; then
+		keep_unsafe=1
+	fi
+
+	local keep=1
+	if [ -n "$from" ]; then
+		if [ -n "$derive_flag" ]; then
+			keep=0
+		elif [ "$keep_unsafe" -eq 1 ]; then
+			die "cannot tell what '$name' was already built with -- '$MACKAS_VOLUME_NAME' is only the derived stem for the currently selected '$PROJECT_SELECTED', not necessarily this checkout's" \
+				"$(project_select_drop_hint) and re-run, or pass --derive-volumes to switch '$name' to mackas-$name-* explicitly"
+		elif [ -n "$keep_flag" ]; then
+			keep=1
+		elif [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ] || [ ! -t 0 ]; then
+			# Non-interactive default: KEEP. It writes nothing new to disk,
+			# changes no command's behaviour today (the checkout already
+			# built against $MACKAS_VOLUME_NAME-*), and never invalidates an
+			# existing download/sstate cache the way defaulting to a
+			# brand-new mackas-<name>-* stem would. Switching volumes is a
+			# deliberate, visible choice a human should make with eyes open
+			# (--derive-volumes, or the interactive prompt below) -- not
+			# something a script or CI run should trigger by accident.
+			keep=1
+			info "  non-interactive: keeping the existing '$MACKAS_VOLUME_NAME' volumes for '$name'"
+			info "    (pass --derive-volumes to switch to mackas-$name-* instead; nothing moves either way)"
+		else
+			if confirm "  Keep the existing volumes ($MACKAS_VOLUME_NAME-tmp/-dl/-sstate) for '$name'? Declining switches it to mackas-$name-* volumes going forward -- nothing already on disk is moved either way."; then
+				keep=1
+			else
+				keep=0
+			fi
+		fi
+	fi
+
+	# Which volume-name settings actually belong in a STANDALONE config:
+	# MACKAS_VOLUME_NAME is written explicitly only when this project is
+	# deliberately keeping a non-default stem (the migration answer above),
+	# or when THIS invocation's own settings already pinned one explicitly
+	# (config_pinned_setting, not a bare value check -- see its own comment on
+	# why: MACKAS_VOLUME_NAME's factory default is the non-empty "oe-build",
+	# so a plain value check cannot tell "explicitly oe-build" from "never
+	# touched"). Otherwise it is left unset, so mackas-<name>-* derives once
+	# --project <name> selects this file (#77 slice 1). The DL/SSTATE
+	# overrides are independent of the migration question (M1: opt-in sharing
+	# is available to any project, not just a converted one) and are carried
+	# forward under the exact same explicit-only rule.
+	local want_explicit_stem=0
+	if [ -n "$from" ]; then
+		[ "$keep" -eq 1 ] && want_explicit_stem=1
+	elif config_pinned_setting MACKAS_VOLUME_NAME; then
+		want_explicit_stem=1
+	fi
+
+	# Cross-project volume collision, checked BEFORE any mutation, now that
+	# want_explicit_stem/config_pinned_setting have settled exactly which
+	# values are actually about to be carried into $name's new file -- NOT
+	# simply what $MACKAS_VOL_TMP/_DL/_SSTATE currently resolve to for this
+	# invocation, which is the wrong thing to check: under --derive-volumes
+	# (or the fresh, no-override path), the new project's real future stem
+	# is unconditionally mackas-$name, and by construction nothing else in
+	# projects_dir() can also derive to that exact name -- there is no
+	# collision to find, whatever happens to be resolved right now for a
+	# DIFFERENT selector. Only when a value is actually going to be WRITTEN
+	# explicitly does inheriting it matter.
+	#
+	# This is what closes the gap the #77 integration review flagged:
+	# 'project add newname' run while a DIFFERENT project's selector is
+	# active can inherit that OTHER project's genuinely EXPLICIT override
+	# verbatim -- config_pinned_setting correctly says "yes, explicit" (so
+	# want_explicit_stem/the write loop below are right to carry it
+	# forward), but neither of those asks whether the value carried forward
+	# already belongs to somebody else. $name is excluded from every match:
+	# re-running 'project add' on an already-pinned project against its own
+	# selector is not a collision with itself.
+	#
+	# tmp and dl/sstate get different treatment because they have different
+	# sharing models. tmp is NEVER an opt-in surface -- #72 is explicit that
+	# there is deliberately no TMPDIR equivalent, because two builds in one
+	# /build is corruption, not contention -- so any literal collision there
+	# can only be a mistake and is refused outright, the same way M1 refuses
+	# one config's own dl and sstate resolving to a single name. dl/sstate
+	# sharing, by contrast, is a real M1 feature a user can deliberately opt
+	# into (MACKAS_VOLUME_DL_NAME=mackas-shared-dl and friends), so a
+	# collision there is only WARNED about -- loud enough that an
+	# accidental one (this bug) is impossible to miss, but not blocking a
+	# legitimate one.
+	if [ "$want_explicit_stem" -eq 1 ]; then
+		local tmp_target tmp_collides
+		tmp_target="${MACKAS_VOLUME_NAME}-tmp"
+		tmp_collides="$(pinned_projects_referencing_volume "$tmp_target" | grep -vxF "$name" || true)"
+		if [ -n "$tmp_collides" ]; then
+			local tmp_collides_list; tmp_collides_list="$(printf '%s' "$tmp_collides" | tr '\n' ' ')"
+			tmp_collides_list="${tmp_collides_list% }"
+			die "'$tmp_target' is already $tmp_collides_list's build volume -- refusing to give '$name' the same one" \
+				"tmp is never shared (#72: two builds in one /build is corruption, not contention) -- if a different project's selector is active, drop it and re-run; otherwise pass --set MACKAS_VOLUME_NAME=<a-free-stem>"
+		fi
+	fi
+	local dl_collides="" sstate_collides=""
+	if config_pinned_setting MACKAS_VOLUME_DL_NAME; then
+		dl_collides="$(pinned_projects_referencing_volume "$MACKAS_VOLUME_DL_NAME" | grep -vxF "$name" || true)"
+	fi
+	if config_pinned_setting MACKAS_VOLUME_SSTATE_NAME; then
+		sstate_collides="$(pinned_projects_referencing_volume "$MACKAS_VOLUME_SSTATE_NAME" | grep -vxF "$name" || true)"
+	fi
+	if [ -n "$dl_collides" ] || [ -n "$sstate_collides" ]; then
+		info ""
+		info "  note: '$name' is about to share a cache volume with another pinned project."
+		info "  This is not an error -- opt-in sharing is a real M1 feature -- but make sure"
+		info "  it is what you meant, especially if the currently-effective settings came"
+		info "  from something other than '$name' choosing it on purpose, e.g. a different"
+		info "  project's --project selector, the environment, or --set."
+		[ -n "$dl_collides" ] && info "    dl      $MACKAS_VOLUME_DL_NAME   (also used by: $(printf '%s' "$dl_collides" | tr '\n' ' ' | sed 's/ $//'))"
+		[ -n "$sstate_collides" ] && info "    sstate  $MACKAS_VOLUME_SSTATE_NAME   (also used by: $(printf '%s' "$sstate_collides" | tr '\n' ' ' | sed 's/ $//'))"
+	fi
+
+	run mkdir -p "$workspace_dir"
+
+	# Created under umask 077, never the ambient one -- same reasoning as
+	# cmd_set's own bootstrap of this directory: --project holds it to
+	# config_file_is_safe(), and an inherited `umask 002` would otherwise
+	# produce a group-writable directory that then refuses to be sourced.
+	local cfg_dir; cfg_dir="$(dirname "$config_file")"
+	[ -d "$cfg_dir" ] || ( umask 077 && run mkdir -p "$cfg_dir" ) || die "could not create $cfg_dir"
+
+	# What a STANDALONE config needs, and no more: MACKAS_ROOT (which root)
+	# and MACKAS_PROJECT_DIR (which checkout under work/ -- always <name> for
+	# a project this command itself created) make it self-sufficient; the
+	# project's own identity (its git remote/branch, if any) and any
+	# volume-name override this invocation's settings are already explicit
+	# about carry the CHOICE that got the user here into the new file too.
+	# Deliberately NOT seeded: volume SIZES, CPUS/MEMORY, mirror settings,
+	# MACKAS_KAS_CONFIG -- machine-wide or build-time choices that belong to
+	# defaults/config, not to project identity. Freezing today's value of any
+	# of those into every new project's file forever is exactly the
+	# "unreadable, frozen-forever" failure mode a standalone config has to
+	# avoid (same reasoning as the M1 MACKAS_VOLUME_DL_NAME/_SSTATE_NAME
+	# design, applied here to the whole file rather than just the stem).
+	# Every value below is written OR explicitly deleted, never just
+	# conditionally written -- 'project add' on an already-pinned NAME is an
+	# overwrite (confirmed above), and config_write_setting only ever
+	# edits/appends a line, it never removes one on its own. Without the
+	# delete branches, re-running with a different answer (say,
+	# --derive-volumes after a prior --keep-volumes) would leave the OLD
+	# MACKAS_VOLUME_NAME line sitting in the file, silently disagreeing with
+	# what this run just decided. delete's own "line was not there" return of
+	# 1 is not a failure here, so it is swallowed.
+	config_write_setting "$config_file" MACKAS_ROOT "$MACKAS_ROOT"
+	config_write_setting "$config_file" MACKAS_PROJECT_DIR "$name"
+	if [ -n "$proj_url" ]; then
+		config_write_setting "$config_file" MACKAS_PROJECT_URL "$proj_url"
+		config_write_setting "$config_file" MACKAS_PROJECT_BRANCH "$proj_branch"
+	else
+		config_write_setting "$config_file" MACKAS_PROJECT_URL "" delete || true
+		config_write_setting "$config_file" MACKAS_PROJECT_BRANCH "" delete || true
+	fi
+	if [ "$want_explicit_stem" -eq 1 ]; then
+		config_write_setting "$config_file" MACKAS_VOLUME_NAME "$MACKAS_VOLUME_NAME"
+	else
+		config_write_setting "$config_file" MACKAS_VOLUME_NAME "" delete || true
+	fi
+	local s sval
+	for s in MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
+		if config_pinned_setting "$s"; then
+			eval "sval=\"\${$s}\""
+			config_write_setting "$config_file" "$s" "$sval"
+		else
+			config_write_setting "$config_file" "$s" "" delete || true
+		fi
+	done
+	did "wrote $config_file"
+	did "workspace directory: $workspace_dir"
+
+	hdr "Done"
+	if [ -n "$proj_url" ]; then
+		info "  next: $SCRIPT_CMD --project $name setup   # clones $proj_url (branch $proj_branch) and builds out the rest"
+	else
+		info "  no project URL set yet -- '$SCRIPT_CMD --project $name setup' will skip the checkout step"
+		info "    until MACKAS_PROJECT_URL/_BRANCH are set: $SCRIPT_CMD --project $name set MACKAS_PROJECT_URL <url>"
+	fi
+	info "  from now on : $SCRIPT_CMD --project $name ...   ($SCRIPT_CMD projects lists every pinned project)"
+}
+
+cmd_project() {
+	local sub="" rest=() a want_help=0
+	for a in "$@"; do
+		case "$a" in
+			--dry-run)     DRY_RUN=1 ;;
+			-y|-f|--yes|--force)  ASSUME_YES=1 ;;
+			-v|--verbose)  VERBOSE=1 ;;
+			-h|--help)     want_help=1 ;;
+			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" project ;;
+			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
+		esac
+	done
+
+	case "${sub:-help}" in
+		add)
+			# -h/--help caught above is consumed here, never forwarded, unless
+			# re-appended -- same reason cmd_volume's subcommands need it back:
+			# 'project add --help' must show project_add_usage (the specific
+			# one), not this function's own generic project_usage.
+			[ "$want_help" -eq 1 ] && rest+=("--help")
+			cmd_project_add ${rest+"${rest[@]}"} ;;
+		help)  project_usage ;;
+		*) die "unknown 'project' subcommand: $sub" \
+			"$SCRIPT_CMD project --help  (add)" ;;
+	esac
 }
 
 # ---------------------------------------------------------------------------
@@ -5330,6 +6902,13 @@ run_kas() {
 		return 0
 	fi
 
+	# One-VM rule, for the last entrypoint that lacked it: 'shell' and every
+	# smoketest rung land here. It sits AFTER ensure_container_running above,
+	# because volume_in_use() short-circuits to "not in use" with the daemon
+	# down (see kas_project_subcommand_preflight for the same ordering), and
+	# after the --dry-run return, so --dry-run queries no volume state.
+	require_volumes_free "$SCRIPT_CMD $SCRIPT_SUBCOMMAND"
+
 	# The one place a user finds out MACKAS_MONITOR=1 actually took effect.
 	# monitor_runtime_args() already warns on every path that skips the
 	# bridge, so silence here means it is genuinely in rt_args -- checking
@@ -5446,7 +7025,9 @@ kas_shell_ro() {
 	# a directly-driven kas-container per project under work/ -- never runs
 	# 'setup' again for each newly-cloned project. So KAS_FILES_ARG's
 	# always-appended kas/macos-local.yml (compose_kas_files) may simply not
-	# exist yet for THIS project even though the shared kas/macos.yml does.
+	# exist yet for THIS project even though the canonical copy at
+	# MACKAS_KAS_FRAGMENT_SRC (macos.yml, or macos-<name>.yml once a project
+	# is selected -- #79) already does.
 	# Write it: deterministic, idempotent, no different from env.sh/gitconfig
 	# regenerating unconditionally, and setup_kas_fragment() already honours
 	# --dry-run itself (prints the plan, writes nothing). Redirected to
@@ -5715,6 +7296,11 @@ removed again (checkout + generated kas fragment) once the ladder finishes.
 Declining exits smoketest without running anything.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. smoketest refuses while
+  another build ($SCRIPT_CMD shell, a second smoketest, or a raw
+  kas-container) still holds any of the three volumes -- stop it first.
 EOF
 }
 
@@ -5943,6 +7529,11 @@ is what an interactive session should get.
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
 though shell has nothing to confirm and nothing --dry-run would print instead
 of doing.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. shell refuses while a
+  running build ($SCRIPT_CMD smoketest, another shell, or a raw
+  kas-container) still holds any of the three volumes -- stop it first.
 EOF
 }
 
@@ -6028,7 +7619,7 @@ cmd_exec() {
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" exec ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" exec ;;
 			--)            started=1; shift ;;
 			-*) die "unknown option for 'exec': $a" "$SCRIPT_CMD exec --help" ;;
 			*)  started=1; cmd_words+=("$a"); shift ;;
@@ -6174,12 +7765,17 @@ ${C_BLD}$SCRIPT_CMD dump${C_RST} -- write the fully-resolved kas config next to 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD dump
 
-Runs \`kas-container dump --resolve-env --resolve-local --resolve-refs\`
-against the project's kas config and saves the resolved YAML it prints to
+Runs \`kas-container dump --skip repos_checkout --skip repos_apply_patches
+--resolve-env --resolve-local --resolve-refs\` against the project's kas
+config and saves the resolved YAML it prints to
 \$MACKAS_LOGS/dump-<timestamp>.yml -- every env var, every local override
 and every repo ref resolved to its exact value, a reproducibility record
-next to a build's own logs (see item 13 in TODO.md). Purely read-only:
-kas dump writes nothing into the checkout itself.
+next to a build's own logs. Purely read-only:
+kas dump writes nothing into the checkout itself -- the two --skip flags are
+load-bearing for that claim, not decorative. Resolving a branch/tag still
+needs kas to know the repo (cloning one that is missing, same as a real
+build), so setup_dir/finish_setup_repos are NOT skipped; only the two steps
+that would force-checkout or patch an EXISTING clone are.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
 
@@ -6189,6 +7785,22 @@ ${C_BLD}ONE-VM RULE${C_RST}
 EOF
 }
 
+# kas's dump plugin subclasses its checkout one, so --resolve-refs does not
+# just read state -- to turn a floating branch/tag into an exact commit it
+# runs the SAME repos_checkout task a build does, which force-resets a clean
+# repo to that resolved commit exactly like build/lock do. Confirmed against
+# real kas (5.5): a local-only commit on an otherwise-clean sibling repo is
+# silently gone after a bare `kas dump --resolve-refs`, no different from
+# what kas_shell_ro's own header describes hitting mackas retrieve before it
+# was wrapped. --skip repos_checkout stops that reset while still letting kas
+# clone a repo that is not there yet and fetch/resolve the ref -- confirmed
+# that resolution still works and still yields the real commit with the skip
+# in place. --skip repos_apply_patches is paired with it on the same
+# reasoning as everywhere else in this file (and is a no-op today -- dump
+# never reaches the patch step even unskipped -- kept for when that changes
+# out from under us). Do NOT drop either flag: this is the one thing Step 1
+# of the --skip decision procedure in skills/mackas/SKILL.md relies on dump
+# being safe to run before Step 2 has even looked at the repo.
 cmd_dump() {
 	# No argument parsing here: 'dump' is dispatched bare, like check/status/
 	# shell/destroy -- the outer parser already consumed --dry-run/-y/-v/
@@ -6208,7 +7820,8 @@ cmd_dump() {
 			"$C_DIM" "$(printf '%q' "$MACKAS_PROJECT")" \
 			"$(kas_env_vars 0)" "$(printf '%q' "$KAS_CONTAINER_REAL")" \
 			"$(printf '%q' "$rt_args")" \
-			"$(quote_cmd dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")" "$C_RST"
+			"$(quote_cmd dump --skip repos_checkout --skip repos_apply_patches \
+				--resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG")" "$C_RST"
 		info "  writing resolved config to: $out"
 		return 0
 	fi
@@ -6217,7 +7830,8 @@ cmd_dump() {
 	local rc=0
 	(
 		cd "$MACKAS_PROJECT" 2>/dev/null || exit 1
-		kas_invoke_env "$rt_args" "$gitconfig" 0 dump --resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
+		kas_invoke_env "$rt_args" "$gitconfig" 0 dump --skip repos_checkout --skip repos_apply_patches \
+			--resolve-env --resolve-local --resolve-refs "$KAS_FILES_ARG"
 	) > "$out" || rc=$?
 	if [ "$rc" -ne 0 ]; then
 		rm -f "$out"
@@ -6246,15 +7860,35 @@ cmd_dump() {
 # mount, so files land owned by the invoking user already and a `chown -R`
 # there fails "Operation not permitted".
 
-# fetch_tmp_subdir SUB DEST VAR DEFAULT [EXTRA] -- copy the guest directory VAR
-# resolves to out of the TMPDIR volume into DEST/SUB[/EXTRA]. Returns non-zero
-# (with a clear message) when that directory is absent -- e.g. no build has run,
-# so there is no tmp/buildstats -- rather than letting a raw `cp` error surface.
+# fetch_volume_subdir VOL MOUNT SUB DEST VAR DEFAULT [EXTRA] [MACHINE] [NEWER]
+# -- copy the guest directory VAR resolves to, out of the ext4 volume VOL
+# mounted at MOUNT, into DEST/SUB[/EXTRA]. Returns non-zero (with a clear
+# message) when that directory is absent -- e.g. no build has run, so there is
+# no tmp/buildstats -- rather than letting a raw `cp` error surface.
 # Idempotent within one EXTRA: re-copying the same EXTRA overwrites in place.
 #
-# The name is historical: nothing here requires the source to sit under
-# /build/tmp, and several objects need not. A distro may move DEPLOY_DIR
-# anywhere it likes (Angstrom points it at ${TOPDIR}/deploy), buildhistory
+# VOL/MOUNT are parameters because publication reads a DIFFERENT volume than
+# retrieval does: `sstate push` stages out of MACKAS_VOL_SSTATE at /sstate,
+# every retrieve object out of MACKAS_VOL_TMP at /build. Nothing in the
+# mechanism was ever tmp-specific. MOUNT is the whole `-v` suffix, so it can
+# carry a `:ro` -- push has no business writing to what it publishes.
+#
+# An empty VAR means "use DEFAULT verbatim, ask bitbake nothing": push needs
+# no project checkout and no kas-container context, exactly like sstate_prune.
+# NEWER, if set, is an epoch cutoff -- only files modified after it are copied,
+# and the source manifest covers exactly that subset. sstate objects are NOT
+# write-once (bitbake touches one on every reuse -- the same os.utime()
+# 'sstate prune' relies on), so this over-selects rather than misses: what it
+# names is everything recent builds wrote or reused.
+#
+# The three failure-ish returns are deliberately distinct, because `sstate
+# push` ADVANCES ITS STAMP on one of them: 1 is "the directory is not there",
+# 2 is "the scan ran and matched nothing" (a normal outcome, safe to stamp),
+# 3 is "the scan did not produce a trustworthy answer" (never stamp).
+#
+# Nothing here requires the source to sit under /build/tmp either, and
+# several retrieve objects do not. A distro may move DEPLOY_DIR anywhere it
+# likes (Angstrom points it at ${TOPDIR}/deploy), buildhistory
 # lives at ${TOPDIR}/buildhistory (a sibling of tmp/), and the SPDX tree
 # lives under DEPLOY_DIR/spdx/${SPDX_VERSION} (inheriting DEPLOY_DIR's
 # relocatability). Only the FALLBACK used when bitbake-getvar cannot answer
@@ -6273,7 +7907,7 @@ cmd_dump() {
 # itself already does guest-side (see check_buildstats_accumulation).
 # Print the POSIX-sh script that, run from inside the directory being
 # verified, emits a sorted "<relpath>#<chunk>\t<cksum-line>" manifest of
-# every regular file under it -- fetch_tmp_subdir's way of checking a cp -r
+# every regular file under it -- fetch_volume_subdir's way of checking a cp -r
 # copy actually matches its source instead of trusting it blind. A file over
 # 256M (keep in sync with retrieve_verify_local()'s own threshold) is split
 # into up to 8 whole-MiB byte-range chunks so one huge deploy image
@@ -6291,11 +7925,19 @@ cmd_dump() {
 # also has the property the batching below depends on -- given multiple
 # paths on one invocation, it labels each line with the exact path it was
 # given, so a batch's own internal ordering is never load-bearing.
+#
+# $1, if given, is an extra `find` predicate (mackas-generated, always
+# `-newermt @<epoch>`) restricting the manifest to the same subset a staged
+# copy took -- empty for every retrieve, which verifies whole trees. It is
+# emitted as a quoted assignment and expanded UNQUOTED below so it splits back
+# into find's two arguments; BOTH find passes below carry it or the batched
+# small-file half would checksum the whole tree. Empty leaves find as it was.
 retrieve_verify_script() {
+	printf 'newer="%s"\n' "${1:-}"
 	cat <<'EOS'
 : > /tmp/.mackas-verify-jobs
 mkdir -p /tmp/.mackas-verify-batches
-find . -type f -size +268435456c -printf '%s %p\n' | while read -r size path; do
+find . -type f $newer -size +268435456c -printf '%s %p\n' | while read -r size path; do
 	rel="${path#./}"
 	size_mb=$(( (size + 1048575) / 1048576 ))
 	chunk_mb=$(( (size_mb + 7) / 8 ))
@@ -6313,7 +7955,7 @@ done
 		sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
 		printf "%s#%s\t%s\n" "$1" "$2" "$sum"
 	' _
-	find . -type f ! -size +268435456c -print0 | \
+	find . -type f $newer ! -size +268435456c -print0 | \
 		xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' /tmp/.mackas-verify-batches
 	find /tmp/.mackas-verify-batches -type f -exec cat {} + | \
 		LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
@@ -6403,8 +8045,16 @@ retrieve_verify_local() {
 	return $rc
 }
 
-fetch_tmp_subdir() {
-	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" guest destsub quiet_undefined=0 rc
+fetch_volume_subdir() {
+	local vol="$1" mount="$2" sub="$3" dest="$4" var="$5" default="$6"
+	local extra="${7:-}" machine="${8:-}" newer="${9:-}"
+	local guest destsub quiet_undefined=0 rc
+
+	# NEWER is an epoch, not a file: the throwaway container mounts the
+	# volume and the staging directory, nothing else, so there is no host
+	# stamp file in there to point `find -newer` at.
+	local find_newer=""
+	[ -n "$newer" ] && find_newer="-newermt @$newer"
 
 	# buildhistory and sbom are the objects whose variables are only ever
 	# defined by an optional bbclass (see bitbake_getvar): BUILDHISTORY_DIR
@@ -6416,39 +8066,47 @@ fetch_tmp_subdir() {
 		buildhistory|sbom) quiet_undefined=1 ;;
 	esac
 
-	# Distros can redefine where these actually land (e.g. Angstrom sets
-	# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
-	# ask bitbake itself rather than assume the default layout.
-	guest="$(bitbake_getvar "$var" "$quiet_undefined")"; rc=$?
-	if [ "$rc" -eq 2 ]; then
+	if [ -z "$var" ]; then
+		# 'sstate push': the guest path IS the mount point, and there is no
+		# project checkout to ask -- exactly like sstate_prune, which also
+		# only runs `find` against a mounted volume. Skipping bitbake_getvar
+		# is what keeps push usable with no kas-container context at all.
 		guest="$default"
-	elif [ "$rc" -ne 0 ]; then
-		guest="$default"
-		warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
-	elif [ -n "$machine" ]; then
-		# 'retrieve deploy images MACHINE' (item 24): DEPLOY_DIR_IMAGE was just
-		# resolved for real, for the PROJECT's currently configured MACHINE --
-		# bitbake has no CLI knob to re-resolve it under a different one
-		# without reconfiguring the checkout. OE-core's bitbake.conf always
-		# names this directory's final path component literally ${MACHINE}
-		# regardless of how a distro redefines DEPLOY_DIR itself (the
-		# multiconfig/SDK machinery across the ecosystem depends on that), so
-		# swapping only the trailing component of the REAL resolved path is a
-		# distro-safe substitution -- never a blind 'DEPLOY_DIR/images/
-		# $machine' guess built without asking bitbake first. Only done on
-		# the rc=0 (real answer) path -- $default above is already built with
-		# $machine appended where it belongs, by the caller.
-		guest="${guest%/*}/$machine"
+	else
+		# Distros can redefine where these actually land (e.g. Angstrom sets
+		# DEPLOY_DIR to $TOPDIR/deploy, not OE-core's $TMPDIR/deploy default) --
+		# ask bitbake itself rather than assume the default layout.
+		guest="$(bitbake_getvar "$var" "$quiet_undefined")"; rc=$?
+		if [ "$rc" -eq 2 ]; then
+			guest="$default"
+		elif [ "$rc" -ne 0 ]; then
+			guest="$default"
+			warn "  could not resolve $var via bitbake-getvar; assuming the default ($guest)"
+		elif [ -n "$machine" ]; then
+			# 'retrieve deploy images MACHINE' (item 24): DEPLOY_DIR_IMAGE was just
+			# resolved for real, for the PROJECT's currently configured MACHINE --
+			# bitbake has no CLI knob to re-resolve it under a different one
+			# without reconfiguring the checkout. OE-core's bitbake.conf always
+			# names this directory's final path component literally ${MACHINE}
+			# regardless of how a distro redefines DEPLOY_DIR itself (the
+			# multiconfig/SDK machinery across the ecosystem depends on that), so
+			# swapping only the trailing component of the REAL resolved path is a
+			# distro-safe substitution -- never a blind 'DEPLOY_DIR/images/
+			# $machine' guess built without asking bitbake first. Only done on
+			# the rc=0 (real answer) path -- $default above is already built with
+			# $machine appended where it belongs, by the caller.
+			guest="${guest%/*}/$machine"
+		fi
 	fi
 
 	# Existence probe AND a real size measurement in the SAME container hop --
 	# a VM boot is the expensive part, not the extra `du`. Always runs for
 	# real, dry-run or not (same reasoning as clean_tmp_deploy/sstate_prune's
 	# own probes): a --dry-run preview is more useful showing the REAL
-	# transfer size than an assumed yes. The trailing `exit 0` means a `du`
-	# failure (permissions, an exotic guest fs) never masks a directory that
-	# DOES exist -- size reporting is a nicety, not a precondition; only a
-	# missing directory (the `[ -d ] || exit 1`) is treated as absent.
+	# transfer size than an assumed yes. A `du` failure (permissions, an
+	# exotic guest fs) never masks a directory that DOES exist -- size
+	# reporting is a nicety, not a precondition; only a missing directory
+	# (the `[ -d ] || exit 1`) is treated as absent.
 	# printf %q quotes $guest safely for the sh -c string. `|| rc=$?` (never a
 	# bare `rc=$?` on the next line) -- under this script's set -euo
 	# pipefail, a failing substitution trips set -e before a later bare
@@ -6456,13 +8114,51 @@ fetch_tmp_subdir() {
 	# already use. NOT `2>/dev/null` on the outer command: a genuine runtime
 	# failure (the VM never started, the image is missing) must still reach
 	# the user, not be silently folded into "no such directory".
-	local probe rc=0 size_kb=""
-	probe="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
-		sh -c "[ -d $(printf '%q' "$guest") ] || exit 1; du -sk $(printf '%q' "$guest") 2>/dev/null; exit 0")" || rc=$?
-	if [ "$rc" -ne 0 ]; then
+	#
+	# With NEWER set, `du -sk` would report the whole 40G sstate volume when
+	# a handful of objects is what is actually about to move, so the subset
+	# is summed instead -- printed in du's own "<kb><TAB>..." shape so the
+	# parse below stays one code path. The object COUNT rides along in the
+	# second field, and is what distinguishes "nothing new" from "absent".
+	#
+	# Exit 1 stays reserved for "the directory is not there"; every other
+	# non-zero code is a probe that BROKE, and gets its own return below.
+	# The two have to stay distinguishable from each other and from an empty
+	# answer, because push stamps on the empty one (see sstate_push) and must
+	# never stamp on a broken one. Both probe shapes therefore end in the
+	# same MACKAS-SCAN-OK marker, checked unconditionally below: whether the
+	# push is incremental, --full or the very first one, a probe that exited
+	# clean without reaching its end must not read as an answer.
+	local probe rc=0 size_kb="" newer_count="" probe_cmd q_guest
+	q_guest="$(printf '%q' "$guest")"
+	if [ -n "$find_newer" ]; then
+		# Not a `find | awk` pipeline: the guest sh is dash, which has no
+		# pipefail, so a find that dies mid-scan still leaves the pipeline
+		# exiting 0 and reads as "nothing newer" -- the one answer that
+		# advances the stamp. find's status is checked on its own, and
+		# MACKAS-SCAN-OK is printed only once awk has also finished, so a
+		# truncated or half-run scan cannot pass for an empty one.
+		probe_cmd="[ -d $q_guest ] || exit 1; cd $q_guest || exit 8; find . -type f $find_newer -printf '%s\\n' > /tmp/.mackas-scan || exit 9; LC_ALL=C awk '{ s += \$1; n++ } END { printf \"%d\\t%d objects\\n\", (s + 1023) / 1024, n }' /tmp/.mackas-scan || exit 10; printf 'MACKAS-SCAN-OK\\n'"
+	else
+		# The SAME completion marker, never a trailing `exit 0`, even though
+		# this branch has no scan to truncate: `sstate push` reaches it on
+		# --full and on every FIRST push (no stamp yet, so no cutoff and no
+		# find), and stamps afterwards exactly as the incremental path does.
+		# A guard that only covered the incremental path would leave the
+		# never-stamp rule off the path a new user hits first. printf, not
+		# `exit 0`, is also what keeps du's own failure a nicety: du writes
+		# nothing, printf still succeeds, and only the size is lost.
+		probe_cmd="[ -d $q_guest ] || exit 1; du -sk $q_guest 2>/dev/null; printf 'MACKAS-SCAN-OK\\n'"
+	fi
+	probe="$(container run --rm -u 0:0 -v "$vol:$mount" "$KAS_IMAGE" \
+		sh -c "$probe_cmd")" || rc=$?
+	if [ "$rc" -eq 0 ] && ! printf '%s\n' "$probe" | grep -q '^MACKAS-SCAN-OK$'; then
+		rc=11
+	fi
+	if [ "$rc" -eq 1 ]; then
 		case "$sub" in
 			buildstats)
-				warn "  no $guest in '$MACKAS_VOL_TMP' -- has a build run yet? ($SCRIPT_CMD smoketest)"
+				warn "  no $guest in '$vol' -- has a build run yet? ($SCRIPT_CMD smoketest)"
 				;;
 			buildhistory)
 				# By far the likeliest reason, and one a bare "no such
@@ -6475,7 +8171,7 @@ fetch_tmp_subdir() {
 				# from a completely different cause. Say what to add and
 				# where, so this is one edit away from working rather than
 				# a hunt through the manual.
-				warn "  no $guest in '$MACKAS_VOL_TMP' -- this project does not INHERIT buildhistory."
+				warn "  no $guest in '$vol' -- this project does not INHERIT buildhistory."
 				warn "  Nothing records it unless you ask: add to your kas config's local_conf_header"
 				warn "  (or conf/local.conf):  INHERIT += \"buildhistory\""
 				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
@@ -6491,17 +8187,23 @@ fetch_tmp_subdir() {
 				# either when the class is not inherited -- the same "absent"
 				# symptom from a different cause. Name both, and the one-line
 				# fix, rather than a bare "no such directory".
-				warn "  no $guest in '$MACKAS_VOL_TMP' -- no SPDX/SBOM output has been generated."
+				warn "  no $guest in '$vol' -- no SPDX/SBOM output has been generated."
 				warn "  OE-core inherits create-spdx by default, but a distro can drop it and older"
 				warn "  releases did not have it. If it is not inherited, add to your kas config's"
 				warn "  local_conf_header (or conf/local.conf):  INHERIT += \"create-spdx\""
 				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
 				;;
 			*)
-				warn "  no $guest in '$MACKAS_VOL_TMP'; skipping $sub"
+				warn "  no $guest in '$vol'; skipping $sub"
 				;;
 		esac
 		return 1
+	fi
+	if [ "$rc" -ne 0 ]; then
+		# The probe itself failed, which is NOT the same answer as an empty
+		# scan -- see the return-code note in this function's header.
+		warn "  could not scan '$vol' for $sub (rc=$rc)${probe:+: $probe}"
+		return 3
 	fi
 
 	# NOT the first line: $probe is captured through $(...), not a real TTY,
@@ -6512,8 +8214,22 @@ fetch_tmp_subdir() {
 	# candidate; the LAST such line wins, in case more than one appears.
 	size_kb="$(printf '%s\n' "$probe" | awk '/^[0-9]+[ \t]/ { v = $1 } END { print v }')"
 	case "$size_kb" in ''|*[!0-9]*) size_kb="" ;; esac
+	if [ -n "$find_newer" ]; then
+		newer_count="$(printf '%s\n' "$probe" | awk '/^[0-9]+[ \t]/ { v = $2 } END { print v }')"
+		case "$newer_count" in
+			# NEVER a 0 fallback here: 0 is the answer that advances the
+			# stamp, so an unreadable count has to be a failure instead.
+			''|*[!0-9]*)
+				warn "  could not read $sub's object count from the scan of '$vol'"
+				return 3 ;;
+		esac
+		if [ "$newer_count" -eq 0 ]; then
+			info "  $sub: nothing newer than the stamp -- nothing to stage"
+			return 2
+		fi
+	fi
 	if [ -n "$size_kb" ]; then
-		info "  $sub: $(fmt_kb "$size_kb") to transfer to $dest"
+		info "  $sub: $(fmt_kb "$size_kb")${newer_count:+ in $newer_count object(s)} to transfer to $dest"
 
 		# Warn, never refuse: retrieve is a copy, not a destructive operation,
 		# and a df estimate can be wrong (sparse files, other things writing
@@ -6561,6 +8277,26 @@ fetch_tmp_subdir() {
 	# lying around.
 	run rm -rf "${dest:?}/${destsub:?}"
 	run mkdir -p "$dest/$destsub"
+
+	# `cp -r` has no subset form, so a NEWER staging pass lists the matching
+	# files once and hands that list to tar. NUL-delimited: a 40G cache is
+	# no place to discover that one object's name contains a newline. The
+	# same predicate goes to retrieve_verify_script below, so the source
+	# manifest covers exactly the set that was copied -- the two `find` runs
+	# agree because the volume is provably idle (volume_in_use refused
+	# otherwise), so no mtime can move between them.
+	local copy_cmd fallback_cmd
+	if [ -n "$find_newer" ]; then
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cd $(printf '%q' "$guest") && find . -type f $find_newer -print0 > /tmp/.mackas-stage-list || exit 11; rm -f /tmp/.mackas-tar-src; { tar -S -C $(printf '%q' "$guest") --null -T /tmp/.mackas-stage-list -cf - || echo bad > /tmp/.mackas-tar-src; } | tar -S -C $(printf '%q' "/out/$destsub") -xf - || exit 12; [ ! -s /tmp/.mackas-tar-src ] || exit 13"
+		# No cp -r to fall back FROM: tar IS the safer mechanism here, so a
+		# mismatch retries it once and then dies, rather than pretending a
+		# third algorithm exists.
+		fallback_cmd="$copy_cmd"
+	else
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/")"
+		fallback_cmd="tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+	fi
+
 	# DRY_RUN, its own early branch, same shape volume_fsck_one()'s STEP E
 	# uses: the real path below captures container run's output via command
 	# substitution to compare it, which -- unlike a plain `run container
@@ -6568,18 +8304,40 @@ fetch_tmp_subdir() {
 	# it needs one of its own.
 	if [ "$DRY_RUN" -eq 1 ]; then
 		run container run --rm -u 0:0 \
-			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)"
-		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
+			-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
+			sh -c "$copy_cmd && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$find_newer")"
+		if [ -n "$find_newer" ]; then
+			info "  (dry-run: nothing was copied or verified; a real run retries the copy once on a checksum mismatch, then fails)"
+		else
+			info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
+		fi
 		return 0
 	fi
 	local src_manifest dst_manifest
+	# The container's own status was never checked, and set -e is suspended
+	# here because both call sites invoke this function in a condition. A copy
+	# container that died before printing its manifest left src_manifest empty
+	# -- and the staging dir, already created empty above, made
+	# retrieve_verify_local return empty too, so the two compared EQUAL and a
+	# dead copy read as a verified one. On the push path that then stamps, and
+	# the objects are never offered to the mirror again. Refuse instead: the
+	# guest script exits 11/12/13 for a find, an extract or a source-tar
+	# failure, the last of which no pipeline status would have surfaced.
+	local copy_rc=0
 	src_manifest="$(container run --rm -u 0:0 \
-		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)")"
+		-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
+		sh -c "$copy_cmd && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$find_newer")")" || copy_rc=$?
+	if [ "$copy_rc" -ne 0 ]; then
+		warn "  copying '$sub' out of '$vol' failed (exit $copy_rc) -- not treating this as a verified copy"
+		return 3
+	fi
 	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
-		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
+		if [ -n "$find_newer" ]; then
+			warn "  '$sub' failed verification after the staged copy -- retrying it"
+		else
+			warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
+		fi
 		# Diagnostic, not a fix: this mismatch has been seen both as a
 		# deterministic locale-collation artifact (fixed -- see LC_ALL=C
 		# above) and, separately, as a genuinely intermittent failure even
@@ -6597,20 +8355,28 @@ fetch_tmp_subdir() {
 		run rm -rf "${dest:?}/${destsub:?}"
 		run mkdir -p "$dest/$destsub"
 		run container run --rm -u 0:0 \
-			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+			-v "$vol:$mount" -v "$dest:/out" "$KAS_IMAGE" \
+			sh -c "$fallback_cmd"
 		dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
 		[ "$src_manifest" = "$dst_manifest" ] || die "'$sub' still fails verification after the tar fallback" \
 			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
-		warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
+		if [ -n "$find_newer" ]; then
+			warn "  '$sub' needed a second attempt -- the first staged copy produced wrong content"
+		else
+			warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
+		fi
 	fi
-	did "retrieved $sub -> $dest/$destsub"
+	if [ -n "$find_newer" ]; then
+		did "staged $sub -> $dest/$destsub"
+	else
+		did "retrieved $sub -> $dest/$destsub"
+	fi
 
 	[ "$sub" = "buildstats" ] && check_buildstats_accumulation "$dest/$destsub" "$guest"
 	return 0
 }
 
-# check_buildstats_accumulation DIR GUEST -- DIR is what fetch_tmp_subdir just
+# check_buildstats_accumulation DIR GUEST -- DIR is what fetch_volume_subdir just
 # retrieved (one or more BUILDNAME subdirs); GUEST is their guest-side parent
 # (e.g. /build/tmp/buildstats). buildstats.bbclass opens build_stats in
 # APPEND mode at both BuildStarted and BuildCompleted and never truncates or
@@ -6718,7 +8484,7 @@ EOF
 
 # retrieve <object>... [--dest DIR] -- copy one or more build-output directories
 # out of the TMPDIR volume. Each object names a bitbake variable that resolves
-# to the real guest path (never a guessed one -- see fetch_tmp_subdir), plus the
+# to the real guest path (never a guessed one -- see fetch_volume_subdir), plus the
 # name it lands under on the host: 'logs' is the CLI-facing plural of tmp/log,
 # and 'buildhistory' resolves to ${TOPDIR}/buildhistory, outside tmp/ entirely.
 cmd_retrieve() {
@@ -6731,7 +8497,7 @@ cmd_retrieve() {
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" retrieve ;;
 			--dest)        dest="${2:-}"; [ -n "$dest" ] || die "--dest needs a DIR"; shift 2 ;;
 			--dest=*)      dest="${1#*=}"; shift ;;
 			deploy)
@@ -6755,7 +8521,7 @@ cmd_retrieve() {
 						*)
 							# A MACHINE substitutes straight into the trailing
 							# path component of a resolved guest path (see
-							# fetch_tmp_subdir), which is now %q-quoted for the
+							# fetch_volume_subdir), which is now %q-quoted for the
 							# guest sh -c -- but a shell metacharacter surviving
 							# that quoting intact (e.g. embedded in the printed
 							# --dry-run preview, or in warn/die/info messages)
@@ -6816,7 +8582,7 @@ cmd_retrieve() {
 	# ALL THREE volumes via kas_runtime_args() -- not just TMPDIR -- so all
 	# three must be checked, same as cmd_exec/kas_project_subcommand_preflight.
 	require_volumes_free "$SCRIPT_CMD retrieve"
-	# fetch_tmp_subdir's existence+size probe now always attaches the volume
+	# fetch_volume_subdir's existence+size probe now always attaches the volume
 	# for real, dry-run or not (item 33) -- refuse before that if it does not
 	# exist yet at all, the same guard clean_tmp_deploy/sstate_prune already
 	# have, rather than let a bind-mount of a not-yet-created named volume
@@ -6834,7 +8600,7 @@ cmd_retrieve() {
 	info ""
 
 	# One retrieve-generated timestamp for buildstats specifically (see
-	# fetch_tmp_subdir's own comment): every OTHER object overwrites its dest
+	# fetch_volume_subdir's own comment): every OTHER object overwrites its dest
 	# in place on purpose (latest logs, latest deploy IS what you want), but
 	# buildstats needs a fresh subdirectory per retrieval so successive
 	# retrievals never merge into the same host path -- MACKAS_RETRIEVE_TS is
@@ -6867,7 +8633,7 @@ cmd_retrieve() {
 				var="DEPLOY_DIR_IMAGE"
 				# Everything after the second ':' is the optional MACHINE
 				# override (empty when the user just wrote 'deploy images'
-				# with none), see fetch_tmp_subdir's own comment for how it
+				# with none), see fetch_volume_subdir's own comment for how it
 				# is applied to a REAL bitbake-getvar answer. Appended here
 				# too, to the FALLBACK default -- unlike the real answer, the
 				# fallback has no existing trailing MACHINE component to
@@ -6882,12 +8648,13 @@ cmd_retrieve() {
 				sub="deploy/images${machine:+/$machine}"
 				;;
 		esac
-		# fetch_tmp_subdir itself now measures and prints the real size to
+		# fetch_volume_subdir itself now measures and prints the real size to
 		# transfer (and warns if $dest looks too small) -- replacing what used
 		# to be one hardcoded "deploy can be large" guess that said nothing
 		# about the other three objects and nothing real about this
 		# project's actual deploy/ contents.
-		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra" "$machine"; then
+		if fetch_volume_subdir "$MACKAS_VOL_TMP" /build \
+			"$sub" "$dest" "$var" "$default" "$extra" "$machine"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
 			[ "$it" = "buildhistory" ] && got_buildhistory=1
@@ -6982,7 +8749,7 @@ resolve_buildstats_dir() {
 # the retrieved shape can be PATH/<BUILDNAME>/build_stats (older data, or any
 # other tool that hands this a flat dir) OR
 # PATH/<retrieve-timestamp>/<BUILDNAME>/build_stats (what `retrieve
-# buildstats` produces now -- see fetch_tmp_subdir/cmd_retrieve) -- and should
+# buildstats` produces now -- see fetch_volume_subdir/cmd_retrieve) -- and should
 # not need to hardcode a depth at all. Unlike a single "newest wins" pick, the
 # SVG chart is cheap and per-build charts should not be merged into one
 # answer -- each build gets its own SVG, named after it.
@@ -7059,7 +8826,7 @@ buildstats_render_svg() {
 		# Three host bind-mounts, no named volume: bsdir, svg_dir and stage
 		# are already plain host directories (buildstats analyze works on
 		# what `retrieve buildstats` already copied out), so unlike
-		# fetch_tmp_subdir this never touches oe-build-tmp and needs no
+		# fetch_volume_subdir this never touches oe-build-tmp and needs no
 		# one-VM check.
 		if ! run container run --rm \
 			-v "$pbc:/pbc:ro" -v "$bsdir:/in:ro" -v "$stage:/out" \
@@ -7176,7 +8943,7 @@ cmd_buildstats() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildstats ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildstats ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -7568,7 +9335,7 @@ cmd_buildhistory() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildhistory ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" buildhistory ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -7588,17 +9355,23 @@ cmd_buildhistory() {
 
 sstate_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD sstate${C_RST} -- manage the shared sstate cache volume.
+${C_BLD}$SCRIPT_CMD sstate${C_RST} -- manage and publish the sstate cache volume.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD sstate prune --older-than N[d]
+  $SCRIPT_CMD sstate push [--dest USER@HOST:/PATH] [--full]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
   prune --older-than N[d]   Delete sstate objects bitbake has not reused in
                             at least N days. Reports what would go and how
                             much space it frees first; only deletes after
                             confirmation (or with -y/--yes).
+  push [--dest ...]         Publish sstate objects to a mirror over rsync/ssh.
+                            --dest defaults to MACKAS_SSTATE_PUSH_DEST; --full
+                            ignores the incremental stamp and offers the whole
+                            volume again.
 
+${C_BLD}PRUNE${C_RST}
 bitbake touches (updates the mtime of) an sstate object every time it finds
 and reuses it -- see sstate.bbclass's sstate_eventhandler and the
 setscene-valid check, both call oe.utils.touch()/os.utime() on a hit. So
@@ -7615,12 +9388,42 @@ signature -- see openembedded-core's own scripts/sstate-cache-management.py,
 run inside a project checkout. '$SCRIPT_CMD sstate prune' does not replace
 it; it solves the coarser "nothing has touched this in months" case.
 
+${C_BLD}PUSH${C_RST}
+Objects newer than this volume+destination's own stamp are copied out of the
+volume into a host staging directory (MACKAS_SSTATE_PUSH_STAGE, default
+\$MACKAS_BASE/sstate-push) and verified there with the same checksum manifest
+'$SCRIPT_CMD retrieve' uses, before anything touches the network. The volume is
+released before the transfer, which then runs as two rsync passes -- every
+object first, the .siginfo files second, so a consumer reading the mirror
+mid-push never finds a signature whose object is missing.
+
+Everything is sent with --ignore-existing and never --inplace: a published
+object is immutable, the first writer wins, and each one appears at the
+destination atomically. Re-running a push is therefore always safe, and a
+lost stamp costs a full rescan rather than a wrong result. So does a scan
+that could not answer: only a scan that provably ran and provably matched
+nothing moves the stamp forward.
+
+The stamp selects on mtime, and bitbake touches an sstate object every time
+it REUSES it -- so a push offers everything recent builds wrote or reused,
+not only what is new. Nothing is missed that way, and --ignore-existing makes
+a re-offer free on the wire, but every re-offered object is still staged and
+checksummed on the host: size MACKAS_SSTATE_PUSH_STAGE for the reuse set.
+
+Push before you prune. Once an object is on the mirror, pruning it locally
+costs an HTTP refetch instead of a rebuild.
+
+The destination is an rsync/ssh target, not an HTTP URL: mackas-mirrord serves
+the read path anonymously and read-only, and that is a property worth keeping
+-- so the write path is authenticated out of band, over ssh.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after the subcommand.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. prune refuses while a
-  running build (smoketest/shell) still holds the sstate volume.
+  Only one VM may access an ext4 image at a time. Both prune and push
+  refuse while a running build (smoketest/shell) still holds the sstate
+  volume.
 EOF
 }
 
@@ -7630,6 +9433,17 @@ EOF
 # constraint item 5/retrieve already work around. No project/kas-container
 # context is needed (unlike bitbake_getvar): this only ever runs `find`
 # against the mounted volume, never bitbake itself.
+#
+# No refuse_shared_volume() call, unlike 'clean sstate': #72 names
+# do_cleanall/do_cleansstate's blanket wipe as the footgun on a shared
+# cache -- exactly what clean_volume_target() now refuses -- but prune is
+# the opposite shape on purpose. It deletes only what NOTHING has reused in
+# N days, which is precisely the question "does any consumer still want
+# this" already answered honestly for a cache several projects share: an
+# object still useful to another pinned project keeps getting reused by
+# that project's own builds and so never ages past --older-than. A shared
+# cache is exactly the case age-based pruning is safe for by construction,
+# not the case it puts at risk.
 sstate_prune() {
 	local older_than="" days report rc=0 count=0 total_kb=0
 
@@ -7723,6 +9537,246 @@ sstate_prune() {
 	fi
 }
 
+# push_stamp_key VOL DEST -- a filesystem-safe name for one volume+destination
+# pair's push stamp. The readable prefix says what the file belongs to; the
+# cksum of the exact pair is what makes it correct, since two destinations
+# differing only in punctuation sanitize to the same prefix -- and a shared
+# stamp would silently skip objects the OTHER mirror never received.
+push_stamp_key() {
+	local pair="$1|$2" slug sum
+	slug="$(printf '%s' "$pair" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)"
+	sum="$(printf '%s' "$pair" | cksum | awk '{print $1}')"
+	printf '%s-%s\n' "$slug" "$sum"
+}
+
+# push_stamp_write FILE EPOCH -- record a completed push.
+#
+# The epoch is the moment the SCAN started, not the moment rsync finished, so
+# an object written while the push ran is picked up by the next one rather
+# than skipped; --ignore-existing makes re-offering it free. It is stored as
+# the file's CONTENT, never as its mtime: copying, restoring or syncing the
+# state directory rewrites mtimes, and a stamp that silently jumped forward
+# would skip objects the mirror never got. A stamp that is lost or unreadable
+# costs a full rescan -- slow, never wrong.
+push_stamp_write() {
+	local file="$1" epoch="$2"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		return 0
+	fi
+	mkdir -p "$(dirname "$file")"
+	printf '%s\n' "$epoch" > "$file"
+}
+
+# container_epoch_now -- the wall clock as read INSIDE a throwaway container,
+# not the Mac's own (issue #107). The sstate object mtimes an incremental
+# push compares its stamp against are set by whatever wrote them on the BUILD
+# VM's clock; stamping with the HOST's `date +%s` instead is only safe while
+# the two clocks agree, and Apple's `container` VM is known to lag the host's
+# after a sleep/wake -- sometimes by minutes, with nothing surfacing it. An
+# object written in that window then gets an mtime the next push's `find
+# -newermt @<host-epoch-stamp>` reads as "older than the cutoff", and it is
+# silently, permanently skipped until someone thinks to run --full. Reading
+# "now" from the same clock domain as the mtimes it will later be compared
+# against removes the skew instead of trying to bound or detect it.
+#
+# One more lightweight `container run` per push, not another VM boot -- the
+# VM is already up by the time sstate_push calls this (ensure_container_
+# running ran first), so this is just another hop through it, the same cost
+# `du -sk`'s own probe already pays for a size estimate nobody strictly needs.
+#
+# Never calls die(): like bitbake_getvar, every caller invokes this through
+# command substitution, and `exit` inside that subshell would only kill the
+# subshell, leaving the script to carry on with an empty "now" -- so failure
+# is a bare non-zero return, and the caller decides what to say and whether
+# to stop.
+container_epoch_now() {
+	local out rc=0
+	out="$(container run --rm -u 0:0 "$KAS_IMAGE" date +%s)" || rc=$?
+	[ "$rc" -eq 0 ] || return "$rc"
+	# Apple's own container tool can interleave boot-progress lines ("[3/6]
+	# Fetching kernel [0s]") ahead of the real output -- the identical noise
+	# fetch_volume_subdir's own probe already defends against (see its
+	# du -sk comment). Take the LAST line that is purely digits, never the
+	# first line unconditionally.
+	out="$(printf '%s\n' "$out" | awk '/^[0-9]+$/ { v = $0 } END { print v }')"
+	case "$out" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	printf '%s\n' "$out"
+}
+
+# sstate_push -- publish new sstate objects to a mirror, over rsync/ssh.
+#
+# The order of the steps is the design, not an implementation detail:
+#
+#   1. refuse a volume a running build still holds (the one-VM rule);
+#   2. stage only what is newer than THIS volume+destination's stamp into a
+#      host directory, and verify that copy with the same chunked-cksum
+#      manifest `retrieve` uses;
+#   3. release the volume -- the staging container has exited by the time
+#      anything touches the network;
+#   4. rsync in two passes, payload before siginfo;
+#   5. write the stamp only once rsync has exited clean.
+#
+# Staging on the host instead of pushing from inside the container is the
+# whole point of (2): the verified-copy path exists only here, and it exists
+# because a real >18G artifact was once copied with the right size and the
+# wrong content -- a shared mirror is the last place to skip that. It also
+# keeps push credentials on the host (the throwaway container stays
+# network-free and credential-free) and keeps a long transfer out of the
+# window where the volume is held.
+sstate_push() {
+	local dest="" full=0 key stamp since="" since_desc now stage stage_root rc=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--dest)   dest="${2:-}"
+				[ -n "$dest" ] || die "--dest needs a value, e.g. user@host:/srv/mackas/sstate" \
+					"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH"
+				shift 2 ;;
+			--dest=*) dest="${1#*=}"
+				[ -n "$dest" ] || die "--dest needs a value, e.g. user@host:/srv/mackas/sstate" \
+					"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH"
+				shift ;;
+			--full)   full=1; shift ;;
+			-*) die "unknown option for 'sstate push': $1" "$SCRIPT_CMD sstate --help" ;;
+			*) die "unexpected argument for 'sstate push': $1" \
+				"$SCRIPT_CMD sstate push [--dest USER@HOST:/PATH] [--full]" ;;
+		esac
+	done
+
+	[ -n "$dest" ] || dest="$MACKAS_SSTATE_PUSH_DEST"
+	[ -n "$dest" ] || die "'sstate push' needs a destination" \
+		"set MACKAS_SSTATE_PUSH_DEST=user@host:/srv/mackas/sstate in $(config_hint), or pass --dest"
+	case "$dest" in
+		# rsync reads a leading '-' as an option, and the write path is the
+		# one place a typo reaches another machine.
+		-*) die "the push destination may not start with '-' (got '$dest')" \
+			"$SCRIPT_CMD sstate push --dest USER@HOST:/PATH" ;;
+		*:*) ;;
+		*) die "the push destination must be a remote rsync target, e.g. user@host:/srv/mackas/sstate (got '$dest')" \
+			"the mirror's READ path is anonymous and read-only on purpose, so the write path goes over ssh; that split is the design (docs/storage.md)" ;;
+	esac
+
+	require_mackas_root
+	command -v rsync >/dev/null 2>&1 || die "rsync is not on PATH" \
+		"'sstate push' transfers with rsync over ssh; macOS ships one at /usr/bin/rsync"
+	# The daemon does not survive a reboot; start it before the volume_in_use
+	# and volume_exists checks below, same reasoning as sstate_prune/run_kas
+	# and cmd_retrieve: with the daemon down, volume_exists' 'container volume
+	# ls' reads as "does not exist yet" rather than the actual problem.
+	ensure_container_running
+
+	# One-VM rule: never attach the volume a build might still hold. Refuse
+	# loudly rather than corrupt an ext4 image mounted by two VMs at once --
+	# read-only is no exemption, the staging mount below is `:ro` for content
+	# safety, not for concurrency.
+	if volume_in_use "$MACKAS_VOL_SSTATE"; then
+		die "volume '$MACKAS_VOL_SSTATE' is attached to a running container" \
+			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD sstate push'"
+	fi
+
+	# fetch_volume_subdir's probe attaches the volume for real, --dry-run or
+	# not -- the same guard cmd_retrieve has. die rather than warn: an
+	# absent volume bind-mounts as an EMPTY one, which scans as "nothing
+	# newer" and is exactly the answer that would move the stamp past
+	# objects nothing ever read.
+	volume_exists "$MACKAS_VOL_SSTATE" || \
+		die "volume '$MACKAS_VOL_SSTATE' does not exist yet" \
+			"nothing was pushed and the stamp is unchanged ($SCRIPT_CMD setup)"
+
+	key="$(push_stamp_key "$MACKAS_VOL_SSTATE" "$dest")"
+	stamp="$MACKAS_BASE/state/sstate-push/$key.stamp"
+	if [ "$full" -eq 0 ] && [ -f "$stamp" ]; then
+		since="$(head -1 "$stamp" 2>/dev/null || true)"
+		case "$since" in
+			''|*[!0-9]*)
+				since=""
+				warn "  unreadable push stamp ($stamp) -- rescanning everything" ;;
+		esac
+	fi
+	# The build VM's own clock, not the Mac's -- see container_epoch_now's
+	# header. Every "now" this command captures (this one, and since_desc
+	# below) has to come from here: it is what gets written to the stamp,
+	# and the stamp is later compared against mtimes that clock produced.
+	now="$(container_epoch_now)" || rc=$?
+	[ "$rc" -eq 0 ] || die "could not read the clock inside the build VM (rc=$rc)" \
+		"nothing was staged and the push stamp is unchanged; check 'container system status' and retry"
+	since_desc="everything (no usable stamp yet)"
+	[ -n "$since" ] && since_desc="objects newer than $(date -r "$since" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '@%s' "$since")"
+
+	# One staging tree per volume+destination, wiped before use and after a
+	# clean transfer: it holds a second copy of every NEW object, so a
+	# leftover would quietly grow. A failed push deliberately leaves it for
+	# inspection.
+	stage_root="${MACKAS_SSTATE_PUSH_STAGE:-$MACKAS_BASE/sstate-push}"
+	stage="$stage_root/$key"
+
+	info "${C_BLD}mackas sstate push${C_RST}"
+	info "  volume     : $MACKAS_VOL_SSTATE"
+	info "  destination: $dest"
+	info "  pushing    : $since_desc"
+	info "  staging in : $stage"
+	info ""
+
+	run rm -rf "${stage:?}"
+	run mkdir -p "$stage"
+
+	# An empty VAR: no bitbake, no project, no kas-container context -- the
+	# guest path IS the mount point. `:ro` because publishing must not be able
+	# to write to what it publishes.
+	fetch_volume_subdir "$MACKAS_VOL_SSTATE" "/sstate:ro" \
+		sstate "$stage" "" /sstate "" "" "$since" || rc=$?
+	# rc=2 is the ONLY non-zero code that stamps, and that is the whole point
+	# of fetch_volume_subdir keeping 1/2/3 apart: it means the scan really ran
+	# and really matched nothing, so nothing can be missed by moving the stamp
+	# forward -- and doing so keeps the next push's scan cheap. A failed or
+	# unparseable scan (3) is indistinguishable from "nothing new" only if you
+	# let it be; stamping there would drop the objects that DO exist below the
+	# cutoff permanently, which is the opposite of what the stamp is for.
+	case "$rc" in
+		0) ;;
+		2)	push_stamp_write "$stamp" "$now"
+			run rm -rf "${stage:?}"
+			info "Nothing to push -- '$dest' is already current for '$MACKAS_VOL_SSTATE'."
+			return 0 ;;
+		*) die "could not stage '$MACKAS_VOL_SSTATE' for push (rc=$rc)" \
+			"nothing was transferred and the push stamp is unchanged; $stage was left in place" ;;
+	esac
+
+	# The staging container has exited, so the volume is free again for the
+	# whole (potentially long) transfer below.
+	local src="$stage/sstate/" pass_rc=0
+
+	# Two passes, payload first. bitbake decides an sstate object is
+	# available by finding its .siginfo, so a consumer listing the mirror
+	# mid-push must never see one whose object has not landed yet.
+	#
+	# --ignore-existing is the point of the whole transport: published
+	# objects become immutable and the first writer wins, so two pushers
+	# racing on one hash-derived path need no lock (they are pushing
+	# identical bytes anyway), and a re-offered object costs a directory
+	# listing rather than a re-upload. NEVER --inplace: rsync's default
+	# temp-file-then-rename is what makes each object appear atomically,
+	# the same same-directory-rename pattern sstate.bbclass itself uses.
+	run rsync -rlt --ignore-existing --exclude='lost+found' --exclude='*.siginfo' "$src" "$dest" || pass_rc=$?
+	[ "$pass_rc" -eq 0 ] || die "rsync failed on the payload pass (rc=$pass_rc)" \
+		"nothing was stamped, so the next '$SCRIPT_CMD sstate push' retries the same objects; check ssh access to $dest"
+
+	pass_rc=0
+	run rsync -rlt --ignore-existing --exclude='lost+found' --include='*/' --include='*.siginfo' --exclude='*' "$src" "$dest" || pass_rc=$?
+	[ "$pass_rc" -eq 0 ] || die "rsync failed on the siginfo pass (rc=$pass_rc)" \
+		"the objects themselves landed; re-run '$SCRIPT_CMD sstate push' once $dest is reachable again"
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		info "  (dry-run: nothing was transferred and the push stamp is unchanged)"
+		return 0
+	fi
+	push_stamp_write "$stamp" "$now"
+	run rm -rf "${stage:?}"
+	did "pushed '$MACKAS_VOL_SSTATE' -> $dest (stamp: $stamp)"
+}
+
 cmd_sstate() {
 	local sub="" rest=() a want_help=0
 	for a in "$@"; do
@@ -7732,7 +9786,7 @@ cmd_sstate() {
 			-v|--verbose)  VERBOSE=1 ;;
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" sstate ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" sstate ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -7744,9 +9798,10 @@ cmd_sstate() {
 
 	case "${sub:-help}" in
 		prune)  sstate_prune ${rest+"${rest[@]}"} ;;
+		push)   sstate_push ${rest+"${rest[@]}"} ;;
 		help)   sstate_usage ;;
 		*) die "unknown 'sstate' subcommand: $sub" \
-			"$SCRIPT_CMD sstate --help  (prune)" ;;
+			"$SCRIPT_CMD sstate --help  (prune, push)" ;;
 	esac
 }
 
@@ -7882,7 +9937,7 @@ cmd_monitor() {
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
 			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
 			-*) die "unknown option for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
 			*) die "unexpected argument for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
 		esac
@@ -8027,9 +10082,68 @@ though status reads only and never prompts, so none of them change anything.
 EOF
 }
 
+# status_project_volume_note -- the #77 "precedence-and-warn" note: when a
+# project is selected and an explicit volume-name setting (MACKAS_VOLUME_NAME
+# and/or the M1 MACKAS_VOLUME_DL_NAME/_SSTATE_NAME overrides) disagrees with
+# what the selector would have derived on its own, say so.
+#
+# Deliberately a plain VALUE comparison -- the three resolved MACKAS_VOL_*
+# names against the mackas-<name>-* triple the selector alone would produce
+# -- rather than re-deriving from setting_is_explicit()/config_pinned_setting.
+# The two always agree by construction: derive_volume_names() already applies
+# that exact default whenever nothing pinned MACKAS_VOLUME_NAME, so a
+# disagreement here can ONLY mean something above the defaults rung -- config
+# file, environment, or --set -- set an explicit value. Comparing values
+# needs no provenance flag at all, so it cannot be fooled by the same
+# factory-default-collision gap config_pinned_setting() exists to work around
+# (see its own comment) -- it is simply never exposed to that question here.
+#
+# "Once" is per invocation: mackas is a short-lived process with no state
+# file to remember having already said something, so this prints at most
+# once, and only from `status` (#77 requires status; a note on every command
+# would be noise on every build).
+#
+# Deliberately informational, never phrased as an error or a suggestion to
+# change anything: migration path B of #72 (explicit MACKAS_VOLUME_NAME=
+# oe-build, no data moves) is a fully supported, deliberate end state, and a
+# user who chose it on purpose must not read this as having done something
+# wrong.
+status_project_volume_note() {
+	[ -n "$PROJECT_SELECTED" ] || return 0
+	local d_tmp d_dl d_sstate
+	d_tmp="mackas-$PROJECT_SELECTED-tmp"
+	d_dl="mackas-$PROJECT_SELECTED-dl"
+	d_sstate="mackas-$PROJECT_SELECTED-sstate"
+	if [ "$MACKAS_VOL_TMP" = "$d_tmp" ] && [ "$MACKAS_VOL_DL" = "$d_dl" ] \
+	   && [ "$MACKAS_VOL_SSTATE" = "$d_sstate" ]; then
+		return 0
+	fi
+	info ""
+	info "  note: an explicit volume name is set for '$PROJECT_SELECTED', and it is"
+	info "  being honoured -- this is not an error; keeping a different stem (e.g."
+	info "  oe-build-*, with no data move) is a fully supported choice."
+	[ "$MACKAS_VOL_TMP" = "$d_tmp" ] \
+		|| info "    tmp     set: $MACKAS_VOL_TMP   (--project $PROJECT_SELECTED would derive: $d_tmp)"
+	[ "$MACKAS_VOL_DL" = "$d_dl" ] \
+		|| info "    dl      set: $MACKAS_VOL_DL   (--project $PROJECT_SELECTED would derive: $d_dl)"
+	[ "$MACKAS_VOL_SSTATE" = "$d_sstate" ] \
+		|| info "    sstate  set: $MACKAS_VOL_SSTATE   (--project $PROJECT_SELECTED would derive: $d_sstate)"
+}
+
 cmd_status() {
 	hdr "Configuration"
 	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
+	# Only when one was selected: the selector is not a setting (it chooses
+	# the file, it is not read out of one), so the loop below never shows it.
+	if [ -n "$PROJECT_SELECTED" ]; then
+		show "project selected"   "$PROJECT_SELECTED"
+		# A separate line, not appended to the one above: the compatibility
+		# contract (tests/implicit_select_compat.bats) matches "project
+		# selected" against an exact value with nothing trailing it, for
+		# every explicit-selector case that predates #78.
+		show "selected via"       "$PROJECT_SELECT_SOURCE"
+		status_project_volume_note
+	fi
 	local n
 	for n in $SETTING_NAMES; do
 		# The three volume sizes: show the REAL cap once a volume already
@@ -8068,6 +10182,10 @@ cmd_status() {
 	show "project checkout"   "$MACKAS_PROJECT"
 	show "kas files"          "$KAS_FILES_ARG"
 	show "env.sh"             "$MACKAS_ENV_SH"
+	# Worth a line of its own now that a selected project moves it to
+	# logs/<name>: "Recent logs" below prints bare filenames, so this is the
+	# only place that says which directory they came out of.
+	show "logs"               "$MACKAS_LOGS"
 	show "shim"               "$SHIM_DIR/docker"
 
 	hdr "Present?"
@@ -8205,7 +10323,10 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD clean [TARGET...]
 
 Bare '$SCRIPT_CMD clean' (no target) deletes and recreates the WHOLE TMPDIR
-volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. That drops everything
+volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. With a project selected
+that is only that project's own logs/<name>, never a sibling's; with none
+selected it is the flat logs/, and clearing that takes every project's
+logs/<name> sitting under it along with it. That drops everything
 under TOPDIR, not just tmp/: deploy, buildhistory (if the project inherits
 it), conf/ and cache/ all go too. DL_DIR and SSTATE_DIR are never touched --
 having them in separate volumes is exactly why this works. Only prompts once
@@ -8270,15 +10391,38 @@ mounts, mirror mounts if enabled, the live-progress-bridge args if
 MACKAS_MONITOR=1) and nothing else.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD runtime-args
+  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR] [--kas-files CHAIN]
 
-Not something you normally run directly: the \`kas-container\` wrapper
-env.sh generates calls this itself, once per invocation, so a setting that
+Not something you normally run directly: the generated \`kas-container\`
+wrapper calls this itself, once per invocation, so a setting that
 affects the build (MACKAS_MONITOR, a volume-name override, ...) takes
 effect on a hand-typed \`kas-container build/shell <files>\` the same way it
 already does for '$SCRIPT_CMD smoketest'/'shell' -- not just after the next
 '$SCRIPT_CMD setup'. Exists so that fact has one implementation instead of
-being copied into the generated env.sh.
+being copied into the generated wrapper.
+
+${C_BLD}--expect-work DIR${C_RST} refuses when the config in effect resolves a
+different work directory than DIR. The wrapper passes the MACKAS_WORK it
+was generated with: volumes are recomputed live while work dir, image and
+gitconfig stay frozen in it, so a config naming another root would mount
+another project's ext4 volumes under this project's sources. Comparing
+identities rather than freezing the config path keeps an ambient
+\$MACKAS_CONF usable whenever it agrees, and refuses only when it does not.
+
+${C_BLD}--kas-files CHAIN${C_RST} is plumbing too: the generated wrapper's own hint at the
+file list a hand-typed \`kas-container build/shell/checkout <files>\` was just
+called with, forwarded here so tier-3 project selection (#78) can derive a
+project from the chain's own leading path component when \$PWD alone (e.g.
+standing in work/ itself) derives nothing. Only ever consulted as a
+fallback -- \$PWD always wins when it derives anything on its own -- and only
+ever after the same validation any other name gets before it is pasted into
+a path.
+
+${C_BLD}--require-volumes-free${C_RST} applies the one-VM rule first and prints nothing
+if it fails: refuse, naming the volume, when a running container already
+holds one of the three ext4 volumes this string attaches. The wrapper
+passes it on every call, so a hand-typed \`kas-container build\` while a
+build is running is refused exactly as '$SCRIPT_CMD shell' would be.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted
 but change nothing here -- there is nothing to confirm and nothing dry-run
@@ -8311,19 +10455,179 @@ EOF
 }
 
 # cmd_runtime_args -- print kas_runtime_args()'s current value, stdout only,
-# nothing else. The env.sh wrapper shells out to this per call (see
-# setup_shim_and_env) instead of freezing the string at 'setup' time, so a
-# setting kas_runtime_args() reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS, a
-# volume-name override) reaches a hand-typed kas-container call the same way
+# nothing else. The generated kas-container wrapper shells out to this per
+# call (see write_kas_wrapper) instead of freezing the string at 'setup' time,
+# so a setting kas_runtime_args() reads (MACKAS_MONITOR, MACKAS_USE_NFS_MIRRORS,
+# a volume-name override) reaches a hand-typed kas-container call the same way
 # it already reaches run_kas() -- one implementation, not two copies that can
 # drift (see issue #25: the frozen copy is exactly how MACKAS_MONITOR=1
 # silently never took effect for a hand-typed build).
+#
+# --require-volumes-free adds run_kas()'s one-VM guard to that same call
+# (issue #96). It lives HERE, rather than being reimplemented in POSIX sh
+# inside the generated wrapper, for the reason above -- one implementation of
+# volume_in_use() -- and it rides on the runtime-args call rather than a
+# second subprocess so the names checked are, by construction, exactly the
+# names that call is about to hand kas-container. Ordering matches run_kas():
+# the wrapper starts the container runtime before it gets here, because
+# volume_in_use() short-circuits to "not in use" with the daemon down.
 cmd_runtime_args() {
+	local want_help=0 require_free=0 expect_work="" kas_files=""
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			-h|--help|help) want_help=1; shift ;;
+			--require-volumes-free) require_free=1; shift ;;
+			--expect-work) expect_work="${2:-}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift 2 ;;
+			--expect-work=*) expect_work="${1#*=}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift ;;
+			--kas-files) kas_files="${2:-}"; [ -n "$kas_files" ] || die "--kas-files needs a CHAIN"; shift 2 ;;
+			--kas-files=*) kas_files="${1#*=}"; [ -n "$kas_files" ] || die "--kas-files needs a CHAIN"; shift ;;
+			--dry-run) DRY_RUN=1; shift ;;
+			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
+			-v|--verbose) VERBOSE=1; shift ;;
+			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" runtime-args ;;
+			-*) die "unknown option for 'runtime-args': $1" "$SCRIPT_CMD runtime-args --help" ;;
+			*) die "unexpected argument for 'runtime-args': $1" "$SCRIPT_CMD runtime-args --help" ;;
+		esac
+	done
+
+	if [ "$want_help" -eq 1 ]; then
+		runtime_args_usage
+		return 0
+	fi
+
+	# The generated wrapper passes the MACKAS_WORK it was built with. Volumes
+	# are recomputed live (so `mackas set` takes effect without regenerating
+	# the wrapper) while work dir, image and gitconfig stay frozen in it -- so
+	# a config that resolves a DIFFERENT root would hand this build another
+	# project's ext4 volumes while its sources and gitconfig stay put. Compare
+	# identities rather than freezing the config path into the wrapper: an
+	# ambient $MACKAS_CONF keeps working whenever it is consistent, and is
+	# refused only when it actually disagrees.
+	if [ -n "$expect_work" ] && [ "$expect_work" != "$MACKAS_WORK" ]; then
+		die "this wrapper was generated for a different configuration" \
+			"$(wrapper_identity_hint "$expect_work")"
+	fi
+
+	# #78: the wrapper replays the pin it was generated under (tier 2, via
+	# $MACKAS_PROJECT_SELECT) -- exactly what lets M3's `project add` put more
+	# than one project under one root sharing a single generated wrapper. If
+	# the directory this call actually runs from (or the chain hint the
+	# wrapper's own leading-options scan found) derives a DIFFERENT single
+	# project, this wrapper is about to hand that build another project's
+	# ext4 volumes while its work dir and gitconfig stay pinned to the one it
+	# was generated for -- refuse rather than silently obey whichever one
+	# PROJECT_SELECT_SOURCE happened to rank first.
+	#
+	# Only checked when tier 2 is what is actually in force: an explicit
+	# --project always wins outright (there is nothing to "replay" and
+	# disagree with), and tier 3 having already run IS this same question,
+	# already answered load_config's own way. An AMBIGUOUS cwd or chain (more
+	# than one candidate from single_candidate_winner) says nothing here --
+	# tier 2 already won, and an ambiguous derivation is not a confident "no"
+	# to check it against, so guessing at a conflict would be exactly the
+	# kind of guess #78 refuses to make.
+	#
+	# MODE "lenient": this is a consultative second opinion on a selection
+	# already settled, not a selection itself -- an unrelated pinned config
+	# elsewhere in projects_dir() that happens to be unreadable must not
+	# turn into a fresh refusal for a build this guard would otherwise have
+	# waved through (see derive_project_candidates()'s own comment). Fail
+	# closed is for CHOOSING a project; this only ever downgrades a "yes,
+	# they agree" to "cannot be sure", which is exactly the same "say
+	# nothing" answer an ambiguous derivation already gets below.
+	if [ "$PROJECT_SELECT_SOURCE" = "\$MACKAS_PROJECT_SELECT" ]; then
+		local rt_pwd rt_n=0 rt_winner="" rt_chain_component rt_chain_n=0 rt_chain_winner=""
+		local rt_effective="" rt_effective_src=""
+		rt_pwd="$(pwd -P)"
+		single_candidate_winner "$rt_pwd" lenient
+		rt_n="$CANDIDATE_COUNT"; rt_winner="$CANDIDATE_WINNER"
+		if [ "$rt_n" -eq 1 ]; then
+			rt_effective="$rt_winner"; rt_effective_src="derived from \$PWD"
+		elif [ "$rt_n" -eq 0 ]; then
+			# The chain hint is only worth consulting once $PWD alone found
+			# NOTHING -- see load_config's own tier 3 for why a $PWD match
+			# always forecloses the chain ever naming something else.
+			rt_chain_component="$(kas_chain_first_component "$kas_files")"
+			if [ -n "$rt_chain_component" ]; then
+				single_candidate_winner "$rt_pwd/$rt_chain_component" lenient
+				rt_chain_n="$CANDIDATE_COUNT"; rt_chain_winner="$CANDIDATE_WINNER"
+				if [ "$rt_chain_n" -eq 1 ]; then
+					rt_effective="$rt_chain_winner"; rt_effective_src="derived from the kas chain"
+				fi
+			fi
+		fi
+		if [ -n "$rt_effective" ] && [ "$rt_effective" != "$PROJECT_SELECTED" ]; then
+			die "this wrapper is pinned to '$PROJECT_SELECTED', but $rt_effective_src names a different pinned project: '$rt_effective'" \
+				"$(wrapper_pin_conflict_hint "$PROJECT_SELECTED" "$rt_effective" "$rt_effective_src")"
+		fi
+	fi
+
+	# Before printing, never after: a caller that refuses on a held volume must
+	# get nothing on stdout to accidentally use.
+	if [ "$require_free" -eq 1 ]; then
+		require_volumes_free "kas-container ..."
+	fi
+
 	printf '%s\n' "$(kas_runtime_args)"
+}
+
+# refuse_shared_volume NAME LABEL -- #72: under a project selector, destroy
+# and clean's downloads/sstate targets touch only THIS project's PRIVATE
+# volumes. A volume more than one pinned project's config resolves to is
+# SHARED -- deliberately: migration path B (keep oe-build-*, no data moves)
+# depends on exactly this being a legitimate, common choice, not a mistake
+# to refuse outright (#77's precedence-and-warn decision). Deleting or
+# recreating a shared volume out from under one project's selector would
+# take another project's cache with it with no confirmation naming what
+# else uses it -- so refuse, name the other projects, and point at the one
+# command that is allowed to act on a shared volume knowingly: naming it
+# directly with `volume destroy <name>`.
+#
+# Gated on PROJECT_SELECTED being non-empty: an unselected invocation
+# predates the whole selector feature -- #72's own "opt-in" rule, the same
+# reasoning derive_volume_names() already applies to the derived stem
+# itself -- so its behaviour stays byte-identical to before M3 existed,
+# even for two pinned configs that happen to explicitly share an oe-build-*
+# name from before any of this existed. Never called with TMP: it is always
+# private, mackas-<name>-tmp with no override knob at all, so it can never
+# legitimately be shared.
+#
+# Checked BEFORE the reverse-grep itself: pinned_configs_unreadable() names
+# any pinned config this process could not open, and an unreadable file
+# answers pinned_projects_referencing_volume() exactly like an unrelated
+# project that shares nothing (config_grep_setting cannot distinguish "no
+# such line" from "permission denied"). Reading that silence as "safe to
+# delete" would be the exact failure mode this whole guard exists to
+# prevent, so a destructive caller fails CLOSED here instead -- refusing
+# and naming the file, never guessing.
+refuse_shared_volume() {
+	local vol="$1" label="$2" others other_list="" unreadable names
+	[ -n "$PROJECT_SELECTED" ] || return 0
+	unreadable="$(pinned_configs_unreadable)"
+	if [ -n "$unreadable" ]; then
+		names="$(printf '%s\n' "$unreadable" | sed 's/$/.conf/' | tr '\n' ' ')"
+		names="${names% }"
+		die "cannot tell whether '$vol' ($label) is shared: unreadable pinned config(s) $names" \
+			"fix their permissions (or remove them if stale) in $(projects_dir), then re-run"
+	fi
+	others="$(pinned_projects_referencing_volume "$vol" | grep -vxF "$PROJECT_SELECTED" || true)"
+	[ -n "$others" ] || return 0
+	other_list="$(printf '%s' "$others" | tr '\n' ' ')"
+	other_list="${other_list% }"
+	die "'$vol' ($label) is shared with $other_list -- refusing to touch it under $(project_select_description)" \
+		"to act on it anyway, name it directly: $SCRIPT_CMD volume destroy $vol"
 }
 
 cmd_destroy() {
 	require_mackas_root
+
+	# Checked FIRST, before the DESTROY confirmation even prints: either
+	# everything below proceeds, or nothing does -- a refusal here must never
+	# leave TMP/legacy already gone while a shared DL or SSTATE survives.
+	refuse_shared_volume "$MACKAS_VOL_DL" "the downloads volume"
+	refuse_shared_volume "$MACKAS_VOL_SSTATE" "the sstate volume"
+
 	local what="EVERYTHING: all three ext4 volumes ($MACKAS_VOL_TMP, $MACKAS_VOL_DL,
   $MACKAS_VOL_SSTATE -- so downloads and sstate too), $MACKAS_ROOT (the project
   checkout and logs), and the $MACKAS_SHORT_LINK symlink"
@@ -8405,6 +10709,12 @@ cmd_destroy() {
 # clean_tmpdir_volume -- bare 'mackas clean' (no target): delete and recreate
 # the WHOLE TMPDIR volume. Unchanged from before targeted cleans existed --
 # see cmd_clean for how a target list routes elsewhere instead.
+#
+# No refuse_shared_volume() call: it only ever touches $MACKAS_VOL_TMP, and
+# tmp is ALWAYS private -- mackas-<name>-tmp, with no MACKAS_VOLUME_*_NAME
+# override knob at all (#77 slice 1) -- so it can never legitimately be
+# shared between two pinned projects in the first place. clean_tmp_deploy
+# (the 'tmp+deploy' target) is the same case for the same reason.
 clean_tmpdir_volume() {
 	local what="the TMPDIR volume '$MACKAS_VOL_TMP' (recreated empty) and $MACKAS_LOGS
   (the '$MACKAS_VOL_DL' and '$MACKAS_VOL_SSTATE' cache volumes and the project
@@ -8576,6 +10886,10 @@ clean_tmp_deploy() {
 # be wiped alone without leaving the other inconsistent.
 clean_volume_target() {
 	local name="$1" size="$2" role="$3" img used=""
+	# Only ever called for the dl/sstate targets (never tmp -- see
+	# cmd_clean), so this alone covers both of #72's "clean variants that
+	# touch dl/sstate".
+	refuse_shared_volume "$name" "$role"
 	if volume_in_use "$name"; then
 		die "volume '$name' is attached to a running container" \
 			"only ONE VM may touch an ext4 image at a time; stop the build first (mackas volume list), then re-run '$SCRIPT_CMD clean'"
@@ -8607,7 +10921,7 @@ cmd_clean() {
 			-h|--help)     want_help=1; shift ;;
 			help)          want_help=1; shift ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" clean ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" clean ;;
 			tmp+deploy|downloads|sstate) targets+=("$1"); shift ;;
 			-*) die "unknown option for 'clean': $1" "$SCRIPT_CMD clean --help" ;;
 			*) die "unknown target for 'clean': $1" \
@@ -9055,7 +11369,18 @@ volume_destroy() {
 # that does not exist is normal here (not every install has all four), not an
 # error -- and a busy one is skipped with a warning, mirroring
 # volume_fstrim_one()'s from_all shape, rather than aborting the whole run.
+#
+# refuse_shared_volume() applies here too, same as cmd_destroy(): --all
+# expands to $MACKAS_VOL_TMP/DL/SSTATE/LEGACY, the CURRENT selector's
+# resolved names, exactly the way `destroy` (bare) does -- it is not
+# "naming a volume outright" the way `volume destroy <name>` is, so it is
+# not the escape hatch #72 describes and must not silently bypass the same
+# guard destroy has, or '$SCRIPT_CMD volume destroy --all' would be a
+# trivial way around the whole feature.
 volume_destroy_all() {
+	refuse_shared_volume "$MACKAS_VOL_DL" "the downloads volume"
+	refuse_shared_volume "$MACKAS_VOL_SSTATE" "the sstate volume"
+
 	local names=("$MACKAS_VOL_TMP" "$MACKAS_VOL_DL" "$MACKAS_VOL_SSTATE" "$MACKAS_VOL_LEGACY")
 	local n present=() total_kb=0 kb img
 
@@ -10295,7 +12620,7 @@ cmd_volume() {
 			# option".
 			-h|--help)     want_help=1 ;;
 			--version)     echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$a" volume ;;
+			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$a" volume ;;
 			*) if [ -z "$sub" ]; then sub="$a"; else rest+=("$a"); fi ;;
 		esac
 	done
@@ -10343,6 +12668,8 @@ ${C_BLD}COMMANDS${C_RST}
   setup      Do the full setup. Idempotent -- safe to re-run after a crash.
   adopt      Bring a MACKAS_ROOT set up by another Mac back to a working
              build here. '$SCRIPT_CMD adopt --help'.
+  project    Pin a project workspace under THIS root -- 'project add NAME'.
+             The in-root sibling of 'adopt'. '$SCRIPT_CMD project --help'.
   smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
   status     Show what is configured and what exists on disk.
   shell      Drop into a kas shell for the project's kas config.
@@ -10356,8 +12683,8 @@ ${C_BLD}COMMANDS${C_RST}
              '$SCRIPT_CMD buildstats --help'.
   buildhistory  Work with a buildhistory tree already retrieved: analyze
              what changed between two builds. '$SCRIPT_CMD buildhistory --help'.
-  sstate     Prune sstate objects bitbake hasn't reused in a while.
-             '$SCRIPT_CMD sstate --help'.
+  sstate     Prune sstate objects bitbake hasn't reused in a while, or push
+             new ones to a mirror. '$SCRIPT_CMD sstate --help'.
   monitor    Show live bitbake progress from a build started with
              MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
   clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the
@@ -10373,6 +12700,8 @@ ${C_BLD}COMMANDS${C_RST}
   set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
   get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.
   unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
+  projects   List the pinned per-project configs --project selects between.
+             '$SCRIPT_CMD projects --help'.
   runtime-args  Plumbing: prints the effective --runtime-args string. The
              env.sh wrapper calls this itself; you don't normally need to.
   lock       Pin every declared repo to its exact current commit
@@ -10383,6 +12712,9 @@ ${C_BLD}COMMANDS${C_RST}
 
 ${C_BLD}OPTIONS${C_RST}
   --config FILE   Use this config file instead of searching.
+  --project NAME  Use the pinned project NAME's config instead of searching:
+                  ~/.config/mackas/projects/NAME.conf. Mutually exclusive
+                  with --config/\$MACKAS_CONF. '$SCRIPT_CMD projects' lists them.
   --set NAME=VAL  Override one setting for THIS command only; beats config
                   file and environment. Repeatable. For a PERSISTENT
                   override, use '$SCRIPT_CMD set NAME VALUE' instead.
@@ -10398,15 +12730,44 @@ ${C_BLD}CONFIGURATION${C_RST}
   Precedence, lowest to highest:
     built-in defaults  ->  config file  ->  environment  ->  command-line flags
 
-  Config file, first match wins:
-    \$MACKAS_CONF
+  Which file, first match wins:
+    --config FILE  /  \$MACKAS_CONF            (a path, named outright)
+    --project NAME /  \$MACKAS_PROJECT_SELECT  (~/.config/mackas/projects/)
+    derived from \$PWD, or a hand-typed kas chain (same directory, no flag)
     ~/.config/mackas/config
     ~/.mackas.conf
 
+  Naming a path and selecting a project are mutually exclusive -- they are two
+  answers to the same question, so mackas refuses rather than ranks them, and
+  says which command drops the one you did not mean. The selector picks WHICH
+  file is sourced; it is not a fifth precedence rung. An empty value is refused
+  either way: --config= behaves like --config \"\", --project= like --project \"\".
+
+  With no explicit selector or path, mackas still tries a pinned project
+  first: if \$PWD (resolved physically, so a ~/oe-style symlink matches either
+  way) sits inside a pinned project's own <MACKAS_ROOT>/work/<name>, that
+  project is selected exactly as --project NAME would select it -- and,
+  standing in work/ itself, a hand-typed 'kas-container build <chain>' gives
+  the wrapper's own file list as the same kind of hint. Zero matches falls
+  straight through to the search path below, unchanged; more than one is
+  refused, listing every candidate, rather than guessed. This is a THIRD
+  SELECTOR TIER, not a fifth precedence rung either: it only ever picks among
+  projects you already pinned by hand, never invents one from what is on
+  disk. '$SCRIPT_CMD status' reports which tier actually fired ('selected
+  via'), and every other command prints a one-line stderr note the first
+  time a derived selection is what put a project in force.
+
+  '$SCRIPT_CMD --project NAME setup' pins NAME into the generated kas-container
+  wrapper, so a hand-typed 'kas-container ...' recomputes --runtime-args
+  against that project's config too, not the default search path.
+
   It is sourced as shell, so it is only looked for in places that are yours:
-  a searched file is skipped unless you (or root) own it and its directory,
-  and neither is writable by group or other. ./mackas.conf is NOT searched --
-  name a per-project config out loud with --config ./mackas.conf.
+  a searched file, and a --project one, are refused unless you (or root) own
+  the file and its directory and neither is writable by group or other. A
+  --config path is exempt: mackas derives every other candidate itself, and a
+  derived path in a guessable place is an ambush, while a typed one is a
+  request. ./mackas.conf is NOT searched -- name it out loud with
+  --config ./mackas.conf.
 
   Every setting is also an environment variable of the same name, and can be
   overridden with --set NAME=VALUE. See mackas.conf.example for the full
@@ -10440,6 +12801,11 @@ ${C_BLD}EXAMPLES${C_RST}
   # Build somewhere else entirely.
   $SCRIPT_CMD --config ~/other.conf setup
 
+  # Or, for a project already pinned by 'adopt':
+  $SCRIPT_CMD projects
+  $SCRIPT_CMD --project meta-ai status
+  export MACKAS_PROJECT_SELECT=meta-ai   # for a whole shell
+
   # Start over.
   $SCRIPT_CMD destroy
 EOF
@@ -10466,7 +12832,7 @@ parse_set() {
 main() {
 	setup_colors
 
-	local cmd="" config_flag="" want_help=0
+	local cmd="" config_flag="" project_flag="" want_help=0
 	# Flags may appear before or after the subcommand. want_help is tracked
 	# SEPARATELY from cmd (rather than cmd="help" as a sentinel) so that
 	# 'mackas setup --help'/'mackas setup help'/'mackas help setup' all still
@@ -10475,7 +12841,21 @@ main() {
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--config) config_flag="${2:-}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift 2 ;;
-			--config=*) config_flag="${1#*=}"; shift ;;
+			# Same arity check as the space-separated form: --config= silently
+			# falling through to $MACKAS_CONF or the search path made an
+			# explicit-but-empty override resolve to a DIFFERENT file.
+			--config=*) config_flag="${1#*=}"; [ -n "$config_flag" ] || die "--config needs a FILE"; shift ;;
+			# Only the flag's arity is checked here. The NAME itself is
+			# validated in load_config, the one place that turns it into a
+			# path, so nothing can ever reach that path unchecked -- and so
+			# --help stays typeable from anywhere, exactly as it is with an
+			# unreadable --config.
+			--project) project_flag="${2:-}"; [ -n "$project_flag" ] || die "--project needs a NAME" "$SCRIPT_CMD projects"; shift 2 ;;
+			# Checked here too: an empty value would otherwise fall through to
+			# the search path (or to an exported $MACKAS_PROJECT_SELECT), so
+			# '--project=' would silently select something other than what was
+			# asked for while '--project ""' dies.
+			--project=*) project_flag="${1#*=}"; [ -n "$project_flag" ] || die "--project needs a NAME" "$SCRIPT_CMD projects"; shift ;;
 			--set) parse_set "${2:-}"; shift 2 ;;
 			--set=*) parse_set "${1#*=}"; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
@@ -10593,12 +12973,56 @@ main() {
 				cmd="adopt"; shift
 				if [ "$want_help" -eq 1 ]; then ADOPT_ARGS=("$@" "--help"); else ADOPT_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|destroy|runtime-args|lock|dump)
+			project)
+				# Same shape again: project owns everything after it (its
+				# verb, 'add', and that verb's own args), captured verbatim
+				# for cmd_project. Exact-string case matching means this can
+				# never collide with the existing, plural, read-only
+				# 'projects' command below.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="project"; shift
+				if [ "$want_help" -eq 1 ]; then PROJECT_ARGS=("$@" "--help"); else PROJECT_ARGS=("$@"); fi
+				break ;;
+			runtime-args)
+				# Same shape again: runtime-args owns everything after it
+				# (--require-volumes-free), captured verbatim for
+				# cmd_runtime_args.
+				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
+				cmd="runtime-args"; shift
+				if [ "$want_help" -eq 1 ]; then RUNTIME_ARGS_ARGS=("$@" "--help"); else RUNTIME_ARGS_ARGS=("$@"); fi
+				break ;;
+			check|smoketest|status|shell|destroy|lock|dump|projects)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset runtime-args lock dump help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt project smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset projects runtime-args lock dump help)" ;;
 		esac
 	done
+
+	SCRIPT_SUBCOMMAND="${cmd:-check}"
+
+	# #78: pull --kas-files out of RUNTIME_ARGS_ARGS BEFORE load_config runs.
+	# load_config's tier 3 needs the wrapper's kas-chain hint while deciding
+	# WHICH config to source, which happens long before cmd_runtime_args ever
+	# gets to parse its own argv -- so this is a small, deliberate, EARLY peek
+	# at the same array cmd_runtime_args() parses properly (and validates)
+	# once dispatch actually reaches it below. Lenient on purpose: a
+	# malformed or duplicated flag here just means load_config sees no hint
+	# (or the last one), and cmd_runtime_args's own parser is what gives a
+	# real user-facing error for a genuinely bad invocation.
+	if [ "${cmd:-}" = "runtime-args" ]; then
+		local _mackas_prescan_arg="" _mackas_prescan_prev=""
+		for _mackas_prescan_arg in ${RUNTIME_ARGS_ARGS+"${RUNTIME_ARGS_ARGS[@]}"}; do
+			if [ "$_mackas_prescan_prev" = "--kas-files" ]; then
+				RUNTIME_ARGS_KAS_FILES="$_mackas_prescan_arg"
+				_mackas_prescan_prev=""
+				continue
+			fi
+			case "$_mackas_prescan_arg" in
+				--kas-files=*) RUNTIME_ARGS_KAS_FILES="${_mackas_prescan_arg#*=}" ;;
+				--kas-files) _mackas_prescan_prev="--kas-files" ;;
+			esac
+		done
+	fi
 
 	snapshot_env
 	set_defaults
@@ -10614,9 +13038,10 @@ main() {
 	if [ "$want_help" -ne 1 ]; then
 		case "${cmd:-check}" in
 			# See load_config's comment: only these three may target a
-			# --config/MACKAS_CONF path that does not exist yet.
-			set|get|unset) load_config "$config_flag" 1 ;;
-			*)              load_config "$config_flag" ;;
+			# --config/$MACKAS_CONF path, or a --project name, that does not
+			# exist yet.
+			set|get|unset) load_config "$config_flag" 1 "$project_flag" ;;
+			*)              load_config "$config_flag" 0 "$project_flag" ;;
 		esac
 		mark_explicit_from_config
 	fi
@@ -10626,7 +13051,7 @@ main() {
 	derive_paths
 
 	# A bare 'help'/'-h' (no command named at all) shows the general usage.
-	# volume/retrieve/buildstats/sstate/monitor/set/get/unset handle their OWN --help
+	# volume/retrieve/buildstats/sstate/monitor/runtime-args/set/get/unset handle their OWN --help
 	# internally (via the "--help" appended to their *_ARGS above), so they
 	# are dispatched normally either way, below.
 	if [ "$want_help" -eq 1 ] && [ -z "$cmd" ]; then
@@ -10638,13 +13063,15 @@ main() {
 		check)     if [ "$want_help" -eq 1 ]; then check_usage;     else cmd_check;     fi ;;
 		setup)     if [ "$want_help" -eq 1 ]; then setup_usage;     else cmd_setup ${SETUP_ARGS+"${SETUP_ARGS[@]}"}; fi ;;
 		adopt)      cmd_adopt ${ADOPT_ARGS+"${ADOPT_ARGS[@]}"} ;;
+		project)    cmd_project ${PROJECT_ARGS+"${PROJECT_ARGS[@]}"} ;;
 		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
 		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
-		runtime-args) if [ "$want_help" -eq 1 ]; then runtime_args_usage; else cmd_runtime_args; fi ;;
+		runtime-args) cmd_runtime_args ${RUNTIME_ARGS_ARGS+"${RUNTIME_ARGS_ARGS[@]}"} ;;
 		lock)      if [ "$want_help" -eq 1 ]; then lock_usage;      else cmd_lock;      fi ;;
 		dump)      if [ "$want_help" -eq 1 ]; then dump_usage;      else cmd_dump;      fi ;;
+		projects)  if [ "$want_help" -eq 1 ]; then projects_usage;  else cmd_projects;  fi ;;
 		clean)      cmd_clean ${CLEAN_ARGS+"${CLEAN_ARGS[@]}"} ;;
 		exec)       cmd_exec ${EXEC_ARGS+"${EXEC_ARGS[@]}"} ;;
 		volume)     cmd_volume ${VOLUME_ARGS+"${VOLUME_ARGS[@]}"} ;;

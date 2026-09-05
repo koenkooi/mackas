@@ -131,6 +131,13 @@ ext4 volume does; hardlinks work inside it.
 | `${MACKAS_VOLUME_NAME}-dl` | `/downloads` | `DL_DIR` | `MACKAS_VOLUME_SIZE_DL=40G` |
 | `${MACKAS_VOLUME_NAME}-sstate` | `/sstate` | `SSTATE_DIR` | `MACKAS_VOLUME_SIZE_SSTATE=40G` |
 
+The two cache volumes can also be named outright, with
+`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME`, instead of being
+derived from the stem — which is what lets two configs point at one shared
+cache. Empty is the default and derives the names above. See
+[storage.md](storage.md#naming-the-cache-volumes-outright) for the trade.
+There is no such knob for TMPDIR: it is per build tree by construction.
+
 200G total, the budget this SSD can spare. All three are sparse — ~1.2 MB
 each until used — and independently capped, so a runaway build cannot eat
 the free space Time Machine needs.
@@ -173,8 +180,9 @@ The corollary: a build that reaches kas-container with **no `-e` at all** — on
 
 `mackas` word-splits nothing itself, but kas-container expands
 `${KAS_EXTRA_RUNTIME_ARGS}` unquoted, so no value inside that string may
-contain a space. That is why `MACKAS_VOLUME_NAME` must be space-free, and
-why `setup` refuses a name that isn't.
+contain a space. That is why `MACKAS_VOLUME_NAME` — and
+`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME` with it — must be
+space-free, and why `setup` refuses a name that isn't.
 
 ### The chown — a fresh volume is `root:root`
 
@@ -229,8 +237,10 @@ Two layers now protect a hand-typed `kas-container` invocation, and they no long
 
 **`$MACKAS_BIN/kas-container` is a generated wrapper *script*** (`write_kas_wrapper()` in `mackas`), and it is what `$PATH` actually resolves `kas-container` to — so it protects **every invocation shape that reaches it via `$PATH` resolution**: `nohup kas-container ...`, `env kas-container ...`, a Makefile recipe, an unsourced shell, and the shell function below's own hand-off, all alike. It:
 
-- computes `--runtime-args` **live**, asking `mackas runtime-args` for the current value on every call rather than a string frozen when `setup` last ran — so a setting `kas_runtime_args()` reads (`MACKAS_MONITOR`, `MACKAS_USE_NFS_MIRRORS`, a volume-name override) takes effect on a hand-typed build the same way it already does for `mackas smoketest`/`shell`, not just after the next `mackas setup`. Falls back to a frozen copy baked in at generation time (`MACKAS_FROZEN_RUNTIME_ARGS`) if the live call ever fails, with a warning;
-- **refuses to launch, rather than guess,** if the value about to be used (live or fallback) is empty or missing any of the three ext4 volume mounts — a multi-hour build with no protected storage attached is strictly worse than failing fast before it ever starts;
+- computes `--runtime-args` **live**, asking `mackas runtime-args --require-volumes-free` for the current value on every call rather than a string frozen when `setup` last ran — so a setting `kas_runtime_args()` reads (`MACKAS_MONITOR`, `MACKAS_USE_NFS_MIRRORS`, a volume-name override) takes effect on a hand-typed build the same way it already does for `mackas smoketest`/`shell`, not just after the next `mackas setup`;
+- **dies if that call fails, and never falls back to a value baked in at `setup` time** ([#96](https://github.com/koenkooi/mackas/issues/96)). There is no such baked-in copy in the generated file at all any more. Everything mackas refuses while computing that string is a safety guard — a held volume, two volume names resolving to one, a project that cannot be derived unambiguously — and each of those means the setup-time values are no longer known to be right, which is exactly when reusing them does the damage. mackas's own message is relayed verbatim; a wrapper more permissive than the command it wraps is a bypass, not a convenience;
+- **applies the one-VM rule**, via the `--require-volumes-free` flag on that same call: a hand-typed `kas-container build` while another container holds one of the three ext4 volumes is refused, naming the volume, exactly as `mackas shell` would be. The check rides on the runtime-args call rather than a second subprocess so the names checked are, by construction, the names about to be attached, and it lives in `mackas` rather than in the generated script so there is one implementation of `volume_in_use()`;
+- **refuses to launch, rather than guess,** if the value about to be used is empty or missing any of the three ext4 volume mounts — what a zero exit status cannot catch (a stale/incompatible `mackas` answering something truncated). A multi-hour build with no protected storage attached is strictly worse than failing fast before it ever starts;
 - blanks `KAS_BUILD_DIR`/`DL_DIR`/`SSTATE_DIR` on the host side of the call (see above);
 - **auto-starts the container runtime if it is not up yet** (`container system status`/`container system start`, the same check `setup_runtime()` has always done for `mackas setup`) — the daemon does not survive a reboot, and without this a hand-typed `kas-container` on a fresh boot hit whatever raw error the daemon-down state produced instead of a clear message ([#33](https://github.com/koenkooi/mackas/issues/33));
 - prepends the shim dir to `PATH` and sets up the container engine, image and `GITCONFIG_FILE`;

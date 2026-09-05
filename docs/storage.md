@@ -83,9 +83,85 @@ Quick index:
   [`mackas volume resize`](#growing-a-volume-mackas-volume-resize).
 - Re-attach an image you moved by hand:
   [`mackas volume recover`](#relocating-a-volume-and-recovering-a-hand-moved-one).
+- Name a cache volume yourself instead of deriving it from the stem:
+  [`MACKAS_VOLUME_DL_NAME` / `MACKAS_VOLUME_SSTATE_NAME`](#naming-the-cache-volumes-outright).
 
 Every one of these obeys the **one-VM rule**: a volume a running build holds
 is refused rather than attached to, or moved under, a second VM.
+
+### Naming the cache volumes outright
+
+The downloads and sstate volumes are `${MACKAS_VOLUME_NAME}-dl` and
+`${MACKAS_VOLUME_NAME}-sstate` unless `MACKAS_VOLUME_DL_NAME` /
+`MACKAS_VOLUME_SSTATE_NAME` name them directly. Both default to empty, which
+derives those names; a mackas that has never been told otherwise behaves
+exactly as it always did.
+
+Naming them is what makes it **possible** for two configs — two adopted
+roots, say — to point at one cache volume. Both caches are safe to share:
+downloads are upstream tarballs and git mirrors keyed by name and checksum,
+so a bad one fails verification at fetch time no matter who wrote it, and
+sstate is keyed by task-input hash. `BB_HASHSERVE_DB_DIR` lives in the sstate
+volume (see above), so its hash-equivalence database travels with the cache
+rather than being left behind.
+
+Safe to share is not the same as worth sharing, and mackas neither shares by
+default nor suggests you start. An ext4 image may be mounted by **one VM at a
+time**, so a shared volume is a point where the builds that name it queue on
+each other — a cost that does not exist on a Linux host, where concurrent
+builds against one cache are ordinary. What you buy is disk and warm-cache
+hit rate; what you pay is serialization. An [HTTP mirror](#http-mirrors--optional-and-not-just-an-nfs-bridge)
+buys the hit rate without the queueing, and is the better answer whenever it
+is available.
+
+Once `--project <name>` selects a pinned project (`mackas project add`,
+[README](../README.md#pinning-a-project-workspace)), the same rule applies
+one level down: `MACKAS_VOLUME_DL_NAME`/`_SSTATE_NAME` default empty *for
+that project's own config too*, so both caches derive `mackas-<name>-dl`/
+`-sstate` and are private to it out of the box — a second pinned project
+never reads or writes the first one's cache unless one of them explicitly
+names the other's volume. That is deliberate (#72): bitbake-setup's
+`site.conf` shares sstate across setups by convention, which is fine on a
+Linux host where concurrent builds are ordinary, but wrong here for exactly
+the queueing reason above, so mackas declines that convention and makes
+sharing an opt-in per project instead of the default. Nothing about pinning
+a project changes what these two settings do or how they are named — a
+project's config is just another config file, read by the same rule.
+
+Because a shared cache volume now has more than one legitimate owner,
+`mackas destroy` and `mackas clean downloads`/`clean sstate` refuse to touch
+one that a *different* pinned project's config also resolves to, while a
+project selector is active — reverse-grepping every file under
+`~/.config/mackas/projects/` (never sourcing them) rather than trusting
+whatever happens to be mounted right now. The refusal names the other
+project(s); nothing is destroyed and nothing is left half-cleaned. The
+explicit way through is naming the volume directly: `mackas volume destroy
+<name>` (or, for `clean`'s narrower targets, drop the selector and act on
+the legacy/default config that owns the shared name). This is the same
+concern `do_cleanall`/`do_cleansstate` are a known upstream footgun for —
+deleting a cache another build still depends on — except here the one-VM
+rule already rules out a *concurrent* victim, so what remains is a build
+that has not run *yet* losing a cache it was relying on finding warm.
+
+Two practical notes: the shared volume has to exist before anything can mount
+it, and `mackas volume duplicate <existing> <newname>` is how to seed it from
+a cache you already have; and the names land unquoted in the word-split
+`--runtime-args` string, so like the stem they must be space-free — mackas
+refuses one that isn't rather than mounting the fragments.
+
+The three volumes must also resolve to three **distinct** names. Sharing a
+cache between two *configs* is the supported thing these knobs make possible;
+naming two volumes of the *same* config alike is not, because all three are
+attached to one container — `-v shared:/downloads -v shared:/sstate` would
+mount a single ext4 image twice into one VM, which is the one-VM rule broken
+from the inside rather than between two builds. mackas refuses a collision
+when it resolves the names, since nothing downstream would catch it: the
+held-volume check only asks what *other* running containers hold, and `setup`
+would otherwise create the name twice at two different sizes and report
+success.
+
+TMPDIR has no such knob on purpose. Two builds sharing one `/build` is not
+contention, it is corruption.
 
 ### Reclaiming disk from a grown volume (`mackas volume fstrim`)
 
@@ -749,6 +825,120 @@ export NETRC_FILE=~/.netrc
 Caveat: a `DL_DIR` populated without `BB_GENERATE_MIRROR_TARBALLS = "1"`
 lacks tarballs for scm checkouts, which makes the downloads mirror much less
 useful than it looks. Check how the mirror's cache was built.
+
+### Publishing sstate: `mackas sstate push`
+
+Everything above is the *read* direction. `mackas sstate push` is the write
+one, and it is the only part of mackas that talks to another host.
+
+```sh
+mackas set MACKAS_SSTATE_PUSH_DEST mirror@linux-computer.local:/srv/mackas/sstate
+mackas sstate push            # incremental
+mackas sstate push --full     # ignore the stamp, offer everything again
+```
+
+One push, in the order the steps have to happen in:
+
+1. **Refuse a held volume.** One VM per ext4 image; a running build wins.
+2. **Stage.** A throwaway container mounts the sstate volume **read-only**
+   plus a host staging directory (`MACKAS_SSTATE_PUSH_STAGE`, default
+   `$MACKAS_BASE/sstate-push`) and copies only the objects whose mtime is
+   newer than this volume+destination's stamp. sstate objects are **not**
+   write-once: bitbake touches one every time it *reuses* it — the same
+   `os.utime()` that `sstate prune`'s `-mtime +N` depends on — so the
+   selection is everything recent builds wrote *or reused*, not only what is
+   new. That direction is safe (it over-selects, never misses, and
+   `--ignore-existing` makes re-offering an object free on the wire), but
+   every over-selected object is still byte-copied into staging and
+   checksummed there. Size the staging filesystem for the **reuse** set.
+3. **Verify.** The same chunked-`cksum` manifest `retrieve` uses runs
+   in-container over the source subset and on the host over the staged copy;
+   a mismatch retries the copy once and then dies. This exists because a real
+   >18 GB artifact was once copied with the right size and the wrong content.
+4. **Release the volume**, then transfer. The staging container has exited, so
+   a long network transfer never sits inside the window where the volume is
+   held — and the container itself stays network-free and credential-free,
+   because the push credentials never leave the host.
+5. **Two `rsync --ignore-existing` passes**, payload then `*.siginfo`. bitbake
+   decides an object is available by finding its signature, so the ordering is
+   what stops a consumer reading the mirror mid-push from seeing a `.siginfo`
+   whose object has not landed. **Never `--inplace`**: rsync's default
+   temp-file-then-rename is what makes each object appear atomically, the same
+   pattern `sstate.bbclass` itself uses.
+6. **Stamp**, only once rsync has exited clean.
+
+`--ignore-existing` is what makes the whole thing safe to repeat: a published
+object is immutable and the first writer wins, so two pushers racing on the
+same hash-derived path need no lock (they are pushing identical bytes), an
+interrupted push re-offers the same objects next time, and a lost stamp costs
+a full rescan — slow, never wrong.
+
+The stamp lives at `$MACKAS_BASE/state/sstate-push/<volume+destination>.stamp`
+and holds the epoch at which the scan *started*, as file content rather than
+as the file's own mtime: copying or restoring the state directory rewrites
+mtimes, and a stamp that silently jumped forward would skip objects the mirror
+never received. One stamp per volume+destination pair, so pushing one volume
+to two mirrors keeps two independent positions. The pair is hashed into the
+filename, not just sanitized into it: two destinations differing only in
+punctuation slug to the same string, and one shared stamp would silently skip
+the objects the other mirror never got.
+
+**The stamp's clock is the build VM's, not the Mac's.** The mtimes the stamp
+is later compared against (`find -newermt`) are set by whatever wrote the
+sstate object *inside the VM*, and Apple's `container` VM is known to lag the
+host's own clock after the Mac sleeps and wakes -- sometimes by minutes, with
+nothing surfacing it. A host-derived `date +%s` stamp is only correct while
+the two clocks agree; when the VM lags, an object it wrote can land with an
+mtime the host-derived cutoff already reads as "in the past", and the next
+incremental push then silently and *permanently* drops it -- only `--full`
+recovers it. `push` reads "now" from inside a throwaway container instead
+(`container_epoch_now()`), so the stamp and the mtimes it is compared against
+always come from the one clock that actually produced them.
+
+**A scan that could not answer never stamps.** "The scan matched nothing" is
+the one outcome that moves the stamp forward, so it must be impossible to
+confuse with "the scan broke". The in-container probe checks `find`'s own
+status rather than a pipeline's (the guest shell has no `pipefail`, so a
+pipeline reports `awk`'s status and a dead `find` looks like an empty result),
+prints a completion marker the host insists on, and treats an unreadable
+object count as an error rather than a zero. On any uncertainty push rescans
+or fails; it never stamps. That holds on **every** path, not only the
+incremental one: `--full` and a first push (no stamp yet, so no cutoff to
+scan against) go through a plain `du` instead, and it ends in the same
+completion marker — a probe that exits clean without reaching its end is
+refused there too. The same reasoning is why push refuses outright
+when the sstate volume does not exist yet — an absent named volume
+bind-mounts as an *empty* one, which scans as "nothing new". Getting this
+wrong drops objects that really existed below the cutoff permanently, so they
+are never offered to the mirror again.
+
+**The same never-verified-never-stamps rule applies to the copy that follows
+the scan, not only the scan itself.** The container that stages objects out
+of the volume can die before it ever prints a manifest to compare against;
+because `set -e` is suspended everywhere `fetch_volume_subdir` is called
+under a condition, that silently leaves both sides of the comparison empty —
+an empty manifest equals an empty manifest, and a dead copy reads as a
+*verified* one. Push checks the copy container's own exit status rather than
+trusting an empty comparison, and, on the incremental path, the guest-side
+`tar | tar` pipeline gets the same treatment as the scan's `find`: the guest
+shell has no `pipefail`, so a source `tar` that dies mid-stream is invisible
+to anything watching only the extract side's status, and is instead marked
+into a file the pipeline's tail checks explicitly.
+
+**Transport: rsync over ssh, deliberately not an HTTP PUT.** Adding a write
+path to `mackas-mirrord` is rejected outright — its read-only-ness is the
+security property being asked for. The split *is* the design: read path
+anonymous and read-only, write path authenticated out of band over ssh.
+
+**Push before you prune.** Prune-then-push buys nothing (`--ignore-existing`
+plus stamp-based staging already keeps pushes incremental) and costs the
+mirror the objects it would have archived. Once an object is on the mirror,
+pruning it locally costs an HTTP refetch instead of a rebuild.
+
+Staging doubles the transient footprint of the new objects — point
+`MACKAS_SSTATE_PUSH_STAGE` at a roomier filesystem if the first push of a
+warm cache does not fit next to `$MACKAS_BASE`. A failed push leaves its
+staging directory behind for inspection; a successful one removes it.
 
 ### Serving local files instead of bind-mounting them
 
