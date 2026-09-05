@@ -391,3 +391,165 @@ assert_volume_names() {
 	assert_fails grep -q '^MACKAS_MEMORY=' "$PROJDIR/proj.conf"
 	grep -q 'keep-me' "$PROJDIR/proj.conf"
 }
+
+# ---------------------------------------------------------------------------
+# status names the tier/source
+# ---------------------------------------------------------------------------
+
+@test "derive: status names the source as 'derived from \$PWD', and only then" {
+	pin proj <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	mkdir -p "$ROOT/work/proj"
+	cd "$ROOT/work/proj"
+	run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE '^  selected via +derived from \$PWD$'
+
+	run "$MACKAS" --project proj status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE '^  selected via +--project$'
+
+	MACKAS_PROJECT_SELECT=proj run "$MACKAS" status
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE '^  selected via +\$MACKAS_PROJECT_SELECT$'
+}
+
+# ---------------------------------------------------------------------------
+# The one-line stderr resolution note: exactly once, and not for status/help
+# ---------------------------------------------------------------------------
+
+@test "derive: the resolution note prints exactly once on stderr for runtime-args" {
+	pin proj <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	mkdir -p "$ROOT/work/proj"
+	cd "$ROOT/work/proj"
+	run --separate-stderr "$MACKAS" runtime-args
+	[ "$status" -eq 0 ]
+	local n
+	n="$(printf '%s\n' "$stderr" | grep -c "derived from \$PWD" || true)"
+	[ "$n" -eq 1 ]
+	printf '%s\n' "$stderr" | grep -q 'proj'
+	printf '%s\n' "$stderr" | grep -q 'mackas-proj-tmp'
+	printf '%s\n' "$stderr" | grep -q 'mackas-proj-dl'
+	printf '%s\n' "$stderr" | grep -q 'mackas-proj-sstate'
+}
+
+@test "derive: the resolution note does NOT print for status (which reports it in its own section instead)" {
+	pin proj <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	mkdir -p "$ROOT/work/proj"
+	cd "$ROOT/work/proj"
+	run --separate-stderr "$MACKAS" status
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$stderr" | grep -q 'derived from \$PWD'
+}
+
+@test "derive: the resolution note does NOT print for --help, which never loads config at all" {
+	pin proj <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	mkdir -p "$ROOT/work/proj"
+	cd "$ROOT/work/proj"
+	run --separate-stderr "$MACKAS" --help
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$stderr" | grep -q 'derived from \$PWD'
+}
+
+# ---------------------------------------------------------------------------
+# destroy/clean's shared-volume refusal fires identically under a derived
+# selection -- one test each, same shape as shared_volume_refusal.bats.
+# ---------------------------------------------------------------------------
+
+mkd() {
+	run "$MACKAS" -y \
+		--set "MACKAS_SHORT_LINK=$TESTDIR/short" \
+		--set MACKAS_RELOCATE_VOLUMES=0 \
+		"$@"
+}
+
+@test "derive: destroy refuses a shared dl volume under a DERIVED selection, exactly as under --project" {
+	pin foo <<-EOF
+	MACKAS_ROOT="$ROOT"
+	MACKAS_VOLUME_DL_NAME="shared-dl"
+	EOF
+	pin bar <<-EOF
+	MACKAS_VOLUME_DL_NAME="shared-dl"
+	EOF
+	mkdir -p "$ROOT/work/foo"
+	have_volume mackas-foo-tmp
+	have_volume shared-dl
+	have_volume mackas-foo-sstate
+	cd "$ROOT/work/foo"
+	mkd destroy
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'bar'
+	printf '%s\n' "$output" | grep -qF 'derived from $PWD'
+	exists_now shared-dl
+}
+
+@test "derive: clean sstate refuses a shared sstate volume under a DERIVED selection" {
+	pin foo <<-EOF
+	MACKAS_ROOT="$ROOT"
+	MACKAS_VOLUME_SSTATE_NAME="shared-sstate"
+	EOF
+	pin bar <<-EOF
+	MACKAS_VOLUME_SSTATE_NAME="shared-sstate"
+	EOF
+	mkdir -p "$ROOT/work/foo"
+	have_volume shared-sstate
+	cd "$ROOT/work/foo"
+	mkd clean sstate
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF 'bar'
+	exists_now shared-sstate
+}
+
+# ---------------------------------------------------------------------------
+# The audited hints read truthfully for a derived selection: no "drop
+# --project NAME" for a selection that was never typed.
+# ---------------------------------------------------------------------------
+
+@test "derive: the shared-volume refusal names the derived source, not '--project'" {
+	pin foo <<-EOF
+	MACKAS_ROOT="$ROOT"
+	MACKAS_VOLUME_DL_NAME="shared-dl"
+	EOF
+	pin bar <<-EOF
+	MACKAS_VOLUME_DL_NAME="shared-dl"
+	EOF
+	mkdir -p "$ROOT/work/foo"
+	have_volume shared-dl
+	cd "$ROOT/work/foo"
+	mkd destroy
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "derived from \$PWD"
+	! printf '%s\n' "$output" | grep -qF -- "under '--project"
+}
+
+@test "derive: project add's 'cannot tell what NAME was already built with' hint says run elsewhere, not 'drop --project NAME'" {
+	# Mirrors project_add.bats' "run under a DIFFERENT project's active
+	# selector, is refused" -- just with the active selector coming from
+	# cwd derivation (standing inside foo's workspace) rather than an
+	# explicit --project other.
+	pin foo <<-EOF
+	MACKAS_ROOT="$ROOT"
+	EOF
+	pin bar <<-'EOF'
+	EOF
+	mkdir -p "$ROOT/work/foo"
+	local bardir="$ROOT/work/bar"
+	mkdir -p "$bardir"
+	( cd "$bardir" && git init -q -b main \
+		&& git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init )
+	cd "$ROOT/work/foo"
+	run "$MACKAS" -y project add bar --from bar
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "cannot tell what 'bar' was already built with"
+	printf '%s\n' "$output" | grep -qi 'run from outside this workspace'
+	! printf '%s\n' "$output" | grep -qF "drop '--project"
+	# Nothing was appended to bar's already-pinned (empty) config.
+	[ ! -s "$PROJDIR/bar.conf" ]
+}
