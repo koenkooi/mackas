@@ -561,6 +561,7 @@ Which file gets sourced, first match wins:
 |---|---|
 | `--config FILE` / `$MACKAS_CONF` | a path, named outright |
 | `--project NAME` / `$MACKAS_PROJECT_SELECT` | `~/.config/mackas/projects/NAME.conf` |
+| *(derived from `$PWD`, or from a hand-typed kas chain)* | whichever pinned project's workspace you are standing in |
 | `~/.config/mackas/config` | |
 | `~/.mackas.conf` | |
 
@@ -586,6 +587,69 @@ setting: `mackas set` will not write it, and it takes no part in the config
 file's own resolution. Naming a path and selecting a project are mutually
 exclusive; combining them is refused rather than ranked, because silently
 ignoring either one is how you build against a project you did not mean.
+
+When neither an explicit selector nor an explicit path names a file, mackas
+tries one more thing before falling back to the search path: it derives a
+selection from where you are standing. It takes the *physical* `$PWD`
+(`pwd -P`, so a symlinked short link such as `~/oe` resolves the same way on
+both sides), and for every already-pinned project's config it **greps** —
+never sources — the file for `MACKAS_ROOT`, forming
+`<that root>/work/<the config's own name>` (the config's filename, not
+whatever `MACKAS_PROJECT_DIR` it sets — volume identity keys off the selector
+name alone) and resolving *that* physically too. If `$PWD` equals or sits
+under exactly one such candidate, that project is selected through the exact
+same strict path `--project` uses (the ownership check below included) —
+inference only ever picks among identities you already pinned, it never
+invents one, and a bare `work/foo` directory with no `foo.conf` decides
+nothing. Zero matches falls straight through to the search path, byte-
+identical to a build with no derivation at all. More than one match — only
+reachable by deliberately nesting one pinned root's `work/` inside another's —
+is refused, listing every candidate and pointing at `--project NAME` to break
+the tie; it is never guessed. A `MACKAS_ROOT` that is not an absolute path
+(relative, `~`, `$HOME`, a command substitution) is simply not a candidate —
+it is printed by the grep, never evaluated or expanded. And a pinned config
+this process cannot even read is *not* silently skipped while a selection is
+being made: it could have been the match, so mackas dies naming the file
+rather than guess "no". A derived path under a predictable, guessable
+location is an ambush surface, not a request — the same reasoning that makes
+`--project` itself stricter than `--config` below.
+
+Standing in `work/` itself and hand-typing a `kas-container build
+<layer>/kas/base.yml:...` defeats derivation from `$PWD` alone — `$PWD` there
+is `work/`, the parent of every checkout, not any one project's own
+directory. For exactly that case the generated wrapper also hands mackas the
+chain's own leading path component (only when every colon-separated entry is
+relative and agrees on it), and mackas tries `<physical $PWD>/<that
+component>` as a second candidate the same way, only once `$PWD` alone found
+nothing.
+
+Whenever this derivation is what selects a project, mackas prints one line to
+stderr the first time — naming the project, what it was derived from, and the
+three resolved volume names — so a build run from inside a workspace never
+mounts a different project's volumes with no visible trace. `./mackas status`
+shows the same fact in its own "selected via" line (`--project`,
+`$MACKAS_PROJECT_SELECT`, "derived from `$PWD`", or "derived from the kas
+chain"), and `./mackas projects` flags a pin whose `work/<name>` has gone
+missing — moved or renamed — the same way it flags a pin whose `MACKAS_ROOT`
+itself is gone: identity is never re-minted from whatever *is* on disk, so
+the fix is to move the checkout back or drop the pin, never for mackas to
+guess a new one.
+
+A workspace renamed or moved after being pinned simply stops matching — it
+falls through to tier 4 exactly as an unpinned checkout always has, never
+re-derived from the new name. And the generated `kas-container` wrapper
+itself replays the pin it was built under (via `$MACKAS_PROJECT_SELECT`) so
+that more than one in-root project can share one wrapper; if the directory
+(or kas chain) a hand-typed build actually runs from derives a *different*
+single pinned project than the one the wrapper was built for, mackas refuses
+rather than silently handing that build the wrong project's volumes under the
+wrapper's own frozen work dir — naming both projects and how to fix it
+(re-run `setup` under the right one, or use that project's own `mackas`
+commands instead of the hand-typed `kas-container`). A derived selection is
+also never baked into a *generated* wrapper: `mackas setup` run from inside a
+derived workspace still creates that project's volumes, but leaves the
+wrapper's own pin empty, so derivation keeps deciding on every call rather
+than freezing to whatever directory `setup` happened to run from.
 
 A `--project` file is held to the same ownership check a *searched* config
 is (a regular file, yours or root's, not group/world-writable, file and
