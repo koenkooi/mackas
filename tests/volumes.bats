@@ -898,6 +898,17 @@ with_project_fragment() {
 	touch "$MACKAS_KAS_FRAGMENT_REPO"
 }
 
+# with_project_fragment_selected -- like with_project_fragment, but the
+# project is also PINNED AND SELECTED (PROJECT_SELECTED set before
+# derive_paths), the M6 (#80 item 3) layout: MACKAS_ENV_SH becomes
+# env-meta-angstrom.sh and MACKAS_WORK becomes the per-project workspace
+# work/meta-angstrom (not the flat work/), with the config checkout at
+# work/meta-angstrom/meta-angstrom.
+with_project_fragment_selected() {
+	PROJECT_SELECTED="meta-angstrom"
+	with_project_fragment
+}
+
 @test "kas-container function: delegates to the wrapper -- one call, FRAGMENT_DONE=1, fragment appended, project derived into the calling shell" {
 	# The end-to-end proof that the simplified tail still gets both of this
 	# function's genuinely-own jobs done (fragment-append, project derivation)
@@ -1248,6 +1259,75 @@ derived() {
 	got="$(cd "$MACKAS_WORK" && /bin/zsh -c '
 		. "$1" >/dev/null 2>&1
 		kas-container shell meta-angstrom/kas/angstrom.yml >/dev/null 2>&1
+		printf "%s|%s" "$MACKAS_PROJECT_DIR" "$MACKAS_KAS_CONFIG"' _ "$MACKAS_ENV_SH")"
+	[ "$got" = "meta-angstrom|kas/angstrom.yml" ]
+}
+
+# ---------------------------------------------------------------------------
+# _mackas_derive_project's THIRD cwd case (M6, #80 item 3): cwd is the flat
+# work ROOT, with a project pinned and selected. The chain's first component
+# names the WORKSPACE, its second the CHECKOUT --
+# <name>/<name>/kas/....yml -- #72's "special case for the hand-typed flow",
+# generalised to the two-level per-project layout.
+#
+# This elif is added AFTER the two existing cases (work/ itself, and inside a
+# checkout), never before them: unselected, MACKAS_WORK equals
+# MACKAS_WORK_ROOT, so the work/ case matches first and this one is
+# unreachable dead code -- today's behaviour byte for byte. The two existing
+# compat tests above ("from work/, a single-layer chain..." and "the appended
+# macos-local.yml never lands...", both run WITHOUT a project selected) are
+# the proof of that: they still exercise the same MACKAS_WORK-cwd case,
+# unchanged, and must keep passing exactly as they did before this slice.
+# ---------------------------------------------------------------------------
+
+@test "derive: from the flat work root with a project selected, workspace/checkout/... sets PROJECT_DIR and a checkout-relative KAS_CONFIG" {
+	with_project_fragment_selected
+	write_env_sh
+	fake_kas_container
+	chain="meta-angstrom/meta-angstrom/kas/a.yml:meta-angstrom/meta-angstrom/kas/b.yml"
+	[ "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK_ROOT" shell "$chain")" = "meta-angstrom" ]
+	[ "$(derived MACKAS_KAS_CONFIG "$MACKAS_WORK_ROOT" shell "$chain")" = "kas/a.yml:kas/b.yml" ]
+}
+
+@test "derive: standing in the workspace itself still derives correctly once a project is selected" {
+	# Case 1 (cwd = MACKAS_WORK) must keep working once MACKAS_WORK has become
+	# the per-project workspace rather than the flat root.
+	with_project_fragment_selected
+	write_env_sh
+	fake_kas_container
+	chain="meta-angstrom/kas/a.yml:meta-angstrom/kas/b.yml"
+	[ "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK" shell "$chain")" = "meta-angstrom" ]
+	[ "$(derived MACKAS_KAS_CONFIG "$MACKAS_WORK" shell "$chain")" = "kas/a.yml:kas/b.yml" ]
+}
+
+@test "derive: from the flat work root, a chain naming a DIFFERENT workspace derives nothing" {
+	# The sourced env-meta-angstrom.sh is for the meta-angstrom workspace; a
+	# chain starting with a sibling workspace's name is not something this
+	# shell can resolve -- same fail-closed rule as the sibling-checkout
+	# refusal in the work/ case.
+	with_project_fragment_selected
+	write_env_sh
+	fake_kas_container
+	chain="other-project/meta-angstrom/kas/a.yml"
+	[ -z "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK_ROOT" shell "$chain")" ]
+}
+
+@test "derive: from the flat work root, a chain spanning two checkouts in ONE workspace derives nothing" {
+	with_project_fragment_selected
+	write_env_sh
+	fake_kas_container
+	chain="meta-angstrom/meta-angstrom/kas/a.yml:meta-angstrom/other-checkout/kas/b.yml"
+	[ -z "$(derived MACKAS_PROJECT_DIR "$MACKAS_WORK_ROOT" shell "$chain")" ]
+	[ -z "$(derived MACKAS_KAS_CONFIG "$MACKAS_WORK_ROOT" shell "$chain")" ]
+}
+
+@test "derive: zsh sourcing env-<name>.sh from the flat work root derives the same values as bash" {
+	with_project_fragment_selected
+	write_env_sh
+	fake_kas_container
+	got="$(cd "$MACKAS_WORK_ROOT" && /bin/zsh -c '
+		. "$1" >/dev/null 2>&1
+		kas-container shell meta-angstrom/meta-angstrom/kas/angstrom.yml >/dev/null 2>&1
 		printf "%s|%s" "$MACKAS_PROJECT_DIR" "$MACKAS_KAS_CONFIG"' _ "$MACKAS_ENV_SH")"
 	[ "$got" = "meta-angstrom|kas/angstrom.yml" ]
 }
