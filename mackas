@@ -2168,6 +2168,7 @@ derive_paths() {
 		MACKAS_DL_MIRROR_PATH="${MACKAS_DL_MIRROR_PATH:-}"
 		MACKAS_BASE=""
 		MACKAS_BIN=""; MACKAS_WORK=""; MACKAS_WORK_ROOT=""; MACKAS_KAS=""; MACKAS_LOGS=""
+		MACKAS_REPO_REF_DIR=""
 		MACKAS_PROJECT=""; MACKAS_ENV_SH=""; MACKAS_GITCONFIG=""
 		KAS_CONTAINER_BIN=""; KAS_CONTAINER_REAL=""; SHIM_DIR=""
 		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
@@ -2221,13 +2222,25 @@ derive_paths() {
 
 	MACKAS_BIN="$MACKAS_BASE/bin"
 	# MACKAS_WORK_ROOT is the flat work root, always -- $MACKAS_BASE/work,
-	# selected or not. MACKAS_WORK is "what KAS_WORK_DIR is": today it is
-	# just an alias of the root (this slice makes zero behaviour change),
-	# but a later slice scopes it per-project while the root stays flat, so
-	# work/repo-ref and project-add's workspace math can hang off the root
-	# even once MACKAS_WORK itself no longer means that.
+	# selected or not. work/repo-ref and project-add's workspace math hang
+	# off the root even though MACKAS_WORK itself no longer means that.
+	#
+	# MACKAS_WORK is "what KAS_WORK_DIR is". Selected -> work/<name>, its own
+	# per-project workspace, so MACKAS_PROJECT below yields work/<name>/<name>
+	# for the config checkout -- #72's documented layout, no change to that
+	# formula needed. Unselected, this must stay exactly $MACKAS_BASE/work,
+	# flat -- #79's backward-compatibility rule, same gate as MACKAS_LOGS/
+	# MACKAS_ENV_SH/MACKAS_KAS_FRAGMENT_SRC below.
 	MACKAS_WORK_ROOT="$MACKAS_BASE/work"
 	MACKAS_WORK="$MACKAS_WORK_ROOT"
+	if [ -n "$PROJECT_SELECTED" ]; then
+		MACKAS_WORK="$MACKAS_WORK_ROOT/$PROJECT_SELECTED"
+	fi
+	# Always empty this slice -- a later slice (M6-6) gives it a value once a
+	# project is selected. Declared now so cmd_runtime_args' --emit-dirs and
+	# kas_invoke_env()'s ensure-step have a variable to read from day one,
+	# rather than each growing its own separate follow-up edit.
+	MACKAS_REPO_REF_DIR=""
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
 	# Selected -> logs/<name>, so two pinned projects on one MACKAS_ROOT never
@@ -5479,9 +5492,9 @@ _mackas_kas_files="\$(_mackas_kas_files_scan "\$@")"
 # bare assignment discards.
 _mackas_rt_rc=0
 if [ -n "\$_mackas_kas_files" ]; then
-	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK_ROOT" --kas-files "\$_mackas_kas_files")" || _mackas_rt_rc=\$?
+	_mackas_rt_all="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK_ROOT" --kas-files "\$_mackas_kas_files" --emit-dirs)" || _mackas_rt_rc=\$?
 else
-	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK_ROOT")" || _mackas_rt_rc=\$?
+	_mackas_rt_all="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK_ROOT" --emit-dirs)" || _mackas_rt_rc=\$?
 fi
 
 # FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
@@ -5496,6 +5509,40 @@ if [ "\$_mackas_rt_rc" -ne 0 ]; then
 	echo "\$SCRIPT_NAME: refusing to launch kas-container -- '\$SCRIPT_NAME runtime-args' exited \$_mackas_rt_rc (its message is above)" >&2
 	echo "\$SCRIPT_NAME: not falling back to the values baked in at setup time: they may name volumes this build must not touch" >&2
 	exit 1
+fi
+
+# --emit-dirs answers three lines from the ONE call above: the --runtime-args
+# string, then KAS_WORK_DIR, then KAS_REPO_REF_DIR -- one resolution, so the
+# work dir, the repo-ref store and the volume names it just validated cannot
+# disagree the way separate subprocess calls could race to. sed -n 'Np', not
+# an array (POSIX sh has none): fixed line numbers, matching the fixed order
+# cmd_runtime_args --emit-dirs always prints them in.
+rt="\$(printf '%s\n' "\$_mackas_rt_all" | sed -n '1p')"
+_mackas_wd_line="\$(printf '%s\n' "\$_mackas_rt_all" | sed -n '2p')"
+_mackas_rr_line="\$(printf '%s\n' "\$_mackas_rt_all" | sed -n '3p')"
+case "\$_mackas_wd_line" in
+	KAS_WORK_DIR=/*) _mackas_work_dir="\${_mackas_wd_line#KAS_WORK_DIR=}" ;;
+	*)
+		echo "\$SCRIPT_NAME: refusing to launch kas-container -- 'runtime-args --emit-dirs' returned no KAS_WORK_DIR line" >&2
+		echo "\$SCRIPT_NAME: next: \$SCRIPT_NAME setup   # reinstalls the wrapper against this \$SCRIPT_NAME" >&2
+		exit 1
+		;;
+esac
+case "\$_mackas_rr_line" in
+	KAS_REPO_REF_DIR=*) _mackas_repo_ref="\${_mackas_rr_line#KAS_REPO_REF_DIR=}" ;;
+	*)
+		echo "\$SCRIPT_NAME: refusing to launch kas-container -- 'runtime-args --emit-dirs' returned no KAS_REPO_REF_DIR line" >&2
+		echo "\$SCRIPT_NAME: next: \$SCRIPT_NAME setup   # reinstalls the wrapper against this \$SCRIPT_NAME" >&2
+		exit 1
+		;;
+esac
+# Empty is legal (no project selected, or this slice's always-empty value) --
+# forward_dir() treats an empty KAS_REPO_REF_DIR as "not set" and mounts
+# nothing. A non-empty value must exist as a real directory before the real
+# kas-container starts, or ITS check_and_expand fails with a message naming a
+# path the caller never typed.
+if [ -n "\$_mackas_repo_ref" ]; then
+	mkdir -p "\$_mackas_repo_ref" || { echo "\$SCRIPT_NAME: could not create the shared git reference store \$_mackas_repo_ref" >&2; exit 1; }
 fi
 
 # Validate the string that is about to be used: it must be non-empty and
@@ -5552,7 +5599,8 @@ fi
 exec env PATH="\$SHIM_DIR:\$BREW_BIN:\$PATH" \\
 	MACKAS_KAS_WRAPPED=1 \\
 	KAS_CONTAINER_ENGINE=$MACKAS_KAS_ENGINE \\
-	KAS_WORK_DIR="\$MACKAS_WORK_ROOT" \\
+	KAS_WORK_DIR="\$_mackas_work_dir" \\
+	KAS_REPO_REF_DIR="\$_mackas_repo_ref" \\
 	KAS_CONTAINER_IMAGE="\$KAS_IMAGE" \\
 	GITCONFIG_FILE="\${GITCONFIG_FILE:-\$MACKAS_GITCONFIG}" \\
 	KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
@@ -5562,7 +5610,38 @@ EOF
 	did "wrote $KAS_CONTAINER_BIN"
 }
 
+# legacy_layout_checkout -- prints the pre-M6 flat checkout path and returns
+# 0 when this pinned project is one of those: its config checkout still sits
+# at $MACKAS_WORK_ROOT/<dir> (the layout every project used before per-project
+# KAS_WORK_DIR existed), rather than at $MACKAS_PROJECT (work/<name>/<dir>,
+# the post-M6 stutter). Returns 1 -- silently, nothing printed -- for every
+# other case: no project selected, no MACKAS_PROJECT_DIR pinned, the new-shape
+# checkout already exists (already converted, or never in the old shape to
+# begin with), or the old-shape path is not actually there either.
+legacy_layout_checkout() {
+	[ -n "$PROJECT_SELECTED" ] || return 1
+	[ -n "$MACKAS_PROJECT_DIR" ] || return 1
+	if [ -d "$MACKAS_PROJECT/.git" ]; then return 1; fi
+	[ -d "$MACKAS_WORK_ROOT/$MACKAS_PROJECT_DIR/.git" ] || return 1
+	printf '%s\n' "$MACKAS_WORK_ROOT/$MACKAS_PROJECT_DIR"
+}
+
+# refuse_legacy_layout -- called from setup_project() and
+# ensure_project_checked_out() before either would see a missing .git at
+# $MACKAS_PROJECT and offer to clone a SECOND copy there. Without this, a
+# project pinned under M3-M5 (checkout at the flat work/<dir>) would look
+# exactly like an unconverted project to those two callers once a project
+# is selected, because $MACKAS_PROJECT now points at work/<name>/<dir> where
+# nothing has been cloned yet.
+refuse_legacy_layout() {
+	local old
+	old="$(legacy_layout_checkout)" || return 0
+	die "'$PROJECT_SELECTED' still uses the pre-M6 flat layout: its checkout is at $old, not $MACKAS_PROJECT" \
+		"$SCRIPT_CMD project add $PROJECT_SELECTED --from $PROJECT_SELECTED   # offers to move it"
+}
+
 setup_project() {
+	refuse_legacy_layout
 	step "project $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH)"
 	if [ -d "$MACKAS_PROJECT/.git" ]; then
 		local br
@@ -6875,6 +6954,13 @@ kas_env_prefix() {
 # are even computed) and for capturing/propagating the exit status.
 kas_invoke_env() {
 	local rt_args="$1" gitconfig="$2" want_build_vars="$3"; shift 3
+	# Always empty this slice, so a no-op -- slice M6-6 gives MACKAS_REPO_REF_DIR
+	# a value once a project is selected, and wires the matching
+	# KAS_REPO_REF_DIR= export into both branches below. Ensuring the directory
+	# exists HERE, not just at 'setup' time, covers every direct call site this
+	# function serves (run_kas, kas_shell_ro, cmd_lock, cmd_dump), the same
+	# reason this function exists at all.
+	[ -n "$MACKAS_REPO_REF_DIR" ] && mkdir -p "$MACKAS_REPO_REF_DIR"
 	if [ "$want_build_vars" = "1" ]; then
 		PATH="$SHIM_DIR:$BREW_BIN:$PATH" \
 		KAS_CONTAINER_ENGINE="$MACKAS_KAS_ENGINE" \
@@ -7526,6 +7612,7 @@ ensure_kas_container_installed() {
 # clone an empty URL.
 ensure_project_checked_out() {
 	[ -d "$MACKAS_PROJECT/.git" ] && return 0
+	refuse_legacy_layout
 	if [ -z "$MACKAS_PROJECT_URL" ]; then
 		die "no project configured (MACKAS_PROJECT_URL is empty)" \
 			"set MACKAS_PROJECT_URL/_BRANCH/_DIR in $(config_hint) (see mackas.conf.example), then re-run"
@@ -10532,7 +10619,7 @@ mounts, mirror mounts if enabled, the live-progress-bridge args if
 MACKAS_MONITOR=1) and nothing else.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR] [--kas-files CHAIN]
+  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR] [--kas-files CHAIN] [--emit-dirs]
 
 Not something you normally run directly: the generated \`kas-container\`
 wrapper calls this itself, once per invocation, so a setting that
@@ -10564,6 +10651,13 @@ if it fails: refuse, naming the volume, when a running container already
 holds one of the three ext4 volumes this string attaches. The wrapper
 passes it on every call, so a hand-typed \`kas-container build\` while a
 build is running is refused exactly as '$SCRIPT_CMD shell' would be.
+
+${C_BLD}--emit-dirs${C_RST} adds two more lines after the runtime-args string itself:
+\`KAS_WORK_DIR=<path>\` and \`KAS_REPO_REF_DIR=<path, possibly empty>\`. The
+generated wrapper passes it so one subprocess answers the work dir, the
+repo-ref store and the volume names together -- they cannot disagree the
+way two separate calls could race to. Without it, output is exactly the
+runtime-args string, byte for byte, as before this flag existed.
 
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted
 but change nothing here -- there is nothing to confirm and nothing dry-run
@@ -10613,7 +10707,7 @@ EOF
 # the wrapper starts the container runtime before it gets here, because
 # volume_in_use() short-circuits to "not in use" with the daemon down.
 cmd_runtime_args() {
-	local want_help=0 require_free=0 expect_work="" kas_files=""
+	local want_help=0 require_free=0 expect_work="" kas_files="" emit_dirs=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
@@ -10622,6 +10716,7 @@ cmd_runtime_args() {
 			--expect-work=*) expect_work="${1#*=}"; [ -n "$expect_work" ] || die "--expect-work needs a DIR"; shift ;;
 			--kas-files) kas_files="${2:-}"; [ -n "$kas_files" ] || die "--kas-files needs a CHAIN"; shift 2 ;;
 			--kas-files=*) kas_files="${1#*=}"; [ -n "$kas_files" ] || die "--kas-files needs a CHAIN"; shift ;;
+			--emit-dirs) emit_dirs=1; shift ;;
 			--dry-run) DRY_RUN=1; shift ;;
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
@@ -10650,6 +10745,31 @@ cmd_runtime_args() {
 	if [ -n "$expect_work" ] && [ "$expect_work" != "$MACKAS_WORK_ROOT" ]; then
 		die "this wrapper was generated for a different configuration" \
 			"$(wrapper_identity_hint "$expect_work")"
+	fi
+
+	# Both gated on a project actually being selected: unselected, KAS_WORK_DIR
+	# is the flat root either way, so a wrapper from before --emit-dirs existed
+	# is still correct there and must keep working byte-identically (#79).
+	#
+	# An old wrapper passes --expect-work alone and reads its own frozen
+	# KAS_WORK_DIR="$MACKAS_WORK_ROOT" -- exactly wrong once a project is
+	# selected, where KAS_WORK_DIR has to be this project's OWN work/<name>,
+	# not the flat root. Catching that HERE, rather than letting the build
+	# proceed against the wrong directory, is what closes the silent-in-place-
+	# upgrade hazard: 'setup' regenerates the wrapper; nothing else does.
+	if [ -n "$PROJECT_SELECTED" ] && [ -n "$expect_work" ] && [ "$emit_dirs" -ne 1 ]; then
+		die "the kas-container wrapper at $KAS_CONTAINER_BIN predates per-project work directories" \
+			"$SCRIPT_CMD --project $PROJECT_SELECTED setup"
+	fi
+
+	# The wrapper's mkdir -p "$MACKAS_WORK" only runs from 'setup'/'project add'
+	# paths -- a selected project whose workspace was never created (or was
+	# removed by hand) would otherwise sail through as an empty KAS_WORK_DIR,
+	# and kas-container's own error for that ("Variable KAS_WORK_DIR set, but
+	# ... is not a directory") names a path the caller never typed.
+	if [ -n "$PROJECT_SELECTED" ] && [ "$emit_dirs" -eq 1 ] && [ ! -d "$MACKAS_WORK" ]; then
+		die "'$PROJECT_SELECTED's work directory does not exist yet: $MACKAS_WORK" \
+			"$SCRIPT_CMD --project $PROJECT_SELECTED setup"
 	fi
 
 	# #78: the wrapper replays the pin it was generated under (tier 2, via
@@ -10713,6 +10833,17 @@ cmd_runtime_args() {
 	fi
 
 	printf '%s\n' "$(kas_runtime_args)"
+
+	# --emit-dirs: two more lines, always in this order, so the wrapper's
+	# fixed-line parser (sed -n '2p'/'3p') never has to guess. One resolution
+	# answers volumes, work dir AND repo-ref together, so they cannot disagree
+	# the way two separate subprocess calls could race to. MACKAS_REPO_REF_DIR
+	# is always empty this slice; a later slice gives it a value once a
+	# project is selected.
+	if [ "$emit_dirs" -eq 1 ]; then
+		printf 'KAS_WORK_DIR=%s\n' "$MACKAS_WORK"
+		printf 'KAS_REPO_REF_DIR=%s\n' "$MACKAS_REPO_REF_DIR"
+	fi
 }
 
 # refuse_shared_volume NAME LABEL -- #72: under a project selector, destroy
