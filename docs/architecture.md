@@ -507,6 +507,13 @@ rather than `MACKAS_ROOT`, which matters once a
 [workspace image](storage.md#the-workspace-image) is mounted there: `work/`
 is then case-sensitive while `MACKAS_ROOT`'s own filesystem is not.
 
+Once a project is selected, `KAS_WORK_DIR` narrows to `work/<name>/`, a
+subdirectory of this same tree, not the whole thing — every pinned project's
+workspace still lands somewhere under the one case-sensitive `work/`, so
+nothing here changes: `setup` still probes (and, on a case-insensitive drive,
+mounts an image at) the literal `MACKAS_ROOT/work`, once per root, regardless
+of how many projects are pinned under it or which one is selected.
+
 An image mounted at `work/` is state mackas re-establishes rather than
 assumes, because `hdiutil attach` does not survive a reboot.
 `MACKAS_WORKSPACE_IMAGE` records the image; every command that touches

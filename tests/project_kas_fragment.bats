@@ -85,10 +85,14 @@ teardown() {
 @test "derive: the in-checkout copy stays kas/macos-local.yml regardless of selection" {
 	# MACKAS_KAS_FRAGMENT_REPO names a file INSIDE one project's own checkout
 	# -- there is only ever one project per checkout, so it needs no project
-	# component and must not grow one.
+	# component and must not grow one. The DIRECTORY it hangs off does change
+	# once selected (M6, #80: MACKAS_PROJECT becomes work/<selected>/<dir>,
+	# not the flat work/<dir>) -- that is MACKAS_PROJECT's own contract, not
+	# this fragment-naming one, so the basename check below is the real
+	# assertion this test exists to make.
 	PROJECT_SELECTED="meta-qcom"
 	derive_paths
-	[ "$MACKAS_KAS_FRAGMENT_REPO" = "$TESTDIR/work/meta-ai/kas/macos-local.yml" ]
+	[ "$MACKAS_KAS_FRAGMENT_REPO" = "$TESTDIR/work/meta-qcom/meta-ai/kas/macos-local.yml" ]
 	[ "$(basename "$MACKAS_KAS_FRAGMENT_REPO")" = "macos-local.yml" ]
 }
 
