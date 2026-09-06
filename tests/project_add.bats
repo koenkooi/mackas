@@ -2,7 +2,7 @@
 #
 # Tests for `mackas project add <name> [--url URL --branch BRANCH |
 # --from <checkout>]` -- the in-root sibling of `adopt`: it pins a project
-# workspace under THIS Mac's own MACKAS_ROOT (creating $MACKAS_WORK/<name>/
+# workspace under THIS Mac's own MACKAS_ROOT (creating $MACKAS_WORK_ROOT/<name>/
 # and a standalone config at ~/.config/mackas/projects/<name>.conf), instead
 # of adopting a whole foreign root. See #72/#77.
 #
@@ -104,6 +104,30 @@ assert_volumes() {
 	# No volume-name override: nothing pinned one explicitly, so it is left
 	# to derive mackas-demo-* once --project demo selects this file.
 	! grep -q '^MACKAS_VOLUME_NAME=' "$PROJDIR/demo.conf"
+}
+
+# ---------------------------------------------------------------------------
+# M6 (#80) slice 2: workspace_dir and the bare-name --from arm must resolve
+# through MACKAS_WORK_ROOT (the flat work root), not MACKAS_WORK -- a later
+# slice scopes MACKAS_WORK to the SELECTED project's own KAS_WORK_DIR, while
+# MACKAS_WORK_ROOT stays the flat root. Getting this backwards is silent:
+# under an active --project A selector, 'project add B' would create
+# work/A/B and pin MACKAS_PROJECT_DIR=B (whose derived checkout is
+# work/B/B) -- the directory created and the directory pinned diverge, with
+# no error.
+#
+# This slice keeps MACKAS_WORK an exact alias of MACKAS_WORK_ROOT (zero
+# behaviour change -- see multi_project_compat.bats), so no runtime output
+# can yet tell the two variables apart -- an assertion built on 'project
+# add's output would pass identically whichever one line 6379/6397 actually
+# read, which is exactly the vacuous-test trap AGENTS.md warns against.
+# Source-grep is the honest test for logic a bats run cannot yet exercise
+# differently (same rule as set -e-guarded logic).
+# ---------------------------------------------------------------------------
+
+@test "project add: workspace_dir and the bare-name --from arm read MACKAS_WORK_ROOT (source-grep, M6 forward-compat)" {
+	grep -qF 'workspace_dir="$MACKAS_WORK_ROOT/$name"' "$MACKAS"
+	grep -qF 'from_resolved="$(resolve_path "$MACKAS_WORK_ROOT/$from")"' "$MACKAS"
 }
 
 @test "project add --url without --branch is refused" {
