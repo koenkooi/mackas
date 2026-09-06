@@ -286,11 +286,25 @@ The rules are deliberately narrow, because a *wrong* derivation is worse
 than none — it produces a config that parses and then resolves against the
 wrong tree:
 
-- **From `work/`** (the documented cwd), the first colon-entry's leading path
-  component names the checkout; it is stripped from every entry to give the
-  checkout-relative form `compose_kas_files()` expects.
-- **From inside a checkout** (`$PWD`'s parent is `work/`), the entries are
-  already relative and the directory name is the project.
+- **From the workspace** (`work/` when no project is selected, or
+  `work/<name>/` once one is — the documented cwd either way), the first
+  colon-entry's leading path component names the checkout; it is stripped
+  from every entry to give the checkout-relative form `compose_kas_files()`
+  expects.
+- **From inside a checkout** (`$PWD`'s parent is the workspace), the entries
+  are already relative and the directory name is the project.
+- **From the flat work ROOT, once a project is selected** (`work/` itself,
+  one level above `work/<name>/` — #80 item 3), the chain names the
+  workspace *and* the checkout: the first colon-entry's first TWO path
+  components are the workspace then the checkout, e.g.
+  `<name>/<name>/kas/base.yml`, both stripped from every entry. This case
+  only exists once `MACKAS_WORK_ROOT` differs from `MACKAS_WORK` (a project
+  selected); unselected, the two are the same directory and the "from the
+  workspace" case above matches first, exactly as before per-project
+  `KAS_WORK_DIR` existed. A chain whose first component names a *different*
+  workspace than the one the sourced `env-<name>.sh` was generated for
+  derives nothing — the sourced shell cannot resolve a sibling project's
+  checkout.
 - **A chain spanning sibling layers** (`meta-angstrom/…:meta-ti/…`) derives
   **nothing at all**. mackas commands `cd` into one checkout, so a sibling
   falls outside kas's `/repo` mount — there is no checkout-relative form to
