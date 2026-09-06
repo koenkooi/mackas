@@ -151,6 +151,70 @@ assert_default_volume_names() {
 }
 
 # ---------------------------------------------------------------------------
+# M6 (#80) is about to split MACKAS_WORK's meaning (today "the flat work
+# root" and "what KAS_WORK_DIR is" at once) so a per-project workspace can
+# exist without work/repo-ref -- a new SIBLING of every per-project work
+# dir -- having nowhere to hang off. Same drill as M3/M4/M5 before it: the
+# unselected contract, pinned FIRST, before any M6 feature code. These four
+# add the internal-variable and kas_env_vars() angle the black-box test
+# above does not reach; do not relax any of them to make M6 land.
+# ---------------------------------------------------------------------------
+
+@test "compat: no selector -- work/ stays flat (internal variables): MACKAS_WORK and MACKAS_PROJECT" {
+	MACKAS_LIB_ONLY=1
+	export MACKAS_LIB_ONLY
+	# shellcheck disable=SC1090
+	. "$MACKAS"
+	SCRIPT_NAME="mackas"
+	setup_colors
+	set_defaults
+	MACKAS_ROOT="$ROOT"
+	MACKAS_PROJECT_DIR="meta-ai"
+	derive_paths
+	[ "$MACKAS_WORK" = "$ROOT/work" ]
+	[ "$MACKAS_PROJECT" = "$ROOT/work/meta-ai" ]
+}
+
+# The case that regresses first if MACKAS_WORK is ever keyed off anything
+# other than the selector: pinned configs on disk, present but unselected,
+# must not perturb work/'s flat layout -- same reasoning as section 2 below,
+# applied to MACKAS_WORK/MACKAS_PROJECT instead of volume names.
+@test "compat: no selector, two pinned configs on disk -- work/ still stays flat" {
+	pin meta-ai <<-'EOF'
+	MACKAS_KAS_CONFIG="kas/from-pin.yml"
+	EOF
+	pin another-project <<-'EOF'
+	MACKAS_MEMORY="8g"
+	EOF
+	mk_status --set MACKAS_PROJECT_DIR=meta-ai
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qE "^  kas work dir +${ROOT}/work\$"
+	printf '%s\n' "$output" | grep -qE "^  project checkout +${ROOT}/work/meta-ai\$"
+}
+
+@test "compat: no selector -- kas_env_vars emits KAS_WORK_DIR=<base>/work and no KAS_REPO_REF_DIR field" {
+	MACKAS_LIB_ONLY=1
+	export MACKAS_LIB_ONLY
+	# shellcheck disable=SC1090
+	. "$MACKAS"
+	SCRIPT_NAME="mackas"
+	setup_colors
+	set_defaults
+	MACKAS_ROOT="$ROOT"
+	MACKAS_PROJECT_DIR="meta-ai"
+	derive_paths
+	out="$(kas_env_vars 1)"
+	printf '%s\n' "$out" | grep -qF "KAS_WORK_DIR=$ROOT/work"
+	# Written the AGENTS.md way, never `grep -qv` for absence (that passes on
+	# any multi-line input): this is true TODAY, because the field is absent
+	# entirely, and stays true once M6 lands, because the field is present
+	# but blanked (KAS_REPO_REF_DIR= , same pattern as KAS_BUILD_DIR/DL_DIR/
+	# SSTATE_DIR already blanked on this same line) -- so it never needs
+	# relaxing either way.
+	! printf '%s\n' "$out" | grep -qE 'KAS_REPO_REF_DIR=[^ ]'
+}
+
+# ---------------------------------------------------------------------------
 # 2. Pinned configs EXIST in projects_dir(), but none is selected. This is
 #    the case that will actually regress the moment M3 wires the selector
 #    into volume-name derivation: merely having pinned SOMETHING must not
