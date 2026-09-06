@@ -30,7 +30,12 @@ setup() {
 	mkdir -p "$PROJDIR"
 
 	ROOT="$TESTDIR/oe"
-	mkdir -p "$ROOT/bin" "$ROOT/work/meta-qcom/.git" "$ROOT/work/meta-angstrom/.git"
+	# work/<name>/<name>/, not the pre-M6 flat work/<name>/ -- once a project
+	# is selected, work/<name>/ is that project's own KAS_WORK_DIR and the
+	# config checkout stutters one level deeper (M6, #80). A flat checkout
+	# here would trip refuse_legacy_layout() and this file is not testing
+	# that -- see tests/project_work_dir.bats for the legacy-layout coverage.
+	mkdir -p "$ROOT/bin" "$ROOT/work/meta-qcom/meta-qcom/.git" "$ROOT/work/meta-angstrom/meta-angstrom/.git"
 	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
 
 	# kas-container.real: records every argv line and, for a `dump` call,

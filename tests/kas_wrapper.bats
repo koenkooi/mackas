@@ -123,18 +123,27 @@ teardown() {
 # Harness helpers
 # ---------------------------------------------------------------------------
 
-# write_self_stub OUTPUT EXITCODE [STDERR] -- (re)write the fake MACKAS_SELF
-# binary: answers "runtime-args" with OUTPUT on stdout, STDERR (if given) on
-# stderr, and exits EXITCODE; refuses anything else. Every call's argv, and
-# the $MACKAS_PROJECT_SELECT it was handed, are appended to $SELF_REC, so a
-# test can assert WHICH flags and WHICH project the wrapper passed. The
-# '<unset>' marker keeps "never passed" distinguishable from "passed empty",
-# which is the whole difference between inheriting the calling shell's
-# selector and overriding it.
+# write_self_stub OUTPUT EXITCODE [STDERR] [MODE] -- (re)write the fake
+# MACKAS_SELF binary: answers "runtime-args" with OUTPUT on stdout, STDERR (if
+# given) on stderr, and exits EXITCODE; refuses anything else. Every call's
+# argv, and the $MACKAS_PROJECT_SELECT it was handed, are appended to
+# $SELF_REC, so a test can assert WHICH flags and WHICH project the wrapper
+# passed. The '<unset>' marker keeps "never passed" distinguishable from
+# "passed empty", which is the whole difference between inheriting the
+# calling shell's selector and overriding it.
+#
+# MODE "full" (the default, and what every pre-existing test in this file
+# relies on) answers the wrapper's own --emit-dirs contract: OUTPUT, then a
+# KAS_WORK_DIR= line, then a KAS_REPO_REF_DIR= line -- exactly what a real
+# 'runtime-args --emit-dirs' prints, since the wrapper passes that flag on
+# every call (M6, #80). MODE "one" answers with OUTPUT alone, no second or
+# third line at all -- simulating a stale MACKAS_SELF that predates
+# --emit-dirs, for the wrapper's own line-parsing refusal test below.
+#
 # Does NOT regenerate the wrapper -- MACKAS_SELF is a fixed path baked in
 # once; only its CONTENT changes here.
 write_self_stub() {
-	local output="$1" exitcode="${2:-0}" errmsg="${3:-}"
+	local output="$1" exitcode="${2:-0}" errmsg="${3:-}" mode="${4:-full}"
 	{
 		printf '#!/usr/bin/env bash\n'
 		printf 'printf "ARGV:%%s\\n" "$*" >> "$SELF_REC"\n'
@@ -144,6 +153,12 @@ write_self_stub() {
 			printf '\tprintf "%%s\\n" %s >&2\n' "$(printf '%q' "$errmsg")"
 		fi
 		printf '\tprintf %%s %s\n' "$(printf '%q' "$output")"
+		if [ "$mode" = "full" ]; then
+			printf '\techo\n'
+			printf '\tprintf %%s %s\n' "$(printf '%q' "KAS_WORK_DIR=$MACKAS_WORK")"
+			printf '\techo\n'
+			printf '\tprintf %%s %s\n' "$(printf '%q' "KAS_REPO_REF_DIR=$MACKAS_REPO_REF_DIR")"
+		fi
 		printf '\texit %s\n' "$exitcode"
 		printf 'fi\n'
 		printf 'exit 1\n'
@@ -717,6 +732,64 @@ rec_runtime_args_value() {
 	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
 	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
 	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+# ---------------------------------------------------------------------------
+# 13: --emit-dirs (M6, #80). The live recompute answers KAS_WORK_DIR and
+# KAS_REPO_REF_DIR as lines 2 and 3, and the wrapper's own fixed-line parser
+# (sed -n '2p'/'3p') reads them into the final exec -- KAS_WORK_DIR is no
+# longer the frozen MACKAS_WORK_ROOT baked in at generation time.
+# ---------------------------------------------------------------------------
+
+@test "--emit-dirs: the wrapper always passes it on the live recompute" {
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qF -- '--emit-dirs' "$SELF_REC"
+}
+
+@test "--emit-dirs: KAS_WORK_DIR and KAS_REPO_REF_DIR from the recompute reach the recorder's environment" {
+	write_self_stub "$(kas_runtime_args)" 0 "" full
+	# Override the values a fresh write_self_stub would otherwise bake in
+	# (MACKAS_WORK/MACKAS_REPO_REF_DIR at call time) with test-distinguishable
+	# ones, so this proves the wrapper THREADS THEM THROUGH rather than
+	# happening to match by construction.
+	printf '#!/usr/bin/env bash\nprintf "ARGV:%%s\\n" "$*" >> "$SELF_REC"\nprintf "SEL:%%s\\n" "${MACKAS_PROJECT_SELECT-<unset>}" >> "$SELF_REC"\nif [ "$1" = "runtime-args" ]; then\n\tprintf %%s %s\n\techo\n\tprintf %%s %s\n\techo\n\tprintf %%s %s\n\texit 0\nfi\nexit 1\n' \
+		"$(printf '%q' "$(kas_runtime_args)")" \
+		"$(printf '%q' "KAS_WORK_DIR=$TESTDIR/distinguishable-work")" \
+		"$(printf '%q' "KAS_REPO_REF_DIR=$TESTDIR/distinguishable-repo-ref")" \
+		> "$SELF_STUB"
+	mkdir -p "$TESTDIR/distinguishable-work"
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ "$(rec_env_var KAS_WORK_DIR)" = "$TESTDIR/distinguishable-work" ]
+	[ "$(rec_env_var KAS_REPO_REF_DIR)" = "$TESTDIR/distinguishable-repo-ref" ]
+	# And the wrapper created the repo-ref dir itself, on the caller's behalf --
+	# kas-container's own check_and_expand fatal-errors on a non-empty
+	# KAS_REPO_REF_DIR that is not a real directory before any container starts.
+	[ -d "$TESTDIR/distinguishable-repo-ref" ]
+}
+
+@test "--emit-dirs: an empty KAS_REPO_REF_DIR line is passed through empty, no directory created" {
+	# The default stub (mode 'full') answers "KAS_REPO_REF_DIR=\$MACKAS_REPO_REF_DIR",
+	# which is always empty this slice -- see lib_setup, no PROJECT_SELECTED.
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	rec_env | grep -qxF 'KAS_REPO_REF_DIR='
+}
+
+@test "--emit-dirs: a MACKAS_SELF that predates it (one line only) makes the wrapper refuse, recorder never created" {
+	write_self_stub "$(kas_runtime_args)" 0 "" one
+	[ ! -e "$KREC" ]
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'refusing to launch'
+	printf '%s\n' "$out" | grep -qF 'no KAS_WORK_DIR line'
+	printf '%s\n' "$out" | grep -qF 'mackas setup'
+	[ ! -e "$KREC" ]
 }
 
 # The wrapper freezes MACKAS_WORK_ROOT/KAS_IMAGE/gitconfig but recomputes
