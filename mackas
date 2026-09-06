@@ -1898,7 +1898,7 @@ EOF
 }
 
 cmd_projects() {
-	local dir name f v s root found=0
+	local dir name f v s root pdir found=0
 	dir="$(projects_dir)"
 	hdr "Pinned projects"
 	show "directory" "$dir"
@@ -1912,11 +1912,12 @@ cmd_projects() {
 		else
 			printf '  %s%s%s\n' "$C_BLD" "$name" "$C_RST"
 		fi
-		root=""
+		root=""; pdir=""
 		for s in MACKAS_ROOT MACKAS_PROJECT_DIR MACKAS_VOLUME_NAME \
 		         MACKAS_VOLUME_DL_NAME MACKAS_VOLUME_SSTATE_NAME; do
 			v="$(config_grep_setting "$f" "$s")" || v=""
 			if [ "$s" = "MACKAS_ROOT" ]; then root="$v"; fi
+			if [ "$s" = "MACKAS_PROJECT_DIR" ]; then pdir="$v"; fi
 			if [ -n "$v" ]; then
 				printf '    %-26s %s\n' "$s" "$v"
 			fi
@@ -1944,6 +1945,13 @@ cmd_projects() {
 			# IS on disk.
 			printf '    %s%-26s %s%s\n' "$C_YEL" "stale" \
 				"$root/work/$name does not exist -- \$PWD derivation will never select this pin until it does; move the checkout back, or remove this pin if it is gone for good" "$C_RST"
+		elif [ -n "$root" ] && [ -n "$pdir" ] && [ -d "$root/work/$pdir/.git" ] \
+		     && [ ! -d "$root/work/$name/$pdir/.git" ]; then
+			# #80 item 4: a pin from before per-project KAS_WORK_DIR existed
+			# still has its checkout at the flat pre-M6 path -- report it,
+			# grep-only, same as every other flag this loop derives.
+			printf '    %s%-26s %s%s\n' "$C_YEL" "legacy layout" \
+				"the checkout still sits at $root/work/$pdir, from before per-project KAS_WORK_DIR; convert it with '$SCRIPT_CMD project add $name --from $name'" "$C_RST"
 		fi
 		# The same test --project applies before sourcing, reported here
 		# instead of at the moment it would refuse.
@@ -6489,6 +6497,15 @@ is not automatically adopted (#72: filesystem shape alone never decides
 anything). An already-pinned <name> is offered for overwrite, exactly like
 '$SCRIPT_CMD adopt' does for its own config file.
 
+A --from conversion of a project pinned before per-project KAS_WORK_DIR
+existed (#80) also offers to move its checkout from the pre-M6
+\$MACKAS_WORK_ROOT/<name>/ into its now-current \$MACKAS_WORK_ROOT/<name>/<name>/
+-- refusing outright, never moving anything, the moment that is ambiguous
+(the destination already exists, an earlier move was interrupted, or the
+checkout is reached through a symlink). It never touches whatever kas
+already cloned flat alongside it -- those siblings are yours to keep or
+discard by hand; 'mackas projects' flags a pin still in the old shape.
+
 Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
 put them before or after 'project add'.
 
@@ -6498,7 +6515,7 @@ EOF
 }
 
 cmd_project_add() {
-	local name="" url="" branch="" from="" keep_flag="" derive_flag="" want_help=0
+	local name="" url="" branch="" from="" keep_flag="" derive_flag="" want_help=0 migrate_pending=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
@@ -6859,8 +6876,72 @@ cmd_project_add() {
 	did "workspace directory: $workspace_dir"
 	did "checkout directory : $workspace_dir/$proj_dir"
 
+	# #80 item 4: --from converted a checkout that predates per-project
+	# KAS_WORK_DIR (#80 item 1) -- its checkout still sits directly at
+	# $workspace_dir instead of the current $workspace_dir/$name (#72's
+	# documented stutter). Offer to move it now that the config itself is
+	# safely written: a declined or failed move here still leaves a state
+	# legacy_layout_checkout()/refuse_legacy_layout() detect and
+	# 'mackas projects' reports, and re-running this same command offers it
+	# again -- doing the move BEFORE the config write would instead risk a
+	# checkout sitting at the new path with no pin to explain why, had the
+	# config write then failed. A --from on an already-converted project
+	# (checkout already at $workspace_dir/$name) leaves this whole block
+	# untouched -- nothing to offer.
+	if [ -n "$from" ] && [ -d "$workspace_dir/.git" ] && [ ! -d "$workspace_dir/$name/.git" ]; then
+		local mig_tmp; mig_tmp="$MACKAS_WORK_ROOT/.mackas-migrating-$name"
+
+		if [ -e "$workspace_dir/$name" ] || [ -L "$workspace_dir/$name" ]; then
+			die "'$workspace_dir/$name' already exists -- refusing to move '$workspace_dir' onto it" \
+				"this project may already be converted; check both paths by hand"
+		fi
+		if [ -e "$mig_tmp" ] || [ -L "$mig_tmp" ]; then
+			die "an earlier move of '$name' was interrupted: $mig_tmp still exists" \
+				"finish it by hand: mkdir -p $(printf '%q' "$workspace_dir") && mv $(printf '%q' "$mig_tmp") $(printf '%q' "$workspace_dir/$name")"
+		fi
+		if [ -L "$workspace_dir" ]; then
+			die "'$workspace_dir' is a symlink -- refusing to move a project's workspace through one" \
+				"resolve it to a real directory first, then re-run '$SCRIPT_CMD project add $name --from $name'"
+		fi
+
+		info ""
+		info "  layout: '$workspace_dir' holds the checkout itself -- the pre-M6 flat layout."
+		info "    move     : $workspace_dir  ->  $workspace_dir/$name"
+		info "    after    : $workspace_dir becomes '$name's own KAS_WORK_DIR, and kas clones"
+		info "               its layers inside it instead of into $MACKAS_WORK_ROOT."
+		info "    NOT moved: the layers kas already cloned flat into $MACKAS_WORK_ROOT."
+		info "               $SCRIPT_NAME cannot tell which of them belong to '$name' -- it never"
+		info "               recorded that -- so they stay exactly where they are, and the next"
+		info "               build re-clones this project's own private copies. Local commits in"
+		info "               those flat checkouts are NOT lost, but they are NOT carried over."
+		if confirm "  Move '$workspace_dir' into '$workspace_dir/$name' now?"; then
+			# $workspace_dir/$name is INSIDE $workspace_dir, so a single mv
+			# can't do it -- via a temp name, same as cmd_volume_move's own
+			# transfer-then-symlink window: block INT/TERM across the three
+			# renames and restore the trap after, so a Ctrl-C cannot land
+			# between them and strand the checkout half-moved.
+			trap '' INT TERM
+			run mv "$workspace_dir" "$mig_tmp"
+			run mkdir -p "$workspace_dir"
+			run mv "$mig_tmp" "$workspace_dir/$name"
+			trap on_interrupt INT TERM
+			did "moved the checkout to $workspace_dir/$name"
+		else
+			migrate_pending=1
+			warn "  declined -- '$name' is pinned, but its checkout is still at $workspace_dir"
+			info "  Nothing was moved. Do it by hand, or re-run this command and answer yes:"
+			info "    mv $(printf '%q' "$workspace_dir") $(printf '%q' "$mig_tmp")"
+			info "    mkdir -p $(printf '%q' "$workspace_dir")"
+			info "    mv $(printf '%q' "$mig_tmp") $(printf '%q' "$workspace_dir/$name")"
+			info "  Until then, '$SCRIPT_CMD --project $name setup'/'smoketest' refuse rather than"
+			info "  clone a second copy at $workspace_dir/$name."
+		fi
+	fi
+
 	hdr "Done"
-	if [ -n "$proj_url" ]; then
+	if [ "$migrate_pending" -eq 1 ]; then
+		info "  next: $SCRIPT_CMD project add $name --from $name --yes   # finishes moving the checkout into its workspace"
+	elif [ -n "$proj_url" ]; then
 		info "  next: $SCRIPT_CMD --project $name setup   # clones $proj_url (branch $proj_branch) and builds out the rest"
 	else
 		info "  no project URL set yet -- '$SCRIPT_CMD --project $name setup' will skip the checkout step"

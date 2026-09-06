@@ -1333,6 +1333,30 @@ Unlike the per-image SBOM — which create-spdx-image-3.0.bbclass deploys
 alongside the images into `DEPLOY_DIR_IMAGE` — the full recipe/package tree
 lands in `DEPLOY_DIR_SPDX` and is brought out with `mackas retrieve sbom`.
 
+## Converting a project pinned before per-project workspaces
+
+A project pinned before per-project `KAS_WORK_DIR` existed (#80) has its
+checkout still directly at `work/<name>/` instead of the current
+`work/<name>/<name>/`. `mackas project add <name> --from <name>` detects
+that shape and offers to move the checkout into place; `mackas projects`
+flags a pin still in the old shape as `legacy layout`.
+
+The move refuses outright, rather than moving anything, the moment it is
+ambiguous: the destination already exists, an earlier attempt was
+interrupted (a temp directory from it is still there), or the checkout is
+reached through a symlink. Declining — including running non-interactively,
+which declines by default — leaves the project pinned but the checkout
+where it was; `setup`/`smoketest` refuse rather than clone a second copy
+until the move is done, by hand or by re-running the same command.
+
+Only the checkout named by `<name>` itself moves. Whatever kas already
+cloned flat into `work/` alongside it — the siblings a real multi-layer
+build depends on — is never moved, renamed or inventoried: mackas has no
+record of which of those belong to which project, so they stay exactly
+where they are, and the next build re-clones this project's own private
+copies inside its new workspace. Local commits in the untouched flat
+checkouts are not lost, but they are not carried over either.
+
 ## The workspace image
 
 `work/` — `KAS_WORK_DIR`, the layer checkouts: oe-core, bitbake, the `meta-*`

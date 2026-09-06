@@ -205,13 +205,23 @@ assert_volumes() {
 }
 
 @test "project add --from accepts the bare name, 'work/<name>', and a full path, identically" {
+	# Each 'mk_add' call below auto-confirms (mk_add always passes -y), so
+	# the #80 item 4 migration offer added alongside this test also
+	# auto-runs and moves the checkout into work/demo/demo -- start a fresh
+	# flat checkout before each attempt so there is still something legacy-
+	# shaped for --from to resolve and introspect; the migration itself is
+	# covered on its own further down this file.
 	mk_checkout demo https://example.com/demo.git
 	mk_add project add demo --from demo
 	[ "$status" -eq 0 ]
 	rm -f "$PROJDIR/demo.conf"
+	rm -rf "$ROOT/work/demo"
+	mk_checkout demo https://example.com/demo.git
 	mk_add project add demo --from "work/demo"
 	[ "$status" -eq 0 ]
 	rm -f "$PROJDIR/demo.conf"
+	rm -rf "$ROOT/work/demo"
+	mk_checkout demo https://example.com/demo.git
 	mk_add project add demo --from "$ROOT/work/demo"
 	[ "$status" -eq 0 ]
 }
@@ -316,10 +326,155 @@ assert_volumes() {
 	[ "$status" -eq 0 ]
 	grep -qxF "MACKAS_VOLUME_NAME='oe-build'" "$PROJDIR/demo.conf"
 
+	# The call above also auto-confirmed the #80 item 4 migration offer
+	# (mk_add always passes -y) and moved the checkout into work/demo/demo
+	# -- start a fresh flat checkout so the second --from call still has
+	# something legacy-shaped to introspect.
+	rm -rf "$ROOT/work/demo"
+	mk_checkout demo https://example.com/demo.git
 	mk_add --set MACKAS_VOLUME_NAME=oe-build project add demo --from demo --derive-volumes
 	[ "$status" -eq 0 ]
 	! grep -q '^MACKAS_VOLUME_NAME=' "$PROJDIR/demo.conf"
 	[ "$(grep -c '^MACKAS_VOLUME_NAME=' "$PROJDIR/demo.conf")" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# #80 item 4: --from offers to move a pre-M6 flat checkout into its
+# now-current work/<name>/<name> workspace. 'mk_checkout' always produces
+# the flat pre-M6 shape (a real git checkout directly at work/<name>), which
+# is exactly the fixture this whole section needs.
+# ---------------------------------------------------------------------------
+
+@test "project add --from -y moves a legacy flat checkout into its workspace" {
+	mk_checkout demo https://example.com/demo.git
+	mk_add project add demo --from demo
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "moved the checkout to $ROOT/work/demo/demo"
+
+	# The checkout itself is intact at the new path, not re-cloned.
+	[ -d "$ROOT/work/demo/demo/.git" ]
+	[ "$(git -C "$ROOT/work/demo/demo" log --oneline | wc -l)" -eq 1 ]
+	# And it is gone from the old, flat path.
+	[ ! -d "$ROOT/work/demo/.git" ]
+}
+
+@test "project add --from, no tty and no --yes, declines the move and prints all three recovery commands" {
+	mk_checkout demo https://example.com/demo.git
+	run "$MACKAS" --set "MACKAS_ROOT=$ROOT" project add demo --from demo
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "declined -- 'demo' is pinned, but its checkout is still at"
+	# Nothing moved.
+	[ -d "$ROOT/work/demo/.git" ]
+	[ ! -d "$ROOT/work/demo/demo" ]
+	# All three recovery commands, naming the real paths.
+	printf '%s\n' "$output" | grep -qF "mv $ROOT/work/demo $ROOT/work/.mackas-migrating-demo"
+	printf '%s\n' "$output" | grep -qF "mkdir -p $ROOT/work/demo"
+	printf '%s\n' "$output" | grep -qF "mv $ROOT/work/.mackas-migrating-demo $ROOT/work/demo/demo"
+}
+
+@test "project add --from --dry-run prints the move but changes nothing on disk" {
+	mk_checkout demo https://example.com/demo.git
+	mk_add --dry-run project add demo --from demo
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "+ mv $ROOT/work/demo $ROOT/work/.mackas-migrating-demo"
+	printf '%s\n' "$output" | grep -qF "+ mkdir -p $ROOT/work/demo"
+	printf '%s\n' "$output" | grep -qF "+ mv $ROOT/work/.mackas-migrating-demo $ROOT/work/demo/demo"
+	# --dry-run's own contract: nothing on disk moved, no config written.
+	[ -d "$ROOT/work/demo/.git" ]
+	[ ! -e "$PROJDIR/demo.conf" ]
+}
+
+@test "project add --from refuses to move onto an already-existing destination" {
+	mk_checkout demo https://example.com/demo.git
+	mkdir -p "$ROOT/work/demo/demo"
+	echo "something already here" > "$ROOT/work/demo/demo/stray-file"
+	mk_add project add demo --from demo
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "already exists -- refusing to move"
+	# Untouched: neither side of the refused move was mutated.
+	[ -d "$ROOT/work/demo/.git" ]
+	[ -f "$ROOT/work/demo/demo/stray-file" ]
+	# But the config WAS already written -- config-first is the point (a
+	# declined/refused move must never leave an unexplained state).
+	[ -f "$PROJDIR/demo.conf" ]
+}
+
+@test "project add --from refuses when a prior interrupted move's temp dir is still there" {
+	mk_checkout demo https://example.com/demo.git
+	mkdir -p "$ROOT/work/.mackas-migrating-demo"
+	mk_add project add demo --from demo
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "an earlier move of 'demo' was interrupted"
+	printf '%s\n' "$output" | grep -qF "$ROOT/work/.mackas-migrating-demo"
+	# Untouched: refused before any mutation.
+	[ -d "$ROOT/work/demo/.git" ]
+	[ -d "$ROOT/work/.mackas-migrating-demo" ]
+}
+
+@test "project add --from refuses to move a workspace reached through a symlink" {
+	mk_checkout real-demo https://example.com/demo.git
+	ln -s "$ROOT/work/real-demo" "$ROOT/work/demo"
+	mk_add project add demo --from demo
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "is a symlink -- refusing to move"
+	# Untouched: the symlink and its target are exactly as they were.
+	[ -L "$ROOT/work/demo" ]
+	[ -d "$ROOT/work/real-demo/.git" ]
+}
+
+@test "project add --from on an already-converted project offers nothing (no-op)" {
+	mk_checkout demo https://example.com/demo.git
+	mk_add project add demo --from demo
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "moved the checkout"
+
+	# Re-running --from demo now dies at introspection (adopt_introspect_project
+	# requires a .git directly at work/demo, which no longer exists once
+	# converted) -- unrelated pre-existing behaviour, not this slice's own
+	# refusal. What matters here is that the migration block itself does not
+	# fire a SECOND time and nothing under work/demo/demo is touched.
+	mk_add project add demo --from demo
+	[ "$status" -ne 0 ]
+	[ -d "$ROOT/work/demo/demo/.git" ]
+	! printf '%s\n' "$output" | grep -qF "moved the checkout"
+}
+
+@test "'mackas projects' flags a pin whose checkout is still in the pre-M6 flat layout" {
+	mk_checkout demo https://example.com/demo.git
+	# Write the pin directly, the same shape 'project add' itself writes,
+	# without going through 'project add --from' -- that would immediately
+	# offer (and, under this suite's -y, perform) the very move this test
+	# means to catch BEFORE it happens.
+	pin demo <<-EOF
+	MACKAS_ROOT='$ROOT'
+	MACKAS_PROJECT_DIR='demo'
+	EOF
+
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qi "legacy layout"
+	printf '%s\n' "$output" | grep -qF "$ROOT/work/demo"
+}
+
+@test "'mackas projects' does not flag a pin once its checkout is migrated" {
+	mk_checkout demo https://example.com/demo.git
+	mk_add project add demo --from demo
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/work/demo/demo/.git" ]
+
+	run "$MACKAS" projects
+	[ "$status" -eq 0 ]
+	! printf '%s\n' "$output" | grep -qi "legacy layout"
+}
+
+@test "cmd_project_add blocks INT/TERM across its move (source-grep: bats cannot trigger a signal mid-mv)" {
+	# AGENTS.md: logic only set -e/signal handling can reach is pinned by
+	# source-grep, not a pretend runtime test. Scoped to cmd_project_add's
+	# own body so this cannot pass on the strength of cmd_volume_move's or
+	# on_interrupt's OWN identical idiom elsewhere in the file.
+	sed -n '/^cmd_project_add() {/,/^}/p' "$MACKAS" > "$TESTDIR/fn.txt"
+	grep -qF "trap '' INT TERM" "$TESTDIR/fn.txt"
+	grep -qF "trap on_interrupt INT TERM" "$TESTDIR/fn.txt"
 }
 
 @test "project add --keep-volumes without --from is refused" {
