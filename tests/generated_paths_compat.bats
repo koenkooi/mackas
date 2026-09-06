@@ -244,8 +244,8 @@ have_volumes() {
 # stay byte-identical, pinned before any M6 feature code exists.
 #
 #   7. env.sh exports both KAS_WORK_DIR and MACKAS_WORK at <base>/work
-#   8. the wrapper's frozen MACKAS_WORK (what --expect-work compares against)
-#      is <base>/work
+#   8. the wrapper's frozen MACKAS_WORK_ROOT (what --expect-work compares
+#      against) is <base>/work
 #   9. bare `clean` never touches <base>/work at all, marker file included
 #
 # Library-level, like tests 1/2 above and project_env_sh.bats/kas_wrapper.
@@ -292,11 +292,11 @@ have_volumes() {
 	DRY_RUN=0
 	write_kas_wrapper >/dev/null 2>&1
 	[ -f "$KAS_CONTAINER_BIN" ]
-	# --expect-work "\$MACKAS_WORK" in the wrapper's live-recompute call always
-	# reads this SAME frozen assignment -- the literal call-site text never
-	# changes, so pinning the frozen value pins what --expect-work actually
-	# compares against.
-	grep -qF "MACKAS_WORK='$ROOT/work'" "$KAS_CONTAINER_BIN"
+	# --expect-work "\$MACKAS_WORK_ROOT" in the wrapper's live-recompute call
+	# always reads this SAME frozen assignment -- the literal call-site text
+	# never changes, so pinning the frozen value pins what --expect-work
+	# actually compares against.
+	grep -qF "MACKAS_WORK_ROOT='$ROOT/work'" "$KAS_CONTAINER_BIN"
 }
 
 @test "compat: unselected -- bare clean leaves <base>/work and everything under it untouched" {

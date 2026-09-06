@@ -447,12 +447,24 @@ teardown() {
 	derive_paths
 	local p
 	for p in "$MACKAS_ENV_SH" "$MACKAS_GITCONFIG" "$KAS_CONTAINER_BIN" \
-	         "$SHIM_DIR" "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_WORK" "$MACKAS_LOGS"; do
+	         "$SHIM_DIR" "$MACKAS_KAS_FRAGMENT_SRC" "$MACKAS_WORK" "$MACKAS_WORK_ROOT" "$MACKAS_LOGS"; do
 		case "$p" in
 			"$MACKAS_ROOT"/*) ;;
 			*) echo "derived path escaped MACKAS_ROOT: $p" >&2; return 1 ;;
 		esac
 	done
+}
+
+# M6 (#80) introduces MACKAS_WORK_ROOT as the flat work root, split out from
+# MACKAS_WORK (which becomes project-scoped once a project is selected). This
+# slice is the audit step: the two must be an exact alias of each other
+# everywhere, zero behaviour change, before anything actually scopes MACKAS_WORK.
+@test "MACKAS_WORK_ROOT: an exact alias of MACKAS_WORK, both \$MACKAS_BASE/work" {
+	MACKAS_ROOT="$TESTDIR/realroot"
+	mkdir -p "$MACKAS_ROOT"
+	derive_paths
+	[ "$MACKAS_WORK_ROOT" = "$MACKAS_WORK" ]
+	[ "$MACKAS_WORK_ROOT" = "$MACKAS_BASE/work" ]
 }
 
 @test "short link: no link at all means MACKAS_BASE is MACKAS_ROOT" {
