@@ -557,7 +557,7 @@ rec_runtime_args_value() {
 # ---------------------------------------------------------------------------
 # 12: the selector propagates into the live recompute.
 #
-# The wrapper freezes MACKAS_WORK/KAS_IMAGE/MACKAS_GITCONFIG from whatever
+# The wrapper freezes MACKAS_WORK_ROOT/KAS_IMAGE/MACKAS_GITCONFIG from whatever
 # config `setup` ran against, but recomputes --runtime-args on every call. If
 # that recompute resolves a DIFFERENT config, the build gets one project's
 # ext4 volumes beside another project's work dir -- on the hand-typed
@@ -719,14 +719,15 @@ rec_runtime_args_value() {
 	grep -qxF 'SEL:proj-a' "$SELF_REC"
 }
 
-# The wrapper freezes MACKAS_WORK/KAS_IMAGE/gitconfig but recomputes volumes
-# LIVE, so a config resolving a different root would hand this build another
-# project's ext4 volumes while its sources stay put. Identity is compared
-# rather than the config path being frozen, so an ambient $MACKAS_CONF keeps
-# working whenever it agrees and is refused only when it does not.
+# The wrapper freezes MACKAS_WORK_ROOT/KAS_IMAGE/gitconfig but recomputes
+# volumes LIVE, so a config resolving a different root would hand this build
+# another project's ext4 volumes while its sources stay put. Identity is
+# compared rather than the config path being frozen, so an ambient
+# $MACKAS_CONF keeps working whenever it agrees and is refused only when it
+# does not.
 
-@test "the generated wrapper passes --expect-work with its frozen MACKAS_WORK" {
-	grep -qF -- '--expect-work "$MACKAS_WORK"' "$MACKAS_BIN/kas-container"
+@test "the generated wrapper passes --expect-work with its frozen MACKAS_WORK_ROOT" {
+	grep -qF -- '--expect-work "$MACKAS_WORK_ROOT"' "$MACKAS_BIN/kas-container"
 }
 
 # ---------------------------------------------------------------------------
