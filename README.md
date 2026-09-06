@@ -391,6 +391,21 @@ layer under `work/` is an equally-reachable sibling:
 kas-container shell meta-angstrom/kas/angstrom.yml:meta-ti/kas/machine.yml
 ```
 
+**Once a project is selected** (`mackas --project <name> setup`, or
+`MACKAS_PROJECT_SELECT` in the environment), `work/` gains a second level:
+`$MACKAS_BASE/work/<name>/` becomes that project's own `KAS_WORK_DIR`, and
+its config checkout lives one level deeper, at
+`$MACKAS_BASE/work/<name>/<name>/` (the `<name>/<name>` stutter is
+cosmetic — see [docs/storage.md](docs/storage.md)). Standing *in* the
+workspace, `work/<name>/`, nothing above changes — the chain is still
+`<name>/kas/….yml`, checkout-relative to that cwd. Standing one level up, in
+the flat `$MACKAS_BASE/work/` itself, the chain needs **both** components:
+`<name>/<name>/kas/….yml`, the workspace name then the checkout name. A
+chain whose first component names a workspace other than the one your
+sourced `env-<name>.sh` was generated for — a sibling project's — derives
+nothing, deliberately, the same fail-closed rule as the sibling-layer case
+above.
+
 `kas-container` here is a **shell function**, not the program on your
 `PATH`. `env.sh` defines it to do the two things only code running in *your*
 shell can do: append the generated tuning fragment `:kas/macos-local.yml`
