@@ -236,3 +236,75 @@ have_volumes() {
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qxF "  sentinel-recent-log.txt"
 }
+
+# ---------------------------------------------------------------------------
+# 7-9. M6 (#80) is about to split work/ into a flat root plus a per-project
+# KAS_WORK_DIR, with work/repo-ref hanging off the root as a new sibling.
+# Same rule as the six facts above: what an UNSELECTED run generates must
+# stay byte-identical, pinned before any M6 feature code exists.
+#
+#   7. env.sh exports both KAS_WORK_DIR and MACKAS_WORK at <base>/work
+#   8. the wrapper's frozen MACKAS_WORK (what --expect-work compares against)
+#      is <base>/work
+#   9. bare `clean` never touches <base>/work at all, marker file included
+#
+# Library-level, like tests 1/2 above and project_env_sh.bats/kas_wrapper.
+# bats' own lib_setup -- setup_shim_and_env()/write_kas_wrapper() are called
+# directly rather than through a full `mackas setup` (no project checkout,
+# no curl/sha256 fixture needed to answer these two).
+# ---------------------------------------------------------------------------
+
+@test "compat: unselected -- generated env.sh exports KAS_WORK_DIR and MACKAS_WORK both equal to <base>/work" {
+	MACKAS_LIB_ONLY=1
+	export MACKAS_LIB_ONLY
+	# shellcheck disable=SC1090
+	. "$MACKAS"
+	SCRIPT_DIR="$REPO_ROOT"
+	SCRIPT_NAME="mackas"
+	setup_colors
+	set_defaults
+	MACKAS_ROOT="$ROOT"
+	MACKAS_PROJECT_DIR="meta-ai"
+	derive_paths
+	DRY_RUN=0
+	mkdir -p "$MACKAS_BIN"
+	setup_shim_and_env >/dev/null 2>&1
+	[ -f "$MACKAS_ENV_SH" ]
+	# Grep the written FILE, not the heredoc source -- shq() single-quotes the
+	# value, exactly like project_env_sh.bats' own MACKAS_PROJECT_SELECT
+	# pin does for its export line.
+	grep -qF "export KAS_WORK_DIR='$ROOT/work'" "$MACKAS_ENV_SH"
+	grep -qF "export MACKAS_WORK='$ROOT/work'" "$MACKAS_ENV_SH"
+}
+
+@test "compat: unselected -- the generated wrapper's --expect-work value is <base>/work" {
+	MACKAS_LIB_ONLY=1
+	export MACKAS_LIB_ONLY
+	# shellcheck disable=SC1090
+	. "$MACKAS"
+	SCRIPT_DIR="$REPO_ROOT"
+	SCRIPT_NAME="mackas"
+	setup_colors
+	set_defaults
+	MACKAS_ROOT="$ROOT"
+	MACKAS_PROJECT_DIR="meta-ai"
+	derive_paths
+	DRY_RUN=0
+	write_kas_wrapper >/dev/null 2>&1
+	[ -f "$KAS_CONTAINER_BIN" ]
+	# --expect-work "\$MACKAS_WORK" in the wrapper's live-recompute call always
+	# reads this SAME frozen assignment -- the literal call-site text never
+	# changes, so pinning the frozen value pins what --expect-work actually
+	# compares against.
+	grep -qF "MACKAS_WORK='$ROOT/work'" "$KAS_CONTAINER_BIN"
+}
+
+@test "compat: unselected -- bare clean leaves <base>/work and everything under it untouched" {
+	have_volumes oe-build-tmp oe-build-dl oe-build-sstate
+	mkdir -p "$ROOT/work/meta-ai/kas"
+	echo "leftover checkout file" > "$ROOT/work/meta-ai/marker.txt"
+	MACKAS_PROJECT_DIR=meta-ai mk clean
+	[ "$status" -eq 0 ]
+	[ -f "$ROOT/work/meta-ai/marker.txt" ]
+	grep -qF "leftover checkout file" "$ROOT/work/meta-ai/marker.txt"
+}
