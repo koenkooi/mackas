@@ -4732,7 +4732,7 @@ export MACKAS_WORK_ROOT=$q_work_root
 # config file, and never overrides a value that is already set.
 _mackas_derive_project() {
 	[ "\${MACKAS_KAS_AUTO_PROJECT:-0}" = "1" ] || return 0
-	local files="\${1:-}" proj="" rest entry stripped out=""
+	local files="\${1:-}" proj="" rest entry stripped out="" ws
 	[ -n "\$files" ] || return 0
 	[ -n "\${MACKAS_WORK:-}" ] || return 0
 
@@ -4766,6 +4766,46 @@ _mackas_derive_project() {
 		# cwd is the checkout itself, so the entries are already relative.
 		proj="\${PWD##*/}"
 		out="\$files"
+	elif [ -n "\${MACKAS_WORK_ROOT:-}" ] && [ "\$PWD" = "\$MACKAS_WORK_ROOT" ]; then
+		# cwd is the flat work root (#80 item 3): the hand-typed chain names a
+		# WORKSPACE first and a CHECKOUT second, e.g.
+		# <name>/<name>/kas/base.yml -- #72's "special case for the hand-typed
+		# flow", generalised to the two-level per-project layout. This elif
+		# MUST stay after the two above: unselected, MACKAS_WORK equals
+		# MACKAS_WORK_ROOT, so the first case matches first and this one is
+		# unreachable -- that ordering is the whole compat proof. The
+		# MACKAS_WORK_ROOT guard (rather than a bare comparison) means a shell
+		# that already sourced an OLDER env.sh, which never exported it,
+		# simply does not get this case instead of breaking.
+		case "\$files" in
+			*/*) ws="\${files%%/*}" ;;
+			*) return 0 ;;
+		esac
+		# The chain must name the workspace THIS env.sh was generated for --
+		# a chain into a SIBLING workspace derives nothing, same fail-closed
+		# rule as the sibling-checkout refusal above.
+		[ "\$MACKAS_WORK_ROOT/\$ws" = "\$MACKAS_WORK" ] || return 0
+		rest="\${files#"\$ws"/}"
+		case "\$rest" in
+			*/*) proj="\${rest%%/*}" ;;
+			*) return 0 ;;
+		esac
+		# Strip BOTH leading components (workspace/checkout/) off every entry.
+		# Any entry not matching -- a chain spanning two checkouts in one
+		# workspace -- derives nothing, exactly as the work/ case above does.
+		rest="\$files"
+		while [ -n "\$rest" ]; do
+			entry="\${rest%%:*}"
+			case "\$rest" in
+				*:*) rest="\${rest#*:}" ;;
+				*)   rest="" ;;
+			esac
+			case "\$entry" in
+				"\$ws"/"\$proj"/*) stripped="\${entry#"\$ws"/"\$proj"/}" ;;
+				*) proj=""; break ;;
+			esac
+			out="\${out:+\$out:}\$stripped"
+		done
 	fi
 	[ -n "\$proj" ] || return 0
 
