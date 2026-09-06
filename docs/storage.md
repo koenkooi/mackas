@@ -7,7 +7,7 @@ Where each piece of the build lives, and why. The short version:
 | **TMPDIR** | Local ext4 container volume, on local disk | **Non-negotiable.** An APFS directory reaching the guest over virtiofs does not provide the semantics TMPDIR requires — hardlinks, permissions, xattrs, case sensitivity, correct `rename()`. See [architecture.md](architecture.md#the-ext4-volumes). |
 | **Writable `SSTATE_DIR` / `DL_DIR`** | Their own local ext4 volumes | Speed, and lifecycle: separate so `clean` can drop TMPDIR without losing them. Unlike TMPDIR, ext4 here is not a *semantic* requirement — see [Does `SSTATE_DIR` actually need ext4?](#does-sstate_dir-actually-need-ext4) |
 | **Read-only sstate + downloads mirrors** | Network, over **HTTP** | **Optional.** bitbake's own mechanism, recommended if you use one. |
-| **Layer checkouts (`work/`)** | Host directory, bind-mounted as `KAS_WORK_DIR` | Must be **case-sensitive**, and stays host-native so `git` and `bitbake -e` keep working from macOS. On a case-insensitive drive, [a workspace image](#the-workspace-image) supplies it. |
+| **Layer checkouts (`work/`, or `work/<name>/` once a project is selected)** | Host directory, bind-mounted as `KAS_WORK_DIR` | Must be **case-sensitive**, and stays host-native so `git` and `bitbake -e` keep working from macOS. On a case-insensitive drive, [a workspace image](#the-workspace-image) supplies it. |
 
 `MACKAS_ROOT` is wherever you point it — a directory on a case-sensitive
 volume, e.g. `/Volumes/<your-case-sensitive-volume>/oe`. (APFS is
@@ -1341,6 +1341,12 @@ case-sensitive, because oe-core contains files whose names differ only by
 case. It is a plain host directory bind-mounted into the container, not an
 ext4 volume, so the host filesystem's rules apply to it directly. `bin/`,
 `kas/` and `logs/` are indifferent.
+
+Once a project is selected, `KAS_WORK_DIR` is `work/<name>/`, not the whole
+tree — but the image (when one exists) still backs the whole flat `work/`,
+mounted once per root: every pinned project's own subdirectory lands
+somewhere under that same case-sensitive mount, so nothing below changes
+per project.
 
 A stock external SSD is case-insensitive APFS and reformatting is not always
 an option, so `setup` offers a case-sensitive APFS **sparse image** mounted at

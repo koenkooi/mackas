@@ -100,17 +100,27 @@ $MACKAS_ROOT/
 └── work/         <- every layer checkout lives HERE, as a sibling
     ├── meta-angstrom/
     ├── meta-openembedded/
-    └── ...
+    └── ...      (NAME/NAME/ once a project is selected -- see below)
 ```
 
-**`work/` is the one directory that matters for multi-layer work.** It is
-what `KAS_WORK_DIR` is set to, and kas-container bind-mounts it whole into
-the container — any checkout under it, whether `setup` cloned it or you put
-it there, is visible to kas and reusable across builds with nothing
-re-cloned. `bin/`, `kas/` and `logs/` do not participate; only `work/` is
-what kas sees. A real multi-layer BSP — a dozen `meta-*` repos, not just the
-single project `setup` clones — goes under `work/` as siblings; see
-[Driving kas directly](#driving-kas-directly).
+**`work/` is the one directory that matters for multi-layer work.** With no
+project selected, it is what `KAS_WORK_DIR` is set to, and kas-container
+bind-mounts it whole into the container — any checkout under it, whether
+`setup` cloned it or you put it there, is visible to kas and reusable across
+builds with nothing re-cloned. `bin/`, `kas/` and `logs/` do not participate;
+only `work/` is what kas sees. A real multi-layer BSP — a dozen `meta-*` repos,
+not just the single project `setup` clones — goes under `work/` as siblings;
+see [Driving kas directly](#driving-kas-directly).
+
+**Once a project is selected, `work/<name>/` is that project's own
+`KAS_WORK_DIR`**, private to it — see
+[Pinning a project workspace](#pinning-a-project-workspace). The config
+checkout then sits one level deeper, at `work/<name>/<name>/` (a
+deliberate, documented stutter: the outer name is the workspace, the inner
+one the checkout `mackas` clones into it), and the layers kas composes for
+*that* project land beside it, inside `work/<name>/`, never mixed with
+another project's. Nothing here changes anything for a root where no project
+has ever been selected: `work/` stays exactly the flat directory above.
 
 Selecting a project migrates nothing. Anything already sitting flat from
 before a project was ever selected on this root stays exactly where it was
@@ -453,9 +463,10 @@ yourself with `type -a kas-container`
 `mackas adopt` pins a whole *foreign* root. `mackas project add <name>` is
 its in-root sibling: it pins a project workspace *inside this Mac's own*
 `MACKAS_ROOT`, so a second (or third) layer set builds alongside the first
-with its own `work/<name>/` and, once selected, its own volumes — see
-[Configuration](#configuration) for the selector itself and how the volume
-stem derives from it.
+with its own `work/<name>/` — its own `KAS_WORK_DIR`, once selected, holding
+the config checkout at `work/<name>/<name>/` and every layer kas clones for
+it beside that — and its own volumes — see [Configuration](#configuration)
+for the selector itself and how the volume stem derives from it.
 
 ```sh
 ./mackas project add meta-qcom --url https://example.com/meta-qcom.git --branch main

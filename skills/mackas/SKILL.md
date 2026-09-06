@@ -18,15 +18,22 @@ container, via `mackas exec` or `mackas retrieve`, never a host-side `cd`.
 
 ## Environment layout
 
-- **Always work from `$MACKAS_BASE/work`** — normally `~/oe/work`, sourced from
-  `env.sh`. The short link (`MACKAS_SHORT_LINK`, default `$HOME/oe`) exists
-  specifically to route around `kas-container` path problems (word-splitting on
-  spaces, case-sensitivity), so it is not one of two equally-valid roots to
-  pick between: always go through the link, never the path it points at.
-  `mackas status` prints where the real storage lives; nothing in this
-  playbook needs to reason about it.
-- Every layer checkout is an ordinary macOS-visible directory under `work/`, as
-  a sibling. Only build *output* is hidden.
+- **Always work from `$MACKAS_WORK`** — the sourced `env.sh` exports it, and it
+  is always `KAS_WORK_DIR`'s own value: `$MACKAS_BASE/work` (normally
+  `~/oe/work`) with no project selected, or that project's own
+  `$MACKAS_BASE/work/<name>/` once one is (`--project <name>`/
+  `$MACKAS_PROJECT_SELECT`, or a pinned project's workspace derived from the
+  cwd). Use the variable, not a hardcoded `work` path, so the same command
+  works unchanged whichever case is in effect. The short link
+  (`MACKAS_SHORT_LINK`, default `$HOME/oe`) exists specifically to route around
+  `kas-container` path problems (word-splitting on spaces, case-sensitivity),
+  so it is not one of two equally-valid roots to pick between: always go
+  through the link, never the path it points at. `mackas status` prints where
+  the real storage lives; nothing in this playbook needs to reason about it.
+- Every layer checkout is an ordinary macOS-visible directory under `$MACKAS_WORK`,
+  as a sibling — for a selected project, that means beside the config checkout
+  at `work/<name>/<name>/`, not beside every OTHER project's own layers. Only
+  build *output* is hidden.
 - On a case-insensitive `MACKAS_ROOT`, `work/` may itself be a case-sensitive
   APFS sparse image that `setup` offered to create (`MACKAS_WORKSPACE_IMAGE`
   records it in the config). `hdiutil attach` does not survive a reboot, so
@@ -179,7 +186,7 @@ the project inherits the class
 All commands assume `env.sh` is sourced:
 
 ```sh
-cd "$MACKAS_BASE/work"
+cd "$MACKAS_WORK"
 ```
 
 **The `cd` is not optional, and it must be the short link, not wherever it
@@ -235,7 +242,7 @@ reset them exactly like a `build` would — a read-only query is **not** exempt.
 ### 2. Build
 
 ```sh
-cd "$MACKAS_BASE/work"
+cd "$MACKAS_WORK"
 kas-container build <checkout>/kas/base.yml:<checkout>/kas/<machine>.yml --target <target>
 ```
 
@@ -714,7 +721,7 @@ one thing that section's `--skip repos_checkout` on `dump` itself protects).
 **Step 2 — for each declared repo, ask whether it carries commits that resolved commit's checkout would discard.**
 
 ```sh
-git -C "$MACKAS_BASE/work/<repo>" log --oneline <commit-from-step-1>..HEAD
+git -C "$MACKAS_WORK/<repo>" log --oneline <commit-from-step-1>..HEAD
 ```
 
 Use the exact commit (or `refspec`) Step 1 resolved for **this** repo — never
@@ -780,7 +787,7 @@ with no error and no warning beyond an easy-to-miss "Repository X checked out
 to `<old sha>`" log line.
 
 ```sh
-cd "$MACKAS_BASE/work"
+cd "$MACKAS_WORK"
 kas-container build --skip repos_checkout --skip repos_apply_patches \
   <checkout>/kas/base.yml:<checkout>/kas/<machine>.yml --target <target>
 ```
@@ -951,8 +958,9 @@ kas is configured to reset to.
   and selecting a project are two answers to the same question and mackas
   refuses rather than ranks them. `mackas project add <name> [--url URL
   --branch BRANCH | --from <checkout>]` is `adopt`'s in-root sibling: it pins
-  a *project workspace* under this Mac's own root (`$MACKAS_WORK/<name>/`)
-  instead of a whole separate root.
+  a *project workspace* under this Mac's own root (`work/<name>/`, that
+  project's own `$MACKAS_WORK` once selected) instead of a whole separate
+  root.
 - **Implicit selection**: with no explicit `--project`/`--config` flag or
   `$MACKAS_PROJECT_SELECT`/`$MACKAS_CONF` env var, mackas still selects a
   pinned project when the cwd sits inside one of its `work/<name>/`
