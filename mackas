@@ -1108,7 +1108,7 @@ wrapper_identity_hint() {
 	printf 'the wrapper'"'"'s frozen work directory and the config now in effect disagree, so the volumes about to be mounted are not this project'"'"'s.\n'
 	printf '\n'
 	printf '    %-22s %s\n' "wrapper built for" "$expect"
-	printf '    %-22s %s\n' "config now resolves" "$MACKAS_WORK"
+	printf '    %-22s %s\n' "config now resolves" "$MACKAS_WORK_ROOT"
 	if [ -n "$src" ]; then
 		printf '    %-22s %s\n' "chosen by" "$src = ${MACKAS_CONF}"
 	fi
@@ -2167,7 +2167,7 @@ derive_paths() {
 		MACKAS_SSTATE_MIRROR_PATH="${MACKAS_SSTATE_MIRROR_PATH:-}"
 		MACKAS_DL_MIRROR_PATH="${MACKAS_DL_MIRROR_PATH:-}"
 		MACKAS_BASE=""
-		MACKAS_BIN=""; MACKAS_WORK=""; MACKAS_KAS=""; MACKAS_LOGS=""
+		MACKAS_BIN=""; MACKAS_WORK=""; MACKAS_WORK_ROOT=""; MACKAS_KAS=""; MACKAS_LOGS=""
 		MACKAS_PROJECT=""; MACKAS_ENV_SH=""; MACKAS_GITCONFIG=""
 		KAS_CONTAINER_BIN=""; KAS_CONTAINER_REAL=""; SHIM_DIR=""
 		MACKAS_KAS_FRAGMENT_SRC=""; MACKAS_KAS_FRAGMENT_REPO=""
@@ -2220,7 +2220,14 @@ derive_paths() {
 	fi
 
 	MACKAS_BIN="$MACKAS_BASE/bin"
-	MACKAS_WORK="$MACKAS_BASE/work"
+	# MACKAS_WORK_ROOT is the flat work root, always -- $MACKAS_BASE/work,
+	# selected or not. MACKAS_WORK is "what KAS_WORK_DIR is": today it is
+	# just an alias of the root (this slice makes zero behaviour change),
+	# but a later slice scopes it per-project while the root stays flat, so
+	# work/repo-ref and project-add's workspace math can hang off the root
+	# even once MACKAS_WORK itself no longer means that.
+	MACKAS_WORK_ROOT="$MACKAS_BASE/work"
+	MACKAS_WORK="$MACKAS_WORK_ROOT"
 	MACKAS_KAS="$MACKAS_BASE/kas"
 	MACKAS_LOGS="$MACKAS_BASE/logs"
 	# Selected -> logs/<name>, so two pinned projects on one MACKAS_ROOT never
@@ -4552,13 +4559,14 @@ setup_shim_and_env() {
 	# generation as text and expand when env.sh is SOURCED. That distinction is
 	# the whole point -- our values must not expand, the user's shell variables
 	# must.
-	local q_shim q_work q_image q_gitconfig q_kasbin q_runtime_args
+	local q_shim q_work q_work_root q_image q_gitconfig q_kasbin q_runtime_args
 	local q_root q_base q_project q_cpus q_parallel q_scriptdir
 	local q_fragrepo q_autofrag q_autoproj q_brew q_projsel
 	q_shim="$(shq "$SHIM_DIR")"
 	q_scriptdir="$(shq "$SCRIPT_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
 	q_work="$(shq "$MACKAS_WORK")"
+	q_work_root="$(shq "$MACKAS_WORK_ROOT")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
 	# Deliberately KAS_CONTAINER_BIN (the write_kas_wrapper() protection
@@ -4693,6 +4701,7 @@ export MACKAS_KAS_AUTO_PROJECT=\${MACKAS_KAS_AUTO_PROJECT:-$q_autoproj}$projsel_
 # checkout under work/". Same value as KAS_WORK_DIR above, under the name the
 # rest of mackas uses.
 export MACKAS_WORK=$q_work
+export MACKAS_WORK_ROOT=$q_work_root
 
 # Derive MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG from the file list a hand-typed
 # 'kas-container build/shell/... <files>' just used, and export them into THIS
@@ -5243,12 +5252,12 @@ write_kas_wrapper() {
 	# turning it into a variable put it straight back inside a raw "..." until
 	# this line existed. No q_rtargs: the frozen --runtime-args string is gone
 	# from the generated file entirely (issue #96) -- there is nothing to quote.
-	local q_real q_shim q_brew q_self q_work q_image q_gitconfig q_scriptname q_projsel
+	local q_real q_shim q_brew q_self q_work_root q_image q_gitconfig q_scriptname q_projsel
 	q_real="$(shq "$KAS_CONTAINER_REAL")"
 	q_shim="$(shq "$SHIM_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
 	q_self="$(shq "$SCRIPT_DIR/$SCRIPT_NAME")"
-	q_work="$(shq "$MACKAS_WORK")"
+	q_work_root="$(shq "$MACKAS_WORK_ROOT")"
 	q_image="$(shq "$KAS_IMAGE")"
 	q_gitconfig="$(shq "$MACKAS_GITCONFIG")"
 	q_scriptname="$(shq "$SCRIPT_NAME")"
@@ -5314,7 +5323,7 @@ KAS_CONTAINER_REAL=$q_real
 SHIM_DIR=$q_shim
 BREW_BIN=$q_brew
 MACKAS_SELF=$q_self
-MACKAS_WORK=$q_work
+MACKAS_WORK_ROOT=$q_work_root
 KAS_IMAGE=$q_image
 MACKAS_GITCONFIG=$q_gitconfig
 SCRIPT_NAME=$q_scriptname
@@ -5470,9 +5479,9 @@ _mackas_kas_files="\$(_mackas_kas_files_scan "\$@")"
 # bare assignment discards.
 _mackas_rt_rc=0
 if [ -n "\$_mackas_kas_files" ]; then
-	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK" --kas-files "\$_mackas_kas_files")" || _mackas_rt_rc=\$?
+	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK_ROOT" --kas-files "\$_mackas_kas_files")" || _mackas_rt_rc=\$?
 else
-	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK")" || _mackas_rt_rc=\$?
+	rt="\$(MACKAS_PROJECT_SELECT="\$MACKAS_PROJECT_PIN" "\$MACKAS_SELF" runtime-args --require-volumes-free --expect-work "\$MACKAS_WORK_ROOT")" || _mackas_rt_rc=\$?
 fi
 
 # FATAL, never a fallback (issue #96). Everything \$SCRIPT_NAME refuses while
@@ -5543,7 +5552,7 @@ fi
 exec env PATH="\$SHIM_DIR:\$BREW_BIN:\$PATH" \\
 	MACKAS_KAS_WRAPPED=1 \\
 	KAS_CONTAINER_ENGINE=$MACKAS_KAS_ENGINE \\
-	KAS_WORK_DIR="\$MACKAS_WORK" \\
+	KAS_WORK_DIR="\$MACKAS_WORK_ROOT" \\
 	KAS_CONTAINER_IMAGE="\$KAS_IMAGE" \\
 	GITCONFIG_FILE="\${GITCONFIG_FILE:-\$MACKAS_GITCONFIG}" \\
 	KAS_BUILD_DIR= DL_DIR= SSTATE_DIR= \\
@@ -6341,7 +6350,7 @@ EOF
 project_add_usage() {
 	cat <<EOF
 ${C_BLD}$SCRIPT_CMD project add${C_RST} -- pin <name> as a project workspace under
-this Mac's own MACKAS_ROOT: creates \$MACKAS_WORK/<name>/ (that project's
+this Mac's own MACKAS_ROOT: creates \$MACKAS_WORK_ROOT/<name>/ (that project's
 entire KAS_WORK_DIR -- the checkout and whatever siblings kas clones next to
 it, private to <name>; see #72) and writes a standalone config to
 ~/.config/mackas/projects/<name>.conf, seeded from the settings in effect
@@ -6358,7 +6367,7 @@ ${C_BLD}OPTIONS${C_RST}
                        is cloned yet -- that is what 'setup' does next.
   --branch BRANCH      The branch to build. Needs --url too.
   --from <checkout>    Convert an EXISTING checkout already at
-                       \$MACKAS_WORK/<name>/ into a pinned project, in place --
+                       \$MACKAS_WORK_ROOT/<name>/ into a pinned project, in place --
                        reads its remote URL and current branch instead of
                        asking for --url/--branch. Mutually exclusive with
                        --url/--branch. <checkout> must name that very
@@ -6395,7 +6404,7 @@ ${C_BLD}OPTIONS${C_RST}
   MACKAS_PROJECT_URL/_BRANCH later with '$SCRIPT_CMD --project <name> set
   MACKAS_PROJECT_URL ...'.
 
-'project add <name>' refuses outright if \$MACKAS_WORK/<name>/ already exists
+'project add <name>' refuses outright if \$MACKAS_WORK_ROOT/<name>/ already exists
 and --from was not given -- a plain checkout that happens to share the name
 is not automatically adopted (#72: filesystem shape alone never decides
 anything). An already-pinned <name> is offered for overwrite, exactly like
@@ -6471,7 +6480,7 @@ cmd_project_add() {
 	hdr "mackas project add: $name"
 
 	local config_file; config_file="$(projects_dir)/$name.conf"
-	local workspace_dir; workspace_dir="$MACKAS_WORK/$name"
+	local workspace_dir; workspace_dir="$MACKAS_WORK_ROOT/$name"
 
 	local proj_url="" proj_branch="" proj_dir=""
 	if [ -n "$from" ]; then
@@ -6489,7 +6498,7 @@ cmd_project_add() {
 		case "$from" in
 			/*)  from_resolved="$(resolve_path "$from")" ;;
 			*/*) from_resolved="$(resolve_path "$MACKAS_ROOT/$from")" ;;
-			*)   from_resolved="$(resolve_path "$MACKAS_WORK/$from")" ;;
+			*)   from_resolved="$(resolve_path "$MACKAS_WORK_ROOT/$from")" ;;
 		esac
 		local workspace_resolved; workspace_resolved="$(resolve_path "$workspace_dir")"
 		if [ "$from_resolved" != "$workspace_resolved" ]; then
@@ -10534,11 +10543,11 @@ already does for '$SCRIPT_CMD smoketest'/'shell' -- not just after the next
 being copied into the generated wrapper.
 
 ${C_BLD}--expect-work DIR${C_RST} refuses when the config in effect resolves a
-different work directory than DIR. The wrapper passes the MACKAS_WORK it
-was generated with: volumes are recomputed live while work dir, image and
-gitconfig stay frozen in it, so a config naming another root would mount
-another project's ext4 volumes under this project's sources. Comparing
-identities rather than freezing the config path keeps an ambient
+different flat work root than DIR. The wrapper passes the MACKAS_WORK_ROOT
+it was generated with: volumes are recomputed live while work dir, image
+and gitconfig stay frozen in it, so a config naming another root would
+mount another project's ext4 volumes under this project's sources.
+Comparing identities rather than freezing the config path keeps an ambient
 \$MACKAS_CONF usable whenever it agrees, and refuses only when it does not.
 
 ${C_BLD}--kas-files CHAIN${C_RST} is plumbing too: the generated wrapper's own hint at the
@@ -10628,15 +10637,17 @@ cmd_runtime_args() {
 		return 0
 	fi
 
-	# The generated wrapper passes the MACKAS_WORK it was built with. Volumes
-	# are recomputed live (so `mackas set` takes effect without regenerating
-	# the wrapper) while work dir, image and gitconfig stay frozen in it -- so
-	# a config that resolves a DIFFERENT root would hand this build another
+	# The generated wrapper passes the MACKAS_WORK_ROOT it was built with --
+	# the flat work root, which identifies the MACKAS_ROOT it was generated
+	# for regardless of which project (if any) is selected. Volumes are
+	# recomputed live (so `mackas set` takes effect without regenerating the
+	# wrapper) while work dir, image and gitconfig stay frozen in it -- so a
+	# config that resolves a DIFFERENT root would hand this build another
 	# project's ext4 volumes while its sources and gitconfig stay put. Compare
 	# identities rather than freezing the config path into the wrapper: an
 	# ambient $MACKAS_CONF keeps working whenever it is consistent, and is
 	# refused only when it actually disagrees.
-	if [ -n "$expect_work" ] && [ "$expect_work" != "$MACKAS_WORK" ]; then
+	if [ -n "$expect_work" ] && [ "$expect_work" != "$MACKAS_WORK_ROOT" ]; then
 		die "this wrapper was generated for a different configuration" \
 			"$(wrapper_identity_hint "$expect_work")"
 	fi
