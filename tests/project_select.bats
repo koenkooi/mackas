@@ -845,7 +845,7 @@ pin() {
 	! printf '%s\n' "$output" | grep -q 'from-env'
 }
 
-# The generated wrapper freezes MACKAS_WORK/KAS_IMAGE/gitconfig but recomputes
+# The generated wrapper freezes MACKAS_WORK_ROOT/KAS_IMAGE/gitconfig but recomputes
 # volumes LIVE, so a config resolving a different root would hand a build
 # another project's ext4 volumes while its sources and gitconfig stay put.
 # Identity is compared rather than the config path being frozen into the
