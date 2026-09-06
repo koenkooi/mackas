@@ -531,6 +531,19 @@ deprecated — or **(B) pin it** with `project add --from`, keeping
 `oe-build-*` explicitly (`--keep-volumes`, no data ever moved) or deriving
 `mackas-<name>-*` instead (`--derive-volumes`).
 
+### Converting a project pinned before per-project workspaces
+
+A project pinned before per-project `KAS_WORK_DIR` existed (#80) still has
+its checkout directly at `work/<name>/` rather than `work/<name>/<name>/`.
+Re-run `mackas project add <name> --from <name>` against it to offer the
+move; `mackas projects` flags a pin still in the old shape as `legacy
+layout`. It refuses outright rather than moving anything the moment
+something is ambiguous — the destination already exists, an earlier attempt
+was interrupted, or the checkout is reached through a symlink — and it never
+touches the flat siblings kas already cloned next to the checkout; those are
+yours to keep or discard by hand. Full detail:
+[storage.md](docs/storage.md#converting-a-project-pinned-before-per-project-workspaces).
+
 ## Adopting a root from another Mac
 
 `MACKAS_ROOT` is portable — an external SSD, or a disk image on a share, can
