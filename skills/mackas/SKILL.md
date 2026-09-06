@@ -496,6 +496,14 @@ build in the same shell, `retrieve` just works. If you rely on derivation:
   dance by exporting the two variables.
 - **A chain spanning sibling layers derives nothing** by design
   ([architecture.md](../../docs/architecture.md#deriving-mackas_project_dir-and-mackas_kas_config)).
+- **Once a project is selected, the chain's shape depends on cwd.** Standing
+  in the workspace itself (`work/<name>/`), nothing changes — the chain is
+  still `<checkout>/kas/….yml`. Standing one level up, in the flat
+  `work/` root, the chain needs **both** components:
+  `<name>/<name>/kas/….yml`, the workspace name then the checkout name — and
+  a chain whose first component names a *different* workspace than the one
+  your sourced `env-<name>.sh` was generated for derives nothing, the same
+  fail-closed rule as the sibling-layer case above.
 - **Requires a fresh `env.sh`** (see Preflight).
 - `mackas clean tmp+deploy` resolves the same way, but without it now refuses
   outright (an in-place `rm -rf` has no safe default to guess).
