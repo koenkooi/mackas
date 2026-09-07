@@ -2005,6 +2005,47 @@ pinned_projects_referencing_volume() {
 	done
 }
 
+# pinned_projects_referencing_root ROOT -- print, one per line, every pinned
+# project (projects_dir()/*.conf, minus the .conf suffix) whose MACKAS_ROOT
+# setting is exactly ROOT. Same shape as pinned_projects_referencing_volume()
+# just above: GREPPED via config_grep_setting -- projects_dir() is $HOME-wide
+# (#78), not scoped to any one MACKAS_ROOT, and sourcing a directory's worth
+# of other people's configs to answer this is exactly the code execution the
+# search-path restriction exists to prevent -- same defensive
+# `[ -f "$f" ] || continue` cmd_projects() and the volume variant both use, so
+# a directory with no configs at all, or none yet, is silent rather than
+# iterating a literal unexpanded glob.
+#
+# A plain string compare is enough: every writer of a MACKAS_ROOT= line
+# (cmd_project_add(), adopt) writes $MACKAS_ROOT only after derive_paths()
+# has already run strip_trailing_slash() on it, so a pinned config's stored
+# value and a live $MACKAS_ROOT this process is holding are already the same
+# normalization -- resolve_path()'ing either side here would just risk
+# disagreeing with the value the OTHER writer actually put on disk (a stale
+# or renamed root prints back unresolved, per derive_project_candidates()'s
+# own comment) for no matching benefit, since this is a same-root membership
+# check, not a cwd-prefix check against a physical filesystem path.
+#
+# write_kas_wrapper() is the one caller (#114): it needs to know whether MORE
+# THAN ONE pinned project claims THIS root, not merely whether one exists, to
+# tell apart "genuinely the only project under this root" -- the single-
+# project convenience #78 tier-1/2 pin-baking was designed for -- from "one
+# of several sharing a root", where baking any one of them into the ONE
+# wrapper file shared by the whole root would silently hijack every sibling
+# project's hand-typed kas-container invocations under it.
+pinned_projects_referencing_root() {
+	local target="$1" dir f name root
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		name="$(basename "$f" .conf)"
+		root="$(config_grep_setting "$f" MACKAS_ROOT)" || continue
+		if [ "$root" = "$target" ]; then
+			printf '%s\n' "$name"
+		fi
+	done
+}
+
 # pinned_configs_unreadable -- print, one per line, the basename (minus
 # .conf) of every projects_dir()/*.conf that EXISTS as a regular file but
 # this process could not read (permission denied, a stale ACL, an NFS
@@ -5222,8 +5263,31 @@ write_kas_wrapper() {
 	# Leaving it empty here keeps derivation live: MACKAS_PROJECT_PIN="" makes
 	# load_config treat $MACKAS_PROJECT_SELECT as absent (same as never set),
 	# so the wrapper's own subprocess re-derives from ITS inherited cwd.
+	#
+	# #114: an explicit tier-1/2 selector is ALSO not enough on its own any
+	# more. This file is the ONE wrapper $PATH resolves 'kas-container' to
+	# for every project under $MACKAS_ROOT, not one per project -- so baking
+	# a pin in here is only safe when it can only ever mean one thing under
+	# this root. The moment a second project is pinned under the same root,
+	# ITS explicit setup would overwrite this same wrapper with ITS pin, and
+	# every OTHER project's hand-typed kas-container calls would silently
+	# start mounting whichever project's setup ran last, regardless of the
+	# cwd they were actually typed from (confirmed live: #114). So the
+	# explicit-selector branch below only bakes the pin in when
+	# pinned_projects_referencing_root() finds EXACTLY ONE claimant of this
+	# $MACKAS_ROOT -- the genuine single-project case the tier-1/2
+	# convenience was designed for. Two or more claimants falls through to
+	# the same empty pin tier 3 gets, for the same reason: forcing every
+	# hand-typed invocation back onto live, per-invocation cwd derivation
+	# beats freezing today's project's answer into every sibling's build.
 	case "$PROJECT_SELECT_SOURCE" in
-		--project|"\$MACKAS_PROJECT_SELECT") q_projsel="$(shq "$PROJECT_SELECTED")" ;;
+		--project|"\$MACKAS_PROJECT_SELECT")
+			if [ "$(pinned_projects_referencing_root "$MACKAS_ROOT" | wc -l | tr -d ' ')" -eq 1 ]; then
+				q_projsel="$(shq "$PROJECT_SELECTED")"
+			else
+				q_projsel="$(shq "")"
+			fi
+			;;
 		*) q_projsel="$(shq "")" ;;
 	esac
 
