@@ -273,36 +273,52 @@ run_wrapper() {
 }
 
 # ---------------------------------------------------------------------------
-# The pin-vs-cwd disagreement guard (cmd_runtime_args(), next to
-# --expect-work): a wrapper is per ROOT, and M3's `project add` puts several
-# projects in one root sharing that ONE generated wrapper -- so a wrapper
-# pinned to A (because 'mackas --project A setup' ran last) must refuse
-# rather than silently hand a hand-typed build standing in work/B A's
-# volumes with B's sources. Regenerates the SAME $KAS_CONTAINER_BIN with an
-# EXPLICIT tier-1/2 pin baked in (PROJECT_SELECT_SOURCE "--project", exactly
-# as write_kas_wrapper()'s own q_projsel branch requires before it bakes
-# anything at all -- see that function's own comment for why a derived
-# selection never reaches here), matching kas_wrapper.bats's own "selector:"
-# tests' shape for regenerating the wrapper mid-test.
+# A wrapper is per ROOT, and M3's `project add` puts several projects in one
+# root sharing that ONE generated wrapper. Before #114, a wrapper pinned to A
+# (because 'mackas --project A setup' ran last) relied on a SEPARATE
+# pin-vs-cwd disagreement guard (cmd_runtime_args(), next to --expect-work)
+# to catch a hand-typed build standing in work/B and refuse before handing it
+# A's volumes with B's sources -- and that guard had a gap: it could only
+# refuse when tier-3 cwd derivation found a DIFFERENT candidate to disagree
+# with the frozen pin, so a build with no derivable candidate at all (a flat/
+# legacy layout, an ambiguous cwd) silently fell through to the stale pin
+# instead (the actual #114 incident).
+#
+# #114's fix removes the frozen pin itself in this scenario: with two or
+# more projects pinned under one root, write_kas_wrapper() leaves
+# MACKAS_PROJECT_PIN empty even for an explicit tier-1/2 selector, so there
+# is nothing left for cwd to disagree WITH -- every hand-typed invocation
+# through this wrapper now re-derives live from ITS OWN cwd (or falls
+# through to the neutral default), the same as any unpinned invocation
+# would. The tests below regenerate the SAME $KAS_CONTAINER_BIN with an
+# EXPLICIT tier-1/2 pin requested (PROJECT_SELECT_SOURCE "--project", exactly
+# as write_kas_wrapper()'s own q_projsel branch requires before it even
+# CONSIDERS baking anything in) to prove the pin still comes out empty and
+# every invocation is answered correctly anyway -- matching
+# kas_wrapper.bats's own "selector:"/"#114:" tests' shape for regenerating
+# the wrapper mid-test.
 # ---------------------------------------------------------------------------
 
-@test "pin-vs-cwd guard: a wrapper pinned to meta-qcom refuses when standing in poky's own workspace" {
+# #114: meta-qcom and poky share ONE root, so write_kas_wrapper() now leaves
+# the pin EMPTY even though this call is an explicit --project meta-qcom --
+# pinned_projects_referencing_root() finds two claimants of $TESTDIR, not
+# one. There is therefore no frozen pin left for cwd to disagree WITH: the
+# wrapper's live recompute falls straight through to ordinary tier-3
+# derivation, which -- standing in poky's own workspace -- correctly derives
+# poky on its own. The refusal this test used to assert was the OLD guard
+# catching a disagreement between a frozen wrong pin and a live right cwd;
+# post-#114 there is no wrong pin to freeze in the first place, so the build
+# just succeeds with poky's own volumes instead of needing a refusal to
+# recover from a bad pin.
+@test "#114: a wrapper written under --project meta-qcom, meta-qcom and poky sharing a root, derives poky live when standing in poky's own workspace" {
 	PROJECT_SELECTED="meta-qcom"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
 	cd "$TESTDIR/work/poky"
 	run_wrapper build kas/base.yml
-	[ "$rc" -ne 0 ]
-	[ ! -e "$KREC" ]
-	printf '%s\n' "$out" | grep -qF 'meta-qcom'
-	printf '%s\n' "$out" | grep -qF 'poky'
-	# Both one-off escapes must name the project the DIRECTORY says, not the
-	# wrapper's pin: someone who cd'd into work/poky and typed kas-container
-	# wants poky built, so "$SCRIPT_CMD --project meta-qcom shell" answers a
-	# question they did not ask, and leaves the one they did ask unanswered.
-	printf '%s\n' "$out" | grep -qF -- '--project poky shell'
-	printf '%s\n' "$out" | grep -qF -- '--project poky setup'
-	! printf '%s\n' "$out" | grep -qF -- '--project meta-qcom shell'
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	[ -e "$KREC" ]
+	assert_volume_names mackas-poky
 }
 
 @test "pin-vs-cwd guard: the SAME wrapper still launches normally from meta-qcom's own workspace" {
@@ -316,7 +332,15 @@ run_wrapper() {
 	assert_volume_names mackas-meta-qcom
 }
 
-@test "pin-vs-cwd guard: the SAME wrapper still launches normally standing in work/ with no chain at all" {
+# #114: standing in bare work/ (neither project's own directory, no chain
+# hint to derive from) with an empty pin, tier 3 finds zero candidates --
+# neither meta-qcom's nor poky's MACKAS_ROOT/work/<name> matches "$TESTDIR/
+# work" itself -- so this now falls through to tier 4's default search path
+# config, the plain oe-build-* stem, rather than replaying meta-qcom's
+# frozen pin. That fallthrough is the whole point of #114: a NEUTRAL,
+# project-agnostic default beats confidently mounting the WRONG one of two
+# sibling projects sharing this root.
+@test "#114: a wrapper written under --project meta-qcom, meta-qcom and poky sharing a root, falls through to the default stem standing in bare work/ with no chain" {
 	PROJECT_SELECTED="meta-qcom"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
@@ -324,21 +348,31 @@ run_wrapper() {
 	run_wrapper build foo.yml
 	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
 	[ -e "$KREC" ]
-	assert_volume_names mackas-meta-qcom
+	assert_volume_names oe-build
 }
 
 # ---------------------------------------------------------------------------
-# Regression: the pin-vs-cwd guard's own cwd/chain check must not resurrect
-# tier 3's fail-closed-on-unreadable rule for a selector that is already
-# settled. An UNRELATED pinned config elsewhere in projects_dir() going
-# unreadable (someone else's broken permissions, a bad restore, ...) must
-# not turn into a fresh refusal for a build this guard would otherwise have
-# waved straight through -- that would be strictly WORSE than mackas before
-# this guard existed at all, which is exactly what the backward-compat
-# contract for "any invocation carrying a tier-1/2 selector" rules out.
+# #114 superseded the OLD "unrelated unreadable pinned config does not break
+# a settled selector" guarantee for THIS scenario specifically. That
+# guarantee depended on an explicit pin being baked into the wrapper, which
+# let the live recompute skip ordinary tier-3 derivation (and its ALL-of-
+# projects_dir() fail-closed-on-unreadable scan) entirely -- see
+# derive_project_candidates()'s own comment on why MODE=lenient exists only
+# for an ALREADY-pinned consult. With meta-qcom and poky sharing a root,
+# write_kas_wrapper() no longer bakes a pin at all (the whole point of
+# #114), so the live recompute has nothing to skip tier 3 WITH any more: it
+# runs the same ordinary, STRICT tier-3 derivation an unpinned invocation
+# would, which fails closed on ANY unreadable pinned config in
+# projects_dir() -- "it could have been the match" applies just as much to
+# an invocation standing in meta-qcom's own directory as to any other,
+# once there is no explicit selector left to exempt it. This is the correct
+# trade: the alternative would be resurrecting some OTHER way to bypass
+# tier 3's fail-closed rule for "no real pin, but maybe fine anyway", which
+# is exactly the kind of silent-guess mackas's fail-closed philosophy
+# refuses to make.
 # ---------------------------------------------------------------------------
 
-@test "pin-vs-cwd guard: an unrelated unreadable pinned config does not break a matching build" {
+@test "#114: with the pin suppressed (shared root), an unrelated unreadable pinned config now refuses a build that used to be exempt" {
 	PROJECT_SELECTED="meta-qcom"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
@@ -346,12 +380,13 @@ run_wrapper() {
 	cd "$TESTDIR/work/meta-qcom"
 	run_wrapper build kas/base.yml
 	chmod 600 "$PROJDIR/poky.conf"
-	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
-	[ -e "$KREC" ]
-	assert_volume_names mackas-meta-qcom
+	[ "$rc" -ne 0 ]
+	[ ! -e "$KREC" ]
+	printf '%s\n' "$out" | grep -qF 'cannot tell whether $PWD names a pinned project'
+	printf '%s\n' "$out" | grep -qF 'poky.conf'
 }
 
-@test "pin-vs-cwd guard: an unrelated unreadable pinned config does not break a neutral-cwd build either" {
+@test "#114: with the pin suppressed (shared root), an unrelated unreadable pinned config also refuses a neutral-cwd build" {
 	PROJECT_SELECTED="meta-qcom"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
@@ -359,7 +394,8 @@ run_wrapper() {
 	cd "$TESTDIR/work"
 	run_wrapper build foo.yml
 	chmod 600 "$PROJDIR/poky.conf"
-	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
-	[ -e "$KREC" ]
-	assert_volume_names mackas-meta-qcom
+	[ "$rc" -ne 0 ]
+	[ ! -e "$KREC" ]
+	printf '%s\n' "$out" | grep -qF 'cannot tell whether $PWD names a pinned project'
+	printf '%s\n' "$out" | grep -qF 'poky.conf'
 }
