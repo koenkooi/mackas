@@ -436,3 +436,34 @@ teardown() {
 	# 'MACKAS_ROOT="/...' default would have caught the old shipped disk.
 	! grep -nE '^\s*MACKAS_ROOT="/.+"' "$MACKAS"
 }
+
+# ---------------------------------------------------------------------------
+# repo_dir_name_from_url -- the checkout DIRECTORY name 'project add' derives
+# from --url, independent of the project's own pin name (a real reported
+# confusion: a pin named "Meta-angstrom-wrynose" for the actual repo
+# "meta-angstrom" used to leave the checkout ITSELF misnamed to match,
+# breaking anything -- kas included -- that expects a checkout's directory
+# to be the repo's real name).
+# ---------------------------------------------------------------------------
+
+@test "repo_dir_name_from_url: a plain https URL" {
+	[ "$(repo_dir_name_from_url https://github.com/angstrom-distribution/meta-angstrom)" = "meta-angstrom" ]
+}
+
+@test "repo_dir_name_from_url: the conventional .git suffix is stripped" {
+	[ "$(repo_dir_name_from_url https://github.com/angstrom-distribution/meta-angstrom.git)" = "meta-angstrom" ]
+}
+
+@test "repo_dir_name_from_url: a trailing slash names nothing extra" {
+	[ "$(repo_dir_name_from_url https://github.com/angstrom-distribution/meta-angstrom/)" = "meta-angstrom" ]
+}
+
+@test "repo_dir_name_from_url: SCP-style git@host:org/repo.git" {
+	[ "$(repo_dir_name_from_url git@github.com:angstrom-distribution/meta-angstrom.git)" = "meta-angstrom" ]
+}
+
+@test "repo_dir_name_from_url: the derived name never depends on the project's own pin name" {
+	# The whole point: the URL alone decides this, regardless of what the
+	# caller happens to be naming the project pin elsewhere.
+	[ "$(repo_dir_name_from_url https://github.com/angstrom-distribution/meta-angstrom)" != "Meta-angstrom-wrynose" ]
+}
