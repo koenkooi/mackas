@@ -5569,9 +5569,34 @@ setup_project() {
 			# have uncommitted work or fetched layers -- never re-clone over it.
 			skip "$MACKAS_PROJECT_DIR on branch $MACKAS_PROJECT_BRANCH at $MACKAS_PROJECT"
 		else
-			run git -C "$MACKAS_PROJECT" fetch origin "$MACKAS_PROJECT_BRANCH"
-			run git -C "$MACKAS_PROJECT" checkout "$MACKAS_PROJECT_BRANCH"
-			did "switched $MACKAS_PROJECT_DIR to $MACKAS_PROJECT_BRANCH"
+			# The pin and the live checkout disagree. MACKAS_PROJECT_BRANCH is
+			# written once, at project add/--from time, and nothing keeps it in
+			# sync afterward -- switching branches directly in a project
+			# checkout (plain `git checkout <other-branch>`) is normal OE
+			# workflow, so this mismatch just as often means the PIN went
+			# stale as it means the checkout drifted. Forcing the checkout is
+			# a real `git checkout` against a live working tree that may hold
+			# uncommitted work (#115 -- confirmed live: only git itself
+			# refusing over dirty state stopped this from silently switching
+			# branches under a real project). Gate it behind confirm() like
+			# every other real-checkout-mutating decision in this file, and
+			# -- unlike confirm()'s own generic ASSUME_YES semantics, which
+			# treat -y as "proceed" -- make -y default to REFUSING here
+			# rather than assuming "switch", the same fail-closed reasoning
+			# project add --from's own keep/derive-volumes question already
+			# applies above. A plain no-tty invocation (no -y at all) needs
+			# no special case: confirm() already declines on its own when
+			# stdin is not a terminal, which is the correct default here too.
+			if [ "$ASSUME_YES" -eq 1 ] && [ "$DRY_RUN" -ne 1 ]; then
+				warn "      $MACKAS_PROJECT_DIR is on '$br', pinned branch is '$MACKAS_PROJECT_BRANCH' -- not switching a live checkout non-interactively"
+				warn "      run 'git -C $MACKAS_PROJECT checkout $MACKAS_PROJECT_BRANCH' by hand if that is what you want, or update MACKAS_PROJECT_BRANCH in $(config_hint) if the checkout is right and the pin is stale"
+			elif confirm "      $MACKAS_PROJECT_DIR is on '$br', not the pinned '$MACKAS_PROJECT_BRANCH'. Switch the checkout to '$MACKAS_PROJECT_BRANCH'?"; then
+				run git -C "$MACKAS_PROJECT" fetch origin "$MACKAS_PROJECT_BRANCH"
+				run git -C "$MACKAS_PROJECT" checkout "$MACKAS_PROJECT_BRANCH"
+				did "switched $MACKAS_PROJECT_DIR to $MACKAS_PROJECT_BRANCH"
+			else
+				warn "      declined -- leaving $MACKAS_PROJECT_DIR on '$br'"
+			fi
 		fi
 	else
 		run mkdir -p "$MACKAS_WORK"
