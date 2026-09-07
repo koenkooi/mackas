@@ -5972,6 +5972,40 @@ validate_setup_size() {
 	valid_size_shape "$val" || die "$flag '$val' is not a size like 1T, 200G or 512M" "$SCRIPT_CMD setup --help"
 }
 
+# volume_already_provisioned NAME -- true only when we can actually tell NAME
+# already exists as a real ext4 volume. volume_exists() is meaningless while
+# the container daemon is down (its own neighbouring comment: "return nothing
+# useful when the daemon is simply down"), and prompt_setup_settings() below
+# runs before setup_runtime ever starts it -- so false here means "unknown",
+# not "does not exist", and the size prompt correctly falls back to asking,
+# exactly as it always has, rather than guessing a volume is new when it
+# might not be.
+volume_already_provisioned() {
+	container_running && volume_exists "$1"
+}
+
+# skipped_size_prompt_note LABEL VOLUME SETTING -- the line printed in place
+# of a size prompt for a volume that already exists. Distinguishes the two
+# real reasons that happens, because they read very differently to a user:
+# an explicitly-named override (config_pinned_setting SETTING -- the same
+# explicit-vs-factory-default check project add's own dl/sstate collision
+# note already uses for these three settings, since MACKAS_VOLUME_NAME's
+# non-empty factory default means a bare value check cannot tell "explicitly
+# this" from "never touched") means the user is DELIBERATELY reusing a
+# volume, e.g. --set MACKAS_VOLUME_DL_NAME=<existing volume> project add --
+# say so plainly, or a report like the one that motivated this function
+# ("why is it asking me to size a volume I told it to reuse?") recurs one
+# level up instead of being fixed here. Anything else just means this
+# project's own volume already exists from an earlier setup run.
+skipped_size_prompt_note() {
+	local label="$1" vol="$2" setting="$3"
+	if config_pinned_setting "$setting"; then
+		info "  $label volume '$vol' already exists -- reusing it as requested ($setting); its size cannot be changed here (see '$SCRIPT_CMD volume resize')"
+	else
+		info "  $label volume '$vol' already exists from an earlier setup; its size cannot be changed here (see '$SCRIPT_CMD volume resize')"
+	fi
+}
+
 # prompt_setup_settings -- ask for whichever of the root path / three volume
 # sizes is not already resolved (setting_is_explicit) via this invocation's
 # own flag, --set, the environment or the config file -- one prompt per
@@ -5981,6 +6015,14 @@ validate_setup_size() {
 # same guard confirm() uses -- a non-interactive invocation behaves exactly
 # as it always has: sizes stay at their defaults, MACKAS_ROOT falls through
 # to require_mackas_root's own $PWD fallback.
+#
+# Each size prompt is ALSO skipped outright when the volume it would size
+# already exists: ensure_volume() never resizes an existing volume, so a
+# size typed here for an already-provisioned volume is silently discarded a
+# few steps later, which reads as a bug, not a no-op -- this is exactly the
+# shape a reused --set MACKAS_VOLUME_DL_NAME=<existing volume> setup hits
+# every time. Growing an existing volume is 'volume resize', a deliberate
+# separate command (it can only grow, never shrink -- see its own comment).
 prompt_setup_settings() {
 	[ -t 0 ] || return 0
 	local reply
@@ -5992,7 +6034,9 @@ prompt_setup_settings() {
 		[ -n "$reply" ] && MACKAS_ROOT="$reply"
 	fi
 
-	if ! setting_is_explicit MACKAS_VOLUME_SIZE_TMP; then
+	if volume_already_provisioned "$MACKAS_VOL_TMP"; then
+		skipped_size_prompt_note "TMPDIR" "$MACKAS_VOL_TMP" MACKAS_VOLUME_NAME
+	elif ! setting_is_explicit MACKAS_VOLUME_SIZE_TMP; then
 		printf '%sTMPDIR volume size%s [%s]: ' "$C_BLD" "$C_RST" "$MACKAS_VOLUME_SIZE_TMP"
 		read -r reply || reply=""
 		if [ -n "$reply" ]; then
@@ -6001,7 +6045,9 @@ prompt_setup_settings() {
 		fi
 	fi
 
-	if ! setting_is_explicit MACKAS_VOLUME_SIZE_DL; then
+	if volume_already_provisioned "$MACKAS_VOL_DL"; then
+		skipped_size_prompt_note "Downloads" "$MACKAS_VOL_DL" MACKAS_VOLUME_DL_NAME
+	elif ! setting_is_explicit MACKAS_VOLUME_SIZE_DL; then
 		printf '%sDownloads volume size%s [%s]: ' "$C_BLD" "$C_RST" "$MACKAS_VOLUME_SIZE_DL"
 		read -r reply || reply=""
 		if [ -n "$reply" ]; then
@@ -6010,7 +6056,9 @@ prompt_setup_settings() {
 		fi
 	fi
 
-	if ! setting_is_explicit MACKAS_VOLUME_SIZE_SSTATE; then
+	if volume_already_provisioned "$MACKAS_VOL_SSTATE"; then
+		skipped_size_prompt_note "sstate" "$MACKAS_VOL_SSTATE" MACKAS_VOLUME_SSTATE_NAME
+	elif ! setting_is_explicit MACKAS_VOLUME_SIZE_SSTATE; then
 		printf '%ssstate volume size%s [%s]: ' "$C_BLD" "$C_RST" "$MACKAS_VOLUME_SIZE_SSTATE"
 		read -r reply || reply=""
 		if [ -n "$reply" ]; then
