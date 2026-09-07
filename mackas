@@ -970,26 +970,36 @@ PROJECT_SELECT_NOTE_SHOWN=0
 # here; `--project NAME` reads exactly this path back.
 projects_dir() { printf '%s/.config/mackas/projects' "$HOME"; }
 
-# Refuse a project name before it is ever pasted into a path. The name becomes
-# <projects_dir>/<name>.conf, so a '/' or a '..' inside it aims that path
-# somewhere else entirely, and a leading '-' makes the value read as a flag to
-# whatever later passes it along. The allowed class is the one `adopt` already
-# produces (it tr's a checkout name down to [A-Za-z0-9-]), widened by '.' and
-# '_' only.
-validate_project_select() {
-	local name="$1" src="$2" hint
-	hint="$SCRIPT_CMD projects  (lists the pinned ones)"
+# Refuse a value before it is ever pasted into a path, as one path component:
+# no '/' (aims the path somewhere else entirely), no leading '-' (reads as a
+# flag to whatever later passes it along), never '.'/'..' or containing '..'.
+# Shared by validate_project_select() (a project's own pin identity, becomes
+# <projects_dir>/<name>.conf) and project add's --dir (a checkout's own
+# directory name, becomes work/<name>/<dir> -- see #80's note on why the two
+# are independent values, not the same thing worded twice). NOUN is what a
+# violation names itself as, so an error about a checkout directory does not
+# read as if it were complaining about the project's own identity, or the
+# reverse.
+validate_path_component() {
+	local name="$1" noun="$2" src="$3" hint="$4"
 	case "$name" in
-		# Both callers reject an empty name before getting here; kept so the
-		# function is safe standalone, since "" would name <dir>/.conf -- a
-		# perfectly legal hidden file.
-		"") die "$src needs a project name" "$hint" ;;
-		-*) die "$src: a project name cannot start with '-': $name" "$hint" ;;
-		.|..|*..*) die "$src: a project name cannot be '.' or contain '..': $name" "$hint" ;;
+		# Every caller rejects an empty value before getting here; kept so
+		# this stays safe standalone, since "" would name <dir>/.conf -- a
+		# perfectly legal hidden file -- or work/<name>/ itself.
+		"") die "$src needs a $noun" "$hint" ;;
+		-*) die "$src: a $noun cannot start with '-': $name" "$hint" ;;
+		.|..|*..*) die "$src: a $noun cannot be '.' or contain '..': $name" "$hint" ;;
 		*[!A-Za-z0-9._-]*)
-			die "$src: a project name may only contain letters, digits, '.', '_' and '-': $name" \
+			die "$src: a $noun may only contain letters, digits, '.', '_' and '-': $name" \
 				"$hint" ;;
 	esac
+}
+
+# The allowed class is the one `adopt` already produces (it tr's a checkout
+# name down to [A-Za-z0-9-]), widened by '.' and '_' only.
+validate_project_select() {
+	local name="$1" src="$2"
+	validate_path_component "$name" "project name" "$src" "$SCRIPT_CMD projects  (lists the pinned ones)"
 }
 
 # Print FILE's value for setting NAME by GREPPING it, never sourcing it.
@@ -6532,8 +6542,15 @@ it, private to <name>; see #72) and writes a standalone config to
 right now. It PINS; it does not build -- run
 '$SCRIPT_CMD --project <name> setup' afterwards for that.
 
+<name> is the project's own SELECTOR identity only -- what '--project <name>'
+matches, what the workspace directory and default volume names are built
+from. It is deliberately independent of the checkout's own directory name
+(MACKAS_PROJECT_DIR, work/<name>/<dir>): kas and everything else that reads
+that checkout expects its directory to be the real repo's own name, so
+--url's default is derived from the URL, not from <name> -- see --dir below.
+
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD project add <name> --url URL --branch BRANCH
+  $SCRIPT_CMD project add <name> --url URL --branch BRANCH [--dir DIR]
   $SCRIPT_CMD project add <name> --from <checkout>
   $SCRIPT_CMD project add <name>
 
@@ -6541,14 +6558,19 @@ ${C_BLD}OPTIONS${C_RST}
   --url URL            The project's git remote. Needs --branch too. Nothing
                        is cloned yet -- that is what 'setup' does next.
   --branch BRANCH      The branch to build. Needs --url too.
+  --dir DIR            The checkout's own directory name (MACKAS_PROJECT_DIR),
+                       overriding the default derived from --url (the same
+                       name a plain 'git clone URL' would pick on its own).
+                       Only meaningful with --url -- a --from conversion's
+                       checkout already has a real, fixed directory name.
   --from <checkout>    Convert an EXISTING checkout already at
                        \$MACKAS_WORK_ROOT/<name>/ into a pinned project, in place --
                        reads its remote URL and current branch instead of
                        asking for --url/--branch. Mutually exclusive with
-                       --url/--branch. <checkout> must name that very
-                       directory (bare '<name>', 'work/<name>', or a path
-                       resolving to it) -- 'project add' never renames or
-                       moves a checkout to make names line up.
+                       --url/--branch and with --dir. <checkout> must name
+                       that very directory (bare '<name>', 'work/<name>', or
+                       a path resolving to it) -- 'project add' never renames
+                       or moves a checkout to make names line up.
   --keep-volumes       With --from only: keep building against whatever
                        volumes the checkout already used (e.g. oe-build-*),
                        explicitly -- migration path B from the multi-project
@@ -6603,7 +6625,7 @@ EOF
 }
 
 cmd_project_add() {
-	local name="" url="" branch="" from="" keep_flag="" derive_flag="" want_help=0 migrate_pending=0
+	local name="" url="" branch="" from="" dir_flag="" keep_flag="" derive_flag="" want_help=0 migrate_pending=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			-h|--help|help) want_help=1; shift ;;
@@ -6619,6 +6641,10 @@ cmd_project_add() {
 				[ -n "$from" ] || die "--from needs a value" "$SCRIPT_CMD project add --help"
 				shift 2 ;;
 			--from=*)  from="${1#*=}"; shift ;;
+			--dir)     dir_flag="${2:-}"
+				[ -n "$dir_flag" ] || die "--dir needs a value" "$SCRIPT_CMD project add --help"
+				shift 2 ;;
+			--dir=*)   dir_flag="${1#*=}"; shift ;;
 			--keep-volumes)   keep_flag=1; shift ;;
 			--derive-volumes) derive_flag=1; shift ;;
 			-*) die "unknown option for 'project add': $1" "$SCRIPT_CMD project add --help" ;;
@@ -6656,6 +6682,14 @@ cmd_project_add() {
 		die "'--keep-volumes'/'--derive-volumes' only apply to a '--from' conversion" \
 			"a freshly added project has no prior volumes to keep or leave behind"
 	fi
+	if [ -n "$dir_flag" ] && [ -n "$from" ]; then
+		die "'--dir' does not apply to a '--from' conversion" \
+			"a --from checkout's own directory name is fixed by what is already there -- rename it by hand first if you want a different one"
+	fi
+	if [ -n "$dir_flag" ]; then
+		validate_path_component "$dir_flag" "checkout directory name" "project add --dir" \
+			"pass a plain directory name, e.g. --dir meta-angstrom"
+	fi
 
 	# Mutating: it creates a directory inside work/. Same gate 'setup' and
 	# 'adopt's own hand-off to setup use.
@@ -6668,16 +6702,10 @@ cmd_project_add() {
 
 	local proj_url="" proj_branch="" proj_dir=""
 	if [ -n "$from" ]; then
-		# --from converts THAT VERY ENTRY in place -- #72's own wording for the
-		# work/-collision-refusal rule below. Accepting an arbitrary OTHER
-		# directory here would mean either silently renaming/moving a checkout
-		# (never -- see #72) or minting a project whose pinned
-		# MACKAS_PROJECT_DIR points at a directory with a different name than
-		# the project itself, for no benefit -- work/<name>/ IS the workspace
-		# (#72). So the value is accepted in the forms a user is likely to
-		# type (a bare name, 'work/<name>', a path) purely to give a typo a
-		# clear message, not to allow converting anything other than
-		# work/<name> itself.
+		# --from converts THAT VERY ENTRY in place -- the value is accepted in
+		# the forms a user is likely to type (a bare name, 'work/<name>', a
+		# path) purely to give a typo a clear message, not to allow
+		# converting anything other than work/<name> itself.
 		local from_resolved
 		case "$from" in
 			/*)  from_resolved="$(resolve_path "$from")" ;;
@@ -6710,7 +6738,8 @@ cmd_project_add() {
 		# checkout being converted, so whatever name the user originally
 		# gave that directory when they first cloned it (typically the real
 		# repo's own name already) IS $name here, by construction -- there
-		# is nothing to fix.
+		# is nothing to fix. --dir is refused earlier for exactly this
+		# reason: there is no independent value to override.
 		proj_dir="$name"
 	else
 		# The collision refusal (#72): a first-level directory under work/ is
@@ -6745,15 +6774,23 @@ cmd_project_add() {
 		# <dir>) is an independent value from $name (the project's pin
 		# identity) -- kas and every other tool that reads this checkout
 		# expects its directory to be the REAL repo's name, not an arbitrary
-		# label picked purely to select between projects on this Mac. It is
-		# derived from --url, the same name a plain 'git clone URL' would
-		# pick on its own. Only when no --url was given at all (pinning a
-		# name with no checkout configured yet) is there nothing to derive
-		# from, so this still falls back to $name -- there is no repo
-		# identity yet to disagree with.
-		if [ -n "$url" ]; then
+		# label picked purely to select between projects on this Mac. --dir
+		# overrides it explicitly; otherwise it is derived from --url, the
+		# same name a plain 'git clone URL' would pick on its own. Only when
+		# no --url was given at all (pinning a name with no checkout
+		# configured yet) is there nothing to derive from, so this still
+		# falls back to $name -- there is no repo identity yet to disagree
+		# with, and the fallback is overwritten for real the moment a URL is
+		# set (this same computation reruns on the NEXT 'project add', and a
+		# bare 'set MACKAS_PROJECT_URL' does not touch MACKAS_PROJECT_DIR at
+		# all -- a user who wants the derived name after the fact should
+		# re-run 'project add' or set MACKAS_PROJECT_DIR by hand).
+		if [ -n "$dir_flag" ]; then
+			proj_dir="$dir_flag"
+		elif [ -n "$url" ]; then
 			proj_dir="$(repo_dir_name_from_url "$url")"
-			validate_project_select "$proj_dir" "the URL '$url'"
+			validate_path_component "$proj_dir" "checkout directory name" "the URL '$url'" \
+				"pass --dir <name> explicitly"
 		else
 			proj_dir="$name"
 		fi
@@ -6916,9 +6953,11 @@ cmd_project_add() {
 	[ -d "$cfg_dir" ] || ( umask 077 && run mkdir -p "$cfg_dir" ) || die "could not create $cfg_dir"
 
 	# What a STANDALONE config needs, and no more: MACKAS_ROOT (which root)
-	# and MACKAS_PROJECT_DIR (which checkout under work/ -- always <name> for
-	# a project this command itself created) make it self-sufficient; the
-	# project's own identity (its git remote/branch, if any) and any
+	# and MACKAS_PROJECT_DIR (which checkout DIRECTORY under work/<name>/ --
+	# $proj_dir, computed above: the real repo's own name whenever one is
+	# known, $name only as a last resort with nothing to derive from yet)
+	# make it self-sufficient; the project's own identity (its git
+	# remote/branch, if any) and any
 	# volume-name override this invocation's settings are already explicit
 	# about carry the CHOICE that got the user here into the new file too.
 	# Deliberately NOT seeded: volume SIZES, CPUS/MEMORY, mirror settings,

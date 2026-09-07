@@ -107,6 +107,69 @@ assert_volumes() {
 }
 
 # ---------------------------------------------------------------------------
+# MACKAS_PROJECT_DIR (the checkout's own directory name) is independent of
+# <name> (the project's pin identity) -- a real reported break: pinning
+# "Meta-angstrom-wrynose" for https://.../meta-angstrom used to leave the
+# CHECKOUT ITSELF at a directory literally named "Meta-angstrom-wrynose",
+# which kas (and anything else expecting the real repo name) does not
+# recognise. Nothing here is cosmetic -- the checkout's directory name is
+# load-bearing for kas.
+# ---------------------------------------------------------------------------
+
+@test "project add: MACKAS_PROJECT_DIR derives from --url's repo name, not <name>, when they differ" {
+	mk_add project add "Meta-angstrom-wrynose" \
+		--url https://github.com/angstrom-distribution/meta-angstrom --branch wrynose
+	[ "$status" -eq 0 ]
+
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom'" "$PROJDIR/Meta-angstrom-wrynose.conf"
+	! grep -qxF "MACKAS_PROJECT_DIR='Meta-angstrom-wrynose'" "$PROJDIR/Meta-angstrom-wrynose.conf"
+
+	# The WORKSPACE stays keyed by the pin name (that part was never wrong);
+	# only the checkout INSIDE it gets the real repo's name.
+	[ -d "$ROOT/work/Meta-angstrom-wrynose" ]
+	printf '%s\n' "$output" | grep -qF "checkout directory : $ROOT/work/Meta-angstrom-wrynose/meta-angstrom"
+}
+
+@test "project add: --dir overrides the derived checkout directory name explicitly" {
+	mk_add project add demo --url https://example.com/upstream-repo.git --branch main --dir custom-name
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='custom-name'" "$PROJDIR/demo.conf"
+}
+
+@test "project add: --dir together with --from is refused" {
+	mk_checkout demo https://example.com/demo.git
+	mk_add project add demo --from demo --dir something-else
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "does not apply to a '--from' conversion"
+	[ ! -f "$PROJDIR/demo.conf" ]
+}
+
+@test "project add: --dir is validated the same way a project name is (path safety)" {
+	mk_add project add demo --url https://example.com/demo.git --branch main --dir "../escape"
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi "checkout directory name"
+	[ ! -f "$PROJDIR/demo.conf" ]
+}
+
+@test "project add: no --url at all still falls back to <name> (nothing to derive from yet)" {
+	mk_add project add demo
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='demo'" "$PROJDIR/demo.conf"
+}
+
+@test "project add --from: MACKAS_PROJECT_DIR stays <name>, unaffected by URL derivation" {
+	# --from's own equality check already forces the workspace name to match
+	# the checkout being converted, so MACKAS_PROJECT_DIR='meta-angstrom'
+	# here would be WRONG even though the introspected origin URL is the
+	# real 'meta-angstrom' repo -- the directory already on disk is 'demo',
+	# and --from must never rename or move it to make the two agree.
+	mk_checkout demo https://github.com/angstrom-distribution/meta-angstrom
+	mk_add project add demo --from demo
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='demo'" "$PROJDIR/demo.conf"
+}
+
+# ---------------------------------------------------------------------------
 # M6 (#80) slice 2: workspace_dir and the bare-name --from arm must resolve
 # through MACKAS_WORK_ROOT (the flat work root), not MACKAS_WORK -- a later
 # slice scopes MACKAS_WORK to the SELECTED project's own KAS_WORK_DIR, while
