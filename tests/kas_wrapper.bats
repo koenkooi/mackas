@@ -69,6 +69,14 @@ lib_setup() {
 	MACKAS_CPUS=6
 	MACKAS_MEMORY=12g
 
+	# projects_dir() is $HOME/.config/mackas/projects -- $HOME-wide, not
+	# scoped by anything this test controls otherwise (#78, #114). Point it
+	# at a private directory so the #114 root-claimant count write_kas_wrapper()
+	# now computes reads only what THIS test pinned, never whatever is
+	# actually pinned on the machine running the suite.
+	export HOME="$TESTDIR/home"
+	mkdir -p "$HOME"
+
 	# MACKAS_SELF (baked into the wrapper as the binary its LIVE recompute
 	# execs) is "$SCRIPT_DIR/$SCRIPT_NAME" -- point both at a private,
 	# fully-scripted stand-in rather than $REPO_ROOT/mackas, so each test
@@ -176,6 +184,22 @@ EOF
 	chmod +x "$TESTDIR/fakebin/container"
 	PATH="$TESTDIR/fakebin:$PATH"
 	export PATH
+}
+
+# pin_project NAME ROOT -- write a minimal pinned project config,
+# projects_dir()/NAME.conf, with MACKAS_ROOT=ROOT -- exactly the shape
+# pinned_projects_referencing_root() reads (config_grep_setting, never
+# sourced). This is what a real `mackas --project NAME setup` would already
+# have on disk (cmd_project_add()/adopt write MACKAS_ROOT= before setup ever
+# runs) by the time write_kas_wrapper() asks how many projects claim this
+# root (#114) -- callers use it to put that same state in place for a
+# synthetic PROJECT_SELECTED/PROJECT_SELECT_SOURCE that was set directly
+# rather than through a real `mackas --project` invocation.
+pin_project() {
+	local name="$1" root="$2" dir
+	dir="$(projects_dir)"
+	mkdir -p "$dir"
+	printf 'MACKAS_ROOT=%s\n' "$(shq "$root")" > "$dir/$name.conf"
 }
 
 # write_recorder -- the fake .real kas-container the wrapper execs at the
@@ -544,6 +568,11 @@ rec_runtime_args_value() {
 # ---------------------------------------------------------------------------
 
 @test "selector: a wrapper written under --project replays that project into the live recompute" {
+	# #114: pin-baking now also requires proj-a to be the ONLY project
+	# pinned under this MACKAS_ROOT -- pin_project puts that same on-disk
+	# state in place that a real 'mackas --project proj-a setup' would
+	# already have (its config exists before setup ever runs).
+	pin_project proj-a "$MACKAS_ROOT"
 	PROJECT_SELECTED="proj-a"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
@@ -554,6 +583,7 @@ rec_runtime_args_value() {
 }
 
 @test "selector: an exported \$MACKAS_PROJECT_SELECT cannot re-aim a wrapper built for another project" {
+	pin_project proj-a "$MACKAS_ROOT"
 	PROJECT_SELECTED="proj-a"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
@@ -603,6 +633,9 @@ rec_runtime_args_value() {
 	# other interpolated value. validate_project_select refuses this name at
 	# the CLI; the point here is that write_kas_wrapper does not depend on
 	# that check to keep the generated file from executing what it embeds.
+	# #114: still needs to be the sole claimant of this root, same as above,
+	# or the new count guard suppresses the pin before shq() ever sees it.
+	pin_project "a-with-metachar" "$MACKAS_ROOT"
 	PROJECT_SELECTED="a'\$(touch $TESTDIR/pwned)b"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
@@ -611,6 +644,79 @@ rec_runtime_args_value() {
 	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
 	[ ! -e "$TESTDIR/pwned" ]
 	grep -qxF "SEL:a'\$(touch $TESTDIR/pwned)b" "$SELF_REC"
+}
+
+# ---------------------------------------------------------------------------
+# #114: this wrapper is the ONE file $PATH resolves 'kas-container' to for
+# every project under $MACKAS_ROOT, not one per project. write_kas_wrapper()
+# baking an explicit tier-1/2 pin in unconditionally meant whichever
+# project's 'setup --project' ran LAST "won" the shared wrapper for every
+# OTHER project's hand-typed kas-container invocations under the same root
+# too (confirmed live: a build in one project silently mounted a sibling
+# project's workspace). The fix: bake the pin in only when
+# pinned_projects_referencing_root() finds EXACTLY ONE pinned project under
+# THIS root; two or more, and the pin stays empty even for the one whose
+# setup ran explicitly, forcing every hand-typed invocation back onto live
+# cwd-based derivation (#78 tier 3) instead of a frozen, possibly-wrong pin.
+# ---------------------------------------------------------------------------
+
+@test "#114: two projects pinned under the SAME root -- neither gets its pin baked into the shared wrapper" {
+	# proj-a is the one whose setup ran explicitly (PROJECT_SELECT_SOURCE
+	# --project, same as the single-project test above) -- but proj-b is
+	# ALSO pinned under this exact MACKAS_ROOT, so the root now has two
+	# claimants. Before the #114 fix this still baked proj-a in, which is
+	# the exact bug: proj-b's own hand-typed builds would inherit proj-a's
+	# pin from this same shared wrapper.
+	pin_project proj-a "$MACKAS_ROOT"
+	pin_project proj-b "$MACKAS_ROOT"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	# Same assertion shape as "a wrapper written with no project passes an
+	# EMPTY selector" above: an empty SEL: line, never proj-a's.
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
+@test "#114: three projects pinned under the SAME root -- still no pin baked in for any of them" {
+	# Same shape as the two-project case, one claimant further: the count
+	# guard is "exactly one", not "not the majority" or any other special
+	# case around two -- three (or more) claimants must suppress the pin
+	# exactly as firmly as two does.
+	pin_project proj-a "$MACKAS_ROOT"
+	pin_project proj-b "$MACKAS_ROOT"
+	pin_project proj-c "$MACKAS_ROOT"
+	PROJECT_SELECTED="proj-c"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_c="$(grep -c '^SEL:proj-c$' "$SELF_REC" || true)"
+	[ "$sel_c" -eq 0 ]
+}
+
+@test "#114: two projects pinned under DIFFERENT roots do not suppress each other's pin" {
+	# proj-a claims THIS test's MACKAS_ROOT alone; proj-other claims a
+	# completely different root that happens to also be pinned in the same
+	# $HOME-wide projects_dir(). The count must be scoped to $MACKAS_ROOT,
+	# not to projects_dir() as a whole -- otherwise any second pinned
+	# project ANYWHERE would suppress every root's pin-baking, which is not
+	# what #114 asks for (it is specifically about SHARING a root).
+	pin_project proj-a "$MACKAS_ROOT"
+	pin_project proj-other "$TESTDIR/an-entirely-different-root"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
 }
 
 # The wrapper freezes MACKAS_WORK/KAS_IMAGE/gitconfig but recomputes volumes
