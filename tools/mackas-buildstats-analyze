@@ -322,16 +322,20 @@ def format_summary(rep, topn=10):
                % rep["io_bound_count"])
 
     out.append("")
-    out.append("  by task type          cpu_s      wall_s   n     parallelism")
+    out.append("  by task type:")
+    out.append("    %-18s %13s %13s %5s   %7s"
+               % ("", "CPU time (s)", "Wall time (s)", "n", "parallel"))
     for d in rep["by_type"][:topn]:
         par = d["cpu"] / d["wall"] if d["wall"] else 0
-        out.append("    %-18s %9.1f %9.1f %5d   %6.2fx"
+        out.append("    %-18s %13.1f %13.1f %5d   %6.2fx"
                    % (d["task"][:18], d["cpu"], d["wall"], d["n"], par))
 
     out.append("")
-    out.append("  top recipes by cpu    cpu_s      wall_s   n")
+    out.append("  top recipes by CPU:")
+    out.append("    %-18s %13s %13s %5s"
+               % ("", "CPU time (s)", "Wall time (s)", "n"))
     for d in rep["by_recipe"][:topn]:
-        out.append("    %-18s %9.1f %9.1f %5d"
+        out.append("    %-18s %13.1f %13.1f %5d"
                    % (d["recipe"][:18], d["cpu"], d["wall"], d["n"]))
     return "\n".join(out)
 
