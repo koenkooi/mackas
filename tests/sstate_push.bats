@@ -1036,8 +1036,13 @@ probe_last_clause() {
 	# script, the only thing that distinguishes it from the primary copy.
 	[ "$(retry_calls)" -eq 1 ]
 	# ...and the incremental path stages with tar-from-a-list throughout,
-	# because cp -r has no subset form.
-	refute_call "cp -r"
+	# because cp -r has no subset form. Anchored to the real invocation shape
+	# (a path argument, not a bare "cp -r"): retrieve_verify_script()'s own
+	# symlink-handling comment literally contains the substring "cp -r" in
+	# prose, and that comment is embedded verbatim in every copy's command
+	# line regardless of path -- a bare refute_call "cp -r" false-positives
+	# on it every time, not just when cp -r is genuinely invoked.
+	refute_call "cp -r /sstate/."
 	[ "$(rsync_calls)" -eq 2 ]
 }
 
