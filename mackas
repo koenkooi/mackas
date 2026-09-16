@@ -2045,12 +2045,18 @@ pinned_projects_referencing_volume() {
 # check, not a cwd-prefix check against a physical filesystem path.
 #
 # write_kas_wrapper() is the one caller (#114): it needs to know whether MORE
-# THAN ONE pinned project claims THIS root, not merely whether one exists, to
-# tell apart "genuinely the only project under this root" -- the single-
-# project convenience #78 tier-1/2 pin-baking was designed for -- from "one
-# of several sharing a root", where baking any one of them into the ONE
-# wrapper file shared by the whole root would silently hijack every sibling
-# project's hand-typed kas-container invocations under it.
+# THAN ONE project claims THIS root, not merely whether one exists, to tell
+# apart "genuinely the only project under this root" -- the single-project
+# convenience #78 tier-1/2 pin-baking was designed for -- from "one of
+# several sharing a root", where baking any one of them into the ONE wrapper
+# file shared by the whole root would silently hijack every sibling project's
+# hand-typed kas-container invocations under it.
+#
+# This function answers only HALF of that question. A project can also claim
+# a root without ever being pinned, through load_config()'s default search
+# path -- see default_config_claims_root() just below, which write_kas_wrapper
+# adds to this count. Do not read a count of 1 from here alone as "the only
+# project under this root".
 pinned_projects_referencing_root() {
 	local target="$1" dir f name root
 	dir="$(projects_dir)"
@@ -2062,6 +2068,117 @@ pinned_projects_referencing_root() {
 			printf '%s\n' "$name"
 		fi
 	done
+}
+
+# default_config_claims_root ROOT [SELECTED] -- true when load_config()'s
+# DEFAULT search path would configure a project at MACKAS_ROOT=ROOT, i.e.
+# when a project that was never formally pinned nonetheless claims ROOT.
+#
+# write_kas_wrapper() is the one caller (#114), and this is the other half of
+# the claimant count pinned_projects_referencing_root() above starts.
+# That function sees only projects_dir()/*.conf, so an actively-built but
+# NEVER-pinned project -- configured exactly the way mackas.conf.example
+# documents, through $HOME/.config/mackas/config or $HOME/.mackas.conf -- is
+# invisible to it. Confirmed live: one pinned project plus one never-pinned
+# project sharing a root counted as ONE claimant, the pin was baked, and a
+# hand-typed kas-container build from the unpinned side mounted the PINNED
+# project's TMP/SSTATE volumes. Counting this file too is what makes "exactly
+# one claimant" mean what it says.
+#
+# GREPPED via config_grep_setting, never sourced -- same discipline as
+# pinned_projects_referencing_root(): this is a probe run to decide what to
+# write into a file, and sourcing a config to answer it runs it.
+#
+# The same two paths in the same order load_config() walks, and only the
+# FIRST one that EXISTS counts: load_config stops at its first match, so a
+# second file is dead text that configures nothing, and counting it would
+# invent a claimant that cannot exist.
+#
+# Three judgement calls, spelled out because each could plausibly go the
+# other way:
+#
+#   - The SAME FILE as SELECTED's own pinned config: NOT a second claimant,
+#     just this project reached by another name. `~/.mackas.conf ->
+#     ~/.config/mackas/projects/A.conf` is an ordinary dotfiles arrangement,
+#     and config_file_is_safe() explicitly supports symlinked configs.
+#
+#   - UNREADABLE, or failing config_file_is_safe(): COUNTED, fail closed.
+#     config_grep_setting has no way to tell "the file has no such line"
+#     from "grep could not open the file at all" -- both come back as its
+#     ordinary return-1 (see pinned_configs_unreadable()'s own comment) --
+#     so an unreadable config would otherwise read exactly like an innocent
+#     one that claims nothing. Same "cannot tell must never read as no"
+#     rule. The asymmetry with load_config() is DELIBERATE, not an
+#     oversight to be tidied away later: load_config SKIPS an unsafe config
+#     with a warning rather than sourcing it, but that warning literally
+#     instructs the user to `chmod go-w` the file -- a signposted
+#     transition INTO claimant status, after which nothing regenerates this
+#     wrapper.
+#
+#   - NO MACKAS_ROOT line at all: NOT a claimant. A root-less default config
+#     is the documented machine-wide-knobs pattern (MACKAS_CPUS,
+#     MACKAS_MEMORY, the mirror settings -- see mackas.conf.example), so
+#     counting it would suppress pin-baking on essentially every machine
+#     rather than only where two projects really share a root.
+#
+# The non-absolute rule is derive_project_candidates()'s, for the same
+# reason: a MACKAS_ROOT that is not an absolute path (relative, '~',
+# '$HOME', a command substitution -- config_grep_setting prints those raw)
+# is simply not a candidate. Never eval or expand it.
+#
+# Unlike pinned_projects_referencing_root(), the comparison normalizes
+# EXPLICITLY. That function's plain string compare is justified by every
+# writer of a pinned MACKAS_ROOT= line (cmd_project_add(), adopt) emitting
+# $MACKAS_ROOT only after derive_paths() has already run
+# strip_trailing_slash() on it. This file is typically HAND-WRITTEN, so
+# nothing normalized it and a trailing slash is the user's to type. The
+# same-file exemption above is a different comparison ON PURPOSE: that one
+# is a file-IDENTITY question, not a same-normalization membership check,
+# and neither string equality nor same_dir() answers it. resolve_path() is
+# physical only about the DIRECTORY part of its argument -- it leaves a
+# final symlinked COMPONENT standing, which is exactly the component a
+# dotfiles symlink is -- so identity is taken from device+inode, with
+# stat(1) told to follow the link (`-L`; it is lstat by default, see
+# path_is_owned_and_unwritable_by_others()). That also reads a hard link as
+# what it is: the same file.
+#
+# Two known, deliberate limits. --config/$MACKAS_CONF are a third way a root
+# gets claimed (load_config honours them before the search path), and are
+# NOT counted: they are per-invocation requests, not on-disk state a
+# generation-time probe can enumerate. And this whole count IS
+# generation-time -- only `setup` rewrites the wrapper, so `--project A
+# setup` followed later by `project add B` leaves A's pin standing until the
+# next setup. Both are tracked separately from #114.
+default_config_claims_root() {
+	local target="$1" selected="${2-}" f found="" pinned root id_found id_pinned
+	for f in \
+		"$HOME/.config/mackas/config" \
+		"$HOME/.mackas.conf"
+	do
+		# -f, not -e: a directory at either name is what load_config skips
+		# too, and is nobody's configuration.
+		if [ -f "$f" ]; then found="$f"; break; fi
+	done
+	[ -n "$found" ] || return 1
+	if [ -n "$selected" ]; then
+		pinned="$(projects_dir)/$selected.conf"
+		# BSD stat: %d = device, %i = inode. Both must actually answer --
+		# two failed stats come back as two empty strings, which must not
+		# read as "the same file".
+		id_found="$(stat -L -f '%d:%i' "$found" 2>/dev/null || true)"
+		id_pinned="$(stat -L -f '%d:%i' "$pinned" 2>/dev/null || true)"
+		if [ -n "$id_found" ] && [ "$id_found" = "$id_pinned" ]; then
+			return 1
+		fi
+	fi
+	[ -r "$found" ] || return 0
+	config_file_is_safe "$found" || return 0
+	root="$(config_grep_setting "$found" MACKAS_ROOT)" || return 1
+	case "$root" in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	[ "$(strip_trailing_slash "$root")" = "$target" ]
 }
 
 # pinned_configs_unreadable -- print, one per line, the basename (minus
@@ -5323,7 +5440,7 @@ write_kas_wrapper() {
 	# turning it into a variable put it straight back inside a raw "..." until
 	# this line existed. No q_rtargs: the frozen --runtime-args string is gone
 	# from the generated file entirely (issue #96) -- there is nothing to quote.
-	local q_real q_shim q_brew q_self q_work_root q_image q_gitconfig q_scriptname q_projsel
+	local q_real q_shim q_brew q_self q_work_root q_image q_gitconfig q_scriptname q_projsel claimants
 	q_real="$(shq "$KAS_CONTAINER_REAL")"
 	q_shim="$(shq "$SHIM_DIR")"
 	q_brew="$(shq "$BREW_BIN")"
@@ -5353,16 +5470,39 @@ write_kas_wrapper() {
 	# every OTHER project's hand-typed kas-container calls would silently
 	# start mounting whichever project's setup ran last, regardless of the
 	# cwd they were actually typed from (confirmed live: #114). So the
-	# explicit-selector branch below only bakes the pin in when
-	# pinned_projects_referencing_root() finds EXACTLY ONE claimant of this
-	# $MACKAS_ROOT -- the genuine single-project case the tier-1/2
-	# convenience was designed for. Two or more claimants falls through to
-	# the same empty pin tier 3 gets, for the same reason: forcing every
-	# hand-typed invocation back onto live, per-invocation cwd derivation
-	# beats freezing today's project's answer into every sibling's build.
+	# explicit-selector branch below only bakes the pin in when EXACTLY ONE
+	# project claims this $MACKAS_ROOT -- the genuine single-project case the
+	# tier-1/2 convenience was designed for. Two or more claimants falls
+	# through to the same empty pin tier 3 gets, for the same reason: forcing
+	# every hand-typed invocation back onto live, per-invocation cwd
+	# derivation beats freezing today's project's answer into every sibling's
+	# build.
+	#
+	# A project claims this root in either of TWO ways, and both count.
+	# pinned_projects_referencing_root() sees the formally pinned ones
+	# (projects_dir()/*.conf); default_config_claims_root() sees a project
+	# configured through load_config()'s default search path instead
+	# ($HOME/.config/mackas/config, then $HOME/.mackas.conf), which is never
+	# pinned and so was invisible to the pinned count alone. That gap is the
+	# live incident: one pinned project beside one never-pinned one sharing a
+	# root counted as ONE, the pin was baked, and the unpinned project's
+	# hand-typed builds mounted the pinned project's volumes. The default
+	# config is not counted when it IS the selected project's own pinned
+	# config reached through a symlink -- see that function for the full set
+	# of judgement calls.
+	#
+	# The probe stays INSIDE this case arm deliberately. It reads $HOME, and
+	# setup_kas_container.bats/generated_paths_compat.bats call
+	# write_kas_wrapper() with an UNSCOPED $HOME and no PROJECT_SELECT_SOURCE
+	# -- they take the `*)` arm, and hoisting the probe out of the case would
+	# make them read the developer's real home directory.
 	case "$PROJECT_SELECT_SOURCE" in
 		--project|"\$MACKAS_PROJECT_SELECT")
-			if [ "$(pinned_projects_referencing_root "$MACKAS_ROOT" | wc -l | tr -d ' ')" -eq 1 ]; then
+			claimants="$(pinned_projects_referencing_root "$MACKAS_ROOT" | wc -l | tr -d ' ')"
+			if default_config_claims_root "$MACKAS_ROOT" "$PROJECT_SELECTED"; then
+				claimants=$((claimants + 1))
+			fi
+			if [ "$claimants" -eq 1 ]; then
 				q_projsel="$(shq "$PROJECT_SELECTED")"
 			else
 				q_projsel="$(shq "")"

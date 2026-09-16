@@ -217,6 +217,33 @@ pin_project() {
 	printf 'MACKAS_ROOT=%s\n' "$(shq "$root")" > "$dir/$name.conf"
 }
 
+# write_default_config FILE [ROOT] -- write one of load_config()'s DEFAULT
+# search-path configs ($HOME/.config/mackas/config or $HOME/.mackas.conf),
+# the way a user who never ran `mackas project add` hand-writes one. With
+# ROOT it claims that root; without, it is the machine-wide-knobs shape
+# mackas.conf.example documents (no MACKAS_ROOT line at all). This is the
+# state default_config_claims_root() reads for the #114 claimant count.
+#
+# The two chmods are load-bearing, not tidiness. config_file_is_safe()
+# grades the CONTAINING DIRECTORY as well as the file, and lib_setup's bare
+# `mkdir -p "$HOME"` inherits the caller's umask -- 002 gives 0775, which is
+# group-writable. Left alone, a config meant to exercise the "names this
+# root" path would be graded UNSAFE instead and counted under the
+# fail-closed rule, so the test would pass for entirely the wrong reason.
+write_default_config() {
+	local file="$1" root="${2-}" dir
+	dir="$(dirname "$file")"
+	mkdir -p "$dir"
+	chmod 700 "$HOME"
+	chmod 700 "$dir"
+	if [ -n "$root" ]; then
+		printf 'MACKAS_ROOT=%s\n' "$(shq "$root")" > "$file"
+	else
+		printf 'MACKAS_CPUS=6\nMACKAS_MEMORY=12g\n' > "$file"
+	fi
+	chmod 600 "$file"
+}
+
 # write_recorder -- the fake .real kas-container the wrapper execs at the
 # end. Records $PWD, argv and the full environment to $KREC on every call.
 # Same idiom as setup_e2e.bats' fake curl-downloaded recorder, copied rather
@@ -725,6 +752,189 @@ rec_runtime_args_value() {
 	# what #114 asks for (it is specifically about SHARING a root).
 	pin_project proj-a "$MACKAS_ROOT"
 	pin_project proj-other "$TESTDIR/an-entirely-different-root"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+# ---------------------------------------------------------------------------
+# #114, second half: a project does not have to be PINNED to claim a root.
+# Counting only projects_dir()/*.conf missed the project configured through
+# load_config()'s default search path ($HOME/.config/mackas/config, then
+# $HOME/.mackas.conf) -- never pinned, therefore invisible, therefore the
+# root looked single-project when it was not. Confirmed live: one pinned
+# project beside one never-pinned one counted as ONE claimant, the pin was
+# baked, and a hand-typed kas-container build from the UNPINNED side mounted
+# the pinned project's TMP/SSTATE volumes. default_config_claims_root() is
+# the other half of the count; these tests pin its exact semantics.
+#
+# Every test below sets PROJECT_SELECT_SOURCE="--project": without it
+# write_kas_wrapper() takes the case's `*)` arm and empties the pin for
+# reasons that have nothing to do with the claimant count, which would make
+# a "pin suppressed" assertion pass whether or not the count works at all.
+# ---------------------------------------------------------------------------
+
+@test "#114: a never-pinned project claiming this root via ~/.mackas.conf suppresses the pin" {
+	# THE regression test for the live incident. proj-a is pinned and is the
+	# only *.conf under this root, so the pinned count alone is 1 -- but
+	# $HOME/.mackas.conf names this same root, which is a second project
+	# nobody ever ran `project add` for. Two claimants, so the shared
+	# wrapper must carry no pin.
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.mackas.conf" "$MACKAS_ROOT"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
+@test "#114: a never-pinned project claiming this root via ~/.config/mackas/config suppresses the pin" {
+	# The other default search-path location, and the one load_config looks
+	# at FIRST. Both must count; neither is more "real" than the other.
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.config/mackas/config" "$MACKAS_ROOT"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
+@test "#114: a default config naming a DIFFERENT root does not suppress the pin" {
+	# Same scoping rule the pinned count already has: the question is who
+	# claims THIS $MACKAS_ROOT, not whether a default config exists at all.
+	# Nearly every machine has one.
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.mackas.conf" "$TESTDIR/an-entirely-different-root"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+@test "#114: a default config with no MACKAS_ROOT line does not suppress the pin" {
+	# The deliberate fail-OPEN half of the judgement call, pinned here so a
+	# later "be consistent, fail closed everywhere" change has to argue with
+	# a test. A root-less default config is mackas.conf.example's documented
+	# machine-wide-knobs pattern (MACKAS_CPUS/MACKAS_MEMORY/mirror settings)
+	# and configures no project at all; counting it would suppress
+	# pin-baking on essentially every machine.
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.mackas.conf"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+@test "#114: an UNREADABLE default config suppresses the pin even though it names nothing" {
+	# "Cannot tell must never read as no". config_grep_setting returns 1
+	# both for "no such line" and for "could not open the file", so an
+	# unreadable config would otherwise read exactly like an innocent one --
+	# and load_config's own warning tells the user to fix its permissions,
+	# after which it claims a root with nothing left to regenerate this
+	# wrapper. The file below deliberately contains a root-less config, so
+	# the ONLY thing that can suppress the pin here is the unreadability.
+	[ "$(id -u)" -ne 0 ] || skip "root reads any file regardless of mode"
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.mackas.conf"
+	chmod 000 "$HOME/.mackas.conf"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
+@test "#114: a group-writable default config suppresses the pin" {
+	# The config_file_is_safe() half of the same fail-closed rule, and the
+	# deliberate asymmetry with load_config(): load_config SKIPS an unsafe
+	# config with a warning rather than sourcing it, but that warning says
+	# `chmod go-w` -- a signposted transition INTO claimant status. The
+	# file's contents name no root, so only the unsafe mode can suppress.
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.mackas.conf"
+	chmod 664 "$HOME/.mackas.conf"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:' "$SELF_REC"
+	sel_a="$(grep -c '^SEL:proj-a$' "$SELF_REC" || true)"
+	[ "$sel_a" -eq 0 ]
+}
+
+@test "#114: a default config symlinked to the SELECTED project's own pinned config is not a second claimant" {
+	# The one narrow exemption. '~/.mackas.conf ->
+	# ~/.config/mackas/projects/A.conf' is an ordinary dotfiles arrangement
+	# (config_file_is_safe explicitly supports symlinked configs) and names
+	# the same project by another name, not a second one. Without the
+	# exemption this file greps back as claiming this root and the count
+	# would reach 2 -- so the assertion below really does test it.
+	pin_project proj-a "$MACKAS_ROOT"
+	chmod 700 "$HOME"
+	ln -s "$(projects_dir)/proj-a.conf" "$HOME/.mackas.conf"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+@test "#114: only the FIRST default search-path file is consulted" {
+	# load_config stops at its first match, so a second file is dead text
+	# that configures nothing. ~/.config/mackas/config comes first and names
+	# a different root; ~/.mackas.conf names THIS root but is never read by
+	# anything, so it cannot be a claimant and the pin stays baked.
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.config/mackas/config" "$TESTDIR/an-entirely-different-root"
+	write_default_config "$HOME/.mackas.conf" "$MACKAS_ROOT"
+	PROJECT_SELECTED="proj-a"
+	PROJECT_SELECT_SOURCE="--project"
+	write_kas_wrapper
+	cd "$TESTDIR"
+	out="$( ("$KAS_CONTAINER_BIN" build foo.yml) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -eq 0 ] || { printf '%s\n' "$out" >&2; false; }
+	grep -qxF 'SEL:proj-a' "$SELF_REC"
+}
+
+@test "#114: a non-absolute MACKAS_ROOT in the default config is not expanded and does not count" {
+	# derive_project_candidates()'s rule, for its reason: resolving '$HOME'
+	# means running it. So the literal below is compared as the eight
+	# characters it is, matches nothing, and does not claim this root --
+	# even though it would match exactly if anything here expanded it, which
+	# is what makes this test say something. Documents the residual hole
+	# honestly rather than pretending the probe is complete.
+	MACKAS_ROOT="$HOME/oe"
+	pin_project proj-a "$MACKAS_ROOT"
+	write_default_config "$HOME/.mackas.conf" '$HOME/oe'
 	PROJECT_SELECTED="proj-a"
 	PROJECT_SELECT_SOURCE="--project"
 	write_kas_wrapper
