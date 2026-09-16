@@ -76,6 +76,14 @@ Build Started: 1000.00
 Elapsed time: 42.00 seconds
 CPU usage: 55.5%
 EOF
+	# A real symlink alongside a real file -- the shape create-spdx's
+	# by-spdxid-hash dedup cache actually has (a relative symlink to a
+	# sibling), for the Apple container/virtiofs symlink-corruption tests
+	# below. -RP (not plain -r) so the mock's OWN population copy preserves
+	# it as a symlink instead of BSD cp's default of dereferencing under -R
+	# -- GNU cp inside the real container defaults the other way (-P), so
+	# -RP here is what actually matches production, not a test-only quirk.
+	( cd "$FIXTURE/buildstats/20260717121723" && ln -s build_stats build_stats.link )
 	mkdir -p "$FIXTURE/log"
 	echo hi > "$FIXTURE/log/cooker.log"
 	mkdir -p "$FIXTURE/deploy/images"
@@ -251,7 +259,13 @@ case "$last" in
 		resolve_destsub_guestsub "$last" "cp -r " "/\\. "
 		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
-			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+			# -RP, not plain -r: BSD cp under -R dereferences symlinks by
+			# default, unlike the GNU cp -r the real container actually
+			# runs (defaults to -P, preserve) -- -RP here is what matches
+			# production, so the mock's own population step does not
+			# itself destroy the fixture's symlink before the corruption
+			# simulation below ever gets a chance to run.
+			[ -d "$FIXTURE/$guestsub" ] && cp -RP "$FIXTURE/$guestsub/." "$outdir/$destsub/"
 			if [ -n "${MOCK_VERIFY_CORRUPT:-}" ] || [ -n "${MOCK_VERIFY_CORRUPT_ALWAYS:-}" ]; then
 				# Simulate cp -r's rare real corruption: flip one byte in
 				# the DESTINATION after the copy, so retrieve_verify_local()
@@ -261,27 +275,48 @@ case "$last" in
 				f="$(find "$outdir/$destsub" -type f | head -1)"
 				[ -n "$f" ] && printf 'X' | dd of="$f" bs=1 seek=0 count=1 conv=notrunc 2>/dev/null
 			fi
+			if [ -n "${MOCK_VERIFY_BROKEN_SYMLINK:-}" ]; then
+				# The real Apple container/virtiofs finding: a symlink
+				# cp -r meant to preserve lands as an empty, mode-000
+				# regular file on the destination instead.
+				l="$(find "$outdir/$destsub" -type l | head -1)"
+				if [ -n "$l" ]; then
+					rm -f "$l"
+					: > "$l"
+					chmod 000 "$l"
+				fi
+			fi
 		fi
-		# The "source manifest": retrieve_verify_local(), extracted fresh
-		# from the real mackas, run against the FIXTURE it just copied
-		# FROM. mackas itself calls the identical function again afterward,
-		# unmocked, against whatever actually landed at $outdir/$destsub --
-		# same algorithm, so an uncorrupted copy agrees and a
-		# MOCK_VERIFY_CORRUPT one does not, without a second hand-written
-		# implementation to keep in sync.
+		# The "source manifest": retrieve_verify_local() plus
+		# retrieve_symlinks_local(), both extracted fresh from the real
+		# mackas and run against the FIXTURE this handler just copied FROM
+		# -- same combined shape retrieve_verify_script() itself now
+		# produces (manifest, delimiter, symlink map), so mackas's own
+		# split logic sees a realistic "source" side. mackas itself calls
+		# the identical two functions again afterward, unmocked, against
+		# whatever actually landed at $outdir/$destsub -- same algorithm on
+		# both sides, so an uncorrupted copy agrees and a MOCK_VERIFY_*
+		# one does not, without a second hand-written implementation to
+		# keep in sync.
 		eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$REAL_MACKAS")"
-		[ -d "$FIXTURE/$guestsub" ] && retrieve_verify_local "$FIXTURE/$guestsub"
+		eval "$(awk '/^retrieve_symlinks_local\(\) \{/,/^}/' "$REAL_MACKAS")"
+		if [ -d "$FIXTURE/$guestsub" ]; then
+			retrieve_verify_local "$FIXTURE/$guestsub"
+			printf '%s\n' '@@MACKAS-SYMLINKS@@'
+			retrieve_symlinks_local "$FIXTURE/$guestsub"
+		fi
 		exit 0
 		;;
 	# The fallback path, only reached after a verification mismatch: piped
-	# `tar -S`. The mock still uses `cp -r` to populate the fixture data (a
-	# plain copy is fine for a test double); only the real retrieved shape
-	# has to match what fetch_tmp_subdir actually runs.
+	# `tar -S`. The mock still uses `cp -RP` to populate the fixture data (a
+	# plain copy is fine for a test double, -P for the same reason as the
+	# primary path above); only the real retrieved shape has to match what
+	# fetch_tmp_subdir actually runs.
 	*"tar -S -C"*"-cf - . | tar -S -C"*)
 		resolve_destsub_guestsub "$last" "tar -S -C " " -cf" "-C /out/"
 		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
-			[ -d "$FIXTURE/$guestsub" ] && cp -r "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+			[ -d "$FIXTURE/$guestsub" ] && cp -RP "$FIXTURE/$guestsub/." "$outdir/$destsub/"
 			if [ -n "${MOCK_VERIFY_CORRUPT_ALWAYS:-}" ]; then
 				# Corrupts the FALLBACK's own copy too, unlike
 				# MOCK_VERIFY_CORRUPT (primary path only) -- for the "even
@@ -372,6 +407,23 @@ refute_call() {
 	[ "$status" -ne 0 ]
 	printf '%s\n' "$output" | grep -qF "'buildstats' still fails verification after the tar fallback"
 	printf '%s\n' "$output" | grep -qF "was left in place for inspection"
+}
+
+@test "retrieve: a symlink that landed as a broken 0-byte mode-000 file is repaired natively, no tar fallback needed" {
+	# The Apple container/virtiofs finding: a symlink cp -r meant to
+	# preserve lands as an empty, mode-000 regular file. This is NOT a
+	# file-content mismatch (find -type f never matches a symlink on
+	# either side, so the cksum manifests agree regardless), which is
+	# exactly why retrieve_repair_symlinks() has to exist as its own path
+	# rather than reusing the cksum-manifest fallback machinery.
+	MOCK_VERIFY_BROKEN_SYMLINK=1 mk retrieve buildstats
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF "symlink repaired natively (Apple container/virtiofs issue)"
+	assert_fails grep -qi "falling back\|fallback" <<< "$output"
+	link="$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723/build_stats.link"
+	[ -L "$link" ]
+	[ "$(readlink "$link")" = "build_stats" ]
+	grep -qF "Build Started: 1000.00" "$link"
 }
 
 @test "retrieve: the copy container run uses -u 0:0 (uid 30000 cannot read root-owned paths)" {
