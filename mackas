@@ -6318,6 +6318,19 @@ done
 	find /tmp/.mackas-verify-batches -type f -exec cat {} + | \
 		LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
 } | LC_ALL=C sort
+# `find -type f` above never matches a symlink, so nothing above this line
+# ever proves one exists or points where it should -- Apple container's
+# virtiofs bind mount has been observed to turn a symlink cp -r (or the tar
+# fallback) meant to create into an empty, mode-000 regular file instead,
+# which a file-only cksum manifest cannot see: `find -type f` still skips
+# it on both sides, so guest and host manifests silently agree. Append a
+# second block (one container invocation still covers both -- a VM boot is
+# the expensive part) rather than trust `find -type f` to speak for
+# symlinks it structurally cannot see.
+printf '%s\n' '@@MACKAS-SYMLINKS@@'
+find . -type l | while IFS= read -r p; do
+	printf '%s\t%s\n' "${p#./}" "$(readlink "$p")"
+done | LC_ALL=C sort
 EOS
 }
 
@@ -6401,6 +6414,48 @@ retrieve_verify_local() {
 	) | LC_ALL=C sort || rc=$?
 	rm -rf "$batchdir"
 	return $rc
+}
+
+# Host-side counterpart to retrieve_verify_script()'s appended symlink block:
+# same "path<TAB>target" shape, LC_ALL=C sorted so a byte-identical tree
+# compares equal regardless of collation (same reasoning as the cksum
+# manifests above). readlink with no flags prints the raw link text on both
+# BSD (here) and GNU (the guest) -- verified live to agree for a relative,
+# non-existent-target, and dangling-vs-file-vs-dir target.
+retrieve_symlinks_local() {
+	local root="$1"
+	(
+		cd "$root" || exit 1
+		find . -type l | while IFS= read -r p; do
+			printf '%s\t%s\n' "${p#./}" "$(readlink "$p")"
+		done
+	) | LC_ALL=C sort
+}
+
+# retrieve_repair_symlinks DEST DESTSUB SRC_SYMLINKS DST_SYMLINKS -- native
+# fix for the virtiofs finding retrieve_verify_script() now guards against:
+# no container needed, since ln -s is a plain host filesystem call once the
+# target string is known -- there is nothing left to cross the virtiofs
+# boundary for once retrieve_symlinks_local() has already read it back.
+# Recreates only entries SRC_SYMLINKS lists that DST_SYMLINKS is missing or
+# disagrees with (an exact whole-line match against DST_SYMLINKS skips one
+# already correct); a plain 0-byte/mode-000 leftover from cp -r's failed
+# attempt is exactly what "already exists" must never mean here, hence the
+# unconditional rm -rf of whatever currently sits at that path first.
+retrieve_repair_symlinks() {
+	local dest="$1" destsub="$2" src_symlinks="$3" dst_symlinks="$4"
+	local rel tgt repaired=0
+	while IFS="$(printf '\t')" read -r rel tgt; do
+		[ -n "$rel" ] || continue
+		printf '%s\n' "$dst_symlinks" | grep -qxF "$(printf '%s\t%s' "$rel" "$tgt")" && continue
+		rm -rf "${dest:?}/${destsub:?}/${rel:?}"
+		mkdir -p "$(dirname "$dest/$destsub/$rel")"
+		ln -s "$tgt" "$dest/$destsub/$rel"
+		repaired=$((repaired + 1))
+	done < <(printf '%s\n' "$src_symlinks")
+	[ "$repaired" -gt 0 ] && \
+		info "  '$destsub': $repaired symlink$( [ "$repaired" -eq 1 ] || printf s ) repaired natively (Apple container/virtiofs issue)"
+	return 0
 }
 
 fetch_tmp_subdir() {
@@ -6573,11 +6628,17 @@ fetch_tmp_subdir() {
 		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
 		return 0
 	fi
-	local src_manifest dst_manifest
-	src_manifest="$(container run --rm -u 0:0 \
+	local src_combined src_manifest src_symlinks dst_manifest dst_symlinks
+	src_combined="$(container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
 		sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)")"
+	# retrieve_verify_script() bundles the cksum manifest and the symlink
+	# map into one stream (one container invocation, not two -- see its own
+	# comment); split on the delimiter line it prints between them.
+	src_manifest="$(printf '%s\n' "$src_combined" | sed -n '1,/^@@MACKAS-SYMLINKS@@$/{/^@@MACKAS-SYMLINKS@@$/!p;}')"
+	src_symlinks="$(printf '%s\n' "$src_combined" | awk '/^@@MACKAS-SYMLINKS@@$/{f=1;next} f')"
 	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
+	dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
 		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
 		# Diagnostic, not a fix: this mismatch has been seen both as a
@@ -6600,9 +6661,20 @@ fetch_tmp_subdir() {
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
 			sh -c "tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
 		dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
+		dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub")"
 		[ "$src_manifest" = "$dst_manifest" ] || die "'$sub' still fails verification after the tar fallback" \
 			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
 		warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
+	fi
+	# Checked after any tar fallback above, never before: a fallback re-copy
+	# wipes $dest/$destsub from scratch and hits the identical virtiofs
+	# issue on its own symlinks (same cp/tar-style creation), so repairing
+	# first would just have its work discarded by the fallback's rm -rf.
+	if [ "$src_symlinks" != "$dst_symlinks" ]; then
+		retrieve_repair_symlinks "$dest" "$destsub" "$src_symlinks" "$dst_symlinks"
+		dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub")"
+		[ "$src_symlinks" = "$dst_symlinks" ] || die "'$sub' still has broken symlinks after repair" \
+			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
 	fi
 	did "retrieved $sub -> $dest/$destsub"
 
