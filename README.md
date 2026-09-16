@@ -697,10 +697,11 @@ guess a new one.
 A workspace renamed or moved after being pinned simply stops matching — it
 falls through to tier 4 exactly as an unpinned checkout always has, never
 re-derived from the new name. And the generated `kas-container` wrapper
-itself replays the pin it was built under (via `$MACKAS_PROJECT_SELECT`) so
-that more than one in-root project can share one wrapper; if the directory
-(or kas chain) a hand-typed build actually runs from derives a *different*
-single pinned project than the one the wrapper was built for, mackas refuses
+itself replays the pin it was built under (via `$MACKAS_PROJECT_SELECT`)
+*when it carries one* — it only does when a single project claims the root,
+see the pin-baking rule further down; if the directory (or kas chain) a
+hand-typed build actually runs from derives a *different* single pinned
+project than the one the wrapper was built for, mackas refuses
 rather than silently handing that build the wrong project's volumes under the
 wrapper's own frozen work dir — naming both projects and how to fix it
 (re-run `setup` under the right one, or use that project's own `mackas`
@@ -724,7 +725,7 @@ separators, no `..`, no leading `-`, letters/digits/`.`/`_`/`-` only. When
 `700` regardless of your umask, so a `umask 002` login cannot produce a
 directory the same check then refuses.
 
-`mackas --project NAME setup` also bakes the selector into the generated
+`mackas --project NAME setup` can also bake the selector into the generated
 `kas-container` wrapper. The wrapper recomputes `--runtime-args` on every
 call, and it replays `NAME` into that recompute — so a hand-typed
 `kas-container build ...` gets the volumes belonging to the project whose
@@ -732,6 +733,26 @@ work dir and gitconfig the wrapper was built with, not whatever the default
 search path happens to find. The selector is passed explicitly even when
 empty, so an exported `$MACKAS_PROJECT_SELECT` cannot re-aim one project's
 wrapper at another project's volumes.
+
+Baking it in is **conditional**, because there is exactly one wrapper per
+`MACKAS_ROOT`: `$PATH` resolves `kas-container` to that single file for
+every project under the root, not to one file per project. The pin is
+written only when the selection was explicit (`--project` or
+`$MACKAS_PROJECT_SELECT` — a selection derived from `$PWD` never freezes)
+**and** exactly one project claims that root. A project claims a root
+either by being pinned with `MACKAS_ROOT` in
+`~/.config/mackas/projects/NAME.conf`, or by naming it in the config the
+default search path would load anyway (`~/.config/mackas/config`, else
+`~/.mackas.conf`) — a project that was never `mackas project add`ed counts
+just as much as a pinned one. With two or more claimants the pin stays
+empty even for the project whose `setup` ran, so every hand-typed
+`kas-container` under that root goes back to live, per-invocation
+derivation rather than one project's frozen answer. A default config that
+sets only machine-wide knobs (no `MACKAS_ROOT` line) claims nothing and
+does not count; one that cannot be read, or that fails the ownership
+check, is counted anyway, because "cannot tell" must not read as "no". The
+count is taken when the wrapper is written, so adding a second project to
+a root later leaves the existing pin standing until the next `setup`.
 
 When a project is selected, the volume stem also defaults to
 `mackas-<name>` (`mackas-<name>-tmp`/`-dl`/`-sstate`) instead of
