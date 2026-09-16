@@ -986,8 +986,12 @@ kas is configured to reset to.
   layout — pass `--project NAME` to pick one), and a hand-typed
   `kas-container` run through a project's generated wrapper from a *different*
   pinned project's workspace (the wrapper replays the project it was set up
-  under; fix by re-running `setup` under the right project, or using that
-  project's own `mackas` commands instead of the hand-typed one).
+  under — it only carries such a pin when the selection was explicit *and*
+  exactly one project claims that `MACKAS_ROOT`, counting both pinned projects
+  and one configured through the default search path; otherwise the pin is
+  empty and every call re-derives; fix by re-running `setup` under the right
+  project, or using that project's own `mackas` commands instead of the
+  hand-typed one).
 - Most destructive commands are two-phase: they scan for real (even under
   `--dry-run`), report what they would reclaim, and only act after confirmation
   or `-y`.
