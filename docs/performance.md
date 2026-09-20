@@ -177,8 +177,9 @@ a handful of misses actually ran. The takeaway for storage design: **the TMPDIR
 is disposable, sstate is not.** `mackas clean` throwing away TMPDIR while keeping
 the sstate volume is nearly free to recover from; losing the sstate volume costs
 a 35-minute from-scratch rebuild. Put sstate on the fastest, most durable
-storage you have; TMPDIR can be recreated on demand (see item 14 in
-[../TODO.md](../TODO.md) for the per-project volume model that formalizes this).
+storage you have; TMPDIR can be recreated on demand (see item 14 in the
+local `TODO.md` backlog, untracked and not present in a fresh clone, for the
+per-project volume model that formalizes this).
 
 ## Run-to-run variance
 
