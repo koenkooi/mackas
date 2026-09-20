@@ -157,6 +157,102 @@ assert_volumes() {
 	grep -qxF "MACKAS_PROJECT_DIR='demo'" "$PROJDIR/demo.conf"
 }
 
+# ---------------------------------------------------------------------------
+# #119: three-tier checkout-directory disambiguation against a SIBLING
+# project already pinned under this same MACKAS_ROOT that clones the same
+# URL. Both real patterns from the issue: two release branches of one
+# distro side by side (tier 2), and several independent checkouts of the
+# same repo AND branch cleaned up in parallel (tier 3).
+# ---------------------------------------------------------------------------
+
+@test "project add: a same-root sibling with a DIFFERENT url leaves the bare name alone (tier 1)" {
+	pin sibling <<EOF
+MACKAS_ROOT='$ROOT'
+MACKAS_PROJECT_URL='https://example.com/some-other-repo.git'
+MACKAS_PROJECT_BRANCH='main'
+EOF
+	mk_add project add demo --url https://github.com/angstrom-distribution/meta-angstrom --branch master
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom'" "$PROJDIR/demo.conf"
+}
+
+@test "project add: a sibling under a DIFFERENT root sharing the same url is not counted (tier 1)" {
+	pin sibling <<EOF
+MACKAS_ROOT='$ROOT-elsewhere'
+MACKAS_PROJECT_URL='https://github.com/angstrom-distribution/meta-angstrom'
+MACKAS_PROJECT_BRANCH='master'
+EOF
+	mk_add project add demo --url https://github.com/angstrom-distribution/meta-angstrom --branch master
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom'" "$PROJDIR/demo.conf"
+}
+
+@test "project add: a same-root sibling sharing the url but a different branch appends '-<branch>' (tier 2)" {
+	pin meta-angstrom <<EOF
+MACKAS_ROOT='$ROOT'
+MACKAS_PROJECT_URL='https://github.com/angstrom-distribution/meta-angstrom'
+MACKAS_PROJECT_BRANCH='master'
+EOF
+	mk_add project add Meta-angstrom-wrynose \
+		--url https://github.com/angstrom-distribution/meta-angstrom --branch wrynose
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom-wrynose'" "$PROJDIR/Meta-angstrom-wrynose.conf"
+}
+
+@test "project add: a same-root sibling sharing url AND branch appends '-<branch>-<name>' (tier 3)" {
+	pin wrynose-a <<EOF
+MACKAS_ROOT='$ROOT'
+MACKAS_PROJECT_URL='https://github.com/angstrom-distribution/meta-angstrom'
+MACKAS_PROJECT_BRANCH='wrynose'
+EOF
+	mk_add project add wrynose-b \
+		--url https://github.com/angstrom-distribution/meta-angstrom --branch wrynose
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom-wrynose-wrynose-b'" "$PROJDIR/wrynose-b.conf"
+}
+
+@test "project add: --dir still overrides the cascade even at tier 3" {
+	pin wrynose-a <<EOF
+MACKAS_ROOT='$ROOT'
+MACKAS_PROJECT_URL='https://github.com/angstrom-distribution/meta-angstrom'
+MACKAS_PROJECT_BRANCH='wrynose'
+EOF
+	mk_add project add wrynose-b \
+		--url https://github.com/angstrom-distribution/meta-angstrom --branch wrynose --dir custom-name
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='custom-name'" "$PROJDIR/wrynose-b.conf"
+}
+
+@test "project add -y overwriting an already-pinned name does not read its own prior pin as a sibling" {
+	# cmd_project_add() re-derives MACKAS_PROJECT_DIR BEFORE its own
+	# "config already exists" confirmation, so on a re-run the name being
+	# (re-)pinned is still sitting in projects_dir() from the first run --
+	# same URL, same branch. Left uncorrected this would wrongly read as a
+	# tier-3 self-collision and append '-master-demo' to itself.
+	mk_add project add demo --url https://github.com/angstrom-distribution/meta-angstrom --branch master
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom'" "$PROJDIR/demo.conf"
+
+	mk_add project add demo --url https://github.com/angstrom-distribution/meta-angstrom --branch master
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='meta-angstrom'" "$PROJDIR/demo.conf"
+}
+
+@test "project add --from is unaffected by a sibling sharing the same url/branch" {
+	# --from never derives a checkout directory name at all -- it adopts
+	# whatever is already on disk (#119 scope note) -- so the tier-3 sibling
+	# here must have no effect whatsoever.
+	pin wrynose-a <<EOF
+MACKAS_ROOT='$ROOT'
+MACKAS_PROJECT_URL='https://github.com/angstrom-distribution/meta-angstrom'
+MACKAS_PROJECT_BRANCH='wrynose'
+EOF
+	mk_checkout wrynose-b https://github.com/angstrom-distribution/meta-angstrom wrynose
+	mk_add project add wrynose-b --from wrynose-b
+	[ "$status" -eq 0 ]
+	grep -qxF "MACKAS_PROJECT_DIR='wrynose-b'" "$PROJDIR/wrynose-b.conf"
+}
+
 @test "project add --from: MACKAS_PROJECT_DIR stays <name>, unaffected by URL derivation" {
 	# --from's own equality check already forces the workspace name to match
 	# the checkout being converted, so MACKAS_PROJECT_DIR='meta-angstrom'
