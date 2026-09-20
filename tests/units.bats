@@ -556,3 +556,15 @@ pin_sibling() {
 	pin_sibling demo "$TESTDIR/oe" https://example.com/demo.git main
 	[ -z "$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/demo.git main demo)" ]
 }
+
+@test "checkout_dir_disambiguation_suffix: a sibling pinned with a trailing .git/slash still matches (tier 2)" {
+	# repo_dir_name_from_url() strips a trailing '/' and '.git' before
+	# deriving the bare name, so two spellings of the identical URL already
+	# collide on the SAME bare directory name -- the comparison here must
+	# normalize the same way or it silently misses exactly the case this
+	# cascade exists to catch.
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling meta-angstrom "$TESTDIR/oe" https://example.com/meta-angstrom.git/ master
+	got="$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom wrynose Meta-angstrom-wrynose)"
+	[ "$got" = "-wrynose" ]
+}
