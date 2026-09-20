@@ -2070,6 +2070,76 @@ pinned_projects_referencing_root() {
 	done
 }
 
+# checkout_dir_disambiguation_suffix ROOT URL BRANCH SELF_NAME -- #119's
+# three-tier cascade for what, if anything, repo_dir_name_from_url()'s bare
+# <repo-name> needs appended so a fresh 'project add --url ... --branch ...'
+# does not derive the exact same checkout-directory name as a SIBLING
+# project already pinned under this same ROOT. Prints one of:
+#
+#   ""                       -- no other pinned project under ROOT shares
+#                                this URL: bare <repo-name> is unambiguous
+#                                already (today's behavior, unchanged).
+#   "-<branch>"               -- a sibling shares the URL but a DIFFERENT
+#                                branch (confirmed live: two release
+#                                branches of one distro checked out side by
+#                                side -- meta-angstrom/master and
+#                                Meta-angstrom-wrynose/wrynose both deriving
+#                                a checkout literally named meta-angstrom).
+#   "-<branch>-<self_name>"   -- a sibling shares URL *and* branch too (also
+#                                confirmed live: cleaning up patches against
+#                                the same branch across parallel checkouts).
+#                                <branch> alone would collide again here, so
+#                                append this project's own pin NAME -- the
+#                                one thing still guaranteed unique, since
+#                                mackas already refuses to double-pin a
+#                                name.
+#
+# SELF_NAME is excluded from the scan: cmd_project_add()'s -y overwrite path
+# re-derives this BEFORE the "config already exists" confirmation, while the
+# name being (re-)pinned is still sitting in projects_dir() from its own
+# prior run -- left in, it would read as its own sibling and gratuitously
+# promote a plain re-run to tier 2 or 3.
+#
+# Same scan shape as pinned_projects_referencing_root() just above (#114) --
+# GREPPED via config_grep_setting, NEVER sourced, same defensive
+# `[ -f "$f" ] || continue` for a directory with no configs at all -- just
+# extended to also read each match's MACKAS_PROJECT_URL/MACKAS_PROJECT_BRANCH.
+# A cousin, not a replacement: pinned_projects_referencing_root()'s own
+# signature and output stay exactly as #114 left them (write_kas_wrapper()'s
+# claimant count is keyed to that exact shape via `| wc -l`), and this
+# function's result is not a substitute for that one's.
+#
+# cmd_project_add()'s fresh (non---from) path is the one caller: --from
+# never derives a checkout directory name at all (it adopts whatever is
+# already on disk), so this cascade only ever affects FUTURE fresh
+# 'project add --url ... --branch ...' calls, per #119's own scope note.
+checkout_dir_disambiguation_suffix() {
+	local root="$1" url="$2" branch="$3" self_name="$4"
+	local dir f name other_root other_url other_branch
+	local url_match=0 branch_match=0
+	dir="$(projects_dir)"
+	for f in "$dir"/*.conf; do
+		[ -f "$f" ] || continue
+		name="$(basename "$f" .conf)"
+		[ "$name" = "$self_name" ] && continue
+		other_root="$(config_grep_setting "$f" MACKAS_ROOT)" || continue
+		[ "$other_root" = "$root" ] || continue
+		other_url="$(config_grep_setting "$f" MACKAS_PROJECT_URL)" || continue
+		[ "$other_url" = "$url" ] || continue
+		url_match=1
+		other_branch="$(config_grep_setting "$f" MACKAS_PROJECT_BRANCH)" || other_branch=""
+		if [ "$other_branch" = "$branch" ]; then
+			branch_match=1
+			break
+		fi
+	done
+	if [ "$branch_match" -eq 1 ]; then
+		printf -- '-%s-%s\n' "$branch" "$self_name"
+	elif [ "$url_match" -eq 1 ]; then
+		printf -- '-%s\n' "$branch"
+	fi
+}
+
 # default_config_claims_root ROOT [SELECTED] -- true when load_config()'s
 # DEFAULT search path would configure a project at MACKAS_ROOT=ROOT, i.e.
 # when a project that was never formally pinned nonetheless claims ROOT.
@@ -6928,7 +6998,11 @@ cmd_project_add() {
 		if [ -n "$dir_flag" ]; then
 			proj_dir="$dir_flag"
 		elif [ -n "$url" ]; then
-			proj_dir="$(repo_dir_name_from_url "$url")"
+			# #119: the bare name alone only stays unambiguous when no
+			# already-pinned sibling under this same MACKAS_ROOT clones the
+			# same URL -- see checkout_dir_disambiguation_suffix()'s own
+			# comment for the three tiers this appends.
+			proj_dir="$(repo_dir_name_from_url "$url")$(checkout_dir_disambiguation_suffix "$MACKAS_ROOT" "$url" "$branch" "$name")"
 			validate_path_component "$proj_dir" "checkout directory name" "the URL '$url'" \
 				"pass --dir <name> explicitly"
 		else
