@@ -467,3 +467,92 @@ teardown() {
 	# caller happens to be naming the project pin elsewhere.
 	[ "$(repo_dir_name_from_url https://github.com/angstrom-distribution/meta-angstrom)" != "Meta-angstrom-wrynose" ]
 }
+
+# ---------------------------------------------------------------------------
+# checkout_dir_disambiguation_suffix -- #119's three-tier cascade on top of
+# repo_dir_name_from_url()'s bare name, so two SIBLING projects pinned under
+# the same MACKAS_ROOT that clone the same URL do not derive the identical
+# checkout directory name. Real confirmed patterns: a meta-angstrom
+# (branch master) and a Meta-angstrom-wrynose (branch wrynose) sharing one
+# root, both deriving "meta-angstrom" (tier 2 -- different branch); and
+# several independent checkouts of the same repo AND branch, cleaning up
+# patches in parallel (tier 3 -- same branch too).
+#
+# pin_sibling writes the same shape checkout_dir_disambiguation_suffix()
+# reads -- projects_dir()/NAME.conf with MACKAS_ROOT/MACKAS_PROJECT_URL/
+# MACKAS_PROJECT_BRANCH -- the way cmd_project_add() itself would already
+# have left it on disk for an earlier pin under the same root.
+# ---------------------------------------------------------------------------
+
+pin_sibling() {
+	local name="$1" root="$2" url="$3" branch="$4" dir
+	dir="$(projects_dir)"
+	mkdir -p "$dir"
+	{
+		printf 'MACKAS_ROOT=%s\n' "$(shq "$root")"
+		printf 'MACKAS_PROJECT_URL=%s\n' "$(shq "$url")"
+		printf 'MACKAS_PROJECT_BRANCH=%s\n' "$(shq "$branch")"
+	} > "$dir/$name.conf"
+}
+
+@test "checkout_dir_disambiguation_suffix: no sibling under this root shares the URL -- empty (tier 1)" {
+	HOME="$TESTDIR/home"; export HOME
+	[ -z "$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom main new-pin)" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: no siblings pinned at all yet -- empty (tier 1)" {
+	# projects_dir() itself does not exist yet -- the very first 'project add'
+	# on a fresh Mac. Same defensive '[ -f ] || continue' as
+	# pinned_projects_referencing_root() must make this silent, not a glob
+	# error.
+	HOME="$TESTDIR/home"; export HOME
+	[ -z "$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom main new-pin)" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: a sibling under a DIFFERENT root sharing the URL is not counted" {
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling other-root-sibling "$TESTDIR/elsewhere" https://example.com/meta-angstrom master
+	[ -z "$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom main new-pin)" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: a sibling with a DIFFERENT URL under the same root is not counted" {
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling unrelated "$TESTDIR/oe" https://example.com/some-other-repo main
+	[ -z "$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom main new-pin)" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: a sibling shares the URL but a different branch -- '-branch' (tier 2)" {
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling meta-angstrom "$TESTDIR/oe" https://example.com/meta-angstrom master
+	got="$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom wrynose Meta-angstrom-wrynose)"
+	[ "$got" = "-wrynose" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: a sibling shares URL AND branch -- '-branch-selfname' (tier 3)" {
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling wrynose-a "$TESTDIR/oe" https://example.com/meta-angstrom wrynose
+	got="$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom wrynose wrynose-b)"
+	[ "$got" = "-wrynose-wrynose-b" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: a tier-2 AND a tier-3 sibling both present -- tier 3 wins" {
+	# The most specific match applies regardless of scan order: a
+	# different-branch sibling alone would only justify tier 2, but a
+	# same-branch sibling ALSO present still collides on '-branch' alone.
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling master-copy "$TESTDIR/oe" https://example.com/meta-angstrom master
+	pin_sibling wrynose-a "$TESTDIR/oe" https://example.com/meta-angstrom wrynose
+	got="$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/meta-angstrom wrynose wrynose-b)"
+	[ "$got" = "-wrynose-wrynose-b" ]
+}
+
+@test "checkout_dir_disambiguation_suffix: SELF_NAME's own prior pin is excluded from the scan" {
+	# cmd_project_add()'s -y overwrite path re-derives this BEFORE its own
+	# "config already exists" confirmation, so the name being (re-)pinned is
+	# still sitting in projects_dir() from its own earlier run. Left in, it
+	# would read as its own sibling (same URL, same branch) and wrongly
+	# promote a plain re-run to tier 3.
+	HOME="$TESTDIR/home"; export HOME
+	pin_sibling demo "$TESTDIR/oe" https://example.com/demo.git main
+	[ -z "$(checkout_dir_disambiguation_suffix "$TESTDIR/oe" https://example.com/demo.git main demo)" ]
+}
