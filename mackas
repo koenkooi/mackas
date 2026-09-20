@@ -2109,12 +2109,24 @@ pinned_projects_referencing_root() {
 # claimant count is keyed to that exact shape via `| wc -l`), and this
 # function's result is not a substitute for that one's.
 #
+# The URL comparison is normalized the same way repo_dir_name_from_url()
+# strips its own input (trailing '/' then trailing '.git') before comparing
+# -- confirmed live as a real miss otherwise: a sibling pinned from
+# "https://host/org/repo.git" and a fresh add of the bare
+# "https://host/org/repo" both derive the identical checkout name but a raw
+# string compare would call them different URLs and skip the cascade
+# entirely. #119 deliberately compares URLs, not derived basenames (two
+# unrelated repos sharing a basename is out of scope), so it is the URL that
+# gets normalized here, not the name.
+#
 # cmd_project_add()'s fresh (non---from) path is the one caller: --from
 # never derives a checkout directory name at all (it adopts whatever is
 # already on disk), so this cascade only ever affects FUTURE fresh
 # 'project add --url ... --branch ...' calls, per #119's own scope note.
 checkout_dir_disambiguation_suffix() {
-	local root="$1" url="$2" branch="$3" self_name="$4"
+	local root="$1" branch="$3" self_name="$4"
+	local url="${2%/}"
+	url="${url%.git}"
 	local dir f name other_root other_url other_branch
 	local url_match=0 branch_match=0
 	dir="$(projects_dir)"
@@ -2125,6 +2137,8 @@ checkout_dir_disambiguation_suffix() {
 		other_root="$(config_grep_setting "$f" MACKAS_ROOT)" || continue
 		[ "$other_root" = "$root" ] || continue
 		other_url="$(config_grep_setting "$f" MACKAS_PROJECT_URL)" || continue
+		other_url="${other_url%/}"
+		other_url="${other_url%.git}"
 		[ "$other_url" = "$url" ] || continue
 		url_match=1
 		other_branch="$(config_grep_setting "$f" MACKAS_PROJECT_BRANCH)" || other_branch=""
