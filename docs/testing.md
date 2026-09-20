@@ -225,8 +225,8 @@ Anything where a mock would only test the mock. The classes of gap:
   suite pins the `setgroups`→`setgid`→`setuid` *ordering* textually
   instead, which guards the classic bug).
 
-See [TODO.md](../TODO.md) for the itemised gaps and what is covered by hand
-instead.
+See the local `TODO.md` backlog (untracked, not present in a fresh clone)
+for the itemised gaps and what is covered by hand instead.
 
 ## The opt-in real-runtime suites
 
@@ -376,8 +376,9 @@ where kas puts it under a mackas root) and the volume size from
 **What it does not prove.** It says nothing about the *margin*. An OE task
 can write far faster than the 1 s heartbeat, so a single greedy task could
 still blow through 2 GiB between two checks; whether 2 GiB is the right
-number is a separate, unmeasured question (see
-[TODO.md](../TODO.md)). It also runs bitbake standalone rather than under
+number is a separate, unmeasured question (see the local `TODO.md` backlog,
+untracked and not present in a fresh clone). It also runs bitbake
+standalone rather than under
 kas, so the fragment being *composed into* a real build stays the business
 of `tests/volumes.bats` and the smoketest ladder.
 

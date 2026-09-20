@@ -66,8 +66,9 @@ no GNU realpath can be found at all, `setup` errors with
 That makes the wiring robust, but it does not remove the Homebrew (or
 MacPorts) dependency itself — `setup` still needs a GNU coreutils installed
 *somewhere* to symlink from. Actually dropping that dependency is a
-different, not-yet-done idea, tracked as
-[TODO item 9](../TODO.md): a small shim mackas ships itself, over
+different, not-yet-done idea, tracked as item 9 in the local `TODO.md`
+backlog (untracked, not present in a fresh clone): a small shim mackas
+ships itself, over
 `/usr/bin/python3` (present on every stock Mac) — `os.path.realpath` + an
 `os.path.exists` check + `os.path.relpath` covers those three call forms in
 ~30 lines — but make it four: `env.sh`'s own `kas-container()` function
@@ -108,4 +109,4 @@ hardcode it, because it differs between a brew
 install and a `.pkg` install — and the failure it causes (`Operation not
 permitted` creating a volume on an external disk) looks nothing like a
 permissions problem, so a misdirected instruction there costs hours. Tracked
-in [TODO.md](../TODO.md).
+in the local `TODO.md` backlog (untracked, not present in a fresh clone).
