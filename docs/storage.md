@@ -758,8 +758,8 @@ identical, only `--root` and the mirror URLs change:
    HTTP at the vmnet gateway. One machine, no second host, no virtiofs in
    the path. The container-to-Mac HTTP leg works (see
    [Serving local files](#serving-local-files-instead-of-bind-mounting-them));
-   the server has not yet been run against a real NFS root — see
-   [TODO.md](../TODO.md).
+   the server has not yet been run against a real NFS root — tracked in the
+   local `TODO.md` backlog (untracked, not present in a fresh clone).
 3. **[Serving purely local files](#serving-local-files-instead-of-bind-mounting-them)**,
    to avoid bind-mounting caches through virtiofs.
 
@@ -1485,4 +1485,5 @@ The fix is to grant Full Disk Access to the daemon binary. Its location is
 `container-apiserver` in different places (a versioned Cellar path vs
 `/usr/local/libexec/container-apiserver`), so any tooling or instruction here
 must **derive** the path rather than hardcode it. This is not yet automated;
-see [TODO.md](../TODO.md).
+tracked in the local `TODO.md` backlog (untracked, not present in a fresh
+clone).
