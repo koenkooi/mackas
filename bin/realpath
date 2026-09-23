@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""realpath stand-in for the three forms kas-container calls.
+
+macOS /bin/realpath is BSD and rejects -e, -qe, and --relative-base.
+This covers those forms with os.path. It is not GNU coreutils.
+"""
+
+import os
+import sys
+
+
+def fail(quiet, message):
+    if not quiet:
+        sys.stderr.write(message + "\n")
+    return 1
+
+
+def canon(path):
+    return os.path.realpath(path)
+
+
+def main(argv):
+    quiet = False
+    must_exist = False
+    base = None
+    paths = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--version":
+            sys.stdout.write("mackas realpath shim (python)\n")
+            return 0
+        if arg in ("-q", "--quiet"):
+            quiet = True
+        elif arg in ("-e", "--canonicalize-existing"):
+            must_exist = True
+        elif arg.startswith("-") and not arg.startswith("--") and set(arg[1:]) <= set("qe"):
+            if "q" in arg[1:]:
+                quiet = True
+            if "e" in arg[1:]:
+                must_exist = True
+        elif arg == "--relative-base":
+            i += 1
+            if i >= len(argv):
+                return fail(quiet, "realpath: --relative-base needs a directory")
+            base = argv[i]
+        elif arg.startswith("--relative-base="):
+            base = arg.split("=", 1)[1]
+        elif arg.startswith("-"):
+            return fail(quiet, "realpath: unsupported option %s" % arg)
+        else:
+            paths.append(arg)
+        i += 1
+
+    if not paths:
+        return fail(quiet, "realpath: missing operand")
+
+    status = 0
+    base_real = canon(base) if base else None
+    for path in paths:
+        if must_exist and not os.path.exists(path):
+            status = fail(quiet, "realpath: %s: No such file or directory" % path)
+            continue
+        resolved = canon(path)
+        if base_real:
+            try:
+                if os.path.commonpath([base_real, resolved]) == base_real:
+                    sys.stdout.write(os.path.relpath(resolved, base_real) + "\n")
+                    continue
+            except ValueError:
+                pass
+        sys.stdout.write(resolved + "\n")
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
