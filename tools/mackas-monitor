@@ -36,6 +36,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -632,6 +633,47 @@ def transition_message(prev_status, state):
     return None
 
 
+def _once_state_path(port):
+    """Where --once persists this port's last-seen status between its own,
+    separate process invocations (issue #130) -- follow mode never touches
+    this file, see _once_prev_status's docstring for why."""
+    return os.path.join(tempfile.gettempdir(), f"mackas-monitor-{port}.once-status")
+
+
+def _load_once_prev_status(port):
+    """The status --once last recorded for THIS port, or None.
+
+    None is returned for three different cases, deliberately conflated: no
+    state file yet (the very first --once poll), a corrupt/unreadable one,
+    and an explicit re-arm written by _save_once_status(port, None) after a
+    connection failure. All three want the same answer -- transition_message
+    already treats None as "unknown prior state, a 'building' poll still
+    announces a start" (see its own docstring), which is exactly the
+    "reset prev_status to None on every disconnect" principle
+    docs/monitor-app.md lays out for --watch's in-process reconnect case.
+    --once has no single process to hold that reset in, so the file is what
+    carries it across invocations instead. Failing open to None (rather than
+    raising, or caching a stale status) means the failure mode of a wonky
+    state file is "one extra 'started' notification", never silence."""
+    try:
+        with open(_once_state_path(port), encoding="utf-8") as f:
+            return json.load(f).get("status")
+    except (OSError, ValueError):
+        return None
+
+
+def _save_once_status(port, status):
+    """Record STATUS (or None, to re-arm the next poll's prev_status) for
+    THIS port's next --once invocation to load. Best-effort: a failed write
+    only costs one wrong/missing notification on the next poll, never this
+    one -- never let it turn a monitor problem into a build problem."""
+    try:
+        with open(_once_state_path(port), "w", encoding="utf-8") as f:
+            json.dump({"status": status}, f)
+    except OSError:
+        pass
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -665,7 +707,14 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     want_notify = args.notify or os.environ.get("MACKAS_MONITOR_NOTIFY", "0") == "1"
-    prev_status = None
+    # Follow mode keeps its own in-process None -- a real, single monitor
+    # session that has never polled before, so "attaching mid-build still
+    # announces once" is exactly right. --once is a fresh process every
+    # invocation, so on its own it would see that same None on EVERY poll
+    # and re-announce "started" for as long as a build stays in "building"
+    # (issue #130) -- load what the LAST --once invocation actually saw
+    # instead, from the per-port state file _load_once_prev_status manages.
+    prev_status = _load_once_prev_status(args.port) if args.once else None
     ctx = new_render_context()
 
     # Where this poll is actually talking to. Starts at the published
@@ -723,6 +772,13 @@ def main(argv=None):
                     time.sleep(POLL_INTERVAL)
                     continue
                 print(connection_error_message(port, exc, host), file=sys.stderr)
+                if args.once:
+                    # A gap, exactly like the one --watch will need to
+                    # survive across (docs/monitor-app.md): re-arm so the
+                    # NEXT successful --once poll treats itself as a fresh
+                    # attach rather than trusting a status that may belong
+                    # to a since-finished, unrelated build on this port.
+                    _save_once_status(args.port, None)
                 return EXIT_UNREACHABLE
             ever_connected = True
             render(state, ctx)
@@ -731,6 +787,8 @@ def main(argv=None):
                 if message:
                     notify(*message)
             prev_status = state.get("status") or "?"
+            if args.once:
+                _save_once_status(args.port, prev_status)
             if args.once or state.get("status") in ("success", "failed"):
                 return EXIT_BUILD_FAILED if state.get("status") == "failed" else EXIT_OK
             time.sleep(POLL_INTERVAL)

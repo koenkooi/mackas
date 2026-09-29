@@ -33,6 +33,12 @@
 #     yet, but only before the first successful fetch; a failure after that
 #     is still immediate. time.monotonic/time.sleep are monkeypatched (a
 #     deterministic counter and a no-op) so this is instant, not a real wait.
+#   * --once's per-port status persistence (issue #130) -- --notify must not
+#     re-announce "started" on every --once poll of a build still in
+#     "building", but a genuinely new build after a disconnect (a different
+#     bridge on the same port) must still get its own "started". The state
+#     file lives under tempfile.gettempdir(), monkeypatched per test to a
+#     throwaway TemporaryDirectory so runs never share or leak state.
 
 import contextlib
 import importlib.machinery
@@ -42,6 +48,7 @@ import itertools
 import json
 import os
 import socket
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
@@ -930,6 +937,136 @@ class WaitForStartTest(unittest.TestCase):
         self.assertEqual(rc, mon.EXIT_OK)
         self.assertIn("192.168.64.76:8801", err)
         self.assertNotIn("waiting up to", err)
+
+
+def _state(status, **overrides):
+    """A bridge JSON payload with STATUS, built from BRIDGE_JSON's real shape
+    (targets/machine/distro/progress/failed_tasks) so describe_targets() and
+    friends have everything they read, whatever the status."""
+    payload = json.loads(BRIDGE_JSON)
+    payload["status"] = status
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+class OnceRenotifyTest(unittest.TestCase):
+    """--once's cross-invocation state file (issue #130): a build that is
+    still 'building' on every 15s poll must announce 'started' exactly
+    once, not once per poll, but a genuinely different build later on the
+    same port -- the normal shape of a sequential multi-machine batch --
+    must still get its own 'started'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.object(mon.tempfile, "gettempdir", return_value=self._tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _once(self, urlopen, notify, port=8801):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mon.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(mon, "notify", notify), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mon.main(["--port", str(port), "--once", "--notify"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_building_polled_repeatedly_announces_started_only_once(self):
+        notify = mock.Mock()
+        for _ in range(4):
+            rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+            self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 1)
+        self.assertEqual(notify.call_args[0][0], "mackas: build started")
+
+    def test_status_change_across_once_polls_still_notifies(self):
+        notify = mock.Mock()
+        self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+        rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("success"))), notify)
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(notify.call_args_list[1][0][0], "mackas: build succeeded")
+
+    def test_repeated_terminal_polls_do_not_renotify_either(self):
+        # The same bug, at the other end of a build: TERMINAL_LINGER_SECONDS
+        # (docs/monitor-app.md) means a still-lingering bridge can answer
+        # "success" to more than one --once poll before its container exits.
+        notify = mock.Mock()
+        self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+        self._once(mock.Mock(return_value=_FakeResponse(_state("success"))), notify)
+        rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("success"))), notify)
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 2)
+
+    def test_a_disconnect_rearms_the_next_build_as_a_fresh_start(self):
+        # The real batch shape: machine A finishes, its container (and
+        # bridge) goes away, machine B's container is not up yet -- some
+        # --once polls in between fail outright -- then machine B's bridge
+        # starts serving and the very first thing it says is "building".
+        # That must still announce "started", not be swallowed by machine
+        # A's leftover "success" in the state file.
+        notify = mock.Mock()
+        self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+        rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("success"))), notify)
+        self.assertEqual(rc, mon.EXIT_OK)
+        rc, _, _ = self._once(mock.Mock(side_effect=ConnectionRefusedError(61, "refused")), notify)
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+        rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 3)
+        self.assertEqual(notify.call_args_list[0][0][0], "mackas: build started")
+        self.assertEqual(notify.call_args_list[1][0][0], "mackas: build succeeded")
+        self.assertEqual(notify.call_args_list[2][0][0], "mackas: build started")
+
+    def test_no_prior_state_file_still_announces_a_start(self):
+        # The very first --once poll of a Mac's very first build: nothing
+        # has ever been written yet. Failing open to None (not raising, not
+        # silently skipping) is what makes this the same as any other
+        # never-seen-before attach.
+        notify = mock.Mock()
+        rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 1)
+
+    def test_a_corrupt_state_file_fails_open_to_a_start_not_a_crash(self):
+        notify = mock.Mock()
+        path = mon._once_state_path(8801)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("not json")
+        rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 1)
+
+    def test_state_is_isolated_per_port(self):
+        # Two machines in the SAME batch, polled through two different
+        # published ports, must not suppress each other's "started".
+        notify = mock.Mock()
+        self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify, port=8801)
+        rc, _, _ = self._once(
+            mock.Mock(return_value=_FakeResponse(_state("building"))), notify, port=8802
+        )
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(notify.call_count, 2)
+
+    def test_follow_mode_never_reads_the_once_state_file(self):
+        # A prior --once poll left "success" on disk for this port. A
+        # follow-mode session (no --once) that also sees "success" as its
+        # very FIRST fetch must still notify: its own prev_status starts at
+        # None, same as if the file did not exist. If it wrongly loaded
+        # "success" from disk instead, status == prev_status would suppress
+        # this notification entirely -- "success" is a terminal status, so
+        # this single fetch is also the whole run, real time.sleep never
+        # runs either way.
+        self._once(mock.Mock(return_value=_FakeResponse(_state("success"))), mock.Mock())
+        notify = mock.Mock()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(mon.urllib.request, "urlopen",
+                                mock.Mock(return_value=_FakeResponse(_state("success")))), \
+                mock.patch.object(mon, "notify", notify), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = mon.main(["--port", "8801", "--notify"])
+        self.assertEqual(rc, mon.EXIT_OK)
+        notify.assert_called_once_with("mackas: build succeeded", mock.ANY)
 
 
 if __name__ == "__main__":
