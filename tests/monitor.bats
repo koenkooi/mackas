@@ -23,6 +23,12 @@ setup() {
 	unset MACKAS_CONF MACKAS_MEMORY MACKAS_CPUS MACKAS_ROOT MACKAS_KAS_CONFIG
 	unset MACKAS_MONITOR_NOTIFY MACKAS_MONITOR_POLL_INTERVAL
 	export HOME="$TESTDIR"
+	# --once's per-port state file (issue #130) lives under tempfile.
+	# gettempdir(), which honors $TMPDIR -- scope it into this test's own
+	# throwaway dir so a real Mac's actual /tmp never sees test litter and
+	# no two tests can ever collide on it even if they happened to share a
+	# port number.
+	export TMPDIR="$TESTDIR"
 	SERVER_PID=""
 	RESET_PID=""
 	MONITOR_TOOL="$REPO_ROOT/tools/mackas-monitor"
@@ -68,6 +74,44 @@ PYEOF
 	done
 	FAKE_PORT="$(cat "$TESTDIR/port.txt" 2>/dev/null)"
 	[ -n "$FAKE_PORT" ]
+}
+
+# Same as start_fake_bridge, but on the CALLER-CHOSEN port $1 rather than an
+# OS-assigned one -- for the one test that needs two successive bridges on
+# literally the same port number (a second machine's container reusing a
+# batch build's fixed published port), where "whatever the OS happens to
+# hand back" would make the test itself flaky rather than what it is
+# supposed to be pinning down. Sets SERVER_PID; FAKE_PORT is the caller's
+# own $1, already known.
+start_fake_bridge_on_port() {
+	local port="$1" body="$2"
+	cat > "$TESTDIR/fake_bridge_fixed.py" <<PYEOF
+import http.server
+
+BODY = b'''$body'''
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY)
+
+    def log_message(self, *a):
+        pass
+
+srv = http.server.HTTPServer(("127.0.0.1", $port), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYEOF
+	python3 "$TESTDIR/fake_bridge_fixed.py" > "$TESTDIR/port_fixed.txt" &
+	SERVER_PID=$!
+	for _ in $(seq 1 50); do
+		[ -s "$TESTDIR/port_fixed.txt" ] && break
+		sleep 0.1
+	done
+	[ -s "$TESTDIR/port_fixed.txt" ]
 }
 
 # Same, but each argument is one JSON body, served one per request in order;
@@ -458,6 +502,61 @@ EOF
 	[ "$(grep -cF 'mackas: build started' "$TESTDIR/osascript.log")" -eq 1 ]
 	[ "$(grep -cF 'mackas: build succeeded' "$TESTDIR/osascript.log")" -eq 1 ]
 	assert_fails grep -qF 'mackas: build failed' "$TESTDIR/osascript.log"
+}
+
+@test "monitor --once --notify: exactly one start notification across repeated --once polls (issue #130)" {
+	# The real bug shape: mackas-watch-build.sh runs a FRESH 'mackas monitor
+	# --once' process every 15s, not one long-running follow-mode process
+	# (the test just above this one). Each --once used to start its own
+	# in-process prev_status=None, so every single poll of a still-building
+	# bridge fired 'started' again -- this loop is what that actually looks
+	# like, four separate real subprocess invocations against one sequence
+	# bridge.
+	fake_notifier osascript
+	start_fake_bridge_sequence \
+		'{"status": "building", "current": {"recipe": "busybox", "task": "do_fetch"}, "progress": {"done": 1, "total": 10}, "recent_events": []}' \
+		'{"status": "building", "current": {"recipe": "busybox", "task": "do_compile"}, "progress": {"done": 2, "total": 10}, "recent_events": []}' \
+		'{"status": "building", "current": {"recipe": "zlib", "task": "do_compile"}, "progress": {"done": 3, "total": 10}, "recent_events": []}' \
+		'{"status": "success", "current": {"recipe": null, "task": null}, "progress": {"done": 10, "total": 10}, "recent_events": []}'
+	for _ in 1 2 3 4; do
+		run_monitor --port "$FAKE_PORT" --once --notify
+		[ "$status" -eq 0 ]
+	done
+	# Four separate --once processes, three of them polling 'building' --
+	# and still exactly two notifications: started, succeeded. Never per poll.
+	[ "$(notifier_calls osascript)" -eq 2 ]
+	[ "$(grep -cF 'mackas: build started' "$TESTDIR/osascript.log")" -eq 1 ]
+	[ "$(grep -cF 'mackas: build succeeded' "$TESTDIR/osascript.log")" -eq 1 ]
+}
+
+@test "monitor --once --notify: a genuinely new build on the same port still gets its own 'started'" {
+	# The other half of issue #130's fix: persistence must not survive a real
+	# gap. Poll one build to completion, then -- simulating the container-swap
+	# gap between two machines in a sequential batch, both publishing on the
+	# SAME fixed port -- point --once at that port with nothing listening
+	# (an unreachable poll), then start a second bridge on that identical
+	# port. It must announce 'started' again, not stay silent because the
+	# port last said 'success'. A fixed port (not start_fake_bridge's
+	# OS-assigned one) is what makes "the same port, twice" a guarantee
+	# rather than a hope.
+	local reused_port=18809
+	fake_notifier osascript
+	start_fake_bridge_on_port "$reused_port" \
+		'{"status": "success", "current": {"recipe": null, "task": null}, "progress": {"done": 10, "total": 10}, "recent_events": []}'
+	run_monitor --port "$reused_port" --once --notify
+	[ "$status" -eq 0 ]
+	kill "$SERVER_PID"
+	wait "$SERVER_PID" 2>/dev/null || true
+	SERVER_PID=""
+	run_monitor --port "$reused_port" --once --notify
+	[ "$status" -eq 2 ]
+	start_fake_bridge_on_port "$reused_port" \
+		'{"status": "building", "current": {"recipe": "busybox", "task": "do_fetch"}, "progress": {"done": 1, "total": 10}, "recent_events": []}'
+	run_monitor --port "$reused_port" --once --notify
+	[ "$status" -eq 0 ]
+	[ "$(notifier_calls osascript)" -eq 2 ]
+	[ "$(grep -cF 'mackas: build started' "$TESTDIR/osascript.log")" -eq 1 ]
+	[ "$(grep -cF 'mackas: build succeeded' "$TESTDIR/osascript.log")" -eq 1 ]
 }
 
 @test "monitor --notify: a build that fails notifies started then failed, once each" {
