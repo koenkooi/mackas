@@ -6246,8 +6246,14 @@ cmd_dump() {
 # mount, so files land owned by the invoking user already and a `chown -R`
 # there fails "Operation not permitted".
 
-# fetch_tmp_subdir SUB DEST VAR DEFAULT [EXTRA] -- copy the guest directory VAR
-# resolves to out of the TMPDIR volume into DEST/SUB[/EXTRA]. Returns non-zero
+# fetch_tmp_subdir SUB DEST VAR DEFAULT [EXTRA] [MACHINE] [EXCLUDE] -- copy the
+# guest directory VAR resolves to out of the TMPDIR volume into DEST/SUB[/EXTRA].
+# EXCLUDE, when given, is a single top-level directory name under that guest
+# directory to skip entirely -- never transferred, never part of the
+# verification manifest (see retrieve_verify_script()'s own comment below);
+# only bare 'deploy' sets it, to skip sbom-cve-check/databases (a shared
+# CVE/NVD database mirror, not build output -- see retrieve_usage()).
+# Returns non-zero
 # (with a clear message) when that directory is absent -- e.g. no build has run,
 # so there is no tmp/buildstats -- rather than letting a raw `cp` error surface.
 # Idempotent within one EXTRA: re-copying the same EXTRA overwrites in place.
@@ -6291,11 +6297,40 @@ cmd_dump() {
 # also has the property the batching below depends on -- given multiple
 # paths on one invocation, it labels each line with the exact path it was
 # given, so a batch's own internal ordering is never load-bearing.
+# retrieve_verify_script [EXCLUDE] -- EXCLUDE, when given, is a single
+# top-level directory name under the guest root that must be pruned from
+# BOTH the cksum manifest and the symlink map (fetch_tmp_subdir() prunes it
+# from the copy itself too -- see its own comment for why: a shared external
+# database under bare 'deploy', not build output). Substituted into the
+# heredoc's placeholders AFTER capture, host-side, since EXCLUDE is always a
+# fixed literal mackas itself controls, never guest/user input -- this keeps
+# the no-EXCLUDE case's emitted text byte-identical to before this existed
+# (every caller but one still passes nothing).
 retrieve_verify_script() {
-	cat <<'EOS'
+	local exclude="${1:-}" prune="" print=""
+	if [ -n "$exclude" ]; then
+		prune="\\( -path './$exclude' -prune \\) -o "
+		# The two finds below already have an explicit action (-printf/
+		# -print0), so -prune alone does not suppress their output -- but
+		# 'find . -type l' relies on find's implicit -print, which stops
+		# applying once -prune is anywhere in the expression.
+		print="-print "
+	fi
+	# read -d '' (not `script="$(cat <<'EOS' ... )"`) is deliberate: macOS's
+	# stock /bin/bash (3.2) mis-parses a single-quoted heredoc nested inside
+	# a $(...) capture once its body contains an apostrophe (reproduced
+	# standalone: "unexpected EOF while looking for matching `''"; fixed in
+	# later bash, but this script targets 3.2) -- and this heredoc's body
+	# has several ("container's own", "find's implicit"). `read -d ''`
+	# slurps the same heredoc into a variable with no such nesting.
+	local script
+	# `|| :`: `read -d ''` returns 1 at EOF even on a fully successful read
+	# (there is no trailing empty-string delimiter to find) -- under this
+	# script's `set -e`, an unguarded call would abort right here.
+	read -r -d '' script <<'EOS' || :
 : > /tmp/.mackas-verify-jobs
 mkdir -p /tmp/.mackas-verify-batches
-find . -type f -size +268435456c -printf '%s %p\n' | while read -r size path; do
+find . __MACKAS_PRUNE__-type f -size +268435456c -printf '%s %p\n' | while read -r size path; do
 	rel="${path#./}"
 	size_mb=$(( (size + 1048575) / 1048576 ))
 	chunk_mb=$(( (size_mb + 7) / 8 ))
@@ -6313,7 +6348,7 @@ done
 		sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
 		printf "%s#%s\t%s\n" "$1" "$2" "$sum"
 	' _
-	find . -type f ! -size +268435456c -print0 | \
+	find . __MACKAS_PRUNE__-type f ! -size +268435456c -print0 | \
 		xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' /tmp/.mackas-verify-batches
 	find /tmp/.mackas-verify-batches -type f -exec cat {} + | \
 		LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
@@ -6328,10 +6363,13 @@ done
 # the expensive part) rather than trust `find -type f` to speak for
 # symlinks it structurally cannot see.
 printf '%s\n' '@@MACKAS-SYMLINKS@@'
-find . -type l | while IFS= read -r p; do
+find . __MACKAS_PRUNE__-type l __MACKAS_PRINT__| while IFS= read -r p; do
 	printf '%s\t%s\n' "${p#./}" "$(readlink "$p")"
 done | LC_ALL=C sort
 EOS
+	script="${script//__MACKAS_PRUNE__/$prune}"
+	script="${script//__MACKAS_PRINT__/$print}"
+	printf '%s\n' "$script"
 }
 
 # Host-side (macOS/BSD) counterpart to retrieve_verify_script() above: the
@@ -6376,8 +6414,15 @@ EOS
 # empty input" behavior on the guest side while BSD xargs does not, so an
 # empty directory's guest and host manifests disagreed and fell back to
 # tar before failing outright.
+# retrieve_verify_local ROOT [EXCLUDE] -- host-side counterpart to
+# retrieve_verify_script()'s manifest; EXCLUDE has the same meaning there
+# (see its comment). Kept as a genuine if/else duplication of the two `find`
+# lines rather than an array of extra predicate words -- this file targets
+# plain `#!/usr/bin/env bash` (macOS's stock /bin/bash included), where
+# "${arr[@]}" on a declared-but-empty array under `set -u` is not reliably
+# safe across bash versions; two short branches sidestep the question.
 retrieve_verify_local() {
-	local root="$1"
+	local root="$1" exclude="${2:-}"
 	local batchdir rc=0
 	# A plain host tmpdir, not under $root -- it must never end up inside
 	# the tree being verified and checksum itself. Created before the cd
@@ -6391,7 +6436,11 @@ retrieve_verify_local() {
 	# instead of erroring, which is worse than not verifying at all.
 	(
 		cd "$root" || exit 1
-		find . -type f -size +268435456c | while IFS= read -r path; do
+		if [ -n "$exclude" ]; then
+			find . -path "./$exclude" -prune -o -type f -size +268435456c -print
+		else
+			find . -type f -size +268435456c
+		fi | while IFS= read -r path; do
 			local size rel size_mb chunk_mb i skip_mb
 			size="$(stat -f%z "$path")"
 			rel="${path#./}"
@@ -6407,8 +6456,11 @@ retrieve_verify_local() {
 			sum=$(dd if="$3" bs=1M skip="$4" count="$5" 2>/dev/null | cksum)
 			printf "%s#%s\t%s\n" "$1" "$2" "$sum"
 		' _
-		find . -type f ! -size +268435456c -print0 | \
-			xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' "$batchdir"
+		if [ -n "$exclude" ]; then
+			find . -path "./$exclude" -prune -o -type f ! -size +268435456c -print0
+		else
+			find . -type f ! -size +268435456c -print0
+		fi | xargs -0 -r -P 8 -n 256 sh -c 'cksum "$@" >> "$0/c.$$"' "$batchdir"
 		find "$batchdir" -type f -exec cat {} + | \
 			LC_ALL=C awk '{ c = $1; s = $2; sub(/^[0-9]+ [0-9]+ \.\//, ""); printf "%s#0\t%s %s\n", $0, c, s }'
 	) | LC_ALL=C sort || rc=$?
@@ -6423,10 +6475,14 @@ retrieve_verify_local() {
 # BSD (here) and GNU (the guest) -- verified live to agree for a relative,
 # non-existent-target, and dangling-vs-file-vs-dir target.
 retrieve_symlinks_local() {
-	local root="$1"
+	local root="$1" exclude="${2:-}"
 	(
 		cd "$root" || exit 1
-		find . -type l | while IFS= read -r p; do
+		if [ -n "$exclude" ]; then
+			find . -path "./$exclude" -prune -o -type l -print
+		else
+			find . -type l
+		fi | while IFS= read -r p; do
 			printf '%s\t%s\n' "${p#./}" "$(readlink "$p")"
 		done
 	) | LC_ALL=C sort
@@ -6459,16 +6515,19 @@ retrieve_repair_symlinks() {
 }
 
 fetch_tmp_subdir() {
-	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" guest destsub quiet_undefined=0 rc
+	local sub="$1" dest="$2" var="$3" default="$4" extra="${5:-}" machine="${6:-}" \
+		exclude="${7:-}" guest destsub quiet_undefined=0 rc
 
-	# buildhistory and sbom are the objects whose variables are only ever
-	# defined by an optional bbclass (see bitbake_getvar): BUILDHISTORY_DIR
-	# by buildhistory.bbclass, DEPLOY_DIR_SPDX by spdx-common.bbclass (pulled
-	# in by create-spdx). Opt into the quiet-undefined signal so "this project
-	# doesn't INHERIT it" is explained once, below, rather than as a generic
-	# bitbake-getvar warning first.
+	# buildhistory, sbom and deploy/sbom-cve-check are the objects whose
+	# variables are only ever defined by an optional bbclass (see
+	# bitbake_getvar): BUILDHISTORY_DIR by buildhistory.bbclass,
+	# DEPLOY_DIR_SPDX by spdx-common.bbclass (pulled in by create-spdx),
+	# SBOM_CVE_CHECK_DEPLOY_DB_DIR by sbom-cve-check-common.bbclass. Opt into
+	# the quiet-undefined signal so "this project doesn't INHERIT it" is
+	# explained once, below, rather than as a generic bitbake-getvar warning
+	# first.
 	case "$sub" in
-		buildhistory|sbom) quiet_undefined=1 ;;
+		buildhistory|sbom|deploy/sbom-cve-check) quiet_undefined=1 ;;
 	esac
 
 	# Distros can redefine where these actually land (e.g. Angstrom sets
@@ -6552,6 +6611,18 @@ fetch_tmp_subdir() {
 				warn "  local_conf_header (or conf/local.conf):  INHERIT += \"create-spdx\""
 				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
 				;;
+			deploy/sbom-cve-check)
+				# sbom-cve-check.bbclass is NOT inherited by default (unlike
+				# create-spdx) -- it is enabled via an OE_FRAGMENTS entry, per
+				# the class's own top-of-file comment. SBOM_CVE_CHECK_DEPLOY_DB_DIR
+				# is defined nowhere else, so bitbake-getvar has nothing to
+				# return either when the fragment is not enabled -- the same
+				# "absent" symptom as buildhistory/sbom, different cause.
+				warn "  no $guest in '$MACKAS_VOL_TMP' -- sbom-cve-check is not enabled."
+				warn "  Enable it with: bitbake-config-build enable-fragment core/yocto/sbom-cve-check"
+				warn "  (or add  OE_FRAGMENTS += \"core/yocto/sbom-cve-check\"  to local.conf)"
+				warn "  then run a build ($SCRIPT_CMD smoketest) and retrieve again."
+				;;
 			*)
 				warn "  no $guest in '$MACKAS_VOL_TMP'; skipping $sub"
 				;;
@@ -6569,6 +6640,8 @@ fetch_tmp_subdir() {
 	case "$size_kb" in ''|*[!0-9]*) size_kb="" ;; esac
 	if [ -n "$size_kb" ]; then
 		info "  $sub: $(fmt_kb "$size_kb") to transfer to $dest"
+		[ -n "$exclude" ] && info "    excluding $sub/$exclude (shared external CVE/NVD database" \
+			"cache, not build output -- see '$SCRIPT_CMD retrieve deploy sbom-cve-check')"
 
 		# Warn, never refuse: retrieve is a copy, not a destructive operation,
 		# and a df estimate can be wrong (sparse files, other things writing
@@ -6616,6 +6689,24 @@ fetch_tmp_subdir() {
 	# lying around.
 	run rm -rf "${dest:?}/${destsub:?}"
 	run mkdir -p "$dest/$destsub"
+	# copy_cmd/tar_cmd: identical to the plain `cp -r "$guest/."`/`tar -S`
+	# forms below when $exclude is empty (every object but bare 'deploy') --
+	# only the bare 'deploy' retrieve ever sets $exclude, to skip
+	# sbom-cve-check/databases (see fetch_tmp_subdir's caller in cmd_retrieve)
+	# without ever reading it across the virtiofs boundary at all: `find
+	# -mindepth 1 -maxdepth 1 ! -name` lists $guest's own top-level entries
+	# minus the excluded one and hands them to a single `cp -r -t`, rather
+	# than copying everything then deleting the excluded subtree afterward
+	# (which would still pay its full transfer cost for nothing). The tar
+	# fallback uses GNU tar's own --exclude instead, for the same reason.
+	local copy_cmd tar_cmd
+	if [ -n "$exclude" ]; then
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && find $(printf '%q' "$guest") -mindepth 1 -maxdepth 1 ! -name $(printf '%q' "$exclude") -exec cp -r -t $(printf '%q' "/out/$destsub/") {} + && cd $(printf '%q' "$guest") && $(retrieve_verify_script "$exclude")"
+		tar_cmd="tar -S --exclude=$(printf '%q' "$exclude") -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+	else
+		copy_cmd="mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)"
+		tar_cmd="tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
+	fi
 	# DRY_RUN, its own early branch, same shape volume_fsck_one()'s STEP E
 	# uses: the real path below captures container run's output via command
 	# substitution to compare it, which -- unlike a plain `run container
@@ -6624,21 +6715,21 @@ fetch_tmp_subdir() {
 	if [ "$DRY_RUN" -eq 1 ]; then
 		run container run --rm -u 0:0 \
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)"
+			sh -c "$copy_cmd"
 		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
 		return 0
 	fi
 	local src_combined src_manifest src_symlinks dst_manifest dst_symlinks
 	src_combined="$(container run --rm -u 0:0 \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "mkdir -p $(printf '%q' "/out/$destsub") && cp -r $(printf '%q' "$guest/.") $(printf '%q' "/out/$destsub/") && cd $(printf '%q' "$guest") && $(retrieve_verify_script)")"
+		sh -c "$copy_cmd")"
 	# retrieve_verify_script() bundles the cksum manifest and the symlink
 	# map into one stream (one container invocation, not two -- see its own
 	# comment); split on the delimiter line it prints between them.
 	src_manifest="$(printf '%s\n' "$src_combined" | sed -n '1,/^@@MACKAS-SYMLINKS@@$/{/^@@MACKAS-SYMLINKS@@$/!p;}')"
 	src_symlinks="$(printf '%s\n' "$src_combined" | awk '/^@@MACKAS-SYMLINKS@@$/{f=1;next} f')"
-	dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
-	dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub")"
+	dst_manifest="$(retrieve_verify_local "$dest/$destsub" "$exclude")"
+	dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub" "$exclude")"
 	if [ "$src_manifest" != "$dst_manifest" ]; then
 		warn "  '$sub' failed verification after cp -r -- falling back to a slower, safer copy"
 		# Diagnostic, not a fix: this mismatch has been seen both as a
@@ -6659,9 +6750,9 @@ fetch_tmp_subdir() {
 		run mkdir -p "$dest/$destsub"
 		run container run --rm -u 0:0 \
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-			sh -c "tar -S -C $(printf '%q' "$guest") -cf - . | tar -S -C $(printf '%q' "/out/$destsub") -xf -"
-		dst_manifest="$(retrieve_verify_local "$dest/$destsub")"
-		dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub")"
+			sh -c "$tar_cmd"
+		dst_manifest="$(retrieve_verify_local "$dest/$destsub" "$exclude")"
+		dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub" "$exclude")"
 		[ "$src_manifest" = "$dst_manifest" ] || die "'$sub' still fails verification after the tar fallback" \
 			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
 		warn "  '$sub' needed the tar fallback -- cp -r produced wrong content this time"
@@ -6672,7 +6763,7 @@ fetch_tmp_subdir() {
 	# first would just have its work discarded by the fallback's rm -rf.
 	if [ "$src_symlinks" != "$dst_symlinks" ]; then
 		retrieve_repair_symlinks "$dest" "$destsub" "$src_symlinks" "$dst_symlinks"
-		dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub")"
+		dst_symlinks="$(retrieve_symlinks_local "$dest/$destsub" "$exclude")"
 		[ "$src_symlinks" = "$dst_symlinks" ] || die "'$sub' still has broken symlinks after repair" \
 			"something is genuinely wrong -- $dest/$destsub was left in place for inspection"
 	fi
@@ -6730,6 +6821,15 @@ ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matte
                        so successive retrievals never merge together.
   logs                 tmp/log -- cooker.log and friends.
   deploy               tmp/deploy -- the images and ipks. Can be tens of GB.
+                       EXCLUDES sbom-cve-check/databases: a shared external
+                       CVE/NVD database mirror (two git checkouts plus one
+                       JSON file per CVE) that sbom-cve-check-update-*-native
+                       populate once and never scope to a build or a machine
+                       -- a real retrieve pulled 8.0GB/~750k files where
+                       7.0GB/748,874 files (87%) was this one directory,
+                       versus ~870MB of actual output (ipks, images,
+                       licenses, spdx). Fetch it explicitly with 'deploy
+                       sbom-cve-check' below if you want a copy of it.
   deploy images [MACHINE]
                        Just DEPLOY_DIR_IMAGE (\${DEPLOY_DIR}/images/\${MACHINE})
                        -- the boot images for one board, without every
@@ -6739,6 +6839,14 @@ ${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matte
                        substitutes only the resolved path's trailing
                        component, never a blind DEPLOY_DIR/images/MACHINE
                        guess. Lands at \$dest/deploy/images.
+  deploy sbom-cve-check
+                       SBOM_CVE_CHECK_DEPLOY_DB_DIR (\${DEPLOY_DIR}/sbom-cve-check/
+                       databases) -- the CVE/NVD database mirror bare 'deploy'
+                       excludes (see above). Only exists if the project
+                       enables sbom-cve-check (an OE_FRAGMENTS entry, not
+                       inherited by default); retrieve says so rather than
+                       reporting a missing directory. Lands at
+                       \$dest/deploy/sbom-cve-check.
   buildhistory         buildhistory/ -- what each build produced: package and
                        image contents, sizes, dependencies, sysroot listings.
                        Only exists if the project INHERITs buildhistory; most
@@ -6811,14 +6919,20 @@ cmd_retrieve() {
 				# [MACHINE]' narrows the whole-DEPLOY_DIR copy down to just
 				# DEPLOY_DIR_IMAGE (boot images for one board), instead of
 				# every ipk/rpm feed and every MACHINE a multiconfig build
-				# has ever produced. Encoded into the object token itself
-				# ('deploy:images' / 'deploy:images:MACHINE') rather than a
-				# separate array, so the rest of this function's per-object
-				# loop stays a flat list of strings.
+				# has ever produced. 'sbom-cve-check' does the opposite --
+				# fetches ONLY the shared CVE/NVD database mirror that bare
+				# 'deploy' excludes by default (see fetch_tmp_subdir's
+				# $exclude and cmd_retrieve's per-object loop below: a real
+				# 8.0GB deploy retrieve was 87% this one directory, none of
+				# it build output). Both are encoded into the object token
+				# itself ('deploy:images'/'deploy:images:MACHINE'/
+				# 'deploy:sbom-cve-check') rather than a separate array, so
+				# the rest of this function's per-object loop stays a flat
+				# list of strings.
 				objects+=("deploy"); shift
+				idx=$((${#objects[@]} - 1))
 				if [ "${1:-}" = "images" ]; then
 					shift
-					idx=$((${#objects[@]} - 1))
 					case "${1:-}" in
 						# Not a MACHINE: either nothing follows, another flag,
 						# or the next object keyword entirely.
@@ -6842,6 +6956,8 @@ cmd_retrieve() {
 							esac
 							objects[$idx]="deploy:images:$1"; shift ;;
 					esac
+				elif [ "${1:-}" = "sbom-cve-check" ]; then
+					objects[$idx]="deploy:sbom-cve-check"; shift
 				fi
 				;;
 			buildstats|logs|buildhistory|sbom) objects+=("$1"); shift ;;
@@ -6923,18 +7039,29 @@ cmd_retrieve() {
 	# (which Angstrom points at ${TOPDIR}/deploy, not the default's tmp/deploy)
 	# -- so their defaults may be siblings of tmp/ or off the TMPDIR volume
 	# entirely, depending on what each project configures.
-	local it sub var extra default machine fetched=0 got_buildstats=0 got_buildhistory=0
+	local it sub var extra default machine exclude fetched=0 got_buildstats=0 got_buildhistory=0
 	for it in "${objects[@]}"; do
 		sub="$it"
 		var="DEPLOY_DIR"
 		extra=""
 		default="/build/tmp/$it"
 		machine=""
+		# Bare 'deploy' excludes sbom-cve-check/databases by default -- see
+		# fetch_tmp_subdir's own comment on $exclude and retrieve_usage() for
+		# why (a shared CVE/NVD database mirror, not build output). Every
+		# other object leaves this empty, which fetch_tmp_subdir treats as
+		# "copy/verify everything", today's behaviour unchanged.
+		[ "$it" = "deploy" ] && exclude="sbom-cve-check" || exclude=""
 		case "$it" in
 			logs)         sub="log"; var="LOG_DIR"; default="/build/tmp/log" ;;
 			buildstats)   var="BUILDSTATS_BASE"; extra="$retrieve_ts" ;;
 			buildhistory) var="BUILDHISTORY_DIR"; default="/build/buildhistory" ;;
 			sbom)         var="DEPLOY_DIR_SPDX"; default="/build/tmp/deploy/spdx" ;;
+			deploy:sbom-cve-check)
+				var="SBOM_CVE_CHECK_DEPLOY_DB_DIR"
+				default="/build/tmp/deploy/sbom-cve-check/databases"
+				sub="deploy/sbom-cve-check"
+				;;
 			deploy:images|deploy:images:*)
 				var="DEPLOY_DIR_IMAGE"
 				# Everything after the second ':' is the optional MACHINE
@@ -6959,7 +7086,7 @@ cmd_retrieve() {
 		# to be one hardcoded "deploy can be large" guess that said nothing
 		# about the other three objects and nothing real about this
 		# project's actual deploy/ contents.
-		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra" "$machine"; then
+		if fetch_tmp_subdir "$sub" "$dest" "$var" "$default" "$extra" "$machine" "$exclude"; then
 			fetched=$((fetched + 1))
 			[ "$it" = "buildstats" ] && got_buildstats=1
 			[ "$it" = "buildhistory" ] && got_buildhistory=1

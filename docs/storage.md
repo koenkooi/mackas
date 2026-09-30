@@ -1143,6 +1143,32 @@ Unlike the per-image SBOM — which create-spdx-image-3.0.bbclass deploys
 alongside the images into `DEPLOY_DIR_IMAGE` — the full recipe/package tree
 lands in `DEPLOY_DIR_SPDX` and is brought out with `mackas retrieve sbom`.
 
+## The CVE/NVD database mirror — `SBOM_CVE_CHECK_DEPLOY_DB_DIR`
+
+`meta/conf/sbom-cve-check-config.inc` defines
+`SBOM_CVE_CHECK_DEPLOY_DB_DIR ??= "${DEPLOY_DIR}/sbom-cve-check/databases"` — two
+full git checkouts (the NVD and cvelist mirrors) plus one JSON file per CVE,
+fetched by the `sbom-cve-check-update-cvelist-native` and
+`sbom-cve-check-update-nvd-native` recipes and used by
+`meta/classes-recipe/sbom-cve-check.bbclass`'s `do_sbom_cve_check` task. It is
+**not** build output: the same database serves every machine and every build
+this project ever runs, and it is not scoped by `IMAGE_NAME`/`MACHINE` the way
+everything else under `deploy/` is. The actual per-image CVE/SBOM reports
+(`.sbom-cve-check.spdx.json`, `.cve.txt`, etc.) are deployed alongside the
+images into `DEPLOY_DIR_IMAGE` instead, so `mackas retrieve deploy images`
+already brings those; nothing else of value lives under `sbom-cve-check/`.
+
+Because it sits directly under `DEPLOY_DIR` and can dwarf everything else
+there (a real project's database mirror measured 7.0GB/748,874 files, 87% of
+an 8.0GB `deploy` retrieve, against ~870MB of actual build output), bare
+`mackas retrieve deploy` excludes it by default — the copy itself skips it
+(never read across the virtiofs boundary, not copied then deleted), not just
+the display. Fetch it explicitly with `mackas retrieve deploy sbom-cve-check`
+if you actually want a local copy, e.g. for offline scanning. It is only
+present at all if the project enables `sbom-cve-check` (an `OE_FRAGMENTS`
+entry, not inherited by default like `create-spdx`); `retrieve` says so
+rather than reporting a missing directory.
+
 ## The workspace image
 
 `work/` — `KAS_WORK_DIR`, the layer checkouts: oe-core, bitbake, the `meta-*`
