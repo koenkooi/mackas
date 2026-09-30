@@ -153,11 +153,20 @@ from macOS. `mackas retrieve` copies them out with a throwaway container:
 ./mackas retrieve buildstats                # -> $MACKAS_BASE/artifacts/
 ./mackas retrieve buildstats logs deploy    # also tmp/log and tmp/deploy; deploy can be tens of GB
 ./mackas retrieve deploy images [MACHINE]   # just the boot images for one board, not the whole feed
+./mackas retrieve deploy sbom-cve-check     # the shared CVE/NVD db bare 'deploy' excludes (see below)
 ./mackas retrieve buildhistory              # what each build produced, if the project inherits it
 ./mackas retrieve buildstats --dest ~/out   # elsewhere
 ./mackas buildstats analyze [PATH]          # summarise what was fetched
 ./mackas buildhistory analyze [PATH]        # what changed between two builds
 ```
+
+Bare `deploy` excludes `sbom-cve-check/databases`: a shared external CVE/NVD
+database mirror (two full git checkouts plus one JSON file per CVE),
+populated once by `sbom-cve-check-update-*-native` and not scoped to any one
+build or machine. A real retrieve pulled 8.0GB/~750k files where
+7.0GB/748,874 files (87%) was this one directory, versus ~870MB of actual
+build output. `deploy sbom-cve-check` fetches it explicitly when you actually
+want a copy.
 
 Every object resolves its real guest path from bitbake itself
 (`BUILDSTATS_BASE`, `LOG_DIR`, `DEPLOY_DIR`, `BUILDHISTORY_DIR`), never from

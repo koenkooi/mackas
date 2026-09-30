@@ -114,6 +114,13 @@ EOF
 	mkdir -p "$FIXTURE/spdx/x86_64/packages" "$FIXTURE/spdx/x86_64/builds"
 	echo '{}' > "$FIXTURE/spdx/x86_64/packages/package-base-files.spdx.json"
 	echo '{}' > "$FIXTURE/spdx/bitbake.spdx.json"
+	# sbom-cve-check/databases is the shared CVE/NVD database mirror bare
+	# 'deploy' excludes by default -- it sits INSIDE the deploy fixture
+	# (a sibling of images/), unlike sbom/buildhistory above which are their
+	# own separate DEPLOY_DIR_SPDX/BUILDHISTORY_DIR trees.
+	mkdir -p "$FIXTURE/deploy/sbom-cve-check/databases/cves/2026"
+	echo '{}' > "$FIXTURE/deploy/sbom-cve-check/databases/cves/2026/CVE-2026-00001.json"
+	echo 'db' > "$FIXTURE/deploy/sbom-cve-check/databases/_state.csv"
 	export FIXTURE
 
 	# MOCK_BUSY_VOLUME, if set, is a volume the modelled runtime reports as held
@@ -247,6 +254,9 @@ resolve_destsub_guestsub() {
 		*/deploy/images|*/deploy/images/*)
 			guestsub="deploy/images${guestdir#*/deploy/images}"
 			;;
+		*/deploy/sbom-cve-check/databases)
+			guestsub="deploy/sbom-cve-check/databases"
+			;;
 		*) guestsub="${guestdir##*/}" ;;
 	esac
 }
@@ -256,7 +266,22 @@ case "$last" in
 	# (fetch_tmp_subdir's own retrieve_verify_script) -- .mackas-verify-jobs
 	# is a marker string unique to that script, safe to match on.
 	*".mackas-verify-jobs"*)
-		resolve_destsub_guestsub "$last" "cp -r " "/\\. "
+		# Bare 'deploy' excludes sbom-cve-check/databases via a DIFFERENT
+		# copy shape (find -mindepth 1 -maxdepth 1 ! -name ... -exec cp -r
+		# -t ..., see fetch_tmp_subdir's own comment) -- "cp -r " no longer
+		# sits right before the guest path there, so it needs its own
+		# extraction pattern, and the excluded name has to be pulled out
+		# separately so this mock's own copy simulation skips it too.
+		exclude_name=""
+		case "$last" in
+			*"-mindepth 1 -maxdepth 1"*)
+				resolve_destsub_guestsub "$last" "find " " -mindepth"
+				exclude_name="$(printf '%s\n' "$last" | head -1 | sed -E 's#.*! -name ([^ ]*).*#\1#')"
+				;;
+			*)
+				resolve_destsub_guestsub "$last" "cp -r " "/\\. "
+				;;
+		esac
 		if [ -n "$outdir" ]; then
 			mkdir -p "$outdir/$destsub"
 			# -RP, not plain -r: BSD cp under -R dereferences symlinks by
@@ -265,7 +290,17 @@ case "$last" in
 			# production, so the mock's own population step does not
 			# itself destroy the fixture's symlink before the corruption
 			# simulation below ever gets a chance to run.
-			[ -d "$FIXTURE/$guestsub" ] && cp -RP "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+			if [ -d "$FIXTURE/$guestsub" ]; then
+				if [ -n "$exclude_name" ]; then
+					( cd "$FIXTURE/$guestsub" && for e in * .[!.]* ..?*; do
+						[ -e "$e" ] || continue
+						[ "$e" = "$exclude_name" ] && continue
+						cp -RP "$e" "$outdir/$destsub/"
+					done )
+				else
+					cp -RP "$FIXTURE/$guestsub/." "$outdir/$destsub/"
+				fi
+			fi
 			if [ -n "${MOCK_VERIFY_CORRUPT:-}" ] || [ -n "${MOCK_VERIFY_CORRUPT_ALWAYS:-}" ]; then
 				# Simulate cp -r's rare real corruption: flip one byte in
 				# the DESTINATION after the copy, so retrieve_verify_local()
@@ -297,13 +332,15 @@ case "$last" in
 		# whatever actually landed at $outdir/$destsub -- same algorithm on
 		# both sides, so an uncorrupted copy agrees and a MOCK_VERIFY_*
 		# one does not, without a second hand-written implementation to
-		# keep in sync.
+		# keep in sync. $exclude_name, when set, is passed through the same
+		# way -- both functions already prune by it for real (see mackas's
+		# own retrieve_verify_local/retrieve_verify_script).
 		eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$REAL_MACKAS")"
 		eval "$(awk '/^retrieve_symlinks_local\(\) \{/,/^}/' "$REAL_MACKAS")"
 		if [ -d "$FIXTURE/$guestsub" ]; then
-			retrieve_verify_local "$FIXTURE/$guestsub"
+			retrieve_verify_local "$FIXTURE/$guestsub" "$exclude_name"
 			printf '%s\n' '@@MACKAS-SYMLINKS@@'
-			retrieve_symlinks_local "$FIXTURE/$guestsub"
+			retrieve_symlinks_local "$FIXTURE/$guestsub" "$exclude_name"
 		fi
 		exit 0
 		;;
@@ -762,11 +799,70 @@ STUB
 	assert_call "-d /build/tmp/log ]"
 }
 
-@test "retrieve: bare 'deploy' still fetches the whole tree, unaffected by item 24" {
+@test "retrieve: bare 'deploy' still probes the whole DEPLOY_DIR, unaffected by item 24" {
+	# "Whole tree" here means the probe/guest path (DEPLOY_DIR itself, not
+	# narrowed to DEPLOY_DIR_IMAGE by 'images') -- the COPY itself excludes
+	# sbom-cve-check/databases by default, see the tests below.
 	MOCK_TMP_HAS="buildstats log deploy" mk retrieve deploy
 	[ "$status" -eq 0 ]
 	assert_call "-d /build/tmp/deploy ]"
 	[ -d "$ROOT/artifacts/deploy" ]
+}
+
+@test "retrieve: bare 'deploy' excludes sbom-cve-check/databases" {
+	MOCK_TMP_HAS="deploy" mk retrieve deploy
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/images" ]
+	[ ! -e "$ROOT/artifacts/deploy/sbom-cve-check" ]
+	printf '%s\n' "$output" | grep -qF "excluding deploy/sbom-cve-check"
+	printf '%s\n' "$output" | grep -qF "retrieve deploy sbom-cve-check"
+}
+
+@test "retrieve: deploy sbom-cve-check fetches only the database mirror" {
+	MOCK_TMP_HAS="databases" mk retrieve deploy sbom-cve-check
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/sbom-cve-check" ]
+	[ -f "$ROOT/artifacts/deploy/sbom-cve-check/cves/2026/CVE-2026-00001.json" ]
+	[ -f "$ROOT/artifacts/deploy/sbom-cve-check/_state.csv" ]
+	[ ! -e "$ROOT/artifacts/deploy/images" ]
+	assert_call "-d /build/tmp/deploy/sbom-cve-check/databases ]"
+}
+
+@test "retrieve: deploy sbom-cve-check composes with another object in one call" {
+	MOCK_TMP_HAS="buildstats databases" mk retrieve deploy sbom-cve-check buildstats
+	[ "$status" -eq 0 ]
+	[ -d "$ROOT/artifacts/deploy/sbom-cve-check" ]
+	[ -d "$ROOT/artifacts/buildstats/$RETRIEVE_TS/20260717121723" ]
+}
+
+@test "retrieve: says sbom-cve-check is not enabled when it is absent" {
+	MOCK_TMP_HAS="" mk retrieve deploy sbom-cve-check
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "sbom-cve-check is not enabled"
+	printf '%s\n' "$output" | grep -qF "enable-fragment core/yocto/sbom-cve-check"
+}
+
+@test "retrieve: deploy sbom-cve-check asks bitbake-getvar for SBOM_CVE_CHECK_DEPLOY_DB_DIR, not an assumed default" {
+	# Mirrors the equivalent sbom test above: the resolved path must win
+	# over the /build/tmp/deploy/sbom-cve-check/databases class default, and
+	# the host destination must still be named after the object key.
+	printf '[safe]\n\tdirectory = *\n' > "$ROOT/gitconfig"
+	mkdir -p "$ROOT/work/meta-angstrom/.git"
+	cat > "$ROOT/bin/kas-container.real" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+	*"bitbake-getvar --value -q SBOM_CVE_CHECK_DEPLOY_DB_DIR "*) echo "/build/deploy/sbom-cve-check/databases" ;;
+esac
+exit 0
+EOF
+	chmod +x "$ROOT/bin/kas-container.real"
+	mkdir -p "$FIXTURE/deploy/sbom-cve-check/databases"
+	echo '{}' > "$FIXTURE/deploy/sbom-cve-check/databases/redefined.json"
+
+	MOCK_TMP_HAS="databases" MACKAS_PROJECT_DIR=meta-angstrom mk retrieve deploy sbom-cve-check
+	[ "$status" -eq 0 ]
+	assert_call "-d /build/deploy/sbom-cve-check/databases ]"
+	[ -d "$ROOT/artifacts/deploy/sbom-cve-check" ]
 }
 
 @test "retrieve: a MACHINE shaped like a path escape is refused before ever touching the runtime" {
@@ -932,16 +1028,33 @@ EOF
 	refute_call ":/out]"
 }
 
-@test "retrieve: --dry-run deploy prints the correctly %q-quoted copy commands" {
+@test "retrieve: --dry-run deploy sbom-cve-check prints the correctly %q-quoted copy commands" {
 	# deploy has no dry-run coverage above (only buildstats/buildhistory/
-	# sbom do) -- exercise it here, and pin the pieces of the %q-quoted
-	# command (mkdir -p, cp -r, cd) that a dry-run preview is the only way
-	# to see without a real container run.
+	# sbom do) -- exercise it here, via the opt-in object, which still uses
+	# the plain (non-exclude) cp -r shape -- pin the pieces of the
+	# %q-quoted command (mkdir -p, cp -r, cd) that a dry-run preview is the
+	# only way to see without a real container run. Bare 'deploy' itself
+	# uses a DIFFERENT shape (see the exclude-specific test below).
+	MOCK_TMP_HAS="databases" mk --dry-run retrieve deploy sbom-cve-check
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF 'mkdir -p /out/deploy/sbom-cve-check'
+	printf '%s\n' "$output" | grep -qF 'cp -r /build/tmp/deploy/sbom-cve-check/databases/.'
+	printf '%s\n' "$output" | grep -qF 'cd /build/tmp/deploy/sbom-cve-check/databases'
+	[ ! -d "$ROOT/artifacts" ]
+}
+
+@test "retrieve: --dry-run deploy excludes sbom-cve-check via find/cp -t, not a plain cp -r" {
+	# Bare 'deploy' never reads sbom-cve-check/databases across the virtiofs
+	# boundary at all (see fetch_tmp_subdir's own comment) -- it lists
+	# $guest's own top-level entries minus the excluded one and hands them
+	# to one cp -r -t, rather than copying everything then deleting the
+	# excluded subtree afterward.
 	MOCK_TMP_HAS="deploy" mk --dry-run retrieve deploy
 	[ "$status" -eq 0 ]
 	printf '%s\n' "$output" | grep -qF 'mkdir -p /out/deploy'
-	printf '%s\n' "$output" | grep -qF 'cp -r /build/tmp/deploy/.'
+	printf '%s\n' "$output" | grep -qF 'find /build/tmp/deploy -mindepth 1 -maxdepth 1 ! -name sbom-cve-check -exec cp -r -t /out/deploy/'
 	printf '%s\n' "$output" | grep -qF 'cd /build/tmp/deploy'
+	assert_fails grep -qF 'cp -r /build/tmp/deploy/.' <<< "$output"
 	[ ! -d "$ROOT/artifacts" ]
 }
 
@@ -1509,15 +1622,23 @@ EOF
 	# POSIX sh) and host (retrieve_verify_local, bash) -- that must agree on
 	# the size threshold and the awk program that turns cksum's own output
 	# back into the manifest format, or the two sides' manifests silently
-	# stop meaning the same thing. Each fragment is expected exactly twice --
-	# one per side -- so a future edit that changes only one side, or that
-	# "simplifies" +268435456c to +262144k/+256M (a rounding a GNU/BSD find
-	# pair would have to be trusted to agree on), fails this test instead of
-	# shipping a mismatch that only shows up as an intermittent-looking
-	# checksum failure.
+	# stop meaning the same thing. The guest side stays a single heredoc (its
+	# EXCLUDE prune clause is spliced in via string substitution, not a
+	# second copy of the find lines), so its two size tests (large-file,
+	# small-file) still appear exactly once each. The host side, added later
+	# for the same EXCLUDE feature, is a genuine if/else duplication instead
+	# (see retrieve_verify_local's own comment on why: this file targets
+	# plain macOS /bin/bash, where an empty array under `set -u` is not
+	# reliably safe to expand), so its own two size tests each appear twice
+	# -- once with the prune clause, once without. A future edit that
+	# changes only one of these four occurrences, or "simplifies"
+	# +268435456c to +262144k/+256M (a rounding a GNU/BSD find pair would
+	# have to be trusted to agree on), fails this test instead of shipping a
+	# mismatch that only shows up as an intermittent-looking checksum
+	# failure.
 	local n
 	n="$(grep -cF -- '-size +268435456c' "$MACKAS")"
-	[ "$n" -eq 4 ] # 2 finds (large-file, small-file) x 2 sides
+	[ "$n" -eq 6 ] # guest: 2 (large-file, small-file) + host: 2x2 (if/else exclude branches)
 	n="$(grep -cF -- 'sub(/^[0-9]+ [0-9]+ \.\//, "")' "$MACKAS")"
 	[ "$n" -eq 2 ]
 	n="$(grep -cF -- "xargs -0 -r -P 8 -n 256 sh -c 'cksum" "$MACKAS")"
