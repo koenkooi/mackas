@@ -2141,10 +2141,8 @@ check_container_runtime() {
 	if [ -x /opt/homebrew/bin/brew ] || command -v brew >/dev/null 2>&1; then
 		ck_pass "Homebrew present"
 	else
-		# shellcheck disable=SC2016  # literal text: this is a command we print
-		# for the user to copy-paste, not one we run. $(...) must survive.
-		ck_fail "Homebrew not found" \
-			'/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+		ck_warn "Homebrew not found" \
+			"optional. Install Apple's container .pkg if 'container' is missing. realpath is provided by bin/realpath."
 	fi
 
 	if command -v container >/dev/null 2>&1; then
@@ -2208,6 +2206,11 @@ find_gnu_realpath() {
 			return 0
 		fi
 	done
+	local shim="$SCRIPT_DIR/bin/realpath"
+	if [ -x "$shim" ] && "$shim" -e / >/dev/null 2>&1; then
+		printf '%s\n' "$shim"
+		return 0
+	fi
 	return 1
 }
 
@@ -2215,8 +2218,8 @@ check_realpath() {
 	hdr "3. Host utilities (BSD vs GNU)"
 	# After setup the guaranteed answer is our own shim in MACKAS_BIN.
 	if [ -x "$SHIM_DIR/realpath" ] &&
-		"$SHIM_DIR/realpath" --version 2>/dev/null | head -1 | grep -q 'GNU coreutils'; then
-		ck_pass "GNU realpath shim installed at $SHIM_DIR/realpath"
+		"$SHIM_DIR/realpath" -e / >/dev/null 2>&1; then
+		ck_pass "realpath shim installed at $SHIM_DIR/realpath"
 		return
 	fi
 	local gnu
@@ -3526,7 +3529,7 @@ setup_shim_and_env() {
 		fi
 	else
 		die "no GNU realpath found -- kas-container needs it (macOS's BSD realpath lacks -e/--relative-base)" \
-			"brew install coreutils"
+			"brew install coreutils, or keep $SCRIPT_DIR/bin/realpath"
 	fi
 
 	local mirrors_note=""
