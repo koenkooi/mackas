@@ -115,6 +115,14 @@ fstrim automatically afterward for exactly that reason
 (`MACKAS_FSTRIM_AUTO=1`, the default the build path already uses around a
 `smoketest`/`shell` run; set `0` to skip it and reclaim by hand later).
 
+A project with `BBMULTICONFIG` (e.g. meta-ti's `k3r5` for pocketbeagle2) has a
+second TMPDIR per multiconfig, such as `/build/tmp-k3r5`, with its own stamps.
+`clean tmp+deploy` resolves each one with `bitbake -e mc:<name>` and clears
+its TMPDIR and DEPLOY_DIR too; leaving it behind makes the next build trust
+stamps whose deploy output is gone and fail on the missing file. Only the
+multiconfigs of the checkout and kas config mackas resolves are covered,
+nothing is globbed.
+
 `mackas sstate prune` is the same story: its `find -delete` also runs **in
 place** inside the already-attached sstate volume, so a prune that reclaims
 tens of GB of stale objects leaves the freed blocks allocated on the host
