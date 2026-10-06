@@ -180,7 +180,8 @@ nothing, instead of reporting a missing directory. Because that default sits in
 the same volume bare `mackas clean` drops wholesale, retrieve it before
 cleaning, point `BUILDHISTORY_DIR` somewhere that survives, or use
 `mackas clean tmp+deploy` instead of bare `clean` — it keeps buildhistory
-(and conf/) intact, clearing only TMPDIR and DEPLOY_DIR.
+(and conf/) intact, clearing only TMPDIR and DEPLOY_DIR (plus those of each
+`BBMULTICONFIG` entry, whose own TMPDIR holds its own stamps).
 
 `buildhistory analyze` reads the retrieved tree with host `git` (`git diff
 --name-status` plus one `git cat-file --batch`, no container) and prints a

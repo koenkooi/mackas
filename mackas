@@ -5544,6 +5544,10 @@ bitbake_getvar() {
 			"The variable '$var' is not defined"*)
 				[ "$quiet_undefined" = "1" ] && return 2 ;;
 		esac
+		# Exit 0 with nothing printed can only be a defined-but-empty value
+		# (e.g. BBMULTICONFIG = ""): an undefined one exits nonzero. For an
+		# opt-in caller that is the same answer as "not defined".
+		[ "$quiet_undefined" = "1" ] && [ "$rc" -eq 0 ] && return 2
 		[ -n "$errmsg" ] && warn "  bitbake-getvar failed for $var: $errmsg"
 		return 1
 	fi
@@ -5552,6 +5556,27 @@ bitbake_getvar() {
 	# ("${TMPDIR}/buildstats/") -- strip it so callers get a plain path to
 	# join with, the same shape DEPLOY_DIR/LOG_DIR already resolve to.
 	printf '%s\n' "${out%/}"
+}
+
+# bitbake_mc_vars MC -- prints "TMPDIR=<path>" and "DEPLOY_DIR=<path>" for the
+# multiconfig MC. bitbake-getvar only sees the base configuration; 'bitbake -e
+# mc:NAME' prints a multiconfig's own datastore, at the cost of loading the
+# recipe cache (so it is not instant like a getvar). Returns 1 unless both
+# values came back.
+bitbake_mc_vars() {
+	local mc="$1" out errfile errmsg rc=0 tmp deploy
+	errfile="$(mktemp "${TMPDIR:-/tmp}/mackas-getvar.XXXXXX" 2>/dev/null)" || errfile=/dev/null
+	out="$(kas_shell_ro "bitbake -e $(printf '%q' "mc:$mc") | grep -E '^(export )?(TMPDIR|DEPLOY_DIR)='" 2>"$errfile")" || rc=$?
+	errmsg="$(tail -1 "$errfile" 2>/dev/null)"
+	rm -f "$errfile"
+	out="$(printf '%s\n' "$out" | sed 's/^export //')"
+	tmp="$(printf '%s\n' "$out" | sed -n 's/^TMPDIR="\(.*\)"$/\1/p' | head -1)"
+	deploy="$(printf '%s\n' "$out" | sed -n 's/^DEPLOY_DIR="\(.*\)"$/\1/p' | head -1)"
+	if [ "$rc" -ne 0 ] || [ -z "$tmp" ] || [ -z "$deploy" ]; then
+		[ -n "$errmsg" ] && warn "  bitbake -e mc:$mc failed: $errmsg"
+		return 1
+	fi
+	printf 'TMPDIR=%s\nDEPLOY_DIR=%s\n' "${tmp%/}" "${deploy%/}"
 }
 
 # ---------------------------------------------------------------------------
@@ -8417,8 +8442,11 @@ ${C_BLD}TARGETS${C_RST} (optional, repeatable, order does not matter)
                always cleared TOGETHER: bitbake's stamps (under TMPDIR) record
                which tasks already wrote DEPLOY_DIR, so clearing either one
                alone leaves the other inconsistent with it -- there is no
-               'deploy only' or 'tmp only' target. SSTATE_DIR survives, so
-               the next build refills both cheaply -- but largely by
+               'deploy only' or 'tmp only' target. A multiconfig has its own
+               TMPDIR (and stamps), so every BBMULTICONFIG entry's TMPDIR and
+               DEPLOY_DIR are cleared with them, or its stale stamps would
+               claim output the shared DEPLOY_DIR no longer has. SSTATE_DIR
+               survives, so the next build refills both cheaply -- but largely by
                RESTORING the same cached artifacts, not recompiling; to force
                a genuinely fresh rebuild of something, use '$SCRIPT_CMD shell'
                and e.g. 'bitbake -f -c deploy <recipe>'. Slower than bare
@@ -8445,6 +8473,10 @@ ${C_BLD}PATH RESOLUTION (tmp+deploy)${C_RST}
   file, or exported in this shell:
     export MACKAS_PROJECT_DIR=<checkout under work/>
     export MACKAS_KAS_CONFIG=<its kas files>
+  Multiconfigs (BBMULTICONFIG) are resolved the same way, one 'bitbake -e
+  mc:<name>' each -- never by globbing /build/tmp-*. That loads the recipe
+  cache, so it is slower than a getvar, and only runs when BBMULTICONFIG is
+  set.
   If bitbake-getvar still fails with those set, tmp+deploy REFUSES rather
   than guessing a path it is about to rm -rf (see '$SCRIPT_CMD status'/
   'check') -- deliberate: a guessed path can only be right by luck or a
@@ -8712,6 +8744,36 @@ clean_tmp_deploy() {
 	refuse_unsafe_guest_path "$tmpdir" TMPDIR
 	refuse_unsafe_guest_path "$deploydir" DEPLOY_DIR
 
+	# A multiconfig has its own TMPDIR, so its own stamps. Left behind, they
+	# claim tasks are done whose output in the shared DEPLOY_DIR was just
+	# deleted, and the next build fails on the missing file (#134). Each
+	# one is resolved through bitbake, never globbed from /build/tmp-*.
+	# extras: one "mc:NAME:VAR|PATH" line per path not already covered.
+	local mcs mcrc=0 mc mcvars p var extras="" nl=$'\n'
+	mcs="$(bitbake_getvar BBMULTICONFIG 1)" || mcrc=$?
+	case "$mcrc" in
+		0) ;;
+		2) mcs="" ;;
+		*) die_unresolved_guest_var BBMULTICONFIG ;;
+	esac
+	for mc in $mcs; do
+		case "$mc" in
+			*[!A-Za-z0-9._-]*) die "multiconfig name '$mc' looks unsafe -- clean tmp+deploy will not build a path to rm -rf from it" \
+				"a multiconfig name is letters, digits, '.', '_', '-' only" ;;
+		esac
+		mcvars="$(bitbake_mc_vars "$mc")" || \
+			die "mc:$mc's TMPDIR/DEPLOY_DIR could not be resolved via 'bitbake -e'; clean tmp+deploy will not guess a path it is about to rm -rf" \
+				"the bitbake query itself failed; see the warning above -- $SCRIPT_CMD status"
+		for var in TMPDIR DEPLOY_DIR; do
+			p="$(printf '%s\n' "$mcvars" | sed -n "s/^$var=//p" | head -1)"
+			refuse_unsafe_guest_path "$p" "mc:$mc $var"
+			if [ "$p" = "$tmpdir" ] || [ "$p" = "$deploydir" ] || printf '%s\n' "$extras" | sed 's/^[^|]*|//' | grep -qxF -- "$p"; then
+				continue
+			fi
+			extras="${extras:+$extras$nl}mc:$mc:$var|$p"
+		done
+	done
+
 	# Always runs for real, dry-run or not -- a read-only probe, same
 	# reasoning as sstate_prune's scan: "nothing to clean" needs the REAL
 	# state, not --dry-run's assumed yes. One container run reports BOTH
@@ -8720,22 +8782,47 @@ clean_tmp_deploy() {
 	# below instead of folded into a blanket "cleared both". The trailing
 	# `exit 0` keeps a genuinely-absent path (a false `[ -d ] && echo`) from
 	# making the whole probe look like it failed.
-	local present have_tmpdir have_deploydir
+	local present have_tmpdir have_deploydir line n=0 probe_extra="" extras_present="" extras_absent=""
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		n=$((n + 1))
+		probe_extra="$probe_extra [ -d $(printf '%q' "${line#*|}") ] && echo MC$n;"
+	done <<< "$extras"
 	present="$(container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
-		sh -c "[ -d $(printf '%q' "$tmpdir") ] && echo TMPDIR; [ -d $(printf '%q' "$deploydir") ] && echo DEPLOY_DIR; exit 0" 2>/dev/null)" || present=""
+		sh -c "[ -d $(printf '%q' "$tmpdir") ] && echo TMPDIR; [ -d $(printf '%q' "$deploydir") ] && echo DEPLOY_DIR;$probe_extra exit 0" 2>/dev/null)" || present=""
 	if printf '%s\n' "$present" | grep -qxF TMPDIR; then have_tmpdir="yes"; else have_tmpdir="no"; fi
 	if printf '%s\n' "$present" | grep -qxF DEPLOY_DIR; then have_deploydir="yes"; else have_deploydir="no"; fi
+	n=0
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		n=$((n + 1))
+		if printf '%s\n' "$present" | grep -qxF "MC$n"; then
+			extras_present="${extras_present:+$extras_present$nl}$line"
+		else
+			extras_absent="${extras_absent:+$extras_absent$nl}$line"
+		fi
+	done <<< "$extras"
 
-	if [ "$have_tmpdir" = "no" ] && [ "$have_deploydir" = "no" ]; then
+	if [ "$have_tmpdir" = "no" ] && [ "$have_deploydir" = "no" ] && [ -z "$extras_present" ]; then
 		info "Nothing to clean -- neither $tmpdir nor $deploydir exists yet (has a build run? $SCRIPT_CMD smoketest)"
 		return 0
 	fi
 
-	confirm "Clear TMPDIR ($tmpdir) and DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP'? They are always cleared together." \
+	local confirm_msg="Clear TMPDIR ($tmpdir) and DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP'? They are always cleared together."
+	local rm_extra="" extra_desc=""
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		rm_extra="$rm_extra $(printf '%q' "${line#*|}")"
+		extra_desc="${extra_desc:+$extra_desc, }${line%%|*} ${line#*|}"
+	done <<< "$extras_present"
+	if [ -n "$extras_present" ]; then
+		confirm_msg="Clear TMPDIR ($tmpdir), DEPLOY_DIR ($deploydir) and the multiconfig paths ($extra_desc) in '$MACKAS_VOL_TMP'? They are always cleared together."
+	fi
+	confirm "$confirm_msg" \
 		|| { info "Declined -- nothing cleaned."; return 1; }
 
 	run container run --rm -u 0:0 -v "$MACKAS_VOL_TMP:/build" "$KAS_IMAGE" \
-		sh -c "rm -rf $(printf '%q' "$tmpdir") $(printf '%q' "$deploydir")"
+		sh -c "rm -rf $(printf '%q' "$tmpdir") $(printf '%q' "$deploydir")$rm_extra"
 
 	# Report per-path, not a blanket "cleared both": an rm -rf against a path
 	# that never existed is a silent no-op, and an earlier version of this
@@ -8745,9 +8832,19 @@ clean_tmp_deploy() {
 		did "cleared TMPDIR ($tmpdir) and DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP' -- buildhistory and conf/ untouched"
 	elif [ "$have_tmpdir" = "yes" ]; then
 		did "cleared TMPDIR ($tmpdir) in '$MACKAS_VOL_TMP'; DEPLOY_DIR ($deploydir) did not exist -- buildhistory and conf/ untouched"
-	else
+	elif [ "$have_deploydir" = "yes" ]; then
 		did "cleared DEPLOY_DIR ($deploydir) in '$MACKAS_VOL_TMP'; TMPDIR ($tmpdir) did not exist -- buildhistory and conf/ untouched"
+	else
+		info "TMPDIR ($tmpdir) and DEPLOY_DIR ($deploydir) did not exist -- buildhistory and conf/ untouched"
 	fi
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		did "cleared ${line%%|*} (${line#*|}) in '$MACKAS_VOL_TMP'"
+	done <<< "$extras_present"
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		info "  ${line%%|*} (${line#*|}) did not exist"
+	done <<< "$extras_absent"
 	info "  the stamps went with TMPDIR, so the next build re-runs the whole task"
 	info "  graph -- SSTATE_DIR survives, so that is mostly cheap sstate restores"
 	info "  of the same cached artifacts. For a genuinely fresh rebuild of"

@@ -95,7 +95,7 @@ case "$last" in
 		# forms. Always exit 0: emptiness of stdout, not exit status, is what
 		# "neither exists" means under the new contract.
 		for p in $MOCK_TMP_HAS; do
-			for token in TMPDIR DEPLOY_DIR; do
+			for token in TMPDIR DEPLOY_DIR MC1 MC2 MC3; do
 				case "$last" in
 					*"-d $p ] && echo $token"*|*"-d '$p' ] && echo $token"*)
 						echo "$token" ;;
@@ -156,7 +156,16 @@ fake_kas_container() {
 		local pair var val
 		for pair in "$@"; do
 			var="${pair%%=*}"; val="${pair#*=}"
-			printf '\t*"bitbake-getvar --value -q %s "*) echo %q ;;\n' "$var" "$val"
+			case "$var" in
+				# mc:NAME=TMPDIR|DEPLOY_DIR answers 'bitbake -e mc:NAME | grep'
+				# the way the real thing prints it: expanded, quoted, one
+				# of them with the 'export ' prefix, plus a line grep would not pass.
+				mc:*)
+					printf '\t*"bitbake -e %s "*) printf '"'"'%%s\\n'"'"' %q %q ;;\n' "$var" \
+						"TMPDIR=\"${val%%|*}\"" "export DEPLOY_DIR=\"${val#*|}\"" ;;
+				*)
+					printf '\t*"bitbake-getvar --value -q %s "*) echo %q ;;\n' "$var" "$val" ;;
+			esac
 		done
 		printf 'esac\n'
 		printf 'exit 0\n'
@@ -436,6 +445,123 @@ tmp_deploy_ok() { fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/tmp/
 		refute_call "rm -rf"
 		: > "$CLOG"
 	done
+}
+
+# ---------------------------------------------------------------------------
+# tmp+deploy and multiconfigs (#134)
+# ---------------------------------------------------------------------------
+
+@test "clean tmp+deploy: without BBMULTICONFIG the rm is exactly TMPDIR and DEPLOY_DIR" {
+	have_volumes oe-build-tmp
+	tmp_deploy_ok
+	MOCK_TMP_HAS="/build/tmp /build/tmp/deploy" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "[rm -rf /build/tmp /build/tmp/deploy]"
+	assert_fails grep -qi multiconfig <<< "$output"
+}
+
+@test "clean tmp+deploy: a multiconfig's own TMPDIR is cleared too" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5" "mc:k3r5=/build/tmp-k3r5|/build/deploy"
+	MOCK_TMP_HAS="/build/tmp /build/deploy /build/tmp-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "[rm -rf /build/tmp /build/deploy /build/tmp-k3r5]"
+	printf '%s\n' "$output" | grep -qF "cleared mc:k3r5:TMPDIR (/build/tmp-k3r5)"
+}
+
+@test "clean tmp+deploy: a multiconfig path equal to the main one is not listed twice" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5 other" "mc:k3r5=/build/tmp-k3r5|/build/deploy" "mc:other=/build/tmp-k3r5|/build/deploy"
+	MOCK_TMP_HAS="/build/tmp /build/deploy /build/tmp-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "[rm -rf /build/tmp /build/deploy /build/tmp-k3r5]"
+}
+
+@test "clean tmp+deploy: a multiconfig DEPLOY_DIR of its own is cleared with its TMPDIR" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5" "mc:k3r5=/build/tmp-k3r5|/build/deploy-k3r5"
+	MOCK_TMP_HAS="/build/tmp /build/deploy /build/tmp-k3r5 /build/deploy-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "[rm -rf /build/tmp /build/deploy /build/tmp-k3r5 /build/deploy-k3r5]"
+}
+
+@test "clean tmp+deploy: reports a multiconfig path that did not exist, and does not rm it" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5" "mc:k3r5=/build/tmp-k3r5|/build/deploy"
+	MOCK_TMP_HAS="/build/tmp /build/deploy" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "[rm -rf /build/tmp /build/deploy]"
+	printf '%s\n' "$output" | grep -qF "mc:k3r5:TMPDIR (/build/tmp-k3r5) did not exist"
+}
+
+@test "clean tmp+deploy: only a multiconfig TMPDIR present still cleans it, without claiming the main paths were cleared" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5" "mc:k3r5=/build/tmp-k3r5|/build/deploy"
+	MOCK_TMP_HAS="/build/tmp-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -eq 0 ]
+	assert_call "/build/tmp-k3r5]"
+	printf '%s\n' "$output" | grep -qF "cleared mc:k3r5:TMPDIR (/build/tmp-k3r5)"
+	printf '%s\n' "$output" | grep -qF "TMPDIR (/build/tmp) and DEPLOY_DIR (/build/deploy) did not exist"
+	assert_fails grep -qF "cleared DEPLOY_DIR" <<< "$output"
+}
+
+@test "clean tmp+deploy: the confirm prompt names the multiconfig paths" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5" "mc:k3r5=/build/tmp-k3r5|/build/deploy"
+	MOCK_TMP_HAS="/build/tmp /build/tmp-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk clean tmp+deploy < /dev/null
+	printf '%s\n' "$output" | grep -qF "multiconfig paths (mc:k3r5:TMPDIR /build/tmp-k3r5)"
+	refute_call "rm -rf"
+}
+
+@test "clean tmp+deploy: --dry-run lists the multiconfig path but deletes nothing" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+		"BBMULTICONFIG=k3r5" "mc:k3r5=/build/tmp-k3r5|/build/deploy"
+	MOCK_TMP_HAS="/build/tmp /build/tmp-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk --dry-run clean tmp+deploy
+	[ "$status" -eq 0 ]
+	refute_call "rm -rf"
+	printf '%s\n' "$output" | grep -qF '/build/tmp-k3r5'
+}
+
+@test "clean tmp+deploy: refuses a multiconfig path that is not safely under /build" {
+	have_volumes oe-build-tmp
+	for bad in "/build" "/" "/sstate/tmp" "/build/../etc"; do
+		fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" \
+			"BBMULTICONFIG=k3r5" "mc:k3r5=$bad|/build/deploy"
+		MOCK_TMP_HAS="/build/tmp /build/deploy $bad" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+		if [ "$status" -eq 0 ]; then
+			echo "expected a refusal for mc TMPDIR=$bad" >&2
+			printf '%s\n' "$output" >&2
+			return 1
+		fi
+		printf '%s\n' "$output" | grep -qi 'not safely under /build'
+		refute_call "rm -rf"
+		: > "$CLOG"
+	done
+}
+
+@test "clean tmp+deploy: refuses, rather than guessing a tmp-<mc> path, when a multiconfig cannot be resolved" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" "BBMULTICONFIG=k3r5"
+	MOCK_TMP_HAS="/build/tmp /build/deploy /build/tmp-k3r5" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "mc:k3r5's TMPDIR/DEPLOY_DIR could not be resolved"
+	refute_call "rm -rf"
+}
+
+@test "clean tmp+deploy: refuses a multiconfig name that is not a plain name" {
+	have_volumes oe-build-tmp
+	fake_kas_container "TMPDIR=/build/tmp" "DEPLOY_DIR=/build/deploy" "BBMULTICONFIG=../x"
+	MOCK_TMP_HAS="/build/tmp /build/deploy" MACKAS_PROJECT_DIR=meta-angstrom mk -y clean tmp+deploy
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "looks unsafe"
+	refute_call "rm -rf"
 }
 
 # ---------------------------------------------------------------------------
