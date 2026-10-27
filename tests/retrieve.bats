@@ -337,9 +337,18 @@ case "$last" in
 		# own retrieve_verify_local/retrieve_verify_script).
 		eval "$(awk '/^retrieve_verify_local\(\) \{/,/^}/' "$REAL_MACKAS")"
 		eval "$(awk '/^retrieve_symlinks_local\(\) \{/,/^}/' "$REAL_MACKAS")"
+		# MOCK_COPY_FAIL models the guest's cp/verify dying (ENFILE): non-zero
+		# exit, nothing usable on stdout.
+		if [ -n "${MOCK_COPY_FAIL:-}" ]; then
+			echo "cp: cannot create regular file: Too many open files in system" >&2
+			exit 1
+		fi
+		# The real script prints the delimiter even for an empty tree.
 		if [ -d "$FIXTURE/$guestsub" ]; then
 			retrieve_verify_local "$FIXTURE/$guestsub" "$exclude_name"
-			printf '%s\n' '@@MACKAS-SYMLINKS@@'
+		fi
+		printf '%s\n' '@@MACKAS-SYMLINKS@@'
+		if [ -d "$FIXTURE/$guestsub" ]; then
 			retrieve_symlinks_local "$FIXTURE/$guestsub" "$exclude_name"
 		fi
 		exit 0
@@ -466,8 +475,8 @@ refute_call() {
 @test "retrieve: the copy container run uses -u 0:0 (uid 30000 cannot read root-owned paths)" {
 	# Pinned to the exact invocation, not just "-u 0:0 appears somewhere":
 	# both the probe and the copy must run as root.
-	mk retrieve buildstats
-	assert_call "[run] [--rm] [-u] [0:0] [-v] [oe-build-tmp:/build] [-v] [$ROOT/artifacts:/out] [ghcr.io/siemens/kas/kas:5.5] [sh] [-c]"
+	mk --set MACKAS_MEMORY=6g retrieve buildstats
+	assert_call "[run] [--rm] [-u] [0:0] [-m] [6g] [-v] [oe-build-tmp:/build] [-v] [$ROOT/artifacts:/out] [ghcr.io/siemens/kas/kas:5.5] [sh] [-c]"
 }
 
 @test "retrieve: the -u 0:0 in the copy is asserted against the source too" {
@@ -765,6 +774,20 @@ STUB
 	# requested MACHINE, never a blind DEPLOY_DIR/images/<machine> guess.
 	assert_call "-d /build/some/dist/images/qemuarm-armv5te ]"
 	refute_call "-d /build/some/dist/images/qemuarm ]"
+}
+
+@test "retrieve: a failing copy container is a clear error, not a checksum mismatch" {
+	MOCK_TMP_HAS="buildstats" MOCK_COPY_FAIL=1 mk retrieve buildstats
+	[ "$status" -ne 0 ]
+	[[ "$output" == *"retrieve container failed"* ]]
+	[[ "$output" == *"MACKAS_MEMORY"* ]]
+	[[ "$output" != *"falling back"* ]]
+}
+
+@test "retrieve: the copy containers get MACKAS_MEMORY, not the 1 GiB default" {
+	MOCK_TMP_HAS="buildstats" mk --set MACKAS_MEMORY=6g retrieve buildstats
+	[ "$status" -eq 0 ]
+	assert_call "[-m] [6g]"
 }
 
 @test "retrieve: deploy images MACHINE falls back with the machine already appended" {

@@ -6738,16 +6738,31 @@ fetch_tmp_subdir() {
 	# run ...` -- does not go through run()'s own dry-run short-circuit, so
 	# it needs one of its own.
 	if [ "$DRY_RUN" -eq 1 ]; then
-		run container run --rm -u 0:0 \
+		run container run --rm -u 0:0 -m "$MACKAS_MEMORY" \
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
 			sh -c "$copy_cmd"
 		info "  (dry-run: nothing was copied or verified; a real run falls back to a slower tar copy on a checksum mismatch)"
 		return 0
 	fi
 	local src_combined src_manifest src_symlinks dst_manifest dst_symlinks
-	src_combined="$(container run --rm -u 0:0 \
+	# -m: the guest kernel scales fs.file-max to the VM's RAM, and the 1 GiB
+	# default is too small for a buildhistory with ~75k files ("Too many open
+	# files in system"). MACKAS_MEMORY is the build VM's size, which is
+	# only reserved while this container runs.
+	local src_rc=0
+	src_combined="$(container run --rm -u 0:0 -m "$MACKAS_MEMORY" \
 		-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
-		sh -c "$copy_cmd")"
+		sh -c "$copy_cmd")" || src_rc=$?
+	# A failed copy or verify in the guest yields a garbage manifest that
+	# only ever shows up as a puzzling checksum mismatch; say what happened.
+	case "$src_combined" in
+		*@@MACKAS-SYMLINKS@@*) ;;
+		*) [ "$src_rc" -ne 0 ] || src_rc=1 ;;
+	esac
+	if [ "$src_rc" -ne 0 ]; then
+		die "the retrieve container failed copying or checksumming '$sub' (exit $src_rc)" \
+			"see the errors above; 'Too many open files in system' means the VM is too small -- raise MACKAS_MEMORY"
+	fi
 	# retrieve_verify_script() bundles the cksum manifest and the symlink
 	# map into one stream (one container invocation, not two -- see its own
 	# comment); split on the delimiter line it prints between them.
@@ -6773,7 +6788,7 @@ fetch_tmp_subdir() {
 			while IFS= read -r mdiff_line; do warn "    $mdiff_line"; done
 		run rm -rf "${dest:?}/${destsub:?}"
 		run mkdir -p "$dest/$destsub"
-		run container run --rm -u 0:0 \
+		run container run --rm -u 0:0 -m "$MACKAS_MEMORY" \
 			-v "$MACKAS_VOL_TMP:/build" -v "$dest:/out" "$KAS_IMAGE" \
 			sh -c "$tar_cmd"
 		dst_manifest="$(retrieve_verify_local "$dest/$destsub" "$exclude")"
