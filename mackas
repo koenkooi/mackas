@@ -3430,11 +3430,26 @@ check_container_runtime() {
 	fi
 }
 
+# realpath_forms_ok BIN -- BIN handles every form kas-container and env.sh's
+# kas-container() use: -e, -qe, --relative-base (children only) and
+# --relative-to (with ..). Probes behavior, not the --version string, so it
+# covers GNU coreutils and bin/realpath alike.
+realpath_forms_ok() {
+	local bin="$1"
+	[ "$("$bin" -e / 2>/dev/null)" = "/" ] || return 1
+	"$bin" -e /nonexistent-mackas-probe >/dev/null 2>&1 && return 1
+	"$bin" -qe / >/dev/null 2>&1 || return 1
+	[ "$("$bin" -q --relative-base=/ /usr 2>/dev/null)" = "usr" ] || return 1
+	[ "$("$bin" --relative-to=/usr/bin /usr 2>/dev/null)" = ".." ] || return 1
+	return 0
+}
+
 # Echo the path to a GNU realpath binary, or return 1. macOS's own /bin/realpath
 # is BSD (no -e, no --relative-base -- the exact flags kas-container calls), and
 # Homebrew's coreutils installs `grealpath` (g-prefixed), NOT an unprefixed
 # `realpath`. Prefer grealpath, then coreutils' gnubin, then any `realpath` on
-# PATH that turns out to be GNU. setup_shim_and_env() symlinks the result into
+# PATH that turns out to be GNU, and last mackas's own bin/realpath (Python,
+# no Homebrew needed). setup_shim_and_env() symlinks the result into
 # MACKAS_BIN (first on env.sh PATH) so kas-container always finds it.
 find_gnu_realpath() {
 	local c p
@@ -3448,7 +3463,7 @@ find_gnu_realpath() {
 		fi
 	done
 	local shim="$SCRIPT_DIR/bin/realpath"
-	if [ -x "$shim" ] && "$shim" -e / >/dev/null 2>&1; then
+	if [ -x "$shim" ] && realpath_forms_ok "$shim"; then
 		printf '%s\n' "$shim"
 		return 0
 	fi
@@ -3458,8 +3473,7 @@ find_gnu_realpath() {
 check_realpath() {
 	hdr "3. Host utilities (BSD vs GNU)"
 	# After setup the guaranteed answer is our own shim in MACKAS_BIN.
-	if [ -x "$SHIM_DIR/realpath" ] &&
-		"$SHIM_DIR/realpath" -e / >/dev/null 2>&1; then
+	if [ -x "$SHIM_DIR/realpath" ] && realpath_forms_ok "$SHIM_DIR/realpath"; then
 		ck_pass "realpath shim installed at $SHIM_DIR/realpath"
 		return
 	fi
@@ -4763,10 +4777,10 @@ setup_shim_and_env() {
 	if gnu_rp="$(find_gnu_realpath)"; then
 		run mkdir -p "$SHIM_DIR"
 		if [ "$(readlink "$SHIM_DIR/realpath" 2>/dev/null || true)" = "$gnu_rp" ]; then
-			skip "GNU realpath shim is current ($gnu_rp)"
+			skip "realpath shim is current ($gnu_rp)"
 		else
 			run ln -sf "$gnu_rp" "$SHIM_DIR/realpath"
-			did "GNU realpath -> $SHIM_DIR/realpath ($gnu_rp)"
+			did "realpath -> $SHIM_DIR/realpath ($gnu_rp)"
 		fi
 	else
 		die "no GNU realpath found -- kas-container needs it (macOS's BSD realpath lacks -e/--relative-base)" \
