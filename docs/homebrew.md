@@ -1,9 +1,8 @@
 # Homebrew — what actually depends on it
 
-mackas currently assumes Homebrew, and `check` **hard-fails** without it
-(in `check_container_runtime()`). That is stricter than the real dependency:
-the two things mackas genuinely needs from brew are not equally
-replaceable.
+mackas no longer requires Homebrew: `check` warns when it is absent and
+checks for the real dependencies instead. The two things brew used to supply
+are `container` and a GNU-compatible `realpath`.
 
 ## 1. `container` itself — genuinely optional
 
@@ -32,54 +31,40 @@ directly needs Xcode 26 — a multi-GB download, a last resort. nixpkgs has
 nothing official; only a third-party nix-darwin module that repackages the
 same `.pkg`.
 
-## 2. GNU `realpath` — the hard one, and the reason brew is still here
+## 2. GNU `realpath` — solved without brew by `bin/realpath`
 
-kas-container calls exactly three forms: `realpath -e`, `realpath -qe`, and
-`realpath -q --relative-base=DIR`. Stock macOS ships a `realpath` binary
-(`/bin/realpath`), but it is **BSD's**, and BSD's has neither `-e` nor
-`--relative-base` — kas-container fails outright against it
-(`illegal option -- e`). A working one comes from `brew install coreutils`,
-which is the actual reason brew stays a dependency.
+kas-container calls three forms: `realpath -e`, `realpath -qe`, and
+`realpath -q --relative-base=DIR`; `env.sh`'s own `kas-container()` function
+adds a fourth, `realpath --relative-to="$PWD"`, to resolve the
+`macos-local.yml` fragment. Stock macOS ships a `realpath` binary
+(`/bin/realpath`), but it is **BSD's**, and BSD's has none of those flags —
+kas-container fails outright against it (`illegal option -- e`).
 
-The wiring is deliberately not left to the ambient `PATH`, because that is
-fragile: `brew install coreutils` installs **`grealpath`, not an unprefixed
-`realpath`**, so an unlucky PATH order — or a hand-made symlink left over
-from an earlier session with no coreutils behind it — silently falls through
-to the BSD binary. Instead, `setup_shim_and_env()` finds a real GNU
-`realpath` (`find_gnu_realpath()` tries `grealpath`, then coreutils'
-`gnubin/realpath`, then any `realpath` on `PATH` that turns out to be GNU)
-and symlinks it into `$MACKAS_BIN`. Two separate things then put that
-directory first on `PATH`: the generated `env.sh` exports it ahead of
-everything else when it is sourced, and — the guarantee that actually
-matters — the protection wrapper `write_kas_wrapper()` generates at
-`$MACKAS_BIN/kas-container` (the file `PATH` resolves `kas-container` to;
-the pinned upstream script sits beside it as `kas-container.real`, never on
-`PATH` itself) re-execs that real script through
-`env PATH="$MACKAS_BIN:/opt/homebrew/bin:$PATH"`. So kas-container finds the
-GNU one on *every* invocation shape — `nohup`, `env`, a bare `$PATH` lookup,
-a shell that never sourced `env.sh` — not only inside `env.sh`'s own
-`kas-container()` shell function. `check` verifies that shim exists
-and is genuinely GNU coreutils, not merely that *some* `realpath` answers. If
-no GNU realpath can be found at all, `setup` errors with
-`brew install coreutils`.
+`setup_shim_and_env()` symlinks a working one into `$MACKAS_BIN`.
+`find_gnu_realpath()` tries `grealpath` (what `brew install coreutils`
+installs — **not** an unprefixed `realpath`), then coreutils'
+`gnubin/realpath`, then any `realpath` on `PATH` that turns out to be GNU, and
+finally mackas's own `bin/realpath`: a small Python stand-in over
+`/usr/bin/python3` (present on every stock Mac, and already needed by the
+mirror server and `monitor`) that implements exactly those four forms with
+`os.path`. `--relative-to` is not `--relative-base`: it emits `..` segments,
+while `--relative-base` leaves a path outside the base absolute. The
+`--relative-to` call is guarded by `2>/dev/null || true`, so a realpath
+missing it would fail silently and the fragment (parallelism,
+`BB_DISKMON_DIRS`, `BB_HASHSERVE_DB_DIR`, mirrors) would stop being appended;
+`realpath_forms_ok()` therefore probes all four forms by behavior, and both
+`find_gnu_realpath()` and `check` use it rather than trusting a `--version`
+string.
 
-That makes the wiring robust, but it does not remove the Homebrew (or
-MacPorts) dependency itself — `setup` still needs a GNU coreutils installed
-*somewhere* to symlink from. Actually dropping that dependency is a
-different, not-yet-done idea, tracked as item 9 in the local `TODO.md`
-backlog (untracked, not present in a fresh clone): a small shim mackas
-ships itself, over
-`/usr/bin/python3` (present on every stock Mac) — `os.path.realpath` + an
-`os.path.exists` check + `os.path.relpath` covers those three call forms in
-~30 lines — but make it four: `env.sh`'s own `kas-container()` function
-resolves the `macos-local.yml` fragment with `realpath --relative-to="$PWD"`
-through that same shim directory, and `--relative-to` is not
-`--relative-base` (it emits `..` segments; `--relative-base` never does).
-That call is guarded by `2>/dev/null || true`, so a shim missing the flag
-would fail silently — the fragment (parallelism, `BB_DISKMON_DIRS`,
-`BB_HASHSERVE_DB_DIR`, mirrors) would simply stop being appended. mackas
-already depends on python3 for the mirror server, so this costs nothing new.
-It is not written yet.
+Two separate things put `$MACKAS_BIN` first on `PATH`: the generated `env.sh`
+exports it ahead of everything else when it is sourced, and — the guarantee
+that actually matters — the protection wrapper `write_kas_wrapper()`
+generates at `$MACKAS_BIN/kas-container` (the file `PATH` resolves
+`kas-container` to; the pinned upstream script sits beside it as
+`kas-container.real`, never on `PATH` itself) re-execs that real script
+through `env PATH="$MACKAS_BIN:/opt/homebrew/bin:$PATH"`. So kas-container
+finds the right `realpath` on *every* invocation shape — `nohup`, `env`, a
+bare `$PATH` lookup, a shell that never sourced `env.sh`.
 
 ## 3. `bats-core` and `shellcheck` are test-only
 
@@ -95,18 +80,13 @@ without it notifications fall back to `osascript`.
 
 ## The achievable target
 
-**Homebrew-optional for `container` today, and Homebrew-free only once
-`realpath` is solved.** Until then `check` should degrade from "Homebrew not
-found → FAIL" to a warning that names precisely what is missing (`container`,
-GNU `realpath`) rather than the package manager that usually supplies them —
-a tool should check for its dependencies, not for one particular way of
-installing them.
+**Homebrew-optional.** `container` comes from Apple's `.pkg` and `realpath`
+from `bin/realpath`, so `check` only warns when Homebrew is absent.
 
-One thing to get right when this is done: the Full Disk Access guidance
+One thing to get right: the Full Disk Access guidance
 [storage.md](storage.md#full-disk-access) already carries — and any tooling
 that ever automates it — must **derive** the daemon's location rather than
-hardcode it, because it differs between a brew
-install and a `.pkg` install — and the failure it causes (`Operation not
-permitted` creating a volume on an external disk) looks nothing like a
-permissions problem, so a misdirected instruction there costs hours. Tracked
-in the local `TODO.md` backlog (untracked, not present in a fresh clone).
+hardcode it, because it differs between a brew install and a `.pkg` install —
+and the failure it causes (`Operation not permitted` creating a volume on an
+external disk) looks nothing like a permissions problem, so a misdirected
+instruction there costs hours. Tracked in #137.
