@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """realpath stand-in for the three forms kas-container calls.
 
 macOS /bin/realpath is BSD and rejects -e, -qe, and --relative-base.
