@@ -1,8 +1,10 @@
 #!/usr/bin/python3
-"""realpath stand-in for the three forms kas-container calls.
+"""realpath stand-in for the forms kas-container and env.sh call.
 
-macOS /bin/realpath is BSD and rejects -e, -qe, and --relative-base.
-This covers those forms with os.path. It is not GNU coreutils.
+macOS /bin/realpath is BSD and rejects -e, -qe, --relative-base and
+--relative-to. This covers those forms with os.path. It is not GNU
+coreutils. --relative-base only relativizes paths under the base;
+--relative-to always relativizes, with .. segments if needed.
 """
 
 import os
@@ -23,6 +25,7 @@ def main(argv):
     quiet = False
     must_exist = False
     base = None
+    rel_to = None
     paths = []
     i = 0
     while i < len(argv):
@@ -46,6 +49,16 @@ def main(argv):
             base = argv[i]
         elif arg.startswith("--relative-base="):
             base = arg.split("=", 1)[1]
+        elif arg == "--relative-to":
+            i += 1
+            if i >= len(argv):
+                return fail(quiet, "realpath: --relative-to needs a directory")
+            rel_to = argv[i]
+        elif arg.startswith("--relative-to="):
+            rel_to = arg.split("=", 1)[1]
+        elif arg == "--":
+            paths.extend(argv[i + 1:])
+            break
         elif arg.startswith("-"):
             return fail(quiet, "realpath: unsupported option %s" % arg)
         else:
@@ -57,11 +70,15 @@ def main(argv):
 
     status = 0
     base_real = canon(base) if base else None
+    rel_to_real = canon(rel_to) if rel_to else None
     for path in paths:
         if must_exist and not os.path.exists(path):
             status = fail(quiet, "realpath: %s: No such file or directory" % path)
             continue
         resolved = canon(path)
+        if rel_to_real:
+            sys.stdout.write(os.path.relpath(resolved, rel_to_real) + "\n")
+            continue
         if base_real:
             try:
                 if os.path.commonpath([base_real, resolved]) == base_real:
