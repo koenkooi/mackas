@@ -128,10 +128,17 @@ hdr "python"
 # mackas-mirrord targets Python 3.7+, stdlib only, so it runs on whatever the
 # mirror host already has. py_compile is the floor; the unittest suite -- all
 # the test_*.py files, not just the mirror server's -- is the point.
-if command -v python3 >/dev/null 2>&1; then
-	pyver="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-	if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)'; then
-		if python3 -m py_compile mirror-server/mackas-mirrord; then
+# On macOS, test with /usr/bin/python3 (3.9 on stock macOS): that is the
+# interpreter mackas itself runs monitor, the mirror server and bin/realpath
+# under. MACKAS_TEST_PYTHON overrides.
+py="${MACKAS_TEST_PYTHON:-python3}"
+if [ -z "${MACKAS_TEST_PYTHON:-}" ] && [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/python3 ]; then
+	py=/usr/bin/python3
+fi
+if command -v "$py" >/dev/null 2>&1; then
+	pyver="$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+	if "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)'; then
+		if "$py" -m py_compile mirror-server/mackas-mirrord; then
 			echo "ok: mirror-server/mackas-mirrord compiles under python $pyver"
 		else
 			echo "FAILED: mirror-server/mackas-mirrord does not compile" >&2
@@ -140,16 +147,16 @@ if command -v python3 >/dev/null 2>&1; then
 		# ruff or pyflakes if the host happens to have one; neither is required.
 		if command -v ruff >/dev/null 2>&1; then
 			ruff check mirror-server/mackas-mirrord tests/test_mirrord.py || rc=1
-		elif python3 -m pyflakes --version >/dev/null 2>&1; then
-			python3 -m pyflakes mirror-server/mackas-mirrord tests/test_mirrord.py || rc=1
+		elif "$py" -m pyflakes --version >/dev/null 2>&1; then
+			"$py" -m pyflakes mirror-server/mackas-mirrord tests/test_mirrord.py || rc=1
 		else
 			echo "no ruff/pyflakes; skipping the python linter"
 		fi
 		if [ $# -eq 0 ]; then
-			python3 -m unittest discover -s tests -p 'test_*.py' || rc=1
+			"$py" -m unittest discover -s tests -p 'test_*.py' || rc=1
 		fi
 	else
-		echo "python3 is $pyver; mackas-mirrord needs 3.7+. Skipping." >&2
+		echo "$py is $pyver; mackas-mirrord needs 3.7+. Skipping." >&2
 		rc=1
 	fi
 else

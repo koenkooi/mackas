@@ -11,11 +11,13 @@
 #             stays skipped (it self-skips unless MACKAS_REAL_RUNTIME=1), which
 #             is correct -- the real-runtime smoketest is dev-Mac-only.
 #
+#             Its Python checks use /usr/bin/python3, macOS's own 3.9 -- the
+#             interpreter mackas runs monitor, the mirror server and
+#             bin/realpath under, and so the 3.9 gate.
+#
 #   linux  -- what a mirror host actually is: shellcheck, a bash syntax check,
-#             and the stdlib Python suite on BOTH 3.9 and 3.12. mackas-mirrord
-#             targets Python 3.7+ and runs on whatever stock python the host has;
-#             two of its tests broke on 3.9 once, so 3.9 is a first-class gate.
-#             Plus a static `systemd-analyze verify` of the mirrord unit.
+#             and the stdlib Python suite on a current Python. Plus a static
+#             `systemd-analyze verify` of the mirrord unit.
 #
 # The real Apple container runtime, a real build, sudo, NFS and the network are
 # never touched -- CI runs exactly the hermetic suite.
@@ -41,26 +43,22 @@ permissions:
 jobs:
   macos:
     name: macOS (full suite)
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install test tools
         run: brew install bats-core shellcheck coreutils
       - name: run-tests.sh
         run: ./run-tests.sh
 
   linux:
-    name: Linux (shellcheck + python ${{ matrix.python }})
+    name: Linux (shellcheck + python 3.12)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.9", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.12"
       - name: shellcheck
         # Ubuntu's packaged shellcheck; the same invocation run-tests.sh uses,
         # so a local `./run-tests.sh` and CI check exactly the same files.
@@ -87,7 +85,7 @@ jobs:
     name: Linux (systemd unit)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: systemd-analyze verify the mirrord unit
         # Static check only -- the unit is never started here. It caught a real
         # defect once (an ExecReload that crash-restarted the daemon).
