@@ -8252,6 +8252,43 @@ cmd_shell() {
 	run_kas "" shell "$KAS_FILES_ARG"
 }
 
+checkout_usage() {
+	cat <<EOF
+${C_BLD}$SCRIPT_CMD checkout${C_RST} -- check out every layer the project's kas config names.
+
+${C_BLD}USAGE${C_RST}
+  $SCRIPT_CMD checkout
+
+Runs \`kas checkout\` with the same volumes, runtime args and kas fragment a
+real build would use, then exits: the layers (bitbake, openembedded-core, the
+meta-* repos) land in the work directory and the build directory's conf/ is
+written, without building anything. A fresh project needs this, or a first
+build, before anything that looks for the checkout's bin/bitbake (the
+progress bridge, claude-container's BitBake monitor) can find it.
+
+Like 'shell', and unlike 'exec', this runs kas's full repo setup: a layer
+already checked out is moved to the revision the kas config pins.
+
+Options: --dry-run and -v/--verbose work here too.
+
+${C_BLD}ONE-VM RULE${C_RST}
+  Only one VM may access an ext4 image at a time. checkout refuses while a
+  running build ($SCRIPT_CMD smoketest, a shell, or a raw kas-container)
+  still holds any of the three volumes -- stop it first.
+EOF
+}
+
+# cmd_checkout -- see checkout_usage. cmd_shell's preamble; only the kas verb
+# differs, and a checkout needs no TTY.
+cmd_checkout() {
+	require_mackas_root
+	ensure_workspace_attached   # see cmd_smoketest for why this is not left to run_kas
+	ensure_kas_container_installed
+	ensure_project_checked_out
+	info "Checking out the layers for $KAS_FILES_ARG ..."
+	run_kas "" checkout "$KAS_FILES_ARG"
+}
+
 # ---------------------------------------------------------------------------
 # exec -- a one-off command against the checkout, safe by construction
 # ---------------------------------------------------------------------------
@@ -13711,6 +13748,7 @@ ${C_BLD}COMMANDS${C_RST}
   smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
   status     Show what is configured and what exists on disk.
   shell      Drop into a kas shell for the project's kas config.
+  checkout   Check out every layer the kas config names, then exit; no build.
   exec       Run a one-off read-only command against the checkout, with
              kas's repo-mutating setup steps always skipped.
              '$SCRIPT_CMD exec --help'.
@@ -14029,10 +14067,10 @@ main() {
 				cmd="runtime-args"; shift
 				if [ "$want_help" -eq 1 ]; then RUNTIME_ARGS_ARGS=("$@" "--help"); else RUNTIME_ARGS_ARGS=("$@"); fi
 				break ;;
-			check|smoketest|status|shell|destroy|lock|dump|projects)
+			check|smoketest|status|shell|checkout|destroy|lock|dump|projects)
 				[ -n "$cmd" ] && die "more than one command given: '$cmd' and '$1'" "$SCRIPT_CMD --help"
 				cmd="$1"; shift ;;
-			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt project smoketest status shell exec retrieve buildstats sstate monitor clean destroy volume set get unset projects runtime-args lock dump help)" ;;
+			*) die "unknown command: $1" "$SCRIPT_CMD --help  (commands: check setup adopt project smoketest status shell checkout exec retrieve buildstats sstate monitor clean destroy volume set get unset projects runtime-args lock dump help)" ;;
 		esac
 	done
 
@@ -14105,6 +14143,7 @@ main() {
 		smoketest) if [ "$want_help" -eq 1 ]; then smoketest_usage; else cmd_smoketest; fi ;;
 		status)    if [ "$want_help" -eq 1 ]; then status_usage;    else cmd_status;    fi ;;
 		shell)     if [ "$want_help" -eq 1 ]; then shell_usage;     else cmd_shell;     fi ;;
+		checkout)  if [ "$want_help" -eq 1 ]; then checkout_usage;  else cmd_checkout;  fi ;;
 		destroy)   if [ "$want_help" -eq 1 ]; then destroy_usage;   else cmd_destroy;   fi ;;
 		runtime-args) cmd_runtime_args ${RUNTIME_ARGS_ARGS+"${RUNTIME_ARGS_ARGS[@]}"} ;;
 		lock)      if [ "$want_help" -eq 1 ]; then lock_usage;      else cmd_lock;      fi ;;

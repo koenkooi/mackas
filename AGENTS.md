@@ -9,7 +9,7 @@ break by accident.
 ## What this repo is
 
 - `mackas` — the whole tool, one ~13,100-line **bash 3.2** script. Subcommands:
-  `check`, `setup`, `adopt`, `project`, `smoketest`, `status`, `shell`, `exec`,
+  `check`, `setup`, `adopt`, `project`, `smoketest`, `status`, `shell`, `checkout`, `exec`,
   `retrieve`, `buildstats`, `buildhistory`, `sstate`, `monitor`, `clean`,
   `destroy`, `volume`, `set`, `get`, `unset`, `projects`, `runtime-args`, `lock`,
   `dump`.

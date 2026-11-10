@@ -161,6 +161,35 @@ refute_volume_state_query() {
 }
 
 # ---------------------------------------------------------------------------
+# checkout -- the same run_kas path as shell, with kas's checkout verb
+# ---------------------------------------------------------------------------
+
+@test "checkout: refuses when a volume is held, naming it and pointing back at 'checkout', before kas runs" {
+	MOCK_BUSY_VOLUME=oe-build-sstate mk checkout
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qF "volume 'oe-build-sstate' is attached to a running container"
+	printf '%s\n' "$output" | grep -qF "then re-run '$MACKAS checkout'"
+	[ ! -f "$KLOG" ]
+}
+
+@test "checkout: nothing holding a volume runs kas checkout on the composed file list, and nothing else" {
+	mk checkout
+	[ "$status" -eq 0 ]
+	[ "$(grep -c -- 'CALL:' "$KLOG")" -eq 1 ]
+	grep -qF -- '[checkout]' "$KLOG"
+	grep -qF -- 'kas/macos-local.yml]' "$KLOG"
+	! grep -qF -- '[shell]' "$KLOG"
+	! grep -qF -- '[build]' "$KLOG"
+}
+
+@test "checkout --dry-run: runs no kas and queries no volume state" {
+	mk --dry-run checkout
+	[ "$status" -eq 0 ]
+	refute_volume_state_query
+	[ ! -f "$KLOG" ]
+}
+
+# ---------------------------------------------------------------------------
 # smoketest -- reaches run_kas via smoketest_ladder/smoketest_rung
 # ---------------------------------------------------------------------------
 
