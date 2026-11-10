@@ -141,6 +141,7 @@ environment until you source the new file.
 | `smoketest` | The validation ladder (see below). |
 | `status` | Every setting in effect, every derived path, what exists on disk. |
 | `shell` | `kas shell` for the project's kas config. |
+| `checkout` | `kas checkout` for the project's kas config: every layer, bitbake included, lands in the work directory without a build. Like `shell`, it moves a layer to the revision the kas config pins. |
 | `exec` | `exec CMD` runs a one-off read-only command against the checkout with kas's repo-mutating setup steps always skipped — see [below](#driving-kas-directly). `mackas exec --help`. |
 | `retrieve` | Copy build outputs (`buildstats`/`logs`/`deploy`/`buildhistory`/`sbom`) out of the ext4 TMPDIR volume, where macOS cannot see them. |
 | `buildstats` | `buildstats analyze [PATH]` summarises the newest retrieved build's wall time/parallelism/io and renders bootchart SVGs. |
