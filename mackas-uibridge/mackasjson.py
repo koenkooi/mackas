@@ -158,6 +158,17 @@ _state = {
     # nonzero value here is the one place a consumer can tell the bridge went
     # dark and came back, distinct from an ordinary transient poll failure.
     "bridge_restarts": 0,
+    # Four more fields join this dict dynamically, once known -- never
+    # pre-populated with None here, so each is OMITTED from the served JSON
+    # entirely (not served as `null`) until it actually has a value:
+    #   "threads"/"buildname": from getVariable, in _set_machine(), same
+    #     timing and multiconfig caveats as "machine"/"distro" above.
+    #   "continue_on_failure": from bitbake's own already-parsed
+    #     command-line options, in _set_continue_on_failure() -- no cooker
+    #     round-trip, so no need to wait for the first waitEvent() either.
+    #   "phase": one of "parsing"/"sstate"/"tasks", advanced forward-only in
+    #     _advance_phase() off events the bridge already receives for other
+    #     reasons -- no new event subscription.
 }
 
 # ---------------------------------------------------------------------------
@@ -366,8 +377,47 @@ def _set_targets(params):
         pass
 
 
+def _set_continue_on_failure(params):
+    """Record whether this build was told to keep going after a failure.
+
+    From bitbake's own already-parsed command-line options -- the same
+    params.options main() already has (see _set_targets, which reads
+    params.options.pkgs_to_build the same way). Deliberately NOT getVariable
+    (this is a parser flag, not cooker state -- no server round-trip, so
+    none of _set_machine()'s first-waitEvent timing concerns apply here) and
+    NOT inferred from whether tasks kept running after a failure (without
+    -k bitbake also lets already-running tasks finish, so that would get the
+    polarity wrong on a healthy, non-continuing build).
+
+    bitbake's own attribute name for `-k`/`--continue` changed between
+    versions, both with the same store_false/default-True shape (true means
+    "halt on the first failure"; -k flips it to false): current bitbake's
+    argparse parser calls it `halt`, older optparse-based bitbake called it
+    `abort`. Checked explicitly, in that order, with no third guess --
+    verified against bitbake's own lib/bb/main.py source rather than
+    assumed. A confidently wrong polarity here is worse than the field
+    simply being left out, so an options object with neither name present
+    leaves `continue_on_failure` out entirely."""
+    try:
+        options = getattr(params, "options", None)
+        if options is None:
+            return
+        if hasattr(options, "halt"):
+            halt_on_failure = bool(options.halt)
+        elif hasattr(options, "abort"):
+            halt_on_failure = bool(options.abort)
+        else:
+            return
+        with _lock:
+            _state["continue_on_failure"] = not halt_on_failure
+    except Exception:
+        # Best-effort context, never a reason to fail a build.
+        pass
+
+
 def _set_machine(server):
-    """Ask the cooker what MACHINE and DISTRO this build is for.
+    """Ask the cooker what MACHINE, DISTRO, BUILDNAME and BB_NUMBER_THREADS
+    this build is for.
 
     MUST be called only from inside knotty's event loop -- i.e. from
     _TeeEventHandler.waitEvent(), never before bb.ui.knotty.main() has run.
@@ -381,13 +431,20 @@ def _set_machine(server):
     setup_hosttools_dir() then does origbbenv.getVar("PATH") -> None ->
     path.split(":") and raises AttributeError. That crash reaches the
     client as a logged ERROR event, turning an otherwise-successful build
-    into one bitbake reports as failed via a non-zero exit code.
+    into one bitbake reports as failed via a non-zero exit code. `threads`/
+    `buildname` are read from this exact same call site for exactly that
+    reason -- not a new, separately-timed round-trip.
 
-    Both are plain strings here. On a MULTICONFIG build MACHINE is only the
-    default one, and per-multiconfig builds legitimately have several; a
-    consumer should treat this as a label, not as a complete description of
-    what was built."""
-    for key, var in (("machine", "MACHINE"), ("distro", "DISTRO")):
+    `machine`/`distro`/`buildname` are plain strings; `threads` is an int.
+    On a MULTICONFIG build MACHINE is only the default one, and
+    per-multiconfig builds legitimately have several; a consumer should
+    treat it as a label, not as a complete description of what was built.
+    `buildname` is also the `tmp/buildstats/<BUILDNAME>/` directory name.
+    Each field is left OUT of the served state entirely (never served as
+    `null`) until its own getVariable call has actually returned a usable
+    value."""
+    for key, var in (("machine", "MACHINE"), ("distro", "DISTRO"),
+                     ("buildname", "BUILDNAME")):
         try:
             value, error = server.runCommand(["getVariable", var])
             if not error and value:
@@ -396,6 +453,17 @@ def _set_machine(server):
         except Exception:
             # Best-effort context, never a reason to fail a build.
             pass
+    try:
+        value, error = server.runCommand(["getVariable", "BB_NUMBER_THREADS"])
+        if not error and value is not None:
+            with _lock:
+                _state["threads"] = int(value)
+    except Exception:
+        # Same best-effort contract as above; BB_NUMBER_THREADS is normally
+        # a plain digit string, but a non-numeric value (should never
+        # happen, but this module never trusts that it can't) leaves the
+        # field out rather than raising.
+        pass
 
 
 # JSON key -> RunQueueStats attribute (bb/runqueue.py). All four or none:
@@ -432,10 +500,49 @@ def _observe_sstate(stats):
         _state["sstate"] = values
 
 
+# phase -> the event-name families that mean the build has reached (at
+# least) that far. Order matters: bitbake fires these in exactly this
+# sequence -- parsing completes before the scene queue can decide what it
+# can reuse, which settles before the run queue executes anything -- so a
+# phase transition only ever moves forward. No new event subscription:
+# every name below is one knotty's own mask already requests and this
+# module already handles for other fields.
+_PHASE_ORDER = ("parsing", "sstate", "tasks")
+_PHASE_FOR_EVENT = {
+    "ParseStarted": "parsing",
+    "ParseProgress": "parsing",
+    "sceneQueueTaskStarted": "sstate",
+    "sceneQueueTaskCompleted": "sstate",
+    "sceneQueueTaskFailed": "sstate",
+    "runQueueTaskStarted": "tasks",
+    "runQueueTaskCompleted": "tasks",
+    "runQueueTaskFailed": "tasks",
+    "runQueueTaskSkipped": "tasks",
+}
+
+
+def _advance_phase(event_type):
+    """Record the furthest build phase reached so far. Caller holds _lock.
+
+    Forward-only: an event type outside the three families above leaves
+    `phase` untouched, and one inside them never moves it backwards -- a
+    build already in "tasks" cannot be reported back to "sstate" by, say, a
+    late-arriving sceneQueue event from hash-equivalence reopening the scene
+    queue. `phase` itself stays absent (never served as `null`) until the
+    very first qualifying event, same convention as threads/buildname."""
+    phase = _PHASE_FOR_EVENT.get(event_type)
+    if phase is None:
+        return
+    current = _state.get("phase")
+    if current is None or _PHASE_ORDER.index(phase) > _PHASE_ORDER.index(current):
+        _state["phase"] = phase
+
+
 def _record(event_type, **fields):
     """Update the shared state under lock. Called only from the event tee,
     a single thread, but the HTTP handler thread reads concurrently."""
     with _lock:
+        _advance_phase(event_type)
         if event_type in ("ParseStarted", "TaskStarted", "sceneQueueTaskStarted",
                           "runQueueTaskStarted"):
             _state["status"] = "building"
@@ -691,6 +798,7 @@ def _serve_forever_resilient(httpd):
 
 def main(server, eventHandler, params):
     _set_targets(params)
+    _set_continue_on_failure(params)
     httpd = _FastBindHTTPServer(("0.0.0.0", PORT), _Handler)
     thread = threading.Thread(target=_serve_forever_resilient, args=(httpd,),
                                daemon=True)

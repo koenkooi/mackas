@@ -124,6 +124,10 @@ this document.
   "targets": ["core-image-base", "console-base-image"],
   "machine": "beaglebone",
   "distro": "angstrom",
+  "threads": 8,
+  "buildname": "20261117130003",
+  "continue_on_failure": false,
+  "phase": "tasks",
   "current": {"recipe": "busybox_1.36.0.bb", "task": "do_compile"},
   "progress": {"done": 412, "total": 3170},
   "failed_tasks": [{"recipe": "linux-yocto_6.6.bb", "task": "do_compile"}],
@@ -149,6 +153,10 @@ this document.
 | `targets` | array of string | What the build was asked to produce, from bitbake's own parsed command line (`params.options.pkgs_to_build`). Populated **before the build starts**, so it is the one useful thing to show at the `building` edge, when no task is running yet. Empty when bitbake was given no explicit target (it then builds whatever the kas config names) — treat empty as "unknown", not as "nothing". |
 | `machine` | string \| null | `MACHINE`, read from the cooker via `server.runCommand(["getVariable", …])` on the **first event-loop call after `bb.ui.knotty.main()` has started** — deliberately not at UI startup, since a pre-knotty round-trip was traced to a real build-killing crash (see [architecture.md](architecture.md#live-build-progress-the-monitor-bridge)). `null` until that first call; it lands at essentially the same instant `status` first becomes `"building"`, so a `"building"` payload with `machine: null` is possible only for a sub-millisecond window, never for a whole poll interval. On a **multiconfig** build this is only the default `MACHINE`; per-multiconfig builds legitimately have several, so treat it as a label rather than a complete description of what was built. |
 | `distro` | string \| null | `DISTRO`, same source, same timing, same caveats. |
+| `threads` | int | `BB_NUMBER_THREADS`, read from the cooker at the same point and with the same timing as `machine`/`distro` (the first event-loop `getVariable` call, never earlier — see [architecture.md](architecture.md#live-build-progress-the-monitor-bridge)). **Absent from the payload — not present as `null` —** until that call has actually returned a value. |
+| `buildname` | string | `BUILDNAME`, same source and timing as `threads`. Also the `tmp/buildstats/<BUILDNAME>/` directory name, so a consumer can build the buildstats path straight from this field. Absent until known, same convention as `threads`. |
+| `continue_on_failure` | bool | `true` when bitbake was run with `-k`/`--continue` (keep going after a failure instead of stopping at the first one), `false` otherwise. Read once from bitbake's own already-parsed command-line options — never `getVariable`, and never inferred from whether a task kept running after a failure (bitbake lets already-running tasks finish either way, so that would get the polarity wrong) — so it is available immediately, with none of `threads`/`buildname`'s first-event timing. Absent only if bitbake's own options object carries neither of its two historical attribute names for this flag, which should not happen on a real build. |
+| `phase` | string | One of `parsing`, `sstate`, `tasks` — the furthest stage this build has reached, derived from events the bridge already receives for other reasons (parse events, then the scene queue settling, then the run queue) rather than a new subscription. Absent before the first parse event; moves forward only within one container's life, the same rule `status` follows. |
 | `current.recipe` | string \| null | The **basename of the task's recipe file**, e.g. `busybox_1.36.0.bb` — not a `PN`. `null` until a task has started, and left at the last known value afterwards. Every runQueue event carries `taskfile` — completion, failure and skip included — so this is the recipe of the most recent task *event*, not necessarily one that is still running. |
 | `current.task` | string \| null | bitbake's task name, e.g. `do_compile`. Same staleness rule. |
 | `progress.done` | int | **Phase-dependent.** During parsing it is parsed-recipe count; during the run queue it is `stats.completed`. |
@@ -200,10 +208,16 @@ Rules for a consumer, in rough order of how much pain they save:
   rather than take the real build down with it — so a field can be missing,
   `null`, or stale. Fields may also be *added* later; ignore ones you do not
   know instead of failing to parse.
-- **There is no build identity in the payload.** No build id, no `BUILDNAME`,
-  no start timestamp. If you need to tell one build from the next you must
-  infer it (an `idle`→`building` edge, or a `progress` reset), or propose
-  adding a field to the bridge rather than guessing in the app.
+- **There is still no build id or start timestamp in the payload, but
+  `buildname` now gives you `BUILDNAME`.** It is absent — not `null` — until
+  the first `getVariable` round-trip completes, same as `machine`/`distro`,
+  and bitbake's own default `BUILDNAME` is a timestamp-shaped string, not a
+  guaranteed-unique id (a custom `BUILDNAME` from the metadata can collide,
+  and so, in principle, can two containers that start in the same second
+  under the default format). If `buildname` isn't reliable enough for what
+  you need, fall back to inferring build identity (an `idle`→`building`
+  edge, or a `progress` reset), or propose a dedicated identity field rather
+  than guessing in the app.
 
 ### What actually reports sub-task progress
 
@@ -438,17 +452,16 @@ while `building`" still means **outcome unknown**: say nothing, never report
 it as a failure — that rule stays mandatory regardless of the linger.
 
 **Per-build identity is already good enough here; do not grow a `--label` for
-it.** The payload carries no build id (above), but the notification bodies do
-not need one: `machine`, `distro` and `targets` come from each new
-invocation's own bridge, so consecutive machines already read as "… for
-beaglebone/Angstrom" then "… for qemuriscv64/Angstrom", and consecutive
-smoketest rungs differ by `targets`. A `--label` echoed into the title is a
-three-line change if a batch ever wants its own name, but it is a
+it.** The payload now carries `buildname` (above) from `BUILDNAME`, but the
+notification bodies still don't need it: `machine`, `distro` and `targets`
+come from each new invocation's own bridge, so consecutive machines already
+read as "… for beaglebone/Angstrom" then "… for qemuriscv64/Angstrom", and
+consecutive smoketest rungs differ by `targets`. A `--label` echoed into the
+title is a three-line change if a batch ever wants its own name, but it is a
 *per-process* constant: it can name the batch, never the build within it, so
 it does not belong in the reconnect work. Correlating builds across
-reconnects into a *history* — the app's problem, not the CLI's — still wants
-a real identity field, and that is a bridge change to propose rather than a
-heuristic to infer.
+reconnects into a *history* — the app's problem, not the CLI's — can now lean
+on `buildname` for that identity instead of a heuristic inferred client-side.
 
 ## Consider SwiftBar first
 
