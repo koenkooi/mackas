@@ -130,6 +130,13 @@ this document.
   "failed_count": 1,
   "task_progress": [{"recipe": "systemd_257.bb", "task": "do_compile",
                      "percent": 42, "rate": null, "elapsed": 862}],
+  "running": [{"tid": "/l/systemd_257.bb:do_compile", "pn": "systemd",
+               "pv": "257.5", "mc": "", "recipe": "systemd_257.bb",
+               "task": "do_compile", "started": 1769000000.0, "percent": 42},
+              {"tid": "/l/util-linux_2.41.bb:do_configure", "pn": "util-linux",
+               "pv": "2.41", "mc": "", "recipe": "util-linux_2.41.bb",
+               "task": "do_configure", "started": 1768999680.0}],
+  "active": 2,
   "sstate": {"covered": 412, "notcovered": 38, "total": 450, "skipped": 1204},
   "recent_events": [{"ts": 1769000000.123, "type": "runQueueTaskStarted",
                      "recipe": "busybox_1.36.0.bb", "task": "do_compile"}]
@@ -149,6 +156,8 @@ this document.
 | `failed_tasks` | array | Tasks that **genuinely failed**, newest last, each `{recipe, task}` with the same recipe-basename convention as `current`. **Setscene failures are deliberately excluded**: a failed setscene task is not a build failure, it only means the sstate object could not be reused and the real task runs instead — bitbake's own knotty treats `runQueueTaskFailed` as fatal and `sceneQueueTaskFailed` as a warning. Listing the latter would name innocent recipes. Capped at 20. |
 | `failed_count` | int | The **true** number of distinct failed tasks, which may exceed `len(failed_tasks)` when the cap bites (`bitbake -k` keeps going after a failure). Show this, not the array length, when reporting a total. |
 | `task_progress` | array | Progress **inside** the tasks that are running *right now* and report any, each `{recipe, task, percent, rate, elapsed}` with the same recipe-basename convention as `current`. Empty is the normal case, not an error: most tasks report nothing (see ["what actually reports"](#what-actually-reports-sub-task-progress) below), and an entry disappears the moment its task ends, so a stale percentage can never outlive the recipe it described. `percent` is an int 0–100, or `null` for bitbake's own "progress is happening but we cannot say how much" — draw an indeterminate bar for that, never a zero. `rate` is an extra display string when the producer has one (`"1.2M/s"` from the download fetchers) and `null` otherwise. `elapsed` is int seconds since that task's `bb.build.TaskStarted`, re-computed on every request rather than cached from the last report — it is the only scale a `percent: null` "busy" entry has. Bounded by `BB_NUMBER_THREADS` in practice and hard-capped at 32. |
+| `running` | array | **Every** tracked task, not just the ones that report progress — this is what closes the gap `task_progress` leaves open: `do_unpack`, `do_configure`, plain `autotools`/`make` `do_compile`, `do_install` and `do_package` never fire `TaskProgress`, so they show up here and nowhere else. One entry per task, each `{tid, pn, pv, mc, recipe, task, started, percent, rate}`: `tid` is the full task id as bitbake itself builds it — `<taskfile>:<task>`, or `mc:<name>:<taskfile>:<task>` on a non-default multiconfig — so it disambiguates `zlib` from `zlib-native` (or an `mc:` variant) the way the `recipe` basename alone cannot; `pn`/`pv` are the recipe name and version, from the same `TaskStarted` event; `mc` is the multiconfig name, `""` for the default one; `recipe`/`task` are the same recipe-basename/taskname convention as `current`; `started` is Unix epoch seconds on the container's clock, from `TaskStarted`, so a consumer computes its own age rather than trusting a value that would otherwise go stale between polls. `percent`/`rate` are **present only when that task has actually reported one** — absent, not `null`, so "never instrumented" and "instrumented but busy with an unknown amount" stay distinguishable from a quick existence check. Capped at the same 32 as `task_progress` — see `active` for the true count. |
+| `active` | int | The **true, uncapped** number of tasks `running` is built from. Compare against `running`'s length to tell whether the cap has bitten: `active > len(running)` means tasks are running that are not listed. |
 | `sstate` | object \| null | `{covered, notcovered, total, skipped}`, copied off bitbake's own `RunQueueStats` the moment it settles. `null` until then. Always all four fields or none — a partial tally would read as a real hit rate when it isn't one. Published only from `runQueue*` events, never `sceneQueue*`: the scene queue can still reopen (hash equivalence) while it's accumulating, so only the settled run queue's numbers are trustworthy. This is an **observation**, not a forecast — see ["why there's no build-wide ETA"](#why-theres-no-build-wide-eta) below. |
 | `recent_events` | array | Newest last, **capped at 50**. Each entry has `ts` (float, Unix seconds, on the *container's* clock) and `type` (the bitbake event name), plus whatever that event carried — `recipe`, `task`. `done`/`total` are deliberately not repeated per event. |
 
@@ -157,14 +166,15 @@ Event `type` values currently produced: `ParseStarted`, `ParseProgress`,
 `sceneQueueTaskCompleted`, `runQueueTaskFailed`, `sceneQueueTaskFailed`,
 `runQueueTaskSkipped`.
 
-The events behind `task_progress` are deliberately **not** among them.
-`bb.build.TaskProgress` fires roughly once per percentage point per
-instrumented task, which would flush that 50-deep ring several times a second
-and destroy the one thing it is for; `bb.build.TaskStarted`/`TaskSucceeded`/
-`TaskFailed`/`TaskFailedSilent` are consumed only to attribute those
-percentages to a task, and would otherwise duplicate the `runQueue` events
-already listed, at twice the volume. So `task_progress` is the whole of what
-the bridge exposes from them.
+The events behind `task_progress` and `running` are deliberately **not**
+among them. `bb.build.TaskProgress` fires roughly once per percentage point
+per instrumented task, which would flush that 50-deep ring several times a
+second and destroy the one thing it is for; `bb.build.TaskStarted`/
+`TaskSucceeded`/`TaskFailed`/`TaskFailedSilent` are consumed instead to build
+`running`/`active` and to attribute `TaskProgress` percentages to a task, and
+would otherwise duplicate the `runQueue` events already listed, at twice the
+volume. So `task_progress` and `running` are the whole of what the bridge
+exposes from them.
 
 Rules for a consumer, in rough order of how much pain they save:
 
