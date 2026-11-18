@@ -453,6 +453,17 @@ class RunningTasksTest(BridgeTestCase):
         self.assertEqual(entry["pv"], "1.3")
         self.assertEqual(entry["mc"], "")
 
+    def test_tid_uses_the_worker_fn_so_native_variants_differ(self):
+        # TaskBase.taskfile is FILE (no virtual: prefix); _fn is the worker's fn.
+        bridge._observe(_event("TaskStarted", pid=21, taskfile="/l/zlib_1.3.bb",
+                               _fn="virtual:native:/l/zlib_1.3.bb", taskname="do_compile",
+                               pn="zlib-native", pv="1.3"))
+        bridge._observe(_event("TaskStarted", pid=22, taskfile="/l/zlib_1.3.bb",
+                               _fn="/l/zlib_1.3.bb", taskname="do_compile", pn="zlib", pv="1.3"))
+        tids = sorted(e["tid"] for e in bridge._state["running"])
+        self.assertEqual(tids, ["/l/zlib_1.3.bb:do_compile",
+                                "virtual:native:/l/zlib_1.3.bb:do_compile"])
+
     def test_mc_defaults_to_empty_string_not_missing_or_null(self):
         # bb.build.TaskBase carries no public `mc` attribute at all on a
         # default-multiconfig build -- `_mc` itself can be absent.
