@@ -492,7 +492,10 @@ def _record_recipe_task(event, name):
     now = time.time()
 
     with _lock:
-        tasks = _recipe_tasks.setdefault(key, {})
+        # Not setdefault: an event recorded as nothing (an unknown skip
+        # reason, a failed or merely started setscene) must not leave an
+        # empty recipe behind in GET /recipes.
+        tasks = _recipe_tasks.get(key, {})
         previous = tasks.get(taskname, {})
 
         if name == "runQueueTaskStarted":
@@ -529,6 +532,7 @@ def _record_recipe_task(event, name):
             tasks[taskname] = {"task": taskname, "state": "setscene"}
         else:
             return
+        _recipe_tasks[key] = tasks
         _publish_recipes()
 
 
