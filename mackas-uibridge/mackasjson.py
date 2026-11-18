@@ -519,18 +519,18 @@ def _observe(event):
             # attribute, and no property either) -- "" for the default
             # multiconfig, same as BB_CURRENT_MC itself. `pn`/`pv` are public.
             # `tid` is built the same way bitbake's own runqueue.build_tid()
-            # does (mc:<mc>:<fn>:<task> when mc, else <fn>:<task>), from the
-            # FULL taskfile path, not its basename -- that is what makes it
-            # disambiguate `zlib` from `zlib-native`, which `recipe` cannot.
-            # A `virtual:native:` prefix is already part of that taskfile
-            # path when bitbake assigns one; nothing extra to add for it here.
+            # does (mc:<mc>:<fn>:<task> when mc, else <fn>:<task>) from
+            # TaskBase's private `_fn`: the worker's fn, which carries any
+            # `virtual:native:` prefix. `taskfile` is d.getVar("FILE"), the
+            # bare recipe path, and would make zlib and zlib-native collide.
             taskfile = getattr(event, "taskfile", "") or ""
             taskname = getattr(event, "taskname", None)
             mc = getattr(event, "_mc", None) or ""
+            fn = getattr(event, "_fn", None) or taskfile
             tid = None
-            if taskfile and taskname:
-                tid = (("mc:" + mc + ":" + taskfile + ":" + taskname) if mc
-                       else (taskfile + ":" + taskname))
+            if fn and taskname:
+                tid = (("mc:" + mc + ":" + fn + ":" + taskname) if mc
+                       else (fn + ":" + taskname))
             _track_task(
                 getattr(event, "pid", 0),
                 os.path.basename(taskfile) or None,
