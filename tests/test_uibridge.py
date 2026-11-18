@@ -171,8 +171,12 @@ class MachineTest(BridgeTestCase):
         bridge._set_machine(srv)
         self.assertEqual(bridge._state["machine"], "beaglebone")
         self.assertEqual(bridge._state["distro"], "angstrom")
+        # _set_machine() also reads BUILDNAME/BB_NUMBER_THREADS at this same
+        # call site (issue #145) -- not present in this server's values, so
+        # they stay unset, but the calls themselves still happen.
         self.assertEqual(srv.calls,
-                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"]])
+                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"],
+                          ["getVariable", "BUILDNAME"], ["getVariable", "BB_NUMBER_THREADS"]])
 
     def test_an_error_from_the_cooker_leaves_them_unset(self):
         bridge._set_machine(self._Server({"MACHINE": "beaglebone"}, error="boom"))
@@ -798,8 +802,12 @@ class TeeEventHandlerMachineFetchTest(BridgeTestCase):
             "runQueueTaskStarted", "/l/busybox_1.36.bb", "do_compile")])
         tee = bridge._TeeEventHandler(real, srv)
         tee.waitEvent(0)
+        # BUILDNAME/BB_NUMBER_THREADS are read at this same call site too
+        # (issue #145); not present in this server's values, so they stay
+        # unset, but the calls themselves still happen.
         self.assertEqual(srv.calls,
-                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"]])
+                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"],
+                          ["getVariable", "BUILDNAME"], ["getVariable", "BB_NUMBER_THREADS"]])
         self.assertEqual(bridge._state["machine"], "beaglebone")
         self.assertEqual(bridge._state["distro"], "angstrom")
 
@@ -811,7 +819,10 @@ class TeeEventHandlerMachineFetchTest(BridgeTestCase):
         tee = bridge._TeeEventHandler(real, srv)
         for _ in range(5):
             tee.waitEvent(0)
-        self.assertEqual(len(srv.calls), 2)
+        # 4, not 2: _set_machine() also reads BUILDNAME/BB_NUMBER_THREADS at
+        # this same call site (issue #145) -- still exactly once, not once
+        # per event.
+        self.assertEqual(len(srv.calls), 4)
 
     def test_a_None_event_still_consumes_the_one_shot_fetch(self):
         # The fix is deliberately unconditional: it fires on the first call
@@ -824,9 +835,11 @@ class TeeEventHandlerMachineFetchTest(BridgeTestCase):
         real = self._RealHandler([None, None])
         tee = bridge._TeeEventHandler(real, srv)
         self.assertIsNone(tee.waitEvent(0))
-        self.assertEqual(len(srv.calls), 2)
+        # 4, not 2: _set_machine() also reads BUILDNAME/BB_NUMBER_THREADS at
+        # this same call site (issue #145).
+        self.assertEqual(len(srv.calls), 4)
         self.assertIsNone(tee.waitEvent(0))
-        self.assertEqual(len(srv.calls), 2)
+        self.assertEqual(len(srv.calls), 4)
 
     def test_event_passes_through_unchanged_and_is_still_observed(self):
         srv = MachineTest._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom"})
@@ -890,9 +903,11 @@ class TeeEventHandlerMachineFetchTest(BridgeTestCase):
         # Nothing was asked of the cooker before knotty's own main() ran.
         self.assertEqual(snapshot, [[]])
         # ...and the ONE waitEvent() call inside it is what triggered the
-        # fetch -- exactly those two calls, nothing more.
+        # fetch -- exactly those four calls (MACHINE/DISTRO/BUILDNAME/
+        # BB_NUMBER_THREADS, issue #145), nothing more.
         self.assertEqual(srv.calls,
-                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"]])
+                         [["getVariable", "MACHINE"], ["getVariable", "DISTRO"],
+                          ["getVariable", "BUILDNAME"], ["getVariable", "BB_NUMBER_THREADS"]])
 
 
 class _HandlerFixture:
