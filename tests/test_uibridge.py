@@ -192,6 +192,124 @@ class MachineTest(BridgeTestCase):
         bridge._set_machine(self._Server(raises=True))
         self.assertIsNone(bridge._state["machine"])
 
+    def test_threads_and_buildname_come_from_the_same_call(self):
+        # issue #145: read at the exact same getVariable call site as
+        # machine/distro, not a separately-timed round-trip.
+        srv = self._Server({"MACHINE": "beaglebone", "DISTRO": "angstrom",
+                             "BUILDNAME": "20261117130003", "BB_NUMBER_THREADS": "8"})
+        bridge._set_machine(srv)
+        self.assertEqual(bridge._state["buildname"], "20261117130003")
+        self.assertEqual(bridge._state["threads"], 8)
+
+    def test_threads_is_an_int_not_a_digit_string(self):
+        srv = self._Server({"BB_NUMBER_THREADS": "12"})
+        bridge._set_machine(srv)
+        self.assertEqual(bridge._state["threads"], 12)
+        self.assertIsInstance(bridge._state["threads"], int)
+
+    def test_threads_and_buildname_are_absent_not_null_when_unknown(self):
+        srv = self._Server({"MACHINE": "beaglebone"})
+        bridge._set_machine(srv)
+        self.assertNotIn("threads", bridge._state)
+        self.assertNotIn("buildname", bridge._state)
+
+    def test_an_error_from_the_cooker_leaves_threads_and_buildname_unset_too(self):
+        srv = self._Server({"BUILDNAME": "x", "BB_NUMBER_THREADS": "8"}, error="boom")
+        bridge._set_machine(srv)
+        self.assertNotIn("buildname", bridge._state)
+        self.assertNotIn("threads", bridge._state)
+
+    def test_a_non_numeric_threads_value_is_left_out_rather_than_raising(self):
+        srv = self._Server({"BB_NUMBER_THREADS": "not-a-number"})
+        bridge._set_machine(srv)
+        self.assertNotIn("threads", bridge._state)
+
+
+class ContinueOnFailureTest(BridgeTestCase):
+    """`continue_on_failure` (issue #145): from bitbake's already-parsed
+    -k/--continue option, never getVariable, never inferred from task
+    behaviour after a failure."""
+
+    @staticmethod
+    def _params(**opts):
+        return types.SimpleNamespace(options=types.SimpleNamespace(**opts))
+
+    def test_halt_true_means_continue_on_failure_is_false(self):
+        # current bitbake's argparse option: `halt` true == stop at the
+        # first failure, i.e. -k/--continue was NOT given.
+        bridge._set_continue_on_failure(self._params(halt=True))
+        self.assertEqual(bridge._state["continue_on_failure"], False)
+
+    def test_halt_false_means_continue_on_failure_is_true(self):
+        # -k/--continue flips `halt` to False.
+        bridge._set_continue_on_failure(self._params(halt=False))
+        self.assertEqual(bridge._state["continue_on_failure"], True)
+
+    def test_falls_back_to_the_older_abort_attribute(self):
+        # older optparse-based bitbake; same polarity as `halt`.
+        bridge._set_continue_on_failure(self._params(abort=True))
+        self.assertEqual(bridge._state["continue_on_failure"], False)
+        bridge._set_continue_on_failure(self._params(abort=False))
+        self.assertEqual(bridge._state["continue_on_failure"], True)
+
+    def test_halt_is_preferred_over_abort_when_both_are_present(self):
+        bridge._set_continue_on_failure(self._params(halt=False, abort=True))
+        self.assertEqual(bridge._state["continue_on_failure"], True)
+
+    def test_neither_attribute_present_leaves_it_absent_not_a_guess(self):
+        bridge._set_continue_on_failure(self._params())
+        self.assertNotIn("continue_on_failure", bridge._state)
+
+    def test_no_options_object_at_all_never_raises(self):
+        bridge._set_continue_on_failure(types.SimpleNamespace())
+        self.assertNotIn("continue_on_failure", bridge._state)
+
+    def test_a_malformed_params_object_never_raises(self):
+        bridge._set_continue_on_failure(None)
+        bridge._set_continue_on_failure(object())
+        self.assertNotIn("continue_on_failure", bridge._state)
+
+
+class PhaseTest(BridgeTestCase):
+    """`phase` (issue #145): parsing -> sstate -> tasks, forward-only, off
+    events the bridge already receives for other reasons."""
+
+    def test_starts_absent_not_a_default_value(self):
+        self.assertNotIn("phase", bridge._state)
+
+    def test_a_parse_event_sets_parsing(self):
+        bridge._observe(_event("ParseStarted", total=10))
+        self.assertEqual(bridge._state["phase"], "parsing")
+
+    def test_a_scenequeue_event_advances_to_sstate(self):
+        bridge._observe(_event("ParseStarted", total=10))
+        bridge._observe(_task_event(
+            "sceneQueueTaskStarted", "/l/a_1.0.bb", "do_populate_sysroot"))
+        self.assertEqual(bridge._state["phase"], "sstate")
+
+    def test_a_runqueue_event_advances_to_tasks(self):
+        bridge._observe(_event("ParseStarted", total=10))
+        bridge._observe(_task_event(
+            "sceneQueueTaskStarted", "/l/a_1.0.bb", "do_populate_sysroot"))
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile"))
+        self.assertEqual(bridge._state["phase"], "tasks")
+
+    def test_phase_never_moves_backwards(self):
+        # hash equivalence can reopen the scene queue mid-build; a late
+        # sceneQueue event must not report a "tasks" build back to "sstate".
+        bridge._observe(_task_event(
+            "runQueueTaskStarted", "/l/a_1.0.bb", "do_compile"))
+        self.assertEqual(bridge._state["phase"], "tasks")
+        bridge._observe(_task_event(
+            "sceneQueueTaskStarted", "/l/b_1.0.bb", "do_populate_sysroot"))
+        self.assertEqual(bridge._state["phase"], "tasks")
+
+    def test_an_unrelated_event_type_does_not_touch_phase(self):
+        bridge._observe(_event("ParseStarted", total=10))
+        bridge._observe(_event("TaskProgress", pid=1, progress=50))
+        self.assertEqual(bridge._state["phase"], "parsing")
+
 
 class FailedTaskTest(BridgeTestCase):
     def test_a_real_task_failure_is_recorded_with_its_recipe(self):
