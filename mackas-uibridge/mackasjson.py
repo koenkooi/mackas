@@ -368,104 +368,30 @@ def _observe_task_progress(pid, progress, rate):
 # ---------------------------------------------------------------------------
 # Per-recipe task history (#146)
 #
-# Everything above tracks the build's current MOMENT (what's running, what
-# has failed); this tracks each recipe's own task-by-task PAST, so a
-# consumer can show what a given recipe already did, or whether a target is
-# done, building, waiting, or failed. Keyed by PN -- "mc:<name>:" prefixed
-# only for a non-default multiconfig, bare otherwise -- each value a list of
-# {"task", "state", "started", "ended"} dicts. `state` is one of:
-#   ran       -- a real runQueueTaskCompleted, i.e. the task actually ran.
-#   restored  -- runQueueTaskSkipped, reason "covered": sstate restored it.
-#   existing  -- runQueueTaskSkipped, reason "existing": stamp already
-#                current, no sstate involved.
-#   setscene  -- the SETSCENE ATTEMPT for this task succeeded
-#                (sceneQueueTaskCompleted). sceneQueueTaskFailed is
-#                deliberately NOT recorded here -- same reasoning _record()
-#                already documents for why that is not a build failure: the
-#                real task simply runs instead and gets its own entry.
-#   noexec    -- a real task bitbake itself flagged as doing no work
-#                (runQueueTaskStarted's own `noexec=True`, e.g. a bare
-#                dependency-placeholder task) that still ran to completion.
-#   running   -- runQueueTaskStarted, no outcome yet.
-#   failed    -- runQueueTaskFailed.
-# `started`/`ended` are epoch seconds, OMITTED (never `null`) when not
-# known -- a skip is instantaneous, so "restored"/"existing" carry neither.
+# Each recipe's task-by-task past, keyed by PN ("mc:<name>:<pn>" on a
+# non-default multiconfig), each value a list of {"task", "state",
+# "started", "ended"} dicts. Built from the worker's bb.build TaskStarted,
+# TaskSucceeded, and TaskFailed: they carry the real PN and multiconfig, and
+# they are in knotty's event mask, which this bridge inherits. The runQueue
+# completion and skip events are not in that mask and never arrive here.
+#   running   -- TaskStarted, no outcome yet.
+#   ran       -- TaskSucceeded.
+#   restored  -- TaskSucceeded for <task>_setscene: sstate restored <task>.
+#   failed    -- TaskFailed.
+# A failed setscene attempt is not recorded; the real task runs instead.
+# Tasks skipped because their stamp is current, and noexec tasks, never run
+# in a worker and fire none of these, so they do not appear. `started` and
+# `ended` are epoch seconds from the event's own `time`, omitted when unknown.
 #
-# PN is a GUESS (_guess_pn): the real one lives only in the cooker's own
-# dataCaches[mc].pkg_fn, which a UI client never sees -- these runQueue/
-# sceneQueue events carry only the recipe FILE path, never a PN. The guess
-# is used uniformly for every state above (not just the ones that lack a
-# better source) so one recipe's tasks can never split across two different
-# keys depending on which event last touched them.
-#
-# One row per (recipe, task) ever seen: a later event for the same task
-# REPLACES its earlier row in place rather than appending a second one --
-# this is what bounds memory for a `setscene` row later superseded by its
-# own `restored`/`ran`/`failed` outcome, which is the issue's own "drop
-# setscene/noexec entries once the real task for that slot is recorded",
-# achieved here as a natural side effect of upserting rather than as a
-# separate eviction pass. The OUTER table (one entry per recipe) is
-# deliberately left uncapped -- it can reach thousands of recipes on an
-# image build, which is exactly why it does not all ride along on the
-# 1-second `/` poll; see _publish_recipes() and _recipes_payload().
+# One row per (recipe, task): a later event replaces the earlier row. The
+# outer table is uncapped (thousands of recipes on an image build), which is
+# why `/` only carries recipes with a running task; GET /recipes has all.
 # ---------------------------------------------------------------------------
 
-# key -> {taskname: {"task", "state", "started"?, "ended"?}}. The inner dict
-# (not a list) is what makes "replace this task's row" an O(1) upsert;
-# lists for `recipes`/`/recipes` are built from its .values() only when
-# served, same rebuild-at-serve-time idiom as _publish_task_progress().
+# key -> {taskname: row}; lists are built from .values() only when served.
 _recipe_tasks = {}
-# runQueue taskid -> whether its TaskStarted carried noexec=True, so the
-# matching runQueueTaskCompleted (which carries no noexec of its own, see
-# _record_recipe_task's docstring) can still tell `noexec` apart from a
-# genuine `ran`. Popped on every Completed/Failed so a reused taskid never
-# inherits a stale flag.
-_recipe_pending_noexec = {}
 
-
-def _guess_pn(recipe):
-    """Best-effort PN from a recipe basename like "glib-2.0_2.84.1.bb".
-
-    Strips a trailing "_<version>" whose first character is a digit, after
-    dropping a ".bb"/".bbappend" extension -- bitbake's own near-universal
-    PN_PV.bb recipe-file naming. Imperfect for a PV that does not start with
-    a digit (an SRCREV-only recipe using "_git", "_AUTOINC", ...); those key
-    by their un-stripped basename instead of their real PN -- still a
-    single, consistent (if slightly wrong) key rather than no key at all.
-    Never raises on a falsy/odd input; callers already treat a None result
-    as "cannot record this one"."""
-    if not recipe:
-        return None
-    base = recipe
-    for ext in (".bbappend", ".bb"):
-        if base.endswith(ext):
-            base = base[: -len(ext)]
-            break
-    if "_" in base:
-        head, _, tail = base.rpartition("_")
-        if head and tail[:1].isdigit():
-            return head
-    return base
-
-
-def _mc_and_recipe_basename(event):
-    """(mc, recipe basename) from a runQueue/sceneQueue event's `taskfile`.
-
-    bitbake's own tid shape is "mc:<name>:<path>:<task>" for a non-default
-    multiconfig, "<path>:<task>" otherwise (same convention TaskStarted's
-    own `tid` comment above documents). The base runQueueEvent sets
-    `taskfile` to everything before the final ":<task>", which for a
-    multiconfig task leaves the "mc:<name>:" prefix glued onto the front of
-    the path -- plain os.path.basename() would silently swallow it (it only
-    ever splits on the last "/"), so it is peeled off explicitly here
-    first."""
-    taskfile = getattr(event, "taskfile", "") or ""
-    mc = ""
-    if taskfile.startswith("mc:"):
-        parts = taskfile.split(":", 2)
-        if len(parts) == 3:
-            mc, taskfile = parts[1], parts[2]
-    return mc, (os.path.basename(taskfile) or None)
+SETSCENE_SUFFIX = "_setscene"
 
 
 def _recipe_key(mc, pn):
@@ -473,65 +399,34 @@ def _recipe_key(mc, pn):
 
 
 def _record_recipe_task(event, name):
-    """Upsert this event's outcome into `_recipe_tasks`. See the "Per-recipe
-    task history" module comment above for the state vocabulary and the
-    upsert-bounds-memory reasoning.
-
-    A `name` this function does not recognise (sceneQueueTaskFailed,
-    sceneQueueTaskStarted, or anything else the caller hands it) is a
-    deliberate no-op, not a missing case -- callers pass every name in
-    their own event group through unconditionally rather than filtering
-    first, same as _record() itself does."""
-    mc, recipe = _mc_and_recipe_basename(event)
-    pn = _guess_pn(recipe)
+    """Upsert a bb.build task event into `_recipe_tasks`; any other NAME is a
+    no-op, so callers can pass their whole event group through."""
+    pn = getattr(event, "pn", None)
     taskname = getattr(event, "taskname", None)
-    if not pn or not taskname:
+    if not pn or not taskname or name not in ("TaskStarted", "TaskSucceeded", "TaskFailed"):
         return
-    tid = getattr(event, "taskid", None) or getattr(event, "taskstring", None)
-    key = _recipe_key(mc, pn)
-    now = time.time()
+    setscene = taskname.endswith(SETSCENE_SUFFIX)
+    if setscene:
+        if name != "TaskSucceeded":
+            return
+        taskname = taskname[: -len(SETSCENE_SUFFIX)]
+    key = _recipe_key(getattr(event, "_mc", None) or "", pn)
+    when = getattr(event, "time", None) or time.time()
 
     with _lock:
-        # Not setdefault: an event recorded as nothing (an unknown skip
-        # reason, a failed or merely started setscene) must not leave an
-        # empty recipe behind in GET /recipes.
+        # Not setdefault: only store a recipe once a row is written.
         tasks = _recipe_tasks.get(key, {})
         previous = tasks.get(taskname, {})
-
-        if name == "runQueueTaskStarted":
-            if tid:
-                _recipe_pending_noexec[tid] = bool(getattr(event, "noexec", False))
-            tasks[taskname] = {"task": taskname, "state": "running", "started": now}
-        elif name == "runQueueTaskCompleted":
-            noexec = _recipe_pending_noexec.pop(tid, False) if tid else False
-            entry = {"task": taskname, "state": "noexec" if noexec else "ran"}
-            if "started" in previous:
-                entry["started"] = previous["started"]
-            entry["ended"] = now
-            tasks[taskname] = entry
-        elif name == "runQueueTaskFailed":
-            if tid:
-                _recipe_pending_noexec.pop(tid, None)
-            entry = {"task": taskname, "state": "failed"}
-            if "started" in previous:
-                entry["started"] = previous["started"]
-            entry["ended"] = now
-            tasks[taskname] = entry
-        elif name == "runQueueTaskSkipped":
-            reason = getattr(event, "reason", None)
-            if reason == "covered":
-                state = "restored"
-            elif reason == "existing":
-                state = "existing"
-            else:
-                # An unrecognised skip reason: say nothing rather than guess
-                # at a state the issue's own vocabulary does not have.
-                return
-            tasks[taskname] = {"task": taskname, "state": state}
-        elif name == "sceneQueueTaskCompleted":
-            tasks[taskname] = {"task": taskname, "state": "setscene"}
+        if setscene:
+            entry = {"task": taskname, "state": "restored"}
+        elif name == "TaskStarted":
+            entry = {"task": taskname, "state": "running", "started": when}
         else:
-            return
+            entry = {"task": taskname, "state": "ran" if name == "TaskSucceeded" else "failed"}
+            if "started" in previous:
+                entry["started"] = previous["started"]
+            entry["ended"] = when
+        tasks[taskname] = entry
         _recipe_tasks[key] = tasks
         _publish_recipes()
 
@@ -823,7 +718,6 @@ def _observe(event):
                 if name.startswith("runQueue"):
                     _observe_sstate(stats)
             _record(name, **fields)
-            _record_recipe_task(event, name)
         elif name == "TaskStarted":
             # bb.build.TaskStarted, not the runQueue one: this is the event
             # fired in the worker, and its pid is what TaskProgress will be
@@ -856,7 +750,9 @@ def _observe(event):
                 pv=getattr(event, "pv", None),
                 mc=mc,
             )
+            _record_recipe_task(event, name)
         elif name in ("TaskSucceeded", "TaskFailed", "TaskFailedSilent"):
+            _record_recipe_task(event, name)
             _untrack_task(getattr(event, "pid", 0))
         elif name == "TaskProgress":
             _observe_task_progress(getattr(event, "pid", 0),
@@ -879,7 +775,6 @@ def _observe(event):
                 if name.startswith("runQueue"):
                     _observe_sstate(stats)
             _record(name, **fields)
-            _record_recipe_task(event, name)
     except Exception:
         # Best-effort observation only -- never let a schema surprise here
         # propagate into the real build's own event loop.

@@ -120,7 +120,6 @@ class BridgeTestCase(unittest.TestCase):
         bridge._active_pids.clear()
         # Per-recipe history (issue #146) is module-global too.
         bridge._recipe_tasks.clear()
-        bridge._recipe_pending_noexec.clear()
 
 
 class TargetsTest(BridgeTestCase):
@@ -1130,100 +1129,76 @@ class ServedPayloadTest(BridgeTestCase):
 
 
 
-def _rq_event(cls_name, taskfile, taskname, taskid=None, **extra):
-    """A runQueue/sceneQueue event as _observe sees it, with the taskid the
-    per-recipe history pairs Started/Completed by."""
-    return _event(cls_name, taskfile=taskfile, taskname=taskname,
-                  taskid=taskid or f"{taskfile}:{taskname}",
-                  taskstring=f"{taskfile}:{taskname}", stats=_Stats(),
-                  **extra)
+def _task(cls_name, pn, taskname, pid=1, mc=None, at=None, fn=None):
+    """A bb.build task event as the worker fires it: FILE as taskfile, the
+    worker's fn as _fn, the real PN, and BB_CURRENT_MC as _mc."""
+    attrs = dict(pid=pid, pn=pn, pv="1.0", taskname=taskname,
+                 taskfile=f"/l/{pn}_1.0.bb", _fn=fn or f"/l/{pn}_1.0.bb")
+    if mc is not None:
+        attrs["_mc"] = mc
+    if at is not None:
+        attrs["time"] = at
+    return _event(cls_name, **attrs)
 
 
 class RecipeHistoryTest(BridgeTestCase):
-    """Per-recipe task history (issue #146), driven through _observe."""
+    """Per-recipe task history (issue #146), driven through _observe with the
+    bb.build events knotty's event mask actually delivers."""
 
     def _tasks(self, key):
         return {t["task"]: t for t in bridge._recipes_payload(key)[key]}
 
-    def test_pn_is_guessed_from_the_recipe_basename(self):
-        g = bridge._guess_pn
-        self.assertEqual(g("glib-2.0_2.84.1.bb"), "glib-2.0")
-        self.assertEqual(g("linux-yocto_6.12.bb"), "linux-yocto")
-        self.assertEqual(g("busybox_1.36.0.bb"), "busybox")
-        self.assertEqual(g("base-files_3.0.14.bbappend"), "base-files")
-        # A PV that does not start with a digit keeps the whole basename.
-        self.assertEqual(g("foo_git.bb"), "foo_git")
-        self.assertEqual(g("packagegroup-core-boot.bb"), "packagegroup-core-boot")
-        self.assertIsNone(g(None))
-        self.assertIsNone(g(""))
-
-    def test_a_started_task_is_running_and_listed_in_the_root_payload(self):
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/busybox_1.36.0.bb", "do_compile"))
-        row = self._tasks("busybox")["do_compile"]
-        self.assertEqual(row["state"], "running")
-        self.assertIn("started", row)
-        self.assertNotIn("ended", row)
+    def test_started_then_succeeded_goes_from_running_to_ran(self):
+        bridge._observe(_task("TaskStarted", "busybox", "do_fetch", at=100.0))
+        self.assertEqual(self._tasks("busybox")["do_fetch"],
+                         {"task": "do_fetch", "state": "running", "started": 100.0})
         self.assertEqual(list(bridge._state["recipes"]), ["busybox"])
-
-    def test_a_completed_task_keeps_its_start_and_leaves_the_root_payload(self):
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/busybox_1.36.0.bb", "do_compile"))
-        started = self._tasks("busybox")["do_compile"]["started"]
-        bridge._observe(_rq_event("runQueueTaskCompleted", "/l/busybox_1.36.0.bb", "do_compile"))
-        row = self._tasks("busybox")["do_compile"]
-        self.assertEqual(row["state"], "ran")
-        self.assertEqual(row["started"], started)
-        self.assertGreaterEqual(row["ended"], started)
+        bridge._observe(_task("TaskSucceeded", "busybox", "do_fetch", at=106.0))
+        self.assertEqual(self._tasks("busybox")["do_fetch"],
+                         {"task": "do_fetch", "state": "ran", "started": 100.0, "ended": 106.0})
         # Nothing of busybox runs any more: only GET /recipes has it now.
         self.assertEqual(bridge._state["recipes"], {})
-        self.assertIn("busybox", bridge._recipes_payload(None))
 
-    def test_a_noexec_task_is_recorded_as_noexec_not_ran(self):
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/a_1.0.bb", "do_build", noexec=True))
-        bridge._observe(_rq_event("runQueueTaskCompleted", "/l/a_1.0.bb", "do_build"))
-        self.assertEqual(self._tasks("a")["do_build"]["state"], "noexec")
-        self.assertEqual(bridge._recipe_pending_noexec, {})
-
-    def test_a_reused_taskid_does_not_inherit_a_stale_noexec_flag(self):
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/a_1.0.bb", "do_build", noexec=True))
-        bridge._observe(_rq_event("runQueueTaskFailed", "/l/a_1.0.bb", "do_build"))
-        bridge._observe(_rq_event("runQueueTaskCompleted", "/l/a_1.0.bb", "do_build"))
-        self.assertEqual(self._tasks("a")["do_build"]["state"], "ran")
+    def test_a_chain_of_tasks_only_leaves_the_current_one_running(self):
+        # The live bug: every earlier task stayed "running".
+        for i, task in enumerate(("do_fetch", "do_unpack", "do_configure")):
+            bridge._observe(_task("TaskStarted", "gcc-cross-aarch64", task, pid=10 + i, at=100.0 + i))
+            bridge._observe(_task("TaskSucceeded", "gcc-cross-aarch64", task, pid=10 + i, at=100.5 + i))
+        bridge._observe(_task("TaskStarted", "gcc-cross-aarch64", "do_compile", pid=20, at=110.0))
+        states = {k: v["state"] for k, v in self._tasks("gcc-cross-aarch64").items()}
+        self.assertEqual(states, {"do_fetch": "ran", "do_unpack": "ran",
+                                  "do_configure": "ran", "do_compile": "running"})
 
     def test_a_failed_task_keeps_its_start(self):
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/linux-yocto_6.12.bb", "do_compile"))
-        bridge._observe(_rq_event("runQueueTaskFailed", "/l/linux-yocto_6.12.bb", "do_compile"))
-        row = self._tasks("linux-yocto")["do_compile"]
-        self.assertEqual(row["state"], "failed")
-        self.assertIn("started", row)
-        self.assertIn("ended", row)
+        bridge._observe(_task("TaskStarted", "linux-yocto", "do_compile", at=100.0))
+        bridge._observe(_task("TaskFailed", "linux-yocto", "do_compile", at=160.0))
+        self.assertEqual(self._tasks("linux-yocto")["do_compile"],
+                         {"task": "do_compile", "state": "failed", "started": 100.0, "ended": 160.0})
 
-    def test_skip_reasons_map_to_restored_and_existing_without_times(self):
-        bridge._observe(_rq_event("runQueueTaskSkipped", "/l/zlib_1.3.bb", "do_populate_sysroot", reason="covered"))
-        bridge._observe(_rq_event("runQueueTaskSkipped", "/l/zlib_1.3.bb", "do_fetch", reason="existing"))
-        tasks = self._tasks("zlib")
-        self.assertEqual(tasks["do_populate_sysroot"], {"task": "do_populate_sysroot", "state": "restored"})
-        self.assertEqual(tasks["do_fetch"], {"task": "do_fetch", "state": "existing"})
-
-    def test_an_unknown_skip_reason_records_nothing(self):
-        bridge._observe(_rq_event("runQueueTaskSkipped", "/l/zlib_1.3.bb", "do_fetch", reason="mystery"))
+    def test_a_succeeded_setscene_marks_the_real_task_restored(self):
+        bridge._observe(_task("TaskStarted", "zlib", "do_populate_sysroot_setscene"))
         self.assertEqual(bridge._recipes_payload("zlib"), {})
-
-    def test_setscene_is_replaced_by_the_real_outcome_not_appended(self):
-        bridge._observe(_rq_event("sceneQueueTaskCompleted", "/l/zlib_1.3.bb", "do_populate_sysroot"))
-        self.assertEqual(self._tasks("zlib")["do_populate_sysroot"]["state"], "setscene")
-        bridge._observe(_rq_event("runQueueTaskSkipped", "/l/zlib_1.3.bb", "do_populate_sysroot", reason="covered"))
-        rows = bridge._recipes_payload("zlib")["zlib"]
-        self.assertEqual(rows, [{"task": "do_populate_sysroot", "state": "restored"}])
+        bridge._observe(_task("TaskSucceeded", "zlib", "do_populate_sysroot_setscene"))
+        self.assertEqual(bridge._recipes_payload("zlib")["zlib"],
+                         [{"task": "do_populate_sysroot", "state": "restored"}])
 
     def test_a_failed_setscene_attempt_is_not_recorded(self):
-        bridge._observe(_rq_event("sceneQueueTaskFailed", "/l/zlib_1.3.bb", "do_populate_sysroot"))
+        bridge._observe(_task("TaskStarted", "zlib", "do_populate_sysroot_setscene"))
+        bridge._observe(_task("TaskFailed", "zlib", "do_populate_sysroot_setscene"))
+        bridge._observe(_task("TaskFailedSilent", "zlib", "do_populate_sysroot_setscene"))
         self.assertEqual(bridge._recipes_payload("zlib"), {})
 
-    def test_a_multiconfig_task_is_keyed_with_its_mc_prefix(self):
-        bridge._observe(_rq_event("runQueueTaskStarted", "mc:arm:/l/zlib_1.3.bb", "do_compile"))
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/zlib_1.3.bb", "do_compile"))
-        payload = bridge._recipes_payload(None)
-        self.assertEqual(sorted(payload), ["mc:arm:zlib", "zlib"])
+    def test_keys_use_the_real_pn_and_multiconfig(self):
+        bridge._observe(_task("TaskStarted", "zlib", "do_compile", pid=1))
+        bridge._observe(_task("TaskStarted", "zlib-native", "do_compile", pid=2,
+                              fn="virtual:native:/l/zlib_1.0.bb"))
+        bridge._observe(_task("TaskStarted", "zlib", "do_compile", pid=3, mc="arm"))
+        self.assertEqual(sorted(bridge._recipes_payload(None)), ["mc:arm:zlib", "zlib", "zlib-native"])
+
+    def test_runqueue_events_do_not_touch_the_history(self):
+        # Not in knotty's mask live; even if one arrived it must not add rows.
+        bridge._observe(_task_event("runQueueTaskStarted", "/l/busybox_1.0.bb", "do_compile"))
+        self.assertEqual(bridge._recipes_payload(None), {})
 
 
 class RecipesEndpointTest(BridgeTestCase):
@@ -1233,9 +1208,9 @@ class RecipesEndpointTest(BridgeTestCase):
         super().setUp()
         self.fixture = _HandlerFixture()
         self.addCleanup(self.fixture.close)
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/busybox_1.36.0.bb", "do_compile"))
-        bridge._observe(_rq_event("runQueueTaskCompleted", "/l/busybox_1.36.0.bb", "do_compile"))
-        bridge._observe(_rq_event("runQueueTaskStarted", "/l/zlib_1.3.bb", "do_install"))
+        bridge._observe(_task("TaskStarted", "busybox", "do_compile", pid=1))
+        bridge._observe(_task("TaskSucceeded", "busybox", "do_compile", pid=1))
+        bridge._observe(_task("TaskStarted", "zlib", "do_install", pid=2))
 
     def _get(self, path):
         status, body = self.fixture.get(path)
