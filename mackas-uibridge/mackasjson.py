@@ -65,10 +65,11 @@
 # WHY NOT SimpleHTTPRequestHandler
 #
 # Same reasoning as mirror-server/mackas-mirrord: its own docs say it is
-# "not recommended for production use". This server only ever emits ONE
-# generated JSON document (never reads an arbitrary path off disk), but it
-# is still built on bare BaseHTTPRequestHandler so every response is code in
-# this file, not inherited behaviour to audit.
+# "not recommended for production use". This server only ever emits
+# generated JSON documents of its own (never reads an arbitrary path off
+# disk) -- "/" and, since #146, "/recipes" -- but it is still built on bare
+# BaseHTTPRequestHandler so every response is code in this file, not
+# inherited behaviour to audit.
 #
 # Binds 0.0.0.0 (not 127.0.0.1 -- that is the CONTAINER's own loopback, not
 # the Mac's) on MACKAS_MONITOR_PORT (env, matching the -p publish mackas'
@@ -86,6 +87,7 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import bb.event
@@ -152,6 +154,12 @@ _state = {
     # The true, uncapped number of running tasks -- distinct from len(running)
     # once MAX_TASK_PROGRESS caps the list itself. See _active_pids.
     "active": 0,
+    # Per-recipe task history (#146) -- see the "Per-recipe task history"
+    # section below for the full shape and the state vocabulary. Only ever
+    # holds recipes that currently have a task in "running"; the complete
+    # table (including everything already finished) is _recipe_tasks,
+    # served separately via GET /recipes -- see _publish_recipes().
+    "recipes": {},
     "recent_events": [],
     # Bumped each time the HTTP server thread itself dies and gets restarted
     # (see _serve_forever_resilient) -- normally 0 for the whole build. A
@@ -355,6 +363,202 @@ def _observe_task_progress(pid, progress, rate):
             "rate": str(rate) if rate else None,
         }
         _publish_task_progress()
+
+
+# ---------------------------------------------------------------------------
+# Per-recipe task history (#146)
+#
+# Everything above tracks the build's current MOMENT (what's running, what
+# has failed); this tracks each recipe's own task-by-task PAST, so a
+# consumer can show what a given recipe already did, or whether a target is
+# done, building, waiting, or failed. Keyed by PN -- "mc:<name>:" prefixed
+# only for a non-default multiconfig, bare otherwise -- each value a list of
+# {"task", "state", "started", "ended"} dicts. `state` is one of:
+#   ran       -- a real runQueueTaskCompleted, i.e. the task actually ran.
+#   restored  -- runQueueTaskSkipped, reason "covered": sstate restored it.
+#   existing  -- runQueueTaskSkipped, reason "existing": stamp already
+#                current, no sstate involved.
+#   setscene  -- the SETSCENE ATTEMPT for this task succeeded
+#                (sceneQueueTaskCompleted). sceneQueueTaskFailed is
+#                deliberately NOT recorded here -- same reasoning _record()
+#                already documents for why that is not a build failure: the
+#                real task simply runs instead and gets its own entry.
+#   noexec    -- a real task bitbake itself flagged as doing no work
+#                (runQueueTaskStarted's own `noexec=True`, e.g. a bare
+#                dependency-placeholder task) that still ran to completion.
+#   running   -- runQueueTaskStarted, no outcome yet.
+#   failed    -- runQueueTaskFailed.
+# `started`/`ended` are epoch seconds, OMITTED (never `null`) when not
+# known -- a skip is instantaneous, so "restored"/"existing" carry neither.
+#
+# PN is a GUESS (_guess_pn): the real one lives only in the cooker's own
+# dataCaches[mc].pkg_fn, which a UI client never sees -- these runQueue/
+# sceneQueue events carry only the recipe FILE path, never a PN. The guess
+# is used uniformly for every state above (not just the ones that lack a
+# better source) so one recipe's tasks can never split across two different
+# keys depending on which event last touched them.
+#
+# One row per (recipe, task) ever seen: a later event for the same task
+# REPLACES its earlier row in place rather than appending a second one --
+# this is what bounds memory for a `setscene` row later superseded by its
+# own `restored`/`ran`/`failed` outcome, which is the issue's own "drop
+# setscene/noexec entries once the real task for that slot is recorded",
+# achieved here as a natural side effect of upserting rather than as a
+# separate eviction pass. The OUTER table (one entry per recipe) is
+# deliberately left uncapped -- it can reach thousands of recipes on an
+# image build, which is exactly why it does not all ride along on the
+# 1-second `/` poll; see _publish_recipes() and _recipes_payload().
+# ---------------------------------------------------------------------------
+
+# key -> {taskname: {"task", "state", "started"?, "ended"?}}. The inner dict
+# (not a list) is what makes "replace this task's row" an O(1) upsert;
+# lists for `recipes`/`/recipes` are built from its .values() only when
+# served, same rebuild-at-serve-time idiom as _publish_task_progress().
+_recipe_tasks = {}
+# runQueue taskid -> whether its TaskStarted carried noexec=True, so the
+# matching runQueueTaskCompleted (which carries no noexec of its own, see
+# _record_recipe_task's docstring) can still tell `noexec` apart from a
+# genuine `ran`. Popped on every Completed/Failed so a reused taskid never
+# inherits a stale flag.
+_recipe_pending_noexec = {}
+
+
+def _guess_pn(recipe):
+    """Best-effort PN from a recipe basename like "glib-2.0_2.84.1.bb".
+
+    Strips a trailing "_<version>" whose first character is a digit, after
+    dropping a ".bb"/".bbappend" extension -- bitbake's own near-universal
+    PN_PV.bb recipe-file naming. Imperfect for a PV that does not start with
+    a digit (an SRCREV-only recipe using "_git", "_AUTOINC", ...); those key
+    by their un-stripped basename instead of their real PN -- still a
+    single, consistent (if slightly wrong) key rather than no key at all.
+    Never raises on a falsy/odd input; callers already treat a None result
+    as "cannot record this one"."""
+    if not recipe:
+        return None
+    base = recipe
+    for ext in (".bbappend", ".bb"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    if "_" in base:
+        head, _, tail = base.rpartition("_")
+        if head and tail[:1].isdigit():
+            return head
+    return base
+
+
+def _mc_and_recipe_basename(event):
+    """(mc, recipe basename) from a runQueue/sceneQueue event's `taskfile`.
+
+    bitbake's own tid shape is "mc:<name>:<path>:<task>" for a non-default
+    multiconfig, "<path>:<task>" otherwise (same convention TaskStarted's
+    own `tid` comment above documents). The base runQueueEvent sets
+    `taskfile` to everything before the final ":<task>", which for a
+    multiconfig task leaves the "mc:<name>:" prefix glued onto the front of
+    the path -- plain os.path.basename() would silently swallow it (it only
+    ever splits on the last "/"), so it is peeled off explicitly here
+    first."""
+    taskfile = getattr(event, "taskfile", "") or ""
+    mc = ""
+    if taskfile.startswith("mc:"):
+        parts = taskfile.split(":", 2)
+        if len(parts) == 3:
+            mc, taskfile = parts[1], parts[2]
+    return mc, (os.path.basename(taskfile) or None)
+
+
+def _recipe_key(mc, pn):
+    return ("mc:" + mc + ":" + pn) if mc else pn
+
+
+def _record_recipe_task(event, name):
+    """Upsert this event's outcome into `_recipe_tasks`. See the "Per-recipe
+    task history" module comment above for the state vocabulary and the
+    upsert-bounds-memory reasoning.
+
+    A `name` this function does not recognise (sceneQueueTaskFailed,
+    sceneQueueTaskStarted, or anything else the caller hands it) is a
+    deliberate no-op, not a missing case -- callers pass every name in
+    their own event group through unconditionally rather than filtering
+    first, same as _record() itself does."""
+    mc, recipe = _mc_and_recipe_basename(event)
+    pn = _guess_pn(recipe)
+    taskname = getattr(event, "taskname", None)
+    if not pn or not taskname:
+        return
+    tid = getattr(event, "taskid", None) or getattr(event, "taskstring", None)
+    key = _recipe_key(mc, pn)
+    now = time.time()
+
+    with _lock:
+        tasks = _recipe_tasks.setdefault(key, {})
+        previous = tasks.get(taskname, {})
+
+        if name == "runQueueTaskStarted":
+            if tid:
+                _recipe_pending_noexec[tid] = bool(getattr(event, "noexec", False))
+            tasks[taskname] = {"task": taskname, "state": "running", "started": now}
+        elif name == "runQueueTaskCompleted":
+            noexec = _recipe_pending_noexec.pop(tid, False) if tid else False
+            entry = {"task": taskname, "state": "noexec" if noexec else "ran"}
+            if "started" in previous:
+                entry["started"] = previous["started"]
+            entry["ended"] = now
+            tasks[taskname] = entry
+        elif name == "runQueueTaskFailed":
+            if tid:
+                _recipe_pending_noexec.pop(tid, None)
+            entry = {"task": taskname, "state": "failed"}
+            if "started" in previous:
+                entry["started"] = previous["started"]
+            entry["ended"] = now
+            tasks[taskname] = entry
+        elif name == "runQueueTaskSkipped":
+            reason = getattr(event, "reason", None)
+            if reason == "covered":
+                state = "restored"
+            elif reason == "existing":
+                state = "existing"
+            else:
+                # An unrecognised skip reason: say nothing rather than guess
+                # at a state the issue's own vocabulary does not have.
+                return
+            tasks[taskname] = {"task": taskname, "state": state}
+        elif name == "sceneQueueTaskCompleted":
+            tasks[taskname] = {"task": taskname, "state": "setscene"}
+        else:
+            return
+        _publish_recipes()
+
+
+def _publish_recipes():
+    """Rebuild the served `recipes` dict from `_recipe_tasks`. Caller holds
+    _lock.
+
+    Root-payload-only (the issue's second proposed shape): a recipe appears
+    here only while at least one of its tracked tasks is still `running` --
+    the full table can reach thousands of entries on an image build, and
+    serving all of it on every 1-second poll of `/` would mean re-sending
+    nearly all of it, nearly unchanged, every second. `GET /recipes` (or
+    `?pn=<pn>`) always has the full table -- see _recipes_payload()."""
+    _state["recipes"] = {
+        key: list(tasks.values())
+        for key, tasks in _recipe_tasks.items()
+        if any(t["state"] == "running" for t in tasks.values())
+    }
+
+
+def _recipes_payload(pn):
+    """The full per-recipe task table, or just PN's, for GET /recipes.
+    Caller holds _lock. `pn` of None returns everything; a PN that was
+    never seen returns {} -- same "say nothing rather than guess"
+    convention as the rest of this module, not a 404 (the path itself is
+    valid, there is just nothing recorded for it yet)."""
+    if pn is not None:
+        tasks = _recipe_tasks.get(pn)
+        return {pn: list(tasks.values())} if tasks is not None else {}
+    return {key: list(tasks.values()) for key, tasks in _recipe_tasks.items()}
 
 
 def _set_targets(params):
@@ -615,6 +819,7 @@ def _observe(event):
                 if name.startswith("runQueue"):
                     _observe_sstate(stats)
             _record(name, **fields)
+            _record_recipe_task(event, name)
         elif name == "TaskStarted":
             # bb.build.TaskStarted, not the runQueue one: this is the event
             # fired in the worker, and its pid is what TaskProgress will be
@@ -670,6 +875,7 @@ def _observe(event):
                 if name.startswith("runQueue"):
                     _observe_sstate(stats)
             _record(name, **fields)
+            _record_recipe_task(event, name)
     except Exception:
         # Best-effort observation only -- never let a schema surprise here
         # propagate into the real build's own event loop.
@@ -728,11 +934,21 @@ class _Handler(BaseHTTPRequestHandler):
                   file=sys.stderr)
 
     def _do_GET(self):
-        if self.path != "/":
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+        # Routing only -- existing "/" behaviour and the 404 for a truly
+        # unknown path are both unchanged, just moved into their own
+        # methods so adding "/recipes" (#146) does not have to touch either.
+        path, _, query = self.path.partition("?")
+        if path == "/":
+            self._serve_root()
             return
+        if path == "/recipes":
+            self._serve_recipes(query)
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _serve_root(self):
         with _lock:
             status = _state["status"]
             # Re-age the running tasks against the clock now, not whenever
@@ -751,6 +967,21 @@ class _Handler(BaseHTTPRequestHandler):
         # JSON body path, never for "building" or an error response.
         if status in TERMINAL_STATUSES:
             _terminal_fetched.set()
+
+    def _serve_recipes(self, query):
+        """GET /recipes[?pn=<pn>] -- the full per-recipe task table (#146),
+        kept off the hot `/` path on purpose; see _publish_recipes()'s own
+        docstring for why. Never touches `_terminal_fetched`: that signal
+        means specifically "a client has seen the terminal status via `/`",
+        which this path does not serve."""
+        pn = (urllib.parse.parse_qs(query).get("pn") or [None])[0]
+        with _lock:
+            body = json.dumps(_recipes_payload(pn)).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_HEAD(self):
         self.send_response(405)
