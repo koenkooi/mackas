@@ -1293,6 +1293,14 @@ class LogPathTest(BridgeTestCase):
         self.assertEqual(tail[-1], "line 499")
         self.assertEqual(tail[0], f"line {500 - bridge.MAX_LOG_TAIL_LINES}")
 
+    def test_a_native_failure_keeps_the_virtual_tid(self):
+        log = self._log("log.do_compile.306", ["boom"])
+        bridge._observe(_event("TaskFailed", pid=306, taskfile="/l/zlib_1.3.bb",
+                               _fn="virtual:native:/l/zlib_1.3.bb", taskname="do_compile",
+                               pn="zlib-native", logfile=log))
+        self.assertEqual(list(bridge._state["log_path"]),
+                         ["virtual:native:/l/zlib_1.3.bb:do_compile"])
+
     def test_a_failure_with_an_unreadable_log_keeps_the_path_without_a_tail(self):
         missing = os.path.join(self.dir, "gone")
         self._start(305, missing)
