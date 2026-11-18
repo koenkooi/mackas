@@ -66,10 +66,14 @@
 #
 # Same reasoning as mirror-server/mackas-mirrord: its own docs say it is
 # "not recommended for production use". This server only ever emits
-# generated JSON documents of its own (never reads an arbitrary path off
-# disk) -- "/" and, since #146, "/recipes" -- but it is still built on bare
-# BaseHTTPRequestHandler so every response is code in this file, not
-# inherited behaviour to audit.
+# generated JSON documents of its own -- "/" and, since #146, "/recipes" --
+# or, since #147, a bounded tail of a log file whose path the bridge
+# ALREADY RECORDED ITSELF in `log_path` ("/log?tid=<tid>&lines=<n>"). It
+# never reads an arbitrary path off disk: `/log` only ever opens a value
+# already present in `_log_paths`, looked up by the `tid` query parameter --
+# never `self.path`, never any other request-supplied string treated as a
+# filesystem path. Still built on bare BaseHTTPRequestHandler so every
+# response is code in this file, not inherited behaviour to audit.
 #
 # Binds 0.0.0.0 (not 127.0.0.1 -- that is the CONTAINER's own loopback, not
 # the Mac's) on MACKAS_MONITOR_PORT (env, matching the -p publish mackas'
@@ -107,6 +111,31 @@ MAX_FAILED_TASKS = 20
 # grow them without limit; it evicts oldest-first, which is exactly the
 # stale entry in that case.
 MAX_TASK_PROGRESS = 32
+
+# log_path/log_tail (#147). `_log_paths` holds one entry per RUNNING task
+# (same lifetime as MAX_TASK_PROGRESS) PLUS one per entry in `failed_tasks`
+# (same lifetime as MAX_FAILED_TASKS) -- see the "Log paths and tails"
+# section below for why those two outlive _task_pids/_task_meta instead of
+# sharing their eviction. Capped at the sum of both so a build with threads
+# maxed out AND a full failed list still fits without evicting a live or
+# still-interesting entry.
+MAX_LOG_PATHS = MAX_TASK_PROGRESS + MAX_FAILED_TASKS
+# Lines kept in the root payload's `log_tail`, captured once at TaskFailed
+# time. Matches mackas-monitor-app's own BridgeState.maxLogTailLines, so
+# nothing sent here is ever thrown away again at decode time.
+MAX_LOG_TAIL_LINES = 200
+# Bytes scanned from the END of a log file to build that captured tail.
+# Large enough to comfortably hold 200 lines of ordinary bitbake task
+# output; small enough to bound one disk read even against a multi-GB log
+# (do_compile on a failing recipe can be enormous).
+LOG_TAIL_CAPTURE_BYTES = 64 * 1024
+
+# GET /log?tid=<tid>&lines=<n> (#147) is a single on-demand request, not
+# something polled every second like `/`, so it can afford a larger budget
+# than the inline failure-time capture above -- but it is still bounded, so
+# one huge log cannot turn a single request into an unbounded response.
+MAX_LOG_REQUEST_LINES = 1000
+LOG_REQUEST_READ_BYTES = 256 * 1024
 
 _lock = threading.Lock()
 
@@ -160,6 +189,18 @@ _state = {
     # table (including everything already finished) is _recipe_tasks,
     # served separately via GET /recipes -- see _publish_recipes().
     "recipes": {},
+    # Log file paths (#147), keyed by the full `tid` -- same shape as
+    # `running[].tid` -- for every RUNNING task and for every entry
+    # `failed_tasks` still remembers. Never built by hand from ${T}: taken
+    # straight off TaskStarted/TaskFailed's own `logfile` attribute. See
+    # the "Log paths and tails" section below for the full lifecycle.
+    "log_path": {},
+    # The last MAX_LOG_TAIL_LINES lines of a FAILED task's log, captured
+    # once at TaskFailed time, keyed by the same `tid` as `log_path`. A
+    # running task's live tail is NOT kept here -- poll GET /log?tid=...
+    # for that instead, so a busy build is never forced to re-send every
+    # running task's tail on every `/` poll.
+    "log_tail": {},
     "recent_events": [],
     # Bumped each time the HTTP server thread itself dies and gets restarted
     # (see _serve_forever_resilient) -- normally 0 for the whole build. A
@@ -237,6 +278,14 @@ _task_meta = {}
 # was truncated. A set rather than a counter: idempotent add/discard can
 # never drift the way a hand-kept +1/-1 tally could.
 _active_pids = set()
+# tid -> log path, and tid -> captured tail lines (#147). Deliberately
+# separate from _task_pids/_task_meta rather than riding along in them:
+# those are pid-keyed and get wiped by _untrack_task the moment a task
+# ends, but a FAILED task's log_path/log_tail must keep serving for as
+# long as that failure stays in `failed_tasks` -- see _capture_failure_log
+# and _untrack_task's own `keep_log` parameter below.
+_log_paths = {}
+_log_tails = {}
 
 
 def _evict_oldest(mapping, cap):
@@ -306,7 +355,7 @@ def _publish_task_progress():
     _state["active"] = len(_active_pids)
 
 
-def _track_task(pid, recipe, task, tid=None, pn=None, pv=None, mc=""):
+def _track_task(pid, recipe, task, tid=None, pn=None, pv=None, mc="", logfile=None):
     if not pid or pid <= 0:
         return
     with _lock:
@@ -321,17 +370,45 @@ def _track_task(pid, recipe, task, tid=None, pn=None, pv=None, mc=""):
         # inheriting the age of whatever task held it before.
         _task_pids[pid] = (recipe, task, time.time())
         _task_meta[pid] = {"tid": tid, "pn": pn, "pv": pv, "mc": mc}
+        # log_path (#147), straight off TaskStarted's own `logfile` --
+        # never a hand-built ${T} path. See the "Log paths and tails"
+        # section below for the full lifecycle.
+        if tid and logfile:
+            if tid not in _log_paths:
+                _evict_oldest(_log_paths, MAX_LOG_PATHS)
+            _log_paths[tid] = logfile
+            _state["log_path"] = dict(_log_paths)
         _publish_task_progress()
 
 
-def _untrack_task(pid):
+def _untrack_task(pid, keep_log=False):
+    """Stop tracking PID. KEEP_LOG=True (TaskFailed only -- see
+    _capture_failure_log) leaves this task's `_log_paths`/`_log_tails`
+    entry in place, since a failure's log must keep serving for as long as
+    it stays in `failed_tasks`, well past when the task itself stops being
+    'running'. KEEP_LOG=False (TaskSucceeded/TaskFailedSilent) drops it:
+    neither case belongs in `failed_tasks`, so neither should keep serving
+    a log_path entry once the task is gone."""
     if not pid or pid <= 0:
         return
     with _lock:
         _active_pids.discard(pid)
         _task_pids.pop(pid, None)
-        _task_meta.pop(pid, None)
+        meta = _task_meta.pop(pid, None)
         _task_reports.pop(pid, None)
+        if not keep_log and meta:
+            tid = meta.get("tid")
+            if tid:
+                # Both pops must run unconditionally -- an `or` short-
+                # circuits on the first truthy pop, which would then skip
+                # (and so leak) a stale _log_tails[tid] left over from an
+                # earlier failure of this same tid within one build (e.g.
+                # a retried task that now succeeds).
+                had_path = _log_paths.pop(tid, None) is not None
+                had_tail = _log_tails.pop(tid, None) is not None
+                if had_path or had_tail:
+                    _state["log_path"] = dict(_log_paths)
+                    _state["log_tail"] = dict(_log_tails)
         _publish_task_progress()
 
 
@@ -458,6 +535,97 @@ def _recipes_payload(pn):
         tasks = _recipe_tasks.get(pn)
         return {pn: list(tasks.values())} if tasks is not None else {}
     return {key: list(tasks.values()) for key, tasks in _recipe_tasks.items()}
+
+
+# ---------------------------------------------------------------------------
+# Log paths and tails (#147)
+#
+# `log_path` closes the gap `running`/`failed_tasks` leave: a consumer can
+# see WHAT is running or has failed, but not where its log lives inside the
+# container (macOS cannot read ${T}/${WORKDIR} on the TMPDIR ext4 volume
+# directly). Taken straight off TaskStarted/TaskFailed's own `logfile`
+# attribute -- see bb/build.py's TaskBase.__init__, which every one of
+# those events inherits -- NEVER rebuilt by hand from ${T}, since that
+# would silently drift the moment bitbake's own layout changes.
+#
+# `log_path` tracks two different lifetimes in the SAME dict:
+#   - a RUNNING task's entry, added in _track_task (alongside _task_meta)
+#     and dropped in _untrack_task the moment that task ends -- unless it
+#     ended via TaskFailed, see below.
+#   - a FAILED task's entry, which must keep serving for as long as that
+#     failure is still listed in `failed_tasks` -- well past when the task
+#     stops being "running". _untrack_task's `keep_log=True` is what keeps
+#     TaskFailed from dropping it the way TaskSucceeded/TaskFailedSilent do.
+# Both share _log_paths/MAX_LOG_PATHS rather than two separate maps, since
+# a given tid is only ever in one state at a time.
+#
+# `log_tail` is deliberately NOT a live tail of every running task -- that
+# would mean re-reading and re-sending every running task's log on every
+# `/` poll, which is exactly the "huge log, unbounded response" risk the
+# issue calls out. It is captured ONCE, at TaskFailed time, bounded to
+# MAX_LOG_TAIL_LINES -- a snapshot for post-mortem, not a stream. A still-
+# running task's live tail is served on demand instead, via GET
+# /log?tid=<tid>&lines=<n> (_serve_log below), which only ever opens a
+# path already present in `_log_paths` -- never the request's own `tid`
+# string, and never any path this module did not record itself.
+# ---------------------------------------------------------------------------
+
+
+def _tail_lines(path, max_lines, max_bytes):
+    """Up to MAX_LINES lines from the end of PATH, having read at most
+    MAX_BYTES from the end of the file. Best-effort: any OSError (missing
+    file, permission, deleted mid-build, a symlink that no longer resolves)
+    returns None rather than raising -- callers treat None as "no tail
+    available", never as a reason to fail the caller's own event handling.
+
+    Reads at most MAX_BYTES from the END of the file first, so a log many
+    times that size still costs one bounded read rather than scaling with
+    the file -- the line split happens only on that bounded window, never
+    on the whole file."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(size, max_bytes)
+            f.seek(size - read_size, os.SEEK_SET)
+            data = f.read(read_size)
+    except OSError:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    # The read window can start mid-line when it didn't cover the whole
+    # file -- drop that first, possibly-truncated line rather than serve a
+    # fragment that looks like a complete one.
+    if read_size < size and lines:
+        lines = lines[1:]
+    return lines[-max_lines:] if max_lines > 0 else []
+
+
+def _capture_failure_log(tid, logfile):
+    """At TaskFailed time: make sure `_log_paths[tid]` names LOGFILE, and
+    snapshot a bounded tail of it into `_log_tails[tid]`. Best-effort
+    throughout, same contract as the rest of this module's event handling
+    -- a missing TID (this module could not build one), a missing
+    LOGFILE, or an unreadable file each leave one or both maps untouched
+    rather than raising. Called from _observe()'s TaskFailed branch,
+    before _untrack_task(pid, keep_log=True) runs."""
+    if not tid or not logfile:
+        return
+    with _lock:
+        if tid not in _log_paths:
+            _evict_oldest(_log_paths, MAX_LOG_PATHS)
+        _log_paths[tid] = logfile
+        _state["log_path"] = dict(_log_paths)
+    # File I/O happens OUTSIDE _lock -- a slow or stuck filesystem read
+    # here must never block the HTTP handler thread from serving `/`.
+    tail = _tail_lines(logfile, MAX_LOG_TAIL_LINES, LOG_TAIL_CAPTURE_BYTES)
+    if tail is None:
+        return
+    with _lock:
+        if tid not in _log_tails:
+            _evict_oldest(_log_tails, MAX_FAILED_TASKS)
+        _log_tails[tid] = tail
+        _state["log_tail"] = dict(_log_tails)
 
 
 def _set_targets(params):
@@ -690,6 +858,18 @@ def _finish(status):
         # window -- see TERMINAL_LINGER_SECONDS.
         _task_pids.clear()
         _task_reports.clear()
+        # Drop log_path for anything that was still "running" when the
+        # build ended -- same reasoning as task_progress/running above,
+        # it's no longer true. A FAILED task's entry is untouched here: it
+        # was never in _task_meta to begin with (_untrack_task popped it
+        # with keep_log=True), so this loop can't reach it.
+        for meta in _task_meta.values():
+            tid = meta.get("tid")
+            if tid:
+                _log_paths.pop(tid, None)
+                _log_tails.pop(tid, None)
+        _state["log_path"] = dict(_log_paths)
+        _state["log_tail"] = dict(_log_tails)
         _task_meta.clear()
         _active_pids.clear()
         _state["task_progress"] = []
@@ -749,11 +929,31 @@ def _observe(event):
                 pn=getattr(event, "pn", None),
                 pv=getattr(event, "pv", None),
                 mc=mc,
+                # TaskBase.__init__ (bb/build.py) sets this on every task
+                # event, TaskStarted included -- see the "Log paths and
+                # tails" section above for why it's recorded here rather
+                # than rebuilt from ${T} by hand.
+                logfile=getattr(event, "logfile", None),
             )
             _record_recipe_task(event, name)
-        elif name in ("TaskSucceeded", "TaskFailed", "TaskFailedSilent"):
+        elif name in ("TaskSucceeded", "TaskFailedSilent"):
             _record_recipe_task(event, name)
             _untrack_task(getattr(event, "pid", 0))
+        elif name == "TaskFailed":
+            _record_recipe_task(event, name)
+            # Build the tid from THIS event, the same way TaskStarted's
+            # branch does (worker fn in _fn, not FILE), rather than looking
+            # it up in the pid-keyed, capped _task_meta: an evicted or unseen
+            # TaskStarted must not lose the failure's log.
+            taskname = getattr(event, "taskname", None)
+            mc = getattr(event, "_mc", None) or ""
+            fn = getattr(event, "_fn", None) or getattr(event, "taskfile", "") or ""
+            tid = None
+            if fn and taskname:
+                tid = (("mc:" + mc + ":" + fn + ":" + taskname) if mc
+                       else (fn + ":" + taskname))
+            _capture_failure_log(tid, getattr(event, "logfile", None))
+            _untrack_task(getattr(event, "pid", 0), keep_log=True)
         elif name == "TaskProgress":
             _observe_task_progress(getattr(event, "pid", 0),
                                    getattr(event, "progress", None),
@@ -835,13 +1035,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _do_GET(self):
         # Routing only -- existing "/" behaviour and the 404 for a truly
         # unknown path are both unchanged, just moved into their own
-        # methods so adding "/recipes" (#146) does not have to touch either.
+        # methods so adding "/recipes" (#146) and "/log" (#147) does not
+        # have to touch either.
         path, _, query = self.path.partition("?")
         if path == "/":
             self._serve_root()
             return
         if path == "/recipes":
             self._serve_recipes(query)
+            return
+        if path == "/log":
+            self._serve_log(query)
             return
         self.send_response(404)
         self.send_header("Content-Length", "0")
@@ -876,6 +1080,43 @@ class _Handler(BaseHTTPRequestHandler):
         pn = (urllib.parse.parse_qs(query).get("pn") or [None])[0]
         with _lock:
             body = json.dumps(_recipes_payload(pn)).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_log(self, query):
+        """GET /log?tid=<tid>&lines=<n> -- a bounded tail of the log file
+        the bridge itself already recorded for TID in `log_path` (#147).
+
+        SECURITY: `tid` is used ONLY as a dict key into `_log_paths` --
+        never concatenated into, or otherwise treated as, a filesystem
+        path. A `tid` this module never recorded (wrong, made up, or for a
+        task that has since been evicted) gets a 404, same as any other
+        unknown resource -- never an attempt to guess or construct a path
+        for it. See the module's own "never reads an arbitrary path off
+        disk" invariant at the top of this file."""
+        tid = (urllib.parse.parse_qs(query).get("tid") or [None])[0]
+        with _lock:
+            path = _log_paths.get(tid) if tid else None
+        if not path:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        # No `lines`, or one that doesn't parse, gets the same sane default
+        # as the inline failure-time capture (MAX_LOG_TAIL_LINES) rather
+        # than silently jumping to the request-side maximum -- a typo in
+        # the query string should not change how much gets served.
+        raw_lines = (urllib.parse.parse_qs(query).get("lines") or [""])[0]
+        try:
+            lines = int(raw_lines) if raw_lines else MAX_LOG_TAIL_LINES
+        except ValueError:
+            lines = MAX_LOG_TAIL_LINES
+        lines = max(1, min(lines, MAX_LOG_REQUEST_LINES))
+        tail = _tail_lines(path, lines, LOG_REQUEST_READ_BYTES)
+        body = json.dumps({"tid": tid, "lines": tail if tail is not None else []}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

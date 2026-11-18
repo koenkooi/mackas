@@ -107,7 +107,7 @@ This is the API. It is small on purpose.
 | | |
 |---|---|
 | **Endpoint** | `GET http://127.0.0.1:<port>/`, or the container's own address when the forward resets that port ([above](#what-already-exists-before-you-write-anything)) |
-| **Also served** | `GET /recipes`, optionally `?pn=<pn>` — the complete per-recipe task table, or just one recipe's; see the `recipes` row below |
+| **Also served** | `GET /recipes`, optionally `?pn=<pn>` — the complete per-recipe task table, or just one recipe's; see the `recipes` row below. `GET /log?tid=<tid>&lines=<n>` — a bounded tail of one task's log; see the `log_path`/`log_tail` rows below |
 | **Port** | `MACKAS_MONITOR_PORT`, default **8801**, published `-p PORT:PORT` so the host port equals the container port |
 | **Any other path** | `404`, empty body |
 | **`HEAD`** | `405`, empty body |
@@ -150,6 +150,12 @@ this document.
     ]
   },
   "sstate": {"covered": 412, "notcovered": 38, "total": 450, "skipped": 1204},
+  "log_path": {"/l/systemd_257.bb:do_compile": "/work/build/tmp/work/x86_64/systemd/257.5/temp/log.do_compile.4100",
+               "/l/linux-yocto_6.6.bb:do_compile": "/work/build/tmp/work/beaglebone/linux-yocto/6.6/temp/log.do_compile.3871"},
+  "log_tail": {"/l/linux-yocto_6.6.bb:do_compile": ["  CC      kernel/sched/core.o",
+                                                     "kernel/sched/core.c: In function 'foo':",
+                                                     "make: *** [Makefile:224: __sub-make] Error 2",
+                                                     "ERROR: oe_runmake failed"]},
   "recent_events": [{"ts": 1769000000.123, "type": "runQueueTaskStarted",
                      "recipe": "busybox_1.36.0.bb", "task": "do_compile"}]
 }
@@ -176,7 +182,21 @@ this document.
 | `active` | int | The **true, uncapped** number of tasks `running` is built from. Compare against `running`'s length to tell whether the cap has bitten: `active > len(running)` means tasks are running that are not listed. |
 | `recipes` | object | What each recipe has **already done**, not just what it's doing now: once a task finishes, this is the only field that still remembers it. **Keyed by PN** (`mc:<name>:` prefixed only for a non-default multiconfig), each value a list of `{task, state, started, ended}`, one row per task. Built from the worker's `bb.build.TaskStarted`/`TaskSucceeded`/`TaskFailed`, which carry the real PN and multiconfig and are in knotty's event mask; the `runQueue` completion and skip events are not in that mask, so the bridge never receives them. `state` is `running`, `ran`, `restored` (the task's `_setscene` variant succeeded, so sstate restored it), or `failed`. A failed setscene attempt is not recorded; the real task runs instead and gets its own row. Tasks skipped because their stamp is current, and noexec tasks, never run in a worker and do not appear. `started`/`ended` are epoch seconds from the event, **absent, not `null`**, when unknown; `restored` carries neither. A later event for the same task replaces its row. Present in **`/` only for a recipe that currently has a task in `running`**: the full table can reach thousands of recipes on an image build. `GET /recipes` (optionally `?pn=<pn>`) always has the complete table; a PN never seen returns `{}`, not a 404. |
 | `sstate` | object \| null | `{covered, notcovered, total, skipped}`, copied off bitbake's own `RunQueueStats` the moment it settles. `null` until then. Always all four fields or none — a partial tally would read as a real hit rate when it isn't one. Published only from `runQueue*` events, never `sceneQueue*`: the scene queue can still reopen (hash equivalence) while it's accumulating, so only the settled run queue's numbers are trustworthy. This is an **observation**, not a forecast — see ["why there's no build-wide ETA"](#why-theres-no-build-wide-eta) below. |
+| `log_path` | object | Log file paths **inside the container**, keyed by the same full `tid` as `running[].tid` (`<taskfile>:<task>`, or `mc:<name>:<taskfile>:<task>`). Taken straight off `bb.build.TaskStarted`/`TaskFailed`'s own `logfile` attribute — **never** rebuilt by hand from `${T}`/`${WORKDIR}`, which macOS cannot read on the TMPDIR ext4 volume anyway. Has an entry for every task currently in `running`, **plus** one for every entry still in `failed_tasks` — a failed task's entry keeps serving for as long as the failure does, well past when the task itself stops running. Empty object when nothing qualifies yet, never omitted. |
+| `log_tail` | object | The last `MAX_LOG_TAIL_LINES` (200) lines of a **failed** task's log, keyed by the same `tid` as `log_path`, captured **once**, at the moment `TaskFailed` fires — a snapshot for post-mortem, not a live stream. A still-**running** task's log is deliberately **not** mirrored here (that would mean re-sending every running task's tail on every `/` poll); poll `GET /log?tid=<tid>&lines=<n>` instead for that. Empty object when nothing has failed yet. |
 | `recent_events` | array | Newest last, **capped at 50**. Each entry has `ts` (float, Unix seconds, on the *container's* clock) and `type` (the bitbake event name), plus whatever that event carried — `recipe`, `task`. `done`/`total` are deliberately not repeated per event. |
+
+`GET /log?tid=<tid>&lines=<n>` serves `{"tid": <tid>, "lines": [...]}`, a
+bounded tail of the log file already named in `log_path[tid]` — never any
+other path, and never a path built from the request itself. `tid` must be a
+key already present in `log_path`; anything else (unknown, stale, or simply
+made up) is `404`, same as any other unknown resource. `lines` defaults to,
+and is capped at, `MAX_LOG_REQUEST_LINES` (1000); the file itself is read in
+at most `LOG_REQUEST_READ_BYTES` (256 KiB) from its end, so a single huge log
+cannot turn one request into an unbounded response. This is a plain
+on-demand request, not part of the polled `/` payload — a consumer wanting a
+running task's live tail polls this endpoint directly rather than finding it
+in `log_tail`, which only ever holds failed tasks' captured snapshots.
 
 Event `type` values currently produced: `ParseStarted`, `ParseProgress`,
 `runQueueTaskStarted`, `sceneQueueTaskStarted`, `runQueueTaskCompleted`,
