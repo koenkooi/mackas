@@ -111,9 +111,13 @@ class BridgeTestCase(unittest.TestCase):
         })
         # The sub-task progress pidmaps are module globals too, and a pid
         # left over from a previous test would attribute the next test's
-        # TaskProgress to the wrong recipe.
+        # TaskProgress to the wrong recipe. `_task_meta`/`_active_pids`
+        # (issue #144) are the same kind of leftover-pid risk: left
+        # uncleared, a prior test's `active` count bleeds into the next.
         bridge._task_pids.clear()
         bridge._task_reports.clear()
+        bridge._task_meta.clear()
+        bridge._active_pids.clear()
 
 
 class TargetsTest(BridgeTestCase):
@@ -412,6 +416,136 @@ class TaskProgressTest(BridgeTestCase):
         bridge._observe(_event("TaskProgress"))
         bridge._observe(_event("TaskSucceeded"))
         self.assertEqual(bridge._state["task_progress"], [])
+
+
+class RunningTasksTest(BridgeTestCase):
+    """`running` (issue #144): every tracked task, not only the ones that
+    report a percentage -- the gap `task_progress` alone cannot close."""
+
+    @staticmethod
+    def _started(pid, taskfile, taskname, pn=None, pv=None, mc=None):
+        kwargs = {"pid": pid, "taskfile": taskfile, "taskname": taskname}
+        if pn is not None:
+            kwargs["pn"] = pn
+        if pv is not None:
+            kwargs["pv"] = pv
+        if mc is not None:
+            kwargs["_mc"] = mc
+        return _event("TaskStarted", **kwargs)
+
+    def test_a_task_that_never_reports_is_still_in_running(self):
+        # The entire point of this field: task_progress would have nothing
+        # to say about this one at all.
+        bridge._observe(self._started(1, "/l/plainmake_1.0.bb", "do_configure",
+                                       pn="plainmake", pv="1.0"))
+        self.assertEqual(bridge._state["task_progress"], [])
+        self.assertEqual(len(bridge._state["running"]), 1)
+        entry = bridge._state["running"][0]
+        self.assertEqual(entry["recipe"], "plainmake_1.0.bb")
+        self.assertEqual(entry["task"], "do_configure")
+
+    def test_tid_pn_pv_mc_come_from_the_started_event(self):
+        bridge._observe(self._started(2, "/l/meta/recipes/zlib_1.3.bb", "do_compile",
+                                       pn="zlib", pv="1.3", mc=""))
+        entry = bridge._state["running"][0]
+        self.assertEqual(entry["tid"], "/l/meta/recipes/zlib_1.3.bb:do_compile")
+        self.assertEqual(entry["pn"], "zlib")
+        self.assertEqual(entry["pv"], "1.3")
+        self.assertEqual(entry["mc"], "")
+
+    def test_mc_defaults_to_empty_string_not_missing_or_null(self):
+        # bb.build.TaskBase carries no public `mc` attribute at all on a
+        # default-multiconfig build -- `_mc` itself can be absent.
+        bridge._observe(self._started(3, "/l/a_1.0.bb", "do_compile", pn="a", pv="1.0"))
+        self.assertEqual(bridge._state["running"][0]["mc"], "")
+
+    def test_a_non_default_multiconfig_tid_carries_the_mc_prefix(self):
+        bridge._observe(self._started(4, "/l/a_1.0.bb", "do_compile",
+                                       pn="a", pv="1.0", mc="qemux86"))
+        entry = bridge._state["running"][0]
+        self.assertEqual(entry["mc"], "qemux86")
+        self.assertEqual(entry["tid"], "mc:qemux86:/l/a_1.0.bb:do_compile")
+
+    def test_percent_and_rate_are_absent_not_null_until_reported(self):
+        bridge._observe(self._started(5, "/l/a_1.0.bb", "do_compile", pn="a", pv="1.0"))
+        entry = bridge._state["running"][0]
+        self.assertNotIn("percent", entry)
+        self.assertNotIn("rate", entry)
+
+    def test_percent_and_rate_appear_once_the_task_reports(self):
+        bridge._observe(self._started(6, "/l/a_1.0.bb", "do_fetch", pn="a", pv="1.0"))
+        bridge._observe(_event("TaskProgress", pid=6, progress=30, rate="1.2M/s"))
+        entry = bridge._state["running"][0]
+        self.assertEqual(entry["percent"], 30)
+        self.assertEqual(entry["rate"], "1.2M/s")
+
+    def test_a_busy_report_with_no_percent_still_omits_the_key(self):
+        # Negative progress ("busy, amount unknown") must not become a
+        # fabricated percent -- same convention task_progress already uses.
+        bridge._observe(self._started(7, "/l/a_1.0.bb", "do_fetch", pn="a", pv="1.0"))
+        bridge._observe(_event("TaskProgress", pid=7, progress=-1, rate="counting"))
+        entry = bridge._state["running"][0]
+        self.assertNotIn("percent", entry)
+        self.assertEqual(entry["rate"], "counting")
+
+    def test_entries_are_removed_on_task_succeeded(self):
+        bridge._observe(self._started(8, "/l/a_1.0.bb", "do_compile", pn="a", pv="1.0"))
+        self.assertEqual(len(bridge._state["running"]), 1)
+        bridge._observe(_event("TaskSucceeded", pid=8, taskfile="/l/a_1.0.bb",
+                                taskname="do_compile"))
+        self.assertEqual(bridge._state["running"], [])
+
+    def test_entries_are_removed_on_task_failed(self):
+        for ending in ("TaskFailed", "TaskFailedSilent"):
+            bridge._task_pids.clear()
+            bridge._task_meta.clear()
+            bridge._active_pids.clear()
+            bridge._state["running"] = []
+            bridge._observe(self._started(9, "/l/a_1.0.bb", "do_compile", pn="a", pv="1.0"))
+            bridge._observe(_event(ending, pid=9, taskfile="/l/a_1.0.bb",
+                                    taskname="do_compile"))
+            self.assertEqual(bridge._state["running"], [], ending)
+
+    def test_several_tasks_are_all_listed_independently(self):
+        bridge._observe(self._started(10, "/l/a_1.0.bb", "do_compile", pn="a", pv="1.0"))
+        bridge._observe(self._started(11, "/l/b_2.0.bb", "do_fetch", pn="b", pv="2.0"))
+        self.assertEqual(
+            sorted(e["recipe"] for e in bridge._state["running"]),
+            ["a_1.0.bb", "b_2.0.bb"])
+
+    def test_active_counts_every_running_task(self):
+        bridge._observe(self._started(12, "/l/a_1.0.bb", "do_compile", pn="a", pv="1.0"))
+        bridge._observe(self._started(13, "/l/b_2.0.bb", "do_fetch", pn="b", pv="2.0"))
+        self.assertEqual(bridge._state["active"], 2)
+
+    def test_active_is_uncapped_even_once_running_itself_is_capped(self):
+        # The whole reason `active` exists as its own tally rather than
+        # len(running): a build busier than MAX_TASK_PROGRESS must not look
+        # LESS busy than one right at the cap.
+        n = bridge.MAX_TASK_PROGRESS + 10
+        for pid in range(1, n + 1):
+            bridge._observe(self._started(pid, f"/l/p{pid}_1.0.bb", "do_compile",
+                                           pn=f"p{pid}", pv="1.0"))
+        self.assertLessEqual(len(bridge._state["running"]), bridge.MAX_TASK_PROGRESS)
+        self.assertEqual(bridge._state["active"], n)
+        self.assertGreater(bridge._state["active"], len(bridge._state["running"]))
+
+    def test_active_drops_on_task_end_even_past_the_cap(self):
+        n = bridge.MAX_TASK_PROGRESS + 5
+        for pid in range(1, n + 1):
+            bridge._observe(self._started(pid, f"/l/p{pid}_1.0.bb", "do_compile",
+                                           pn=f"p{pid}", pv="1.0"))
+        bridge._observe(_event("TaskSucceeded", pid=1, taskfile="/l/p1_1.0.bb",
+                                taskname="do_compile"))
+        self.assertEqual(bridge._state["active"], n - 1)
+
+    def test_a_started_event_missing_everything_never_raises(self):
+        # No `pid` at all means `getattr(event, "pid", 0)` is 0, which the
+        # existing `pid <= 0` guard in `_track_task` already refuses to
+        # track -- same convention `task_progress` follows for an
+        # unattributed report. Nothing should be added, and nothing raises.
+        bridge._observe(_event("TaskStarted"))
+        self.assertEqual(bridge._state.get("running", []), [])
 
 
 class TaskElapsedTest(BridgeTestCase):
