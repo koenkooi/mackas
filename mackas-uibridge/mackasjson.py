@@ -144,6 +144,14 @@ _state = {
     # Progress INSIDE a still-running task, for the tasks that report any --
     # see _observe_task_progress and _publish_task_progress.
     "task_progress": [],
+    # EVERY tracked task, reporting or not -- see _publish_task_progress.
+    # "percent"/"rate" are present per-entry only when that task has reported
+    # one, which is why this is rebuilt by hand rather than json.dumps'd
+    # straight off a dict that always carries both keys.
+    "running": [],
+    # The true, uncapped number of running tasks -- distinct from len(running)
+    # once MAX_TASK_PROGRESS caps the list itself. See _active_pids.
+    "active": 0,
     "recent_events": [],
     # Bumped each time the HTTP server thread itself dies and gets restarted
     # (see _serve_forever_resilient) -- normally 0 for the whole build. A
@@ -198,6 +206,18 @@ _task_pids = {}
 # recipes are all plain make-based keeps this empty rather than listing every
 # running task with nothing to say about it.
 _task_reports = {}
+# pid -> {"tid": str|None, "pn": str|None, "pv": str|None, "mc": str}, the
+# extra TaskStarted attributes `running[]` needs that `_task_pids` does not
+# carry (kept separate so `_task_pids`' own tuple shape -- read directly by
+# existing callers -- never has to change). Evicted in lockstep with
+# `_task_pids`, so a pid never appears in one without the other.
+_task_meta = {}
+# The SAME pids as `_task_pids`, but never evicted -- `_task_pids` is capped
+# at MAX_TASK_PROGRESS so `running[]` cannot grow without bound, but `active`
+# must stay the true count regardless, so a consumer can tell when `running`
+# was truncated. A set rather than a counter: idempotent add/discard can
+# never drift the way a hand-kept +1/-1 tally could.
+_active_pids = set()
 
 
 def _evict_oldest(mapping, cap):
@@ -211,13 +231,15 @@ def _evict_oldest(mapping, cap):
 
 
 def _publish_task_progress():
-    """Rebuild the served list from the two maps. Caller holds _lock.
+    """Rebuild the served lists from the tracking maps. Caller holds _lock.
 
     Rebuilt wholesale rather than patched incrementally so the served value
-    can never outlive the tasks it describes: an entry is present exactly
-    while its pid is both running and reporting. Also re-run on every GET, so
-    `elapsed` is measured against the clock at serve time rather than frozen
-    at whenever the task last had a percentage to report."""
+    can never outlive the tasks it describes: a task_progress entry is
+    present exactly while its pid is both running and reporting, and a
+    running entry exactly while its pid is tracked at all. Also re-run on
+    every GET, so `elapsed` is measured against the clock at serve time
+    rather than frozen at whenever the task last had a percentage to
+    report."""
     now = time.time()
     out = []
     for pid, report in _task_reports.items():
@@ -234,25 +256,64 @@ def _publish_task_progress():
         })
     _state["task_progress"] = out
 
+    # Every tracked task, reporting or not -- the entire point of `running`
+    # over `task_progress`. `percent`/`rate` are added only when that pid has
+    # actually reported one (checked individually: a report whose own
+    # progress was negative, bitbake's "busy, amount unknown", still counts
+    # as reporting for `rate` even though it carries no usable `percent`),
+    # so an un-instrumented `do_configure` serves with neither key rather
+    # than a misleading `null`.
+    running = []
+    for pid, (recipe, task, started) in _task_pids.items():
+        meta = _task_meta.get(pid) or {}
+        entry = {
+            "tid": meta.get("tid"),
+            "pn": meta.get("pn"),
+            "pv": meta.get("pv"),
+            "mc": meta.get("mc", ""),
+            "recipe": recipe,
+            "task": task,
+            "started": started,
+        }
+        report = _task_reports.get(pid)
+        if report is not None:
+            if report["percent"] is not None:
+                entry["percent"] = report["percent"]
+            if report["rate"] is not None:
+                entry["rate"] = report["rate"]
+        running.append(entry)
+    _state["running"] = running
+    # Uncapped on purpose -- see _active_pids' own comment.
+    _state["active"] = len(_active_pids)
 
-def _track_task(pid, recipe, task):
+
+def _track_task(pid, recipe, task, tid=None, pn=None, pv=None, mc=""):
     if not pid or pid <= 0:
         return
     with _lock:
+        # Uncapped: added before the capped map below ever evicts anything,
+        # so the true count is never short even on a build with more
+        # concurrent tasks than MAX_TASK_PROGRESS.
+        _active_pids.add(pid)
         if pid not in _task_pids:
             _evict_oldest(_task_pids, MAX_TASK_PROGRESS)
+            _evict_oldest(_task_meta, MAX_TASK_PROGRESS)
         # Unconditional, so a reused pid starts its clock over rather than
         # inheriting the age of whatever task held it before.
         _task_pids[pid] = (recipe, task, time.time())
+        _task_meta[pid] = {"tid": tid, "pn": pn, "pv": pv, "mc": mc}
+        _publish_task_progress()
 
 
 def _untrack_task(pid):
     if not pid or pid <= 0:
         return
     with _lock:
+        _active_pids.discard(pid)
         _task_pids.pop(pid, None)
-        if _task_reports.pop(pid, None) is not None:
-            _publish_task_progress()
+        _task_meta.pop(pid, None)
+        _task_reports.pop(pid, None)
+        _publish_task_progress()
 
 
 def _observe_task_progress(pid, progress, rate):
@@ -419,7 +480,11 @@ def _finish(status):
         # window -- see TERMINAL_LINGER_SECONDS.
         _task_pids.clear()
         _task_reports.clear()
+        _task_meta.clear()
+        _active_pids.clear()
         _state["task_progress"] = []
+        _state["running"] = []
+        _state["active"] = 0
 
 
 def _observe(event):
@@ -448,10 +513,32 @@ def _observe(event):
             # fired in the worker, and its pid is what TaskProgress will be
             # keyed by. TaskBase carries taskfile/taskname, so the recipe
             # basename convention is the same one `current` uses.
+            #
+            # `mc` is TaskBase's PRIVATE `_mc` (bb/build.py sets
+            # self._mc = d.getVar("BB_CURRENT_MC"); there is no public `mc`
+            # attribute, and no property either) -- "" for the default
+            # multiconfig, same as BB_CURRENT_MC itself. `pn`/`pv` are public.
+            # `tid` is built the same way bitbake's own runqueue.build_tid()
+            # does (mc:<mc>:<fn>:<task> when mc, else <fn>:<task>), from the
+            # FULL taskfile path, not its basename -- that is what makes it
+            # disambiguate `zlib` from `zlib-native`, which `recipe` cannot.
+            # A `virtual:native:` prefix is already part of that taskfile
+            # path when bitbake assigns one; nothing extra to add for it here.
+            taskfile = getattr(event, "taskfile", "") or ""
+            taskname = getattr(event, "taskname", None)
+            mc = getattr(event, "_mc", None) or ""
+            tid = None
+            if taskfile and taskname:
+                tid = (("mc:" + mc + ":" + taskfile + ":" + taskname) if mc
+                       else (taskfile + ":" + taskname))
             _track_task(
                 getattr(event, "pid", 0),
-                os.path.basename(getattr(event, "taskfile", "") or "") or None,
-                getattr(event, "taskname", None),
+                os.path.basename(taskfile) or None,
+                taskname,
+                tid=tid,
+                pn=getattr(event, "pn", None),
+                pv=getattr(event, "pv", None),
+                mc=mc,
             )
         elif name in ("TaskSucceeded", "TaskFailed", "TaskFailedSilent"):
             _untrack_task(getattr(event, "pid", 0))
