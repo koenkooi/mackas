@@ -27,6 +27,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -120,6 +121,9 @@ class BridgeTestCase(unittest.TestCase):
         bridge._active_pids.clear()
         # Per-recipe history (issue #146) is module-global too.
         bridge._recipe_tasks.clear()
+        # Log paths and failure tails (issue #147).
+        bridge._log_paths.clear()
+        bridge._log_tails.clear()
 
 
 class TargetsTest(BridgeTestCase):
@@ -1238,6 +1242,137 @@ class RecipesEndpointTest(BridgeTestCase):
     def test_other_paths_still_404(self):
         self.assertEqual(self.fixture.get("/recipes/busybox")[0], 404)
         self.assertEqual(self.fixture.get("/nope")[0], 404)
+
+
+
+class LogPathTest(BridgeTestCase):
+    """log_path and the failure-time log_tail (issue #147)."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+
+    def _log(self, name, lines):
+        path = os.path.join(self.dir, name)
+        with open(path, "w") as f:
+            f.write("".join(f"{l}\n" for l in lines))
+        return path
+
+    def _start(self, pid, logfile, taskfile="/l/busybox_1.36.0.bb", task="do_compile", mc=None):
+        attrs = dict(pid=pid, taskfile=taskfile, taskname=task, logfile=logfile,
+                     pn="busybox", pv="1.36.0")
+        if mc is not None:
+            attrs["_mc"] = mc
+        bridge._observe(_event("TaskStarted", **attrs))
+
+    def test_a_running_task_reports_its_log_path(self):
+        self._start(301, "/build/tmp/work/x/busybox/1.36.0/temp/log.do_compile.301")
+        self.assertEqual(bridge._state["log_path"],
+                         {"/l/busybox_1.36.0.bb:do_compile": "/build/tmp/work/x/busybox/1.36.0/temp/log.do_compile.301"})
+
+    def test_a_multiconfig_task_uses_the_mc_tid(self):
+        self._start(302, "/b/log.do_compile.302", mc="arm")
+        self.assertEqual(list(bridge._state["log_path"]), ["mc:arm:/l/busybox_1.36.0.bb:do_compile"])
+
+    def test_a_succeeded_task_drops_its_log_path(self):
+        self._start(303, "/b/log.do_compile.303")
+        bridge._observe(_event("TaskSucceeded", pid=303, taskfile="/l/busybox_1.36.0.bb", taskname="do_compile"))
+        self.assertEqual(bridge._state["log_path"], {})
+        self.assertEqual(bridge._state["log_tail"], {})
+
+    def test_a_failed_task_keeps_its_path_and_a_bounded_tail(self):
+        log = self._log("log.do_compile.304", [f"line {i}" for i in range(500)])
+        self._start(304, log)
+        bridge._observe(_event("TaskFailed", pid=304, taskfile="/l/busybox_1.36.0.bb",
+                               taskname="do_compile", logfile=log))
+        tid = "/l/busybox_1.36.0.bb:do_compile"
+        self.assertEqual(bridge._state["log_path"], {tid: log})
+        tail = bridge._state["log_tail"][tid]
+        self.assertEqual(len(tail), bridge.MAX_LOG_TAIL_LINES)
+        self.assertEqual(tail[-1], "line 499")
+        self.assertEqual(tail[0], f"line {500 - bridge.MAX_LOG_TAIL_LINES}")
+
+    def test_a_failure_with_an_unreadable_log_keeps_the_path_without_a_tail(self):
+        missing = os.path.join(self.dir, "gone")
+        self._start(305, missing)
+        bridge._observe(_event("TaskFailed", pid=305, taskfile="/l/busybox_1.36.0.bb",
+                               taskname="do_compile", logfile=missing))
+        self.assertEqual(list(bridge._state["log_path"].values()), [missing])
+        self.assertEqual(bridge._state.get("log_tail", {}), {})
+
+    def test_log_paths_are_capped(self):
+        for pid in range(400, 400 + bridge.MAX_LOG_PATHS + 5):
+            self._start(pid, f"/b/log.{pid}", taskfile=f"/l/r{pid}_1.0.bb")
+        self.assertLessEqual(len(bridge._log_paths), bridge.MAX_LOG_PATHS)
+
+
+class TailLinesTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+
+    def _file(self, text):
+        path = os.path.join(self.dir, "log")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_returns_the_last_lines(self):
+        path = self._file("".join(f"{i}\n" for i in range(10)))
+        self.assertEqual(bridge._tail_lines(path, 3, 1024), ["7", "8", "9"])
+
+    def test_a_bounded_read_drops_the_partial_first_line(self):
+        path = self._file("aaaaaaaaaa\nbbb\nccc\n")
+        # 8 bytes from the end is "bbb\nccc\n" minus its first byte: "bb" is partial.
+        self.assertEqual(bridge._tail_lines(path, 10, 7), ["ccc"])
+
+    def test_a_missing_file_is_none_not_an_error(self):
+        self.assertIsNone(bridge._tail_lines(os.path.join(self.dir, "nope"), 10, 1024))
+
+
+class LogEndpointTest(BridgeTestCase):
+    """GET /log over real HTTP (issue #147)."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
+        self.log = os.path.join(self.dir, "log.do_compile.501")
+        with open(self.log, "w") as f:
+            f.write("".join(f"line {i}\n" for i in range(2000)))
+        bridge._observe(_event("TaskStarted", pid=501, taskfile="/l/busybox_1.36.0.bb",
+                               taskname="do_compile", logfile=self.log, pn="busybox", pv="1.36.0"))
+        self.tid = "/l/busybox_1.36.0.bb:do_compile"
+        self.fixture = _HandlerFixture()
+        self.addCleanup(self.fixture.close)
+
+    def _get(self, query):
+        status, body = self.fixture.get("/log?" + query)
+        return status, (json.loads(body) if body else None)
+
+    def _q(self, **kw):
+        return __import__("urllib.parse").parse.urlencode(kw)
+
+    def test_serves_the_tail_of_a_recorded_log(self):
+        status, payload = self._get(self._q(tid=self.tid, lines=5))
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"tid": self.tid, "lines": [f"line {i}" for i in range(1995, 2000)]})
+
+    def test_line_count_defaults_and_clamps(self):
+        self.assertEqual(len(self._get(self._q(tid=self.tid))[1]["lines"]), bridge.MAX_LOG_TAIL_LINES)
+        self.assertEqual(len(self._get(self._q(tid=self.tid, lines="junk"))[1]["lines"]), bridge.MAX_LOG_TAIL_LINES)
+        self.assertEqual(len(self._get(self._q(tid=self.tid, lines=0))[1]["lines"]), 1)
+        self.assertEqual(len(self._get(self._q(tid=self.tid, lines=99999))[1]["lines"]), bridge.MAX_LOG_REQUEST_LINES)
+
+    def test_an_unrecorded_tid_is_a_404(self):
+        self.assertEqual(self._get(self._q(tid="/l/other_1.0.bb:do_compile"))[0], 404)
+        self.assertEqual(self.fixture.get("/log")[0], 404)
+
+    def test_a_path_is_never_read_directly(self):
+        # tid is only ever a key: a real file's path must not be served.
+        self.assertEqual(self._get(self._q(tid=self.log))[0], 404)
+        self.assertEqual(self._get(self._q(tid="/etc/passwd"))[0], 404)
 
 
 class TerminalStatusLingerTest(BridgeTestCase):
