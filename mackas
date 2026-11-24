@@ -2654,6 +2654,92 @@ validate_nfs_mirror_paths() {
 # Small utilities
 # ---------------------------------------------------------------------------
 
+# _pick_monitor_port -- when MACKAS_MONITOR=1, replace MACKAS_MONITOR_PORT
+# with the first free port at or above it, so a second concurrent build's
+# bridge does not collide with the first's (#142). A no-op otherwise.
+#
+# "Free" means both: no RUNNING container already publishes it (the same
+# container ls/inspect walk volume_in_use()/restart_container_daemon() already
+# use -- see inspect_holds_volume for the matching style) and nothing on the
+# host is already listening on it (a plain bash /dev/tcp probe; a refused
+# connect means free, a successful one means busy -- no external `nc`/
+# `timeout` dependency needed, and a loopback attempt resolves immediately
+# either way so there is nothing to time out).
+#
+# MUST be called directly, never via $(...): it reassigns MACKAS_MONITOR_PORT
+# in the CALLER's own scope, and a command-substitution subshell would throw
+# that reassignment away the moment it exits -- exactly the bug this function
+# exists to avoid. Both real call sites (run_kas(), cmd_runtime_args()) call
+# kas_runtime_args() via $(...) themselves; this must run BEFORE that, as a
+# bare statement, so the chosen port is already in MACKAS_MONITOR_PORT by the
+# time kas_runtime_args() reads it, and so a caller's own later "publishing
+# 127.0.0.1:$MACKAS_MONITOR_PORT" announcement sees the same value.
+#
+# An EXPLICIT pin -- MACKAS_MONITOR_PORT set to anything other than this
+# script's own hardcoded default (8801, set_defaults()) -- is refused outright
+# when taken, never silently moved. The one case this cannot tell apart from
+# "the user's own config happens to already read 8801" is treated as the
+# default (free to roam); that is a known, accepted limitation, not an
+# oversight -- there is no cheap way to ask "did a human type this number on
+# purpose" once config/env/--set have already collapsed to one value.
+_pick_monitor_port() {
+	[ "$MACKAS_MONITOR" = "1" ] || return 0
+
+	local pinned=1 port="$MACKAS_MONITOR_PORT" tries=0
+	[ "$MACKAS_MONITOR_PORT" = "8801" ] && pinned=0
+
+	while [ "$tries" -lt 50 ]; do
+		if ! _port_published_by_running_container "$port" && ! _port_is_listening "$port"; then
+			MACKAS_MONITOR_PORT="$port"
+			return 0
+		fi
+		if [ "$pinned" -eq 1 ]; then
+			die "MACKAS_MONITOR_PORT=$MACKAS_MONITOR_PORT is already in use" \
+				"pick a different port, or unset it to let mackas choose one automatically"
+		fi
+		port=$((port + 1))
+		tries=$((tries + 1))
+	done
+	die "could not find a free port for the monitor bridge within 50 of $MACKAS_MONITOR_PORT" \
+		"free one up, or set MACKAS_MONITOR_PORT to a less busy range"
+}
+
+# _port_published_by_running_container PORT -- true if any RUNNING container
+# already publishes host port PORT. Same container ls/inspect walk as
+# inspect_holds_volume()'s callers; matches "hostPort" the way that function
+# matches a volume "name".
+#
+# Fails CLOSED like volume_in_use()'s own container ls/inspect walk: a query
+# that cannot be answered is treated as "yes, published" (busy), never as
+# "free" -- the one wrong direction here is picking a port something else
+# already holds, which a false "busy" never risks and a false "free" always
+# does.
+_port_published_by_running_container() {
+	local port="$1" listing ids id detail
+	listing="$(container ls 2>/dev/null)" || return 0
+	ids="$(printf '%s\n' "$listing" | awk 'NR>1 && NF {print $1}')"
+	for id in $ids; do
+		[ -n "$id" ] || continue
+		detail="$(container inspect "$id" 2>/dev/null)" || return 0
+		if printf '%s\n' "$detail" | grep -qE "\"hostPort\"[[:space:]]*:[[:space:]]*$port([^0-9]|\$)"; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# _port_is_listening PORT -- true if something on the host (not necessarily
+# one of our own containers) already answers on 127.0.0.1:PORT. Verified live
+# against Apple's own /bin/bash 3.2: a refused connect (nothing listening)
+# and a successful one (something is) are both immediate, so no timeout
+# wrapper is needed -- and macOS ships no GNU `timeout` to wrap it with anyway.
+_port_is_listening() {
+	local port="$1"
+	(exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null || return 1
+	exec 3<&- 3>&- 2>/dev/null
+	return 0
+}
+
 # monitor_runtime_args -- the extra --runtime-args tokens that activate the
 # bitbake progress bridge (TODO.md item 22) when MACKAS_MONITOR=1. Prints
 # nothing (best-effort, never fatal -- MACKAS_MONITOR is opt-in extra
@@ -2702,9 +2788,23 @@ monitor_runtime_args() {
 	# unrelated. Two single-file mounts from the same host directory (as
 	# used here) coexist fine; a directory mount plus a file-inside-it mount
 	# does not.
-	printf ' -v %s/mackasjson.py:/mackas-uibridge/mackasjson.py:ro -v %s/bitbake:/work/%s:ro -p %s:%s -e MACKAS_MONITOR_PORT=%s' \
+	# PROJECT_SELECTED is empty for the unpinned oe-build-* setup -- passed
+	# through as-is (an empty -e MACKAS_PROJECT= is still a real, present
+	# variable inside the container, read as "" rather than unset; see
+	# mackas-uibridge/mackasjson.py's own handling of it). The two labels
+	# (#142) are what lets `mackas status`/`mackas monitor` with no selector
+	# find every running bridge container from `container ls`/`inspect`
+	# alone, without depending on a state file that could go stale across a
+	# crash -- verified live that `container run --label` surfaces under
+	# `container inspect`'s "configuration.labels". Labels and the project
+	# name must stay space-free like every other --runtime-args token (see
+	# this function's own kas_runtime_args() comment on word-splitting);
+	# project names already cannot contain one (they feed volume names,
+	# which refuse a space the same way).
+	printf ' -v %s/mackasjson.py:/mackas-uibridge/mackasjson.py:ro -v %s/bitbake:/work/%s:ro -p %s:%s -e MACKAS_MONITOR_PORT=%s -e MACKAS_PROJECT=%s -l mackas.monitor.bridge=1 -l mackas.monitor.project=%s' \
 		"$SCRIPT_DIR/mackas-uibridge" "$SCRIPT_DIR/mackas-uibridge" "$rel" \
-		"$MACKAS_MONITOR_PORT" "$MACKAS_MONITOR_PORT" "$MACKAS_MONITOR_PORT"
+		"$MACKAS_MONITOR_PORT" "$MACKAS_MONITOR_PORT" "$MACKAS_MONITOR_PORT" \
+		"$PROJECT_SELECTED" "$PROJECT_SELECTED"
 }
 
 # The one string that makes the whole tool work. See README's "The ext4
@@ -7555,6 +7655,11 @@ run_kas() {
 	ensure_workspace_attached
 	ensure_container_running
 
+	# Bare statement, not $(...) -- see _pick_monitor_port()'s own comment for
+	# why: it must mutate MACKAS_MONITOR_PORT in THIS shell, not a subshell,
+	# so both kas_runtime_args() below and this function's own announcement
+	# further down see whichever port was actually chosen (#142).
+	_pick_monitor_port
 	rt_args="$(kas_runtime_args)"
 	# A GITCONFIG_FILE already in this shell's environment always wins; see
 	# setup_gitconfig() for why this exists and why we never override one the
@@ -11568,6 +11673,10 @@ cmd_runtime_args() {
 		require_volumes_free "kas-container ..."
 	fi
 
+	# Bare statement, not $(...), and BEFORE kas_runtime_args() -- see
+	# _pick_monitor_port()'s own comment (#142). Produces no stdout itself, so
+	# it cannot disturb this command's fixed-line output contract.
+	_pick_monitor_port
 	printf '%s\n' "$(kas_runtime_args)"
 
 	# --emit-dirs: two more lines, always in this order, so the wrapper's

@@ -122,6 +122,7 @@ this document.
 ```json
 {
   "status": "building",
+  "project": "meta-ai",
   "targets": ["core-image-base", "console-base-image"],
   "machine": "beaglebone",
   "distro": "angstrom",
@@ -164,6 +165,7 @@ this document.
 | Field | Type | Meaning, and what it is allowed to do |
 |---|---|---|
 | `status` | string | One of **`idle`**, **`building`**, **`success`**, **`failed`**. Starts `idle`; becomes `building` on the first `ParseStarted`/`*TaskStarted`; becomes `success`/`failed` from bitbake's own exit code once `knotty.main()` returns, or `failed` if it raised. Within one container's life it only ever moves forward, and never leaves `success`/`failed`. Once it reaches a terminal value the bridge keeps serving it for a little while rather than shutting down immediately — see ["the end-of-build race"](#the-end-of-build-race-which-watch-mode-makes-impossible-to-ignore) below. |
+| `project` | string | Which pinned project this build is for (#142), from the container's own `MACKAS_PROJECT` env var -- mackas always passes this flag, so the field is always present, never omitted. Empty string for the unpinned `oe-build-*` setup, never `null`. This is also how `mackas monitor`/`mackas status` tell two concurrent builds apart when discovering bridge containers at the runtime level (`container inspect`'s labels), rather than reading it back out of this JSON. |
 | `targets` | array of string | What the build was asked to produce, from bitbake's own parsed command line (`params.options.pkgs_to_build`). Populated **before the build starts**, so it is the one useful thing to show at the `building` edge, when no task is running yet. Empty when bitbake was given no explicit target (it then builds whatever the kas config names) — treat empty as "unknown", not as "nothing". |
 | `machine` | string \| null | `MACHINE`, read from the cooker via `server.runCommand(["getVariable", …])` on the **first event-loop call after `bb.ui.knotty.main()` has started** — deliberately not at UI startup, since a pre-knotty round-trip was traced to a real build-killing crash (see [architecture.md](architecture.md#live-build-progress-the-monitor-bridge)). `null` until that first call; it lands at essentially the same instant `status` first becomes `"building"`, so a `"building"` payload with `machine: null` is possible only for a sub-millisecond window, never for a whole poll interval. On a **multiconfig** build this is only the default `MACHINE`; per-multiconfig builds legitimately have several, so treat it as a label rather than a complete description of what was built. |
 | `distro` | string \| null | `DISTRO`, same source, same timing, same caveats. |
