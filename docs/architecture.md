@@ -430,7 +430,14 @@ the server down, so a poller has a real chance to observe the outcome rather
 than only ever seeing `building` followed by the port disappearing.
 
 `monitor_runtime_args()` (in `mackas`) assembles the mounts and the `-p`
-publish when `MACKAS_MONITOR=1`, appending them to `--runtime-args`. It is
+publish when `MACKAS_MONITOR=1`, appending them to `--runtime-args`.
+`_pick_monitor_port()` (#142) runs first and may move `MACKAS_MONITOR_PORT`
+off its configured value if that port is already taken by another running
+build -- the container also carries two discovery labels (project name,
+and a plain marker) so `mackas monitor`/`mackas status` can find every
+running bridge from `container ls`/`inspect` alone; see
+[monitor-app.md](monitor-app.md#concurrent-builds-across-projects-142) for
+the full contract. It is
 best-effort and never fatal — an opt-in extra, not something a build should
 fail over — so it skips when the work directory or the checkout does not
 exist yet, or when a path involved contains a space (which would corrupt the

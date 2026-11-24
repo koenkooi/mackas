@@ -400,6 +400,15 @@ What follows for a long-running app:
 
 ### The same gap, from the CLI side: multi-build batches
 
+**Not the same thing as concurrent projects (#142, below).** This section is
+about ONE port, SEQUENTIAL containers over time, with gaps between them --
+`--watch` (still unbuilt) is what closes it. #142's port auto-selection does
+mean a sequential batch no longer *needs* the previous container to have
+fully released the port first (a second container would simply get the next
+free one instead of failing to publish), but that is a side effect, not a fix
+for the actual problem here: `tools/mackas-monitor` still only ever follows
+one build before exiting.
+
 **It is not only smoketest.** The same shape turns up with no smoketest in
 sight: a hand-typed batch of N machines, one `kas-container build <machine
 files>` per machine, run in sequence with `MACKAS_MONITOR=1` exported. Per
@@ -493,6 +502,63 @@ title is a three-line change if a batch ever wants its own name, but it is a
 it does not belong in the reconnect work. Correlating builds across
 reconnects into a *history* — the app's problem, not the CLI's — can now lean
 on `buildname` for that identity instead of a heuristic inferred client-side.
+
+## Concurrent builds across projects (#142)
+
+With private per-project volumes (#72), two projects can build at the same
+time. This is the orthogonal problem to the one above: not one project's
+builds spread out over an evening, but several projects' builds running
+*right now*, each with its own bridge container.
+
+**Port auto-selection.** `MACKAS_MONITOR_PORT` is a starting point, not a
+fixed port any more. `mackas` walks upward from it to the first port neither
+a running container nor the host itself already holds, and refuses outright
+(never silently moves) only when a port OTHER than the 8801 default was
+explicitly set and is taken -- see `_pick_monitor_port()`'s own comment in
+`mackas` for the exact rule and its one known blind spot (a config that
+happens to already read 8801 is indistinguishable from "nobody set it").
+
+**Discovery from the runtime, not a state file.** Every bridge container
+carries two labels, `mackas.monitor.bridge=1` and
+`mackas.monitor.project=<name>` (empty for the unpinned `oe-build-*` setup),
+verified live to surface under `container inspect`'s
+`configuration.labels`. `mackas monitor`/`mackas status` read these straight
+from `container ls`/`inspect`, so a crashed build's bridge is simply gone
+from the listing -- nothing to go stale, nothing to clean up by hand.
+
+**`mackas monitor` with no `--port`/`--project` follows every running bridge
+at once**, one thread per discovered build, each line prefixed with its
+project name (or `port N` for the unpinned case) so interleaved output stays
+readable. This deliberately only follows builds already running when it
+starts; one that starts afterward needs a fresh invocation, the same way a
+bare `--port` call has only ever watched the one build named at launch.
+
+- `--project NAME` polls the one build pinned to that project, found via
+  discovery rather than a port number.
+- `--port N` still works exactly as before, and deliberately never queries
+  the runtime itself (a plain `--port` poll asking `container ls`/`inspect`
+  on every invocation would be a real, needless cost on the single most
+  common path) -- use `--project` for project-aware titles and `--once`
+  state.
+- `--list` (optionally `--json`) prints the discovered bridges -- project,
+  port, address -- without polling any of them. The JSON shape is an array
+  of `{"project": ..., "port": ..., "address": ...}` objects, `address`
+  `null` when the container's own IP could not be resolved. This is what a
+  consumer that wants to show more than one build (SwiftBar, the native app)
+  should use to find them, rather than re-implementing the `container ls`/
+  `inspect` walk itself.
+- `--notify` titles name the project (`mackas · meta-ai: build
+  started`), and `--once`'s persisted last-status is keyed by project and
+  container id, not port alone -- a second project reusing a port a first,
+  now-finished one used no longer inherits its last-known status.
+- `mackas status` lists every running build's project and port under its own
+  "Running builds" heading, from the same discovery labels.
+
+**Known limitation, deliberate:** two builds starting at the exact same
+instant can still race on port choice (`_pick_monitor_port()`'s own check
+is read-then-act, not atomic) -- the same class of race #72 already accepts
+for its own volume-held check, and not something this issue set out to
+solve.
 
 ## Consider SwiftBar first
 

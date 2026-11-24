@@ -48,6 +48,7 @@ import itertools
 import json
 import os
 import socket
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -580,23 +581,28 @@ BRIDGE_JSON = json.dumps({
 
 
 def inspect_payload(host_port=8801, container_port=8801, ip="192.168.64.76/24",
-                    state="running", proto="tcp"):
+                    state="running", proto="tcp", labels=None):
     """One `container inspect` entry, in the real shape: a LIST of objects,
     publishedPorts under "configuration", the address under "status" and
-    carrying its prefix length."""
+    carrying its prefix length. labels (#142) is omitted by default --
+    every existing caller of this fixture keeps getting an unlabeled entry,
+    exactly as before."""
+    config = {
+        "id": "4aa8f7c0-b73a-4d45-9326-f643a122cd0b",
+        "image": {"reference": "ghcr.io/siemens/kas/kas:5.5"},
+        "publishedPorts": [{
+            "containerPort": container_port,
+            "count": 1,
+            "hostAddress": "0.0.0.0",
+            "hostPort": host_port,
+            "proto": proto,
+        }],
+        "publishedSockets": [],
+    }
+    if labels is not None:
+        config["labels"] = labels
     return json.dumps([{
-        "configuration": {
-            "id": "4aa8f7c0-b73a-4d45-9326-f643a122cd0b",
-            "image": {"reference": "ghcr.io/siemens/kas/kas:5.5"},
-            "publishedPorts": [{
-                "containerPort": container_port,
-                "count": 1,
-                "hostAddress": "0.0.0.0",
-                "hostPort": host_port,
-                "proto": proto,
-            }],
-            "publishedSockets": [],
-        },
+        "configuration": config,
         "id": "4aa8f7c0-b73a-4d45-9326-f643a122cd0b",
         "status": {
             "networks": [{
@@ -719,6 +725,159 @@ class DirectEndpointTest(unittest.TestCase):
         with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
                 mock.patch.object(mon.subprocess, "run", side_effect=boom):
             self.assertIsNone(mon.resolve_direct_endpoint(8801))
+
+
+class DiscoveryTest(unittest.TestCase):
+    """discover_bridges()/_find_bridge_by_project() (#142): finding every
+    running monitor bridge container from the runtime alone, filtered to
+    the ones mackas itself labeled."""
+
+    BRIDGE_LABELS = {"mackas.monitor.bridge": "1", "mackas.monitor.project": "meta-ai"}
+
+    def test_a_labeled_running_bridge_is_discovered(self):
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(
+                                      inspect=inspect_payload(labels=self.BRIDGE_LABELS))):
+            found = mon.discover_bridges()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["project"], "meta-ai")
+        self.assertEqual(found[0]["port"], 8801)
+        self.assertEqual(found[0]["direct"], ("192.168.64.76", 8801))
+
+    def test_an_entry_without_the_bridge_label_is_not_discovered(self):
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(inspect=inspect_payload())):
+            self.assertEqual(mon.discover_bridges(), [])
+
+    def test_an_unrelated_label_present_without_the_bridge_label_is_ignored(self):
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(
+                                      inspect=inspect_payload(labels={"something.else": "1"}))):
+            self.assertEqual(mon.discover_bridges(), [])
+
+    def test_a_labeled_but_stopped_container_is_not_discovered(self):
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(
+                                      inspect=inspect_payload(labels=self.BRIDGE_LABELS,
+                                                               state="stopped"))):
+            self.assertEqual(mon.discover_bridges(), [])
+
+    def test_the_unpinned_default_project_is_an_empty_string_not_missing(self):
+        labels = {"mackas.monitor.bridge": "1", "mackas.monitor.project": ""}
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(inspect=inspect_payload(labels=labels))):
+            found = mon.discover_bridges()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["project"], "")
+
+    def test_missing_container_cli_discovers_nothing(self):
+        with mock.patch.object(mon.shutil, "which", return_value=None):
+            self.assertEqual(mon.discover_bridges(), [])
+
+    def test_find_bridge_by_project_picks_the_matching_one_among_several(self):
+        ls = (
+            "ID    IMAGE  OS  ARCH  STATE    IP  CPUS  MEMORY  STARTED\n"
+            "aaa   img    os  arch  running      1     1 MB    t\n"
+            "bbb   img    os  arch  running      1     1 MB    t\n"
+        )
+
+        def run(argv, **kwargs):
+            if argv[1] == "ls":
+                return _FakeProc(ls.encode(), 0)
+            if argv[1] == "inspect":
+                cid = argv[2]
+                labels = {"mackas.monitor.bridge": "1",
+                          "mackas.monitor.project": "meta-ai" if cid == "aaa" else "meta-angstrom"}
+                port = 8801 if cid == "aaa" else 8802
+                return _FakeProc(inspect_payload(host_port=port, labels=labels).encode(), 0)
+            raise AssertionError("unexpected container call: %r" % (argv,))
+
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run", side_effect=run):
+            found = mon._find_bridge_by_project("meta-angstrom")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["port"], 8802)
+
+    def test_find_bridge_by_project_is_none_when_nothing_matches(self):
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(
+                                      inspect=inspect_payload(labels=self.BRIDGE_LABELS))):
+            self.assertIsNone(mon._find_bridge_by_project("not-this-one"))
+
+
+class OnceStateKeyTest(unittest.TestCase):
+    """_once_state_key() (#142): project+container when known, so a second
+    project reusing a port cannot inherit the first project's last status."""
+
+    def test_falls_back_to_the_bare_port_with_no_discovery_info(self):
+        self.assertEqual(mon._once_state_key(8801), "port:8801")
+
+    def test_uses_project_and_container_id_when_known(self):
+        info = {"project": "meta-ai", "port": 8801, "container_id": "abc123"}
+        self.assertEqual(mon._once_state_key(8801, info), "meta-ai:abc123")
+
+    def test_two_different_projects_on_the_same_port_get_different_keys(self):
+        first = mon._once_state_key(8801, {"project": "meta-ai", "container_id": "aaa"})
+        second = mon._once_state_key(8801, {"project": "meta-angstrom", "container_id": "bbb"})
+        self.assertNotEqual(first, second)
+
+    def test_an_info_dict_with_no_project_falls_back_to_the_port_too(self):
+        # The unpinned oe-build-* case: project is "", which is falsy.
+        info = {"project": "", "port": 8801, "container_id": "aaa"}
+        self.assertEqual(mon._once_state_key(8801, info), "port:8801")
+
+
+class ListCommandTest(unittest.TestCase):
+    """`mackas monitor --list[--json]` (#142): no polling, just discovery."""
+
+    def test_list_with_no_bridges_running_says_so(self):
+        with mock.patch.object(mon.shutil, "which", return_value=None):
+            rc = mon.main(["--list"])
+        self.assertEqual(rc, mon.EXIT_OK)
+
+    def test_list_json_with_no_bridges_is_an_empty_array(self):
+        out = io.StringIO()
+        with mock.patch.object(mon.shutil, "which", return_value=None), \
+                mock.patch.object(sys, "stdout", out):
+            rc = mon.main(["--list", "--json"])
+        self.assertEqual(rc, mon.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue()), [])
+
+    def test_list_json_reports_project_port_and_address(self):
+        labels = {"mackas.monitor.bridge": "1", "mackas.monitor.project": "meta-ai"}
+        out = io.StringIO()
+        with mock.patch.object(mon.shutil, "which", return_value="/usr/bin/container"), \
+                mock.patch.object(mon.subprocess, "run",
+                                  side_effect=fake_container(inspect=inspect_payload(labels=labels))), \
+                mock.patch.object(sys, "stdout", out):
+            rc = mon.main(["--list", "--json"])
+        self.assertEqual(rc, mon.EXIT_OK)
+        rows = json.loads(out.getvalue())
+        self.assertEqual(rows, [{"project": "meta-ai", "port": 8801, "address": "192.168.64.76:8801"}])
+
+    def test_json_without_list_is_an_argument_error(self):
+        with self.assertRaises(SystemExit):
+            mon.main(["--json"])
+
+
+class ProjectSelectorTest(unittest.TestCase):
+    """`mackas monitor --project NAME` (#142): resolves to the matching
+    discovered bridge's port, or fails clearly when there is none."""
+
+    def test_no_matching_project_is_unreachable_not_a_crash(self):
+        with mock.patch.object(mon.shutil, "which", return_value=None):
+            rc = mon.main(["--project", "no-such-project"])
+        self.assertEqual(rc, mon.EXIT_UNREACHABLE)
+
+    def test_port_and_project_are_mutually_exclusive(self):
+        with self.assertRaises(SystemExit):
+            mon.main(["--port", "8801", "--project", "meta-ai"])
 
 
 class PollLoopFallbackTest(unittest.TestCase):
@@ -1030,7 +1189,7 @@ class OnceRenotifyTest(unittest.TestCase):
 
     def test_a_corrupt_state_file_fails_open_to_a_start_not_a_crash(self):
         notify = mock.Mock()
-        path = mon._once_state_path(8801)
+        path = mon._once_state_path(mon._once_state_key(8801))
         with open(path, "w", encoding="utf-8") as f:
             f.write("not json")
         rc, _, _ = self._once(mock.Mock(return_value=_FakeResponse(_state("building"))), notify)
