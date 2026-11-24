@@ -37,6 +37,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -243,6 +244,96 @@ def resolve_direct_endpoint(host_port):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Discovery (#142) -- finding every running monitor bridge container from the
+# runtime alone, the same container ls/inspect walk resolve_direct_endpoint()
+# already does, filtered to the ones mackas itself marked
+# (monitor_runtime_args() in mackas, verified live against container run
+# --label / container inspect's configuration.labels). No state file: a
+# crashed build's bridge container is simply gone from `container ls`, so
+# there is nothing to go stale.
+# ---------------------------------------------------------------------------
+
+BRIDGE_LABEL = "mackas.monitor.bridge"
+PROJECT_LABEL = "mackas.monitor.project"
+
+
+def _bridge_label(entry, key):
+    labels = (entry.get("configuration") or {}).get("labels") or {}
+    return labels.get(key)
+
+
+def _discovered_bridge_from_entry(entry):
+    """One discovered bridge's info from a single `container inspect` entry,
+    or None if this is not a mackas monitor bridge (no BRIDGE_LABEL) or is
+    not currently running. A bridge container publishes exactly one TCP
+    port (monitor_runtime_args()'s own -p PORT:PORT), so the first TCP
+    publication found is THE one, same as _direct_endpoint() assumes for a
+    single already-known port."""
+    if _bridge_label(entry, BRIDGE_LABEL) != "1":
+        return None
+    state = (entry.get("status") or {}).get("state")
+    if state is not None and state != "running":
+        return None
+    config = entry.get("configuration") or {}
+    host_port = container_port = None
+    for pub in config.get("publishedPorts") or []:
+        if pub.get("proto") not in (None, "tcp"):
+            continue
+        host_port = pub.get("hostPort")
+        container_port = pub.get("containerPort")
+        break
+    if host_port is None:
+        return None
+    ip = _ipv4_of(entry)
+    return {
+        "project": _bridge_label(entry, PROJECT_LABEL) or "",
+        "port": host_port,
+        "direct": (ip, container_port) if ip and container_port else None,
+        "container_id": entry.get("id") or config.get("id"),
+    }
+
+
+def discover_bridges():
+    """Every currently-running mackas monitor bridge container: a list of
+    {project, port, direct, container_id} dicts, newest-last is not
+    guaranteed -- callers that care about order sort it themselves (by
+    project, for stable --list output).
+
+    Best-effort throughout, same as resolve_direct_endpoint(): a missing
+    CLI, a down daemon, or a malformed inspect payload all just mean 'found
+    nothing', because there is no state file to fall back to either."""
+    found = []
+    for cid in _running_container_ids():
+        out = _container_cli("inspect", cid)
+        if not out:
+            continue
+        try:
+            entries = json.loads(out)
+        except ValueError:
+            continue
+        if isinstance(entries, dict):
+            entries = [entries]
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            info = _discovered_bridge_from_entry(entry)
+            if info:
+                found.append(info)
+    return found
+
+
+def _find_bridge_by_project(project):
+    """The one discovered bridge for PROJECT, or None if there is no such
+    bridge running right now. The FIRST match wins on more than one (should
+    not happen -- a project's own volumes are private, so two builds of the
+    SAME project colliding is a different, unrelated problem)."""
+    for info in discover_bridges():
+        if info.get("project") == project:
+            return info
+    return None
+
+
 def _underlying_os_error(exc):
     """The OSError a failure actually is, whether urllib wrapped it in a
     URLError or it propagated bare -- both forms are observed in practice
@@ -380,7 +471,16 @@ def new_render_context():
     }
 
 
-def render(state, ctx):
+def render(state, ctx, prefix=None):
+    """prefix (#142): when several builds are being followed at once, each
+    one's lines are tagged with it ('meta-ai: ...') and always scrolled
+    (never overwritten in place) -- the in-place "\\r" redraw below is a
+    single-build-at-a-time trick (one line, one build, nothing else sharing
+    the terminal); interleaving several builds' redraws on top of each
+    other is not a smaller version of that trick, it is a different and far
+    more involved one (per-line cursor positioning), which is NOT what this
+    issue asked for -- "whichever fits with the least structural change".
+    None (the default) is byte-for-byte today's single-build behavior."""
     status = state.get("status", "?")
 
     if ctx["started_at"] is None and status not in ("idle", "?"):
@@ -389,7 +489,8 @@ def render(state, ctx):
     if not ctx["header_printed"] and status != "idle":
         header = describe_targets(state)
         if header:
-            print(f"watching: {header}", flush=True)
+            head_line = f"watching: {header}"
+            print(f"{prefix}: {head_line}" if prefix else head_line, flush=True)
         ctx["header_printed"] = True
 
     if status == "idle":
@@ -429,7 +530,14 @@ def render(state, ctx):
             line += f"  (bridge restarted {restarts}x)"
 
     changed = line != ctx["last_line"]
-    if ctx["is_tty"]:
+    if prefix is not None:
+        # Multi-build mode: one new line per change, always, prefixed with
+        # which build it is from -- several builds sharing one "\r" redraw
+        # would stomp on each other, so this scrolls instead, same as a
+        # non-TTY single build already does below.
+        if changed:
+            print(f"{prefix}: {line}", flush=True)
+    elif ctx["is_tty"]:
         # Overwrite the previous line in place instead of scrolling -- a
         # ~2s poll over a 90-minute build would otherwise print roughly
         # 2700 near-identical lines. Only committed to a real newline (so
@@ -614,38 +722,64 @@ def describe_failed(state):
     return SEP.join([p for p in (failures, where) if p])
 
 
-def transition_message(prev_status, state):
+def _notify_prefix(project):
+    """'mackas' alone, or 'mackas · meta-ai' when a project is known
+    (#142) -- titles name the project exactly the way the issue's own
+    example does, so two concurrent builds' notifications are told apart at
+    a glance in Notification Center, not just in the terminal."""
+    return f"mackas{SEP}{project}" if project else "mackas"
+
+
+def transition_message(prev_status, state, project=""):
     """(title, message) for the one notification this poll warrants, or None.
 
     Only a CHANGE of status notifies, which is what keeps a build's many
     'building' polls to a single 'started'. prev_status is None before the
     first poll, so attaching to a build already in progress still announces
-    it once -- a monitor started late should say what it found."""
+    it once -- a monitor started late should say what it found.
+
+    PROJECT, when known, is folded into the title (#142) rather than the
+    message, so it survives however the OS truncates/collapses the body."""
     status = state.get("status") or "?"
+    prefix = _notify_prefix(project)
     if status == prev_status:
         return None
     if status == "building" and prev_status in (None, "idle"):
-        return ("mackas: build started", describe_targets(state))
+        return (f"{prefix}: build started", describe_targets(state))
     if status == "success":
-        return ("mackas: build succeeded", describe_success(state))
+        return (f"{prefix}: build succeeded", describe_success(state))
     if status == "failed":
-        return ("mackas: build failed", describe_failed(state))
+        return (f"{prefix}: build failed", describe_failed(state))
     return None
 
 
-def _once_state_path(port):
-    """Where --once persists this port's last-seen status between its own,
+def _once_state_key(port, info=None):
+    """The identity --once's persisted status is keyed by (#142): project and
+    container id when discovery found them, falling back to the bare port
+    when it could not (no `container` CLI, discovery not attempted for an
+    explicit --port with no matching running bridge). Project+container
+    rather than port alone is the actual fix here -- a second project
+    reusing a port a first, now-finished one used would otherwise load and
+    report THAT project's last status as its own on its very first poll."""
+    if info and info.get("project"):
+        return f"{info['project']}:{info.get('container_id') or port}"
+    return f"port:{port}"
+
+
+def _once_state_path(key):
+    """Where --once persists KEY's last-seen status between its own,
     separate process invocations (issue #130) -- follow mode never touches
     this file, see _once_prev_status's docstring for why."""
-    return os.path.join(tempfile.gettempdir(), f"mackas-monitor-{port}.once-status")
+    safe = key.replace("/", "_")
+    return os.path.join(tempfile.gettempdir(), f"mackas-monitor-{safe}.once-status")
 
 
-def _load_once_prev_status(port):
-    """The status --once last recorded for THIS port, or None.
+def _load_once_prev_status(key):
+    """The status --once last recorded for THIS key, or None.
 
     None is returned for three different cases, deliberately conflated: no
     state file yet (the very first --once poll), a corrupt/unreadable one,
-    and an explicit re-arm written by _save_once_status(port, None) after a
+    and an explicit re-arm written by _save_once_status(key, None) after a
     connection failure. All three want the same answer -- transition_message
     already treats None as "unknown prior state, a 'building' poll still
     announces a start" (see its own docstring), which is exactly the
@@ -656,22 +790,195 @@ def _load_once_prev_status(port):
     raising, or caching a stale status) means the failure mode of a wonky
     state file is "one extra 'started' notification", never silence."""
     try:
-        with open(_once_state_path(port), encoding="utf-8") as f:
+        with open(_once_state_path(key), encoding="utf-8") as f:
             return json.load(f).get("status")
     except (OSError, ValueError):
         return None
 
 
-def _save_once_status(port, status):
+def _save_once_status(key, status):
     """Record STATUS (or None, to re-arm the next poll's prev_status) for
-    THIS port's next --once invocation to load. Best-effort: a failed write
+    THIS key's next --once invocation to load. Best-effort: a failed write
     only costs one wrong/missing notification on the next poll, never this
     one -- never let it turn a monitor problem into a build problem."""
     try:
-        with open(_once_state_path(port), "w", encoding="utf-8") as f:
+        with open(_once_state_path(key), "w", encoding="utf-8") as f:
             json.dump({"status": status}, f)
     except OSError:
         pass
+
+
+def _poll_one(args, want_notify, initial_port, project="", line_prefix=None):
+    """Poll ONE build until it reaches a terminal status (or forever, under
+    KeyboardInterrupt) -- this is today's pre-#142 single-build loop,
+    unchanged in every particular except the two new, optional parameters:
+    project (folded into once-state keying and notify titles) and
+    line_prefix (passed straight to render()). Neither changes anything
+    when left at their defaults, so a bare --port call behaves exactly as
+    it always has."""
+    once_info = _find_bridge_by_project(project) if project else None
+    once_key = _once_state_key(initial_port, once_info)
+    # Follow mode keeps its own in-process None -- a real, single monitor
+    # session that has never polled before, so "attaching mid-build still
+    # announces once" is exactly right. --once is a fresh process every
+    # invocation, so on its own it would see that same None on EVERY poll
+    # and re-announce "started" for as long as a build stays in "building"
+    # (issue #130) -- load what the LAST --once invocation actually saw
+    # instead, from the per-key state file _load_once_prev_status manages.
+    prev_status = _load_once_prev_status(once_key) if args.once else None
+    ctx = new_render_context()
+
+    # Where this poll is actually talking to. Starts at the published
+    # loopback port and only ever moves once, to the container's own address,
+    # and only after that port has already failed -- a working poll never
+    # asks the runtime anything.
+    host, port = LOOPBACK, initial_port
+    asked_runtime = False
+    ever_connected = False
+    wait_deadline = time.monotonic() + args.wait_for_start if args.wait_for_start > 0 else None
+    waiting_notice_printed = False
+
+    while True:
+        try:
+            state = fetch(port, host)
+        # socket.timeout is only an alias of TimeoutError from Python
+        # 3.10 on; mackas's stdlib-only floor is 3.7, and a bare timeout
+        # can propagate unwrapped (see _underlying_os_error's docstring),
+        # so it must be listed explicitly or it reaches the user as an
+        # unhandled traceback on older interpreters instead of the
+        # message connection_error_message() already has for it.
+        except (urllib.error.URLError, ConnectionError, TimeoutError,
+                socket.timeout) as exc:
+            direct = None
+            if not asked_runtime and isinstance(
+                _underlying_os_error(exc), ConnectionResetError
+            ):
+                asked_runtime = True
+                direct = resolve_direct_endpoint(initial_port)
+            if direct is not None:
+                host, port = direct
+                print(
+                    f"{LOOPBACK}:{initial_port} reset the connection (Apple "
+                    f"container's port-forward); polling the container "
+                    f"directly at {host}:{port}",
+                    file=sys.stderr,
+                )
+                continue
+            # The startup grace only ever covers the FIRST connection --
+            # once the bridge has answered once, this is a real failure,
+            # not a race, and is reported immediately exactly as before.
+            if (
+                not ever_connected
+                and wait_deadline is not None
+                and time.monotonic() < wait_deadline
+            ):
+                if not waiting_notice_printed:
+                    print(
+                        f"waiting up to {args.wait_for_start:g}s for the "
+                        f"bridge at {host}:{port} to come up...",
+                        file=sys.stderr,
+                    )
+                    waiting_notice_printed = True
+                time.sleep(POLL_INTERVAL)
+                continue
+            print(connection_error_message(port, exc, host), file=sys.stderr)
+            if args.once:
+                # A gap, exactly like the one --watch will need to
+                # survive across (docs/monitor-app.md): re-arm so the
+                # NEXT successful --once poll treats itself as a fresh
+                # attach rather than trusting a status that may belong
+                # to a since-finished, unrelated build on this port.
+                _save_once_status(once_key, None)
+            return EXIT_UNREACHABLE
+        ever_connected = True
+        render(state, ctx, prefix=line_prefix)
+        if want_notify:
+            message = transition_message(prev_status, state, project=project)
+            if message:
+                notify(*message)
+        prev_status = state.get("status") or "?"
+        if args.once:
+            _save_once_status(once_key, prev_status)
+        if args.once or state.get("status") in ("success", "failed"):
+            return EXIT_BUILD_FAILED if state.get("status") == "failed" else EXIT_OK
+        time.sleep(POLL_INTERVAL)
+
+
+def _poll_many(args, want_notify):
+    """Follow every currently-running monitor bridge at once (#142), one
+    thread per discovered build so their output interleaves live instead of
+    one build blocking the next -- stdlib threading, matching the rest of
+    this file's stdlib-only floor.
+
+    Scope, deliberately: builds running at the moment this starts. One that
+    starts afterward needs a fresh invocation to be noticed, the same way a
+    bare --port call has only ever watched the single build named at
+    launch -- continuously re-discovering new arrivals mid-run is real,
+    separate work (a rediscovery scheduler racing against each poll
+    thread's own lifecycle) that this issue does not ask for."""
+    bridges = discover_bridges()
+    if not bridges and args.wait_for_start > 0:
+        deadline = time.monotonic() + args.wait_for_start
+        print(f"waiting up to {args.wait_for_start:g}s for a build to start...",
+              file=sys.stderr)
+        while not bridges and time.monotonic() < deadline:
+            time.sleep(POLL_INTERVAL)
+            bridges = discover_bridges()
+    if not bridges:
+        print("no running mackas monitor bridges found", file=sys.stderr)
+        return EXIT_UNREACHABLE
+
+    bridges.sort(key=lambda b: b.get("project") or "")
+    results = {}
+
+    def _run(info):
+        label = info.get("project") or f"port {info['port']}"
+        results[label] = _poll_one(
+            args, want_notify, info["port"],
+            project=info.get("project") or "",
+            line_prefix=label,
+        )
+
+    threads = [threading.Thread(target=_run, args=(b,), daemon=True) for b in bridges]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if any(rc == EXIT_BUILD_FAILED for rc in results.values()):
+        return EXIT_BUILD_FAILED
+    if any(rc == EXIT_UNREACHABLE for rc in results.values()):
+        return EXIT_UNREACHABLE
+    return EXIT_OK
+
+
+def _print_list(bridges, as_json):
+    """--list[--json] (#142): the discovered bridges, for a consumer that
+    wants to show more than one build without polling each port itself
+    (SwiftBar, the native app). Never polls a bridge's own JSON -- this is
+    purely the runtime-level discovery result (project, port, address,
+    status is deliberately NOT included here: that needs an actual fetch()
+    per bridge, which --list is specifically for consumers that do not want
+    to pay for)."""
+    if as_json:
+        rows = [
+            {
+                "project": b.get("project") or "",
+                "port": b.get("port"),
+                "address": (f"{b['direct'][0]}:{b['direct'][1]}" if b.get("direct") else None),
+            }
+            for b in bridges
+        ]
+        print(json.dumps(rows))
+        return EXIT_OK
+    if not bridges:
+        print("no running mackas monitor bridges found")
+        return EXIT_OK
+    for b in bridges:
+        label = b.get("project") or "(no project)"
+        addr = f"{b['direct'][0]}:{b['direct'][1]}" if b.get("direct") else "?"
+        print(f"{label}\tport {b.get('port')}\t{addr}")
+    return EXIT_OK
 
 
 def main(argv=None):
@@ -680,8 +987,23 @@ def main(argv=None):
         epilog=NOTIFY_HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--port", type=int, required=True,
-                    help="port to poll (MACKAS_MONITOR_PORT)")
+    selector = p.add_mutually_exclusive_group()
+    selector.add_argument("--port", type=int,
+                    help="poll this one build (MACKAS_MONITOR_PORT). With "
+                         "neither --port nor --project, follow every "
+                         "running build's bridge at once (#142).")
+    selector.add_argument("--project", metavar="NAME",
+                    help="poll the one running build pinned to project NAME "
+                         "(#142), found via the container runtime rather "
+                         "than a port number.")
+    selector.add_argument("--list", action="store_true",
+                    help="print every currently-running monitor bridge "
+                         "(project, port, address) and exit -- no "
+                         "polling. Combine with --json for a "
+                         "machine-readable array (#142).")
+    p.add_argument("--json", action="store_true",
+                    help="with --list, print a JSON array instead of "
+                         "plain text. Invalid without --list.")
     p.add_argument("--once", action="store_true",
                     help="fetch and print a single snapshot, then exit")
     p.add_argument("--notify", action="store_true",
@@ -703,95 +1025,37 @@ def main(argv=None):
                          "has answered even once, a later failure is reported "
                          "immediately, exactly as without this flag -- a "
                          "bridge that goes away mid-build is a real problem, "
-                         "not a startup race.")
+                         "not a startup race. With neither --port nor "
+                         "--project, waits for ANY build to appear instead "
+                         "of a specific one.")
     args = p.parse_args(argv)
 
-    want_notify = args.notify or os.environ.get("MACKAS_MONITOR_NOTIFY", "0") == "1"
-    # Follow mode keeps its own in-process None -- a real, single monitor
-    # session that has never polled before, so "attaching mid-build still
-    # announces once" is exactly right. --once is a fresh process every
-    # invocation, so on its own it would see that same None on EVERY poll
-    # and re-announce "started" for as long as a build stays in "building"
-    # (issue #130) -- load what the LAST --once invocation actually saw
-    # instead, from the per-port state file _load_once_prev_status manages.
-    prev_status = _load_once_prev_status(args.port) if args.once else None
-    ctx = new_render_context()
+    if args.json and not args.list:
+        p.error("--json only makes sense with --list")
 
-    # Where this poll is actually talking to. Starts at the published
-    # loopback port and only ever moves once, to the container's own address,
-    # and only after that port has already failed -- a working poll never
-    # asks the runtime anything.
-    host, port = LOOPBACK, args.port
-    asked_runtime = False
-    ever_connected = False
-    wait_deadline = time.monotonic() + args.wait_for_start if args.wait_for_start > 0 else None
-    waiting_notice_printed = False
+    if args.list:
+        return _print_list(discover_bridges(), args.json)
+
+    want_notify = args.notify or os.environ.get("MACKAS_MONITOR_NOTIFY", "0") == "1"
 
     try:
-        while True:
-            try:
-                state = fetch(port, host)
-            # socket.timeout is only an alias of TimeoutError from Python
-            # 3.10 on; mackas's stdlib-only floor is 3.7, and a bare timeout
-            # can propagate unwrapped (see _underlying_os_error's docstring),
-            # so it must be listed explicitly or it reaches the user as an
-            # unhandled traceback on older interpreters instead of the
-            # message connection_error_message() already has for it.
-            except (urllib.error.URLError, ConnectionError, TimeoutError,
-                    socket.timeout) as exc:
-                direct = None
-                if not asked_runtime and isinstance(
-                    _underlying_os_error(exc), ConnectionResetError
-                ):
-                    asked_runtime = True
-                    direct = resolve_direct_endpoint(args.port)
-                if direct is not None:
-                    host, port = direct
-                    print(
-                        f"{LOOPBACK}:{args.port} reset the connection (Apple "
-                        f"container's port-forward); polling the container "
-                        f"directly at {host}:{port}",
-                        file=sys.stderr,
-                    )
-                    continue
-                # The startup grace only ever covers the FIRST connection --
-                # once the bridge has answered once, this is a real failure,
-                # not a race, and is reported immediately exactly as before.
-                if (
-                    not ever_connected
-                    and wait_deadline is not None
-                    and time.monotonic() < wait_deadline
-                ):
-                    if not waiting_notice_printed:
-                        print(
-                            f"waiting up to {args.wait_for_start:g}s for the "
-                            f"bridge at {host}:{port} to come up...",
-                            file=sys.stderr,
-                        )
-                        waiting_notice_printed = True
-                    time.sleep(POLL_INTERVAL)
-                    continue
-                print(connection_error_message(port, exc, host), file=sys.stderr)
-                if args.once:
-                    # A gap, exactly like the one --watch will need to
-                    # survive across (docs/monitor-app.md): re-arm so the
-                    # NEXT successful --once poll treats itself as a fresh
-                    # attach rather than trusting a status that may belong
-                    # to a since-finished, unrelated build on this port.
-                    _save_once_status(args.port, None)
+        if args.project:
+            info = _find_bridge_by_project(args.project)
+            if info is None:
+                print(f"no running build found for project '{args.project}'",
+                      file=sys.stderr)
                 return EXIT_UNREACHABLE
-            ever_connected = True
-            render(state, ctx)
-            if want_notify:
-                message = transition_message(prev_status, state)
-                if message:
-                    notify(*message)
-            prev_status = state.get("status") or "?"
-            if args.once:
-                _save_once_status(args.port, prev_status)
-            if args.once or state.get("status") in ("success", "failed"):
-                return EXIT_BUILD_FAILED if state.get("status") == "failed" else EXIT_OK
-            time.sleep(POLL_INTERVAL)
+            return _poll_one(args, want_notify, info["port"], project=args.project)
+        if args.port:
+            # Deliberately NO discovery lookup here, even to enrich the
+            # notify title / once-state key with a project name: a working
+            # --port poll must never ask the runtime anything (a hard,
+            # tested invariant -- see _poll_one's connection-reset fallback,
+            # the ONLY place this file queries the runtime on a healthy
+            # poll). Use --project instead of --port for project-aware
+            # titles/keying.
+            return _poll_one(args, want_notify, args.port)
+        return _poll_many(args, want_notify)
     except KeyboardInterrupt:
         return EXIT_OK
 

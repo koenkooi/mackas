@@ -417,6 +417,58 @@ JSON
 	! _port_published_by_running_container 9999
 }
 
+@test "status_running_builds: lists a project and its port (#142)" {
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) cat <<'JSON'
+[{"configuration":{"labels":{"mackas.monitor.bridge":"1","mackas.monitor.project":"meta-ai"},"publishedPorts":[{"containerPort":8801,"hostPort":8801,"proto":"tcp"}]},"status":{"state":"running"}}]
+JSON
+				;;
+			*) return 0 ;;
+		esac
+	}
+	out="$(status_running_builds)"
+	printf '%s\n' "$out" | grep -qF "meta-ai"
+	printf '%s\n' "$out" | grep -qF "port 8801"
+}
+
+@test "status_running_builds: an unpinned build is labeled as such" {
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) cat <<'JSON'
+[{"configuration":{"labels":{"mackas.monitor.bridge":"1","mackas.monitor.project":""},"publishedPorts":[{"containerPort":8801,"hostPort":8801,"proto":"tcp"}]},"status":{"state":"running"}}]
+JSON
+				;;
+			*) return 0 ;;
+		esac
+	}
+	out="$(status_running_builds)"
+	printf '%s\n' "$out" | grep -qF "<unpinned>"
+}
+
+@test "status_running_builds: ignores a running container that is not a mackas bridge" {
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) cat <<'JSON'
+[{"configuration":{"publishedPorts":[]},"status":{"state":"running"}}]
+JSON
+				;;
+			*) return 0 ;;
+		esac
+	}
+	out="$(status_running_builds)"
+	printf '%s\n' "$out" | grep -qF "(none)"
+}
+
+@test "status_running_builds: says so, not nothing, when the runtime cannot be reached" {
+	container() { [ "${1:-}" = "ls" ] && return 1; }
+	out="$(status_running_builds)"
+	printf '%s\n' "$out" | grep -qi "not reachable"
+}
+
 @test "runtime-args: MACKAS_MONITOR=1 finds bitbake regardless of the checkout's directory name" {
 	# kas lets a project's kas.yml name the checkout anything; discovery must
 	# not assume the literal name 'bitbake'.

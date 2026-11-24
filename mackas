@@ -11192,6 +11192,35 @@ status_project_volume_note() {
 		|| info "    sstate  set: $MACKAS_VOL_SSTATE   (--project $PROJECT_SELECTED would derive: $d_sstate)"
 }
 
+# status_running_builds -- lists every currently-running mackas monitor
+# bridge container (#142): project (unpinned shown as such) and port. Same
+# container ls/inspect walk _port_published_by_running_container() already
+# does, reading the SAME discovery label monitor_runtime_args() writes --
+# one implementation of "what is running", not a second one that could
+# disagree with it. No jq: grep/sed, matching every other inspect-parsing
+# function in this file.
+status_running_builds() {
+	local listing ids id detail project port found=0
+	hdr "Running builds"
+	if ! listing="$(container ls 2>/dev/null)"; then
+		info "  (container runtime not reachable)"
+		return 0
+	fi
+	ids="$(printf '%s\n' "$listing" | awk 'NR>1 && NF {print $1}')"
+	for id in $ids; do
+		[ -n "$id" ] || continue
+		detail="$(container inspect "$id" 2>/dev/null)" || continue
+		printf '%s\n' "$detail" | grep -qE '"mackas\.monitor\.bridge"[[:space:]]*:[[:space:]]*"1"' || continue
+		found=1
+		project="$(printf '%s\n' "$detail" |
+			sed -n 's/.*"mackas\.monitor\.project"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+		port="$(printf '%s\n' "$detail" |
+			sed -n 's/.*"hostPort"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)"
+		show "${project:-<unpinned>}" "port $port"
+	done
+	[ "$found" -eq 1 ] || info "  (none)"
+}
+
 cmd_status() {
 	hdr "Configuration"
 	show "config file"        "${CONFIG_FILE_USED:-<none: built-in defaults>}"
@@ -11343,6 +11372,8 @@ cmd_status() {
 	info ""
 	info "  Their contents are NOT visible on the host -- they are ext4 images. To"
 	info "  look inside: $SCRIPT_CMD shell"
+
+	status_running_builds
 
 	hdr "Effective kas --runtime-args"
 	printf '  %s\n' "$(kas_runtime_args)"
