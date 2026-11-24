@@ -10873,7 +10873,8 @@ ${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build
 started with MACKAS_MONITOR=1.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD monitor [--port N] [--once] [--notify] [--wait-for-start SECONDS]
+  $SCRIPT_CMD monitor [--port N | --project NAME | --list [--json]]
+                 [--once] [--notify] [--wait-for-start SECONDS]
 
 Polls the in-container progress bridge and prints one line per update:
 '[status] done/total  recipe:task'. This only polls an already-published
@@ -10883,37 +10884,59 @@ want to watch first, e.g.:
   $SCRIPT_CMD --set MACKAS_MONITOR=1 smoketest &
   $SCRIPT_CMD monitor
 
+With private per-project volumes, more than one build can be running at
+once (#72). With none of --port/--project/--list, 'monitor' finds and
+follows EVERY currently-running build at once, one line per project
+('meta-ai: ...'); this only picks up builds already running when it
+starts. --port/--project narrow it back down to one build, and --list
+just shows what is running.
+
 If you want a completion SIGNAL rather than a progress view -- for a script
 or a Claude workflow that just needs to know when a build finished -- the
 build's own exit code is the more reliable choice; see 'A DONE-SIGNAL
 WITHOUT POLLING' below before reaching for this command.
 
 ${C_BLD}OPTIONS${C_RST}
-  --port N              Poll this port instead of MACKAS_MONITOR_PORT.
-  --once                Print a single snapshot and exit, instead of
-                         following until the build reports success/failed.
-                         Exit status distinguishes success (0), a build
-                         that failed (1) and no bridge reachable at all
-                         (2) -- usable as a scripted probe.
+  --port N              Poll this one build, by its published port,
+                         instead of following everything running. Never
+                         queries the container runtime itself.
+  --project NAME         Poll this one build, found by its pinned project
+                         name via the container runtime -- see 'mackas
+                         status' or '--list' for what is running right
+                         now. Mutually exclusive with --port.
+  --list                 Print every currently-running build (project,
+                         port, address) and exit -- no polling. Add --json
+                         for a machine-readable array, e.g. for SwiftBar
+                         or the native app.
+  --once                 Print a single snapshot and exit, instead of
+                         following until the build(s) report
+                         success/failed. One snapshot per build when
+                         following more than one. Exit status
+                         distinguishes success (0), a build that failed
+                         (1) and no bridge reachable at all (2) -- usable
+                         as a scripted probe.
   --notify              Also post a native macOS notification on exactly
-                         three transitions -- build started, succeeded,
-                         failed -- never per task. MACKAS_MONITOR_NOTIFY=1
-                         turns it on without the flag. Uses
-                         terminal-notifier when it is installed, else
-                         osascript.
+                         three transitions per build -- started,
+                         succeeded, failed -- never per task, titled with
+                         the project when one is known.
+                         MACKAS_MONITOR_NOTIFY=1 turns it on without the
+                         flag. Uses terminal-notifier when it is
+                         installed, else osascript.
   --wait-for-start SECONDS
-                         Tolerate the bridge not being up yet for up to
-                         SECONDS, instead of failing on the very first
-                         poll (the default: 0, today's behavior). Makes it
-                         possible to launch 'monitor' at the same moment
-                         as the build it watches -- kas's own
+                         Tolerate no bridge being up yet for up to
+                         SECONDS, instead of failing immediately (the
+                         default: 0, today's behavior). Makes it possible
+                         to launch 'monitor' at the same moment as the
+                         build(s) it watches -- kas's own
                          checkout/patch/container-start plus reaching
                          bitbake can take anywhere from seconds to
-                         minutes. Only covers the FIRST connection: once
-                         the bridge has answered even once, a later
-                         failure is still reported immediately -- a bridge
-                         that goes away mid-build is a real problem, not a
-                         startup race.
+                         minutes. With --port/--project, only covers the
+                         FIRST connection to that one build; following
+                         everything, waits for any build to appear at
+                         all. A later disconnect is still reported
+                         immediately either way -- a bridge that goes
+                         away mid-build is a real problem, not a startup
+                         race.
 
 MACKAS_MONITOR_POLL_INTERVAL sets the poll interval in seconds (default 2);
 there is no flag for it, since it is a display-only knob, not a setting
@@ -10980,7 +11003,14 @@ EOF
 }
 
 cmd_monitor() {
-	local port="$MACKAS_MONITOR_PORT" once=0 want_help=0 wait_for_start=0
+	# port/monitor_project stay empty unless the user actually typed
+	# --port/--project (#142) -- forwarding MACKAS_MONITOR_PORT as an
+	# always-present --port would force every bare 'mackas monitor' onto one
+	# port, which is exactly the single-build assumption this issue removes.
+	# A bare invocation now reaches tools/mackas-monitor with NEITHER flag,
+	# which is what puts it into "follow every running build" mode.
+	local port="" monitor_project="" once=0 want_help=0 wait_for_start=0
+	local list=0 as_json=0
 	local notify="${MACKAS_MONITOR_NOTIFY:-0}"
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
@@ -10989,6 +11019,17 @@ cmd_monitor() {
 				[ -n "$port" ] || die "--port needs a value" "$SCRIPT_CMD monitor --help"
 				shift 2 ;;
 			--port=*)  port="${1#*=}"; shift ;;
+			# A LOCAL --project here, unlike every other subcommand's global
+			# --project: this names which build to FOLLOW, not which
+			# project's config to load (monitor never loads a project
+			# config at all) -- so it is parsed here, not routed through
+			# die_on_misplaced_global_flag like --config/--set.
+			--project) monitor_project="${2:-}"
+				[ -n "$monitor_project" ] || die "--project needs a value" "$SCRIPT_CMD monitor --help"
+				shift 2 ;;
+			--project=*) monitor_project="${1#*=}"; shift ;;
+			--list)    list=1; shift ;;
+			--json)    as_json=1; shift ;;
 			--once)    once=1; shift ;;
 			--notify)  notify=1; shift ;;
 			--wait-for-start) wait_for_start="${2:-}"
@@ -10999,7 +11040,7 @@ cmd_monitor() {
 			-y|-f|--yes|--force) ASSUME_YES=1; shift ;;
 			-v|--verbose) VERBOSE=1; shift ;;
 			--version) echo "$SCRIPT_NAME $SCRIPT_VERSION"; exit 0 ;;
-			--config|--config=*|--project|--project=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
+			--config|--config=*|--set|--set=*) die_on_misplaced_global_flag "$1" monitor ;;
 			-*) die "unknown option for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
 			*) die "unexpected argument for 'monitor': $1" "$SCRIPT_CMD monitor --help" ;;
 		esac
@@ -11010,25 +11051,39 @@ cmd_monitor() {
 		return 0
 	fi
 
+	if [ -n "$port" ] && [ -n "$monitor_project" ]; then
+		die "--port and --project are mutually exclusive" "$SCRIPT_CMD monitor --help"
+	fi
+
 	local tool="$SCRIPT_DIR/tools/mackas-monitor"
 	[ -f "$tool" ] || die "monitor tool missing at $tool" \
 		"reinstall/re-clone mackas -- this should ship with every checkout"
 	[ -x /usr/bin/python3 ] || die "no /usr/bin/python3 -- mackas-monitor needs macOS's own stock python3" \
 		"xcode-select --install   # or open Terminal once to trigger the CLT prompt"
 
-	if [ "$MACKAS_MONITOR" != "1" ]; then
+	# --list needs none of this: it only discovers, it never polls, and it
+	# is not affected by whether THIS shell has MACKAS_MONITOR=1.
+	if [ "$list" -eq 0 ] && [ "$MACKAS_MONITOR" != "1" ]; then
 		warn "MACKAS_MONITOR is not 1 in this shell/config -- a build started now will not publish a bridge for this to poll"
 		printf '%s  start one with: MACKAS_MONITOR=1 %s smoketest &, or make it permanent with: %s set MACKAS_MONITOR 1%s\n' \
 			"$C_BLU" "$SCRIPT_CMD" "$SCRIPT_CMD" "$C_RST" >&2
 	fi
 
-	local args=(--port "$port")
+	local args=()
+	[ -n "$port" ] && args+=(--port "$port")
+	[ -n "$monitor_project" ] && args+=(--project "$monitor_project")
+	[ "$list" -eq 1 ] && args+=(--list)
+	[ "$as_json" -eq 1 ] && args+=(--json)
 	[ "$once" -eq 1 ] && args+=(--once)
 	[ "$notify" = "1" ] && args+=(--notify)
 	[ "$wait_for_start" != "0" ] && args+=(--wait-for-start "$wait_for_start")
 	# run(): prints the invocation and returns 0 under --dry-run instead of
 	# actually polling, same as every other real command in this file.
-	run /usr/bin/python3 "$tool" "${args[@]}"
+	# ${args+"${args[@]}"}, not a bare "${args[@]}" -- under this script's own
+	# set -u, expanding an EMPTY array that way is an unbound-variable error
+	# on bash 3.2 (fixed only in bash 4.4+); args is empty on a bare
+	# 'mackas monitor', which is exactly the follow-everything default (#142).
+	run /usr/bin/python3 "$tool" ${args+"${args[@]}"}
 }
 
 show() { printf '  %-24s %s\n' "$1" "$2"; }
