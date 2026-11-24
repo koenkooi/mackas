@@ -277,6 +277,146 @@ teardown() {
 	! printf '%s\n' "$args" | grep -qF -- "8801"
 }
 
+@test "runtime-args: MACKAS_MONITOR=1 passes the selected project and discovery labels" {
+	MACKAS_MONITOR=1
+	PROJECT_SELECTED="meta-ai"
+	mkdir -p "$MACKAS_WORK/bitbake/bin"
+	touch "$MACKAS_WORK/bitbake/bin/bitbake"
+	args="$(kas_runtime_args)"
+	printf '%s\n' "$args" | grep -qF -- "-e MACKAS_PROJECT=meta-ai"
+	printf '%s\n' "$args" | grep -qF -- "-l mackas.monitor.bridge=1"
+	printf '%s\n' "$args" | grep -qF -- "-l mackas.monitor.project=meta-ai"
+}
+
+@test "runtime-args: MACKAS_MONITOR=1 with no project selected passes an empty MACKAS_PROJECT" {
+	MACKAS_MONITOR=1
+	PROJECT_SELECTED=""
+	mkdir -p "$MACKAS_WORK/bitbake/bin"
+	touch "$MACKAS_WORK/bitbake/bin/bitbake"
+	args="$(kas_runtime_args)"
+	# Present, just empty -- never omitted (mackasjson.py relies on that).
+	printf '%s\n' "$args" | grep -qF -- "-e MACKAS_PROJECT="
+	printf '%s\n' "$args" | grep -qF -- "-l mackas.monitor.project="
+}
+
+# ---------------------------------------------------------------------------
+# _pick_monitor_port (#142) -- concurrent builds must not collide on the same
+# monitor bridge port. _port_is_listening is overridden ("nothing listening")
+# in every test below unless that is specifically what is under test, so each
+# test isolates the one signal (running-container vs real-host-TCP) it names
+# -- exactly like volume_in_use's own tests isolate ls vs inspect failures.
+# ---------------------------------------------------------------------------
+
+@test "_pick_monitor_port: a no-op when MACKAS_MONITOR=0" {
+	MACKAS_MONITOR=0
+	MACKAS_MONITOR_PORT=8801
+	container() { printf 'container must not be called when MACKAS_MONITOR=0\n' >&2; return 1; }
+	_pick_monitor_port
+	[ "$MACKAS_MONITOR_PORT" = "8801" ]
+}
+
+@test "_pick_monitor_port: leaves the default port alone when nothing is using it" {
+	MACKAS_MONITOR=1
+	MACKAS_MONITOR_PORT=8801
+	container() { [ "${1:-}" = "ls" ] && printf 'ID\n' || return 0; }
+	_port_is_listening() { return 1; }
+	_pick_monitor_port
+	[ "$MACKAS_MONITOR_PORT" = "8801" ]
+}
+
+@test "_pick_monitor_port: advances past a port a running container already publishes" {
+	MACKAS_MONITOR=1
+	MACKAS_MONITOR_PORT=8801
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) cat <<'JSON'
+[{"configuration":{"publishedPorts":[{"containerPort":8801,"hostPort":8801,"proto":"tcp"}]},"status":{"state":"running"}}]
+JSON
+				;;
+			*) return 0 ;;
+		esac
+	}
+	_port_is_listening() { return 1; }
+	_pick_monitor_port
+	[ "$MACKAS_MONITOR_PORT" = "8802" ]
+}
+
+@test "_pick_monitor_port: advances past a port the host is already listening on" {
+	MACKAS_MONITOR=1
+	MACKAS_MONITOR_PORT=8801
+	container() { [ "${1:-}" = "ls" ] && printf 'ID\n' || return 0; }
+	_port_is_listening() { [ "$1" = "8801" ]; }
+	_pick_monitor_port
+	[ "$MACKAS_MONITOR_PORT" = "8802" ]
+}
+
+@test "_pick_monitor_port: an explicit pin that is taken is refused, not moved" {
+	MACKAS_MONITOR=1
+	MACKAS_MONITOR_PORT=9100
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) cat <<'JSON'
+[{"configuration":{"publishedPorts":[{"containerPort":9100,"hostPort":9100,"proto":"tcp"}]},"status":{"state":"running"}}]
+JSON
+				;;
+			*) return 0 ;;
+		esac
+	}
+	_port_is_listening() { return 1; }
+	out="$( (_pick_monitor_port) 2>&1 )" && rc=0 || rc=$?
+	[ "$rc" -ne 0 ]
+	printf '%s\n' "$out" | grep -qi 'already in use'
+}
+
+@test "_pick_monitor_port: an explicit pin that is free is left unchanged" {
+	MACKAS_MONITOR=1
+	MACKAS_MONITOR_PORT=9100
+	container() { [ "${1:-}" = "ls" ] && printf 'ID\n' || return 0; }
+	_port_is_listening() { return 1; }
+	_pick_monitor_port
+	[ "$MACKAS_MONITOR_PORT" = "9100" ]
+}
+
+@test "_port_published_by_running_container: fails closed (treated as published) when 'container ls' errors" {
+	container() { [ "${1:-}" = "ls" ] && return 1; }
+	# A query failure must not read as "free" -- same fail-closed contract
+	# volume_in_use() already follows for the same kind of query.
+	if _port_published_by_running_container 8801; then :; else
+		printf 'read a failing ls as "not published" (fail-OPEN)\n' >&2
+		return 1
+	fi
+}
+
+@test "_port_published_by_running_container: fails closed when 'container inspect' errors" {
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) return 1 ;;
+			*) return 0 ;;
+		esac
+	}
+	if _port_published_by_running_container 8801; then :; else
+		printf 'read a failing inspect as "not published" (fail-OPEN)\n' >&2
+		return 1
+	fi
+}
+
+@test "_port_published_by_running_container: a non-matching port is not published" {
+	container() {
+		case "${1:-}" in
+			ls) printf 'ID\nabc123\n' ;;
+			inspect) cat <<'JSON'
+[{"configuration":{"publishedPorts":[{"containerPort":8801,"hostPort":8801,"proto":"tcp"}]},"status":{"state":"running"}}]
+JSON
+				;;
+			*) return 0 ;;
+		esac
+	}
+	! _port_published_by_running_container 9999
+}
+
 @test "runtime-args: MACKAS_MONITOR=1 finds bitbake regardless of the checkout's directory name" {
 	# kas lets a project's kas.yml name the checkout anything; discovery must
 	# not assume the literal name 'bitbake'.

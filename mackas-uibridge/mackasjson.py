@@ -98,6 +98,10 @@ import bb.event
 import bb.ui.knotty
 
 PORT = int(os.environ.get("MACKAS_MONITOR_PORT", "8801"))
+# #142: empty for the unpinned oe-build-* setup, a real project name
+# otherwise -- mackas always passes this flag (monitor_runtime_args()), so
+# there is no "unset" case here to worry about, just possibly-empty.
+PROJECT = os.environ.get("MACKAS_PROJECT", "")
 MAX_RECENT_EVENTS = 50
 
 # A -k build can fail a lot of tasks; keep the list bounded but report the
@@ -155,6 +159,12 @@ _terminal_fetched = threading.Event()
 
 _state = {
     "status": "idle",
+    # #142: which project this build is for, from the container's own
+    # MACKAS_PROJECT env var (read once at import time -- unlike machine/
+    # distro, this needs no cooker round-trip, so none of _set_machine()'s
+    # first-waitEvent timing rules apply). Empty string, never omitted --
+    # a consumer should not have to special-case "key absent" vs "no project".
+    "project": PROJECT,
     # What this build was asked to produce, and what for. "targets" is known
     # before any event arrives (see _set_targets, pure client-side, no server
     # round-trip); "machine"/"distro" arrive later, with the first waitEvent
