@@ -1697,11 +1697,8 @@ ${C_BLD}$SCRIPT_CMD set${C_RST} -- persist one setting in the config file.
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD set NAME VALUE
 
-Writes (or replaces) a single NAME=VALUE line in the config file this
-invocation would otherwise load -- $(set_target_config_file) right now.
-Unlike '--set NAME=VALUE', which only affects the ONE command it rides
-along with, this persists: every future invocation picks it up too.
-
+Writes or replaces NAME=VALUE in the config file this run would load, now
+$(set_target_config_file). Unlike '--set NAME=VALUE', it persists.
 '$SCRIPT_CMD status' lists the valid names.
 EOF
 }
@@ -1713,9 +1710,8 @@ ${C_BLD}$SCRIPT_CMD get${C_RST} -- print one setting's currently resolved value.
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD get NAME
 
-Resolved through the normal precedence (defaults -> config file ->
-environment -> --set), so '$SCRIPT_CMD --set NAME=VALUE get NAME' previews
-what an override would produce without running anything else.
+Uses the normal precedence, so '$SCRIPT_CMD --set NAME=VALUE get NAME'
+previews an override.
 EOF
 }
 
@@ -1726,9 +1722,8 @@ ${C_BLD}$SCRIPT_CMD unset${C_RST} -- remove one persisted setting from the confi
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD unset NAME
 
-Removes NAME's line from the config file this invocation would otherwise
-load -- $(set_target_config_file) right now. Fine to run on a NAME that was
-never persisted; that is a no-op, not an error.
+Removes NAME's line from $(set_target_config_file).
+A NAME that is not set is a no-op.
 EOF
 }
 
@@ -1879,31 +1874,13 @@ ${C_BLD}$SCRIPT_CMD projects${C_RST} -- list the pinned per-project configs.
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD projects
 
-Lists $(projects_dir)/*.conf -- the standalone
-configs '$SCRIPT_CMD adopt' and '$SCRIPT_CMD project add' write -- and, for
-each, the settings that say where that project's build lives. Select one for
-a single command with '$SCRIPT_CMD --project NAME ...', or for a whole shell
-with \$MACKAS_PROJECT_SELECT=NAME.
+Lists $(projects_dir)/*.conf and where each
+project's build lives. Read-only; reads each pin by grepping, never sources
+it. Flags pins whose MACKAS_ROOT or work/NAME is gone, and pins it cannot
+read; it keeps working when other commands refuse over those.
 
-Note the singular sibling: this command LISTS what is already pinned; it
-never creates one. '$SCRIPT_CMD project add NAME' does that.
-
-Read-only, and it reads by GREPPING each file rather than sourcing it: a
-config is shell, and listing a directory of them must not run any of them.
-
-Flags a pin as stale when its MACKAS_ROOT is gone, or when MACKAS_ROOT/work/
-NAME is gone -- the directory implicit (\$PWD-derived) project selection keys
-off. The fix either way is to move the checkout back or drop the pin; mackas
-never re-derives an identity from whatever happens to be on disk.
-
-Flags a pin this process cannot READ too -- and keeps working while one is in
-that state, unlike every other command, whose \$PWD-derived selection fails
-closed on it (an unreadable pin could have been the match). This listing is
-the repair surface those refusals point at, so it has to be the one command
-that still runs.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
-though this reads only and never prompts.
+Select one with '--project NAME' or \$MACKAS_PROJECT_SELECT=NAME.
+'$SCRIPT_CMD project add NAME' creates one.
 EOF
 }
 
@@ -4147,20 +4124,15 @@ check_gitconfig() {
 
 check_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD check${C_RST} -- preflight only. Changes nothing. ${C_BLD}This is the
-default${C_RST} when no command is given.
+${C_BLD}$SCRIPT_CMD check${C_RST} -- preflight only. Changes nothing. ${C_BLD}The default.${C_RST}
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD check
 
-Runs every preflight probe -- host OS/arch/RAM, the Apple container runtime,
-GNU realpath, the docker->container shim, the build volume (case-sensitivity,
-free space, Time Machine), the short-path/socket limit, network reachability,
-existing state (idempotency), and the git dubious-ownership workaround -- and
-prints a pass/warn/fail summary. Exits non-zero on any FAIL.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
-though check reads only and never prompts, so none of them change anything.
+Checks host OS, arch, and RAM, the container runtime, GNU realpath, the
+docker->container shim, the build volume (case-sensitivity, free space, Time
+Machine), the short-path limit, network, existing state, and the git
+dubious-ownership workaround. Exits non-zero on any FAIL.
 EOF
 }
 
@@ -6179,36 +6151,24 @@ setup_image() {
 
 setup_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD setup${C_RST} -- do the full setup. Idempotent -- safe to re-run
-after a crash, or after changing settings.
+${C_BLD}$SCRIPT_CMD setup${C_RST} -- do the full setup. Idempotent; safe to re-run.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD setup [<root>] [--tmpdir-size <size>] [--sstate-size <size>]
                     [--downloads-size <size>]
 
-  <root>               MACKAS_ROOT for this run (a case-sensitive volume).
+  <root>                  MACKAS_ROOT for this run (a case-sensitive volume).
   --tmpdir-size <size>    TMPDIR volume size, e.g. 1T, 200G (default 120G).
   --sstate-size <size>    sstate volume size (default 40G).
   --downloads-size <size> Downloads volume size (default 40G).
 
-These are one-shot for this invocation, exactly like --set -- they are not
-written to the config file. If <root> or a size is not given here, and is
-not already set by --set/the environment/the config file, and this is
-running on a terminal, setup ASKS for it interactively (Enter keeps the
-current value).
+These apply to this run only, like --set. On a terminal, setup asks for any
+that are unset (Enter keeps the current value).
 
-Downloads the pinned, sha256-verified kas-container release; installs the
-docker->container shim; creates the three ext4 volumes (TMPDIR, downloads,
-sstate); and writes env.sh, the git dubious-ownership workaround, and the
-generated kas fragment. Each step is skipped if it is already done, so
-re-running is always safe -- nothing here is destructive. If no project is
-configured (MACKAS_PROJECT_URL is empty), the project checkout and its kas
-fragment are skipped -- not required for the rest of this to work -- with a
-message on how to add one and re-run.
-
-Options: --dry-run (print every mutating command, change nothing), -y/--yes
-(or -f/--force, for the sudo prompts an external volume may need) and
--v/--verbose all work here too.
+Fetches the pinned, sha256-verified kas-container, installs the docker shim,
+creates the TMPDIR, downloads, and sstate volumes, and writes env.sh, the
+gitconfig, and the kas fragment. Done steps are skipped; nothing is
+destructive. With no project configured, the checkout is skipped.
 EOF
 }
 
@@ -6434,42 +6394,25 @@ cmd_setup() {
 
 adopt_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD adopt${C_RST} -- bring a foreign MACKAS_ROOT (set up by a
-different Mac's mackas -- an external drive moved over, or a network share)
-back to a working build on THIS Mac.
+${C_BLD}$SCRIPT_CMD adopt${C_RST} -- bring a foreign MACKAS_ROOT (another Mac's, on a moved
+drive or a share) back to a working build on this Mac.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD adopt <path> [--project-dir NAME] [--write-config FILE]
 
-Reuses whatever survived the move (an existing project checkout, relocated
-volume images '$SCRIPT_CMD volume recover' can find), regenerates whatever is
-host-specific (env.sh, gitconfig, the short link, the kas fragment), and
-gives the adopted root its own volume name and short link so it never
-collides with anything this Mac already has for an unrelated project.
-Refuses outright if <path> turns out to already BE this Mac's own root --
-that is '$SCRIPT_CMD setup'/'$SCRIPT_CMD check' territory, not adopt.
-
 ${C_BLD}OPTIONS${C_RST}
-  --project-dir NAME   Which checkout under <path>/work/ to adopt, when more
-                       than one exists (or none can be found automatically).
-  --write-config FILE  Where to persist the new, per-project config (NOT
-                       the global --config, which loads an EXISTING one).
-                       Default: derived under ~/.config/mackas/projects/,
-                       which is what makes it reachable later as
-                       '$SCRIPT_CMD --project <name>' ('$SCRIPT_CMD projects').
+  --project-dir NAME   Checkout under <path>/work/ to adopt, when there is more
+                       than one or none is found.
+  --write-config FILE  Where to write the new project config (default: under
+                       ~/.config/mackas/projects/, so '--project <name>'
+                       finds it).
 
-Ends by handing off to '$SCRIPT_CMD setup', with the new config in scope, for
-everything setup already does correctly on its own (project checkout,
-volumes, kas-container, the shim, gitconfig).
+Reuses the checkout and relocated volume images, regenerates host-specific
+files, and gives the root its own volume names and short link, then runs
+setup. Refuses if <path> is this Mac's own root. If the volume-relocation
+symlink belongs to another live project, setup offers to switch it.
 
-If this Mac's machine-wide volume-relocation symlink already belongs to a
-different, still-live local project, '$SCRIPT_CMD setup' (via
-setup_relocate_volumes) will detect that and offer -- never silently do --
-to switch it to this adopted root, leaving that other project's volumes
-un-relocated until it is itself re-adopted/re-setup.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after 'adopt'.
+Global options go before or after 'adopt'.
 EOF
 }
 
@@ -6755,113 +6698,54 @@ cmd_adopt() {
 
 project_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD project${C_RST} -- pin a project workspace under THIS Mac's own
-MACKAS_ROOT. The in-root sibling of '$SCRIPT_CMD adopt' (which pins a whole
-FOREIGN root instead): both write the same artifact, a standalone config at
-~/.config/mackas/projects/<name>.conf.
+${C_BLD}$SCRIPT_CMD project${C_RST} -- pin a project workspace under this Mac's MACKAS_ROOT.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD project add <name> [--url URL --branch BRANCH | --from <checkout>]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
-  add <name>   Pin a project. '$SCRIPT_CMD project add --help' for the full
-               flag list.
+  add <name>   Pin a project. '$SCRIPT_CMD project add --help' for options.
 
-Note the plural sibling: '$SCRIPT_CMD projects' LISTS the projects already
-pinned (by either 'project add' or 'adopt'); this singular command instead
-CREATES one. '$SCRIPT_CMD projects --help' has the reading side.
+'$SCRIPT_CMD projects' lists pins; '$SCRIPT_CMD adopt' pins a foreign root.
 EOF
 }
 
 project_add_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD project add${C_RST} -- pin <name> as a project workspace under
-this Mac's own MACKAS_ROOT: creates \$MACKAS_WORK_ROOT/<name>/ (that project's
-entire KAS_WORK_DIR -- the checkout and whatever siblings kas clones next to
-it, private to <name>; see #72) and writes a standalone config to
-~/.config/mackas/projects/<name>.conf, seeded from the settings in effect
-right now. It PINS; it does not build -- run
-'$SCRIPT_CMD --project <name> setup' afterwards for that.
-
-<name> is the project's own SELECTOR identity only -- what '--project <name>'
-matches, what the workspace directory and default volume names are built
-from. It is deliberately independent of the checkout's own directory name
-(MACKAS_PROJECT_DIR, work/<name>/<dir>): kas and everything else that reads
-that checkout expects its directory to be the real repo's own name, so
---url's default is derived from the URL, not from <name> -- see --dir below.
+${C_BLD}$SCRIPT_CMD project add${C_RST} -- pin <name> as a project under this Mac's MACKAS_ROOT.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD project add <name> --url URL --branch BRANCH [--dir DIR]
-  $SCRIPT_CMD project add <name> --from <checkout>
+  $SCRIPT_CMD project add <name> --from <checkout> [--keep-volumes|--derive-volumes]
   $SCRIPT_CMD project add <name>
 
+Creates \$MACKAS_WORK_ROOT/<name>/ (the project's KAS_WORK_DIR) and writes
+~/.config/mackas/projects/<name>.conf from the current settings. Does not
+build; run '$SCRIPT_CMD --project <name> setup' next.
+
 ${C_BLD}OPTIONS${C_RST}
-  --url URL            The project's git remote. Needs --branch too. Nothing
-                       is cloned yet -- that is what 'setup' does next.
-  --branch BRANCH      The branch to build. Needs --url too.
-  --dir DIR            The checkout's own directory name (MACKAS_PROJECT_DIR),
-                       overriding the default derived from --url (the same
-                       name a plain 'git clone URL' would pick on its own).
-                       Only meaningful with --url -- a --from conversion's
-                       checkout already has a real, fixed directory name.
-  --from <checkout>    Convert an EXISTING checkout already at
-                       \$MACKAS_WORK_ROOT/<name>/ into a pinned project, in place --
-                       reads its remote URL and current branch instead of
-                       asking for --url/--branch. Mutually exclusive with
-                       --url/--branch and with --dir. <checkout> must name
-                       that very directory (bare '<name>', 'work/<name>', or
-                       a path resolving to it) -- 'project add' never renames
-                       or moves a checkout to make names line up.
-  --keep-volumes       With --from only: keep building against whatever
-                       volumes the checkout already used (e.g. oe-build-*),
-                       explicitly -- migration path B from the multi-project
-                       design (#72): a fully supported end state, no data
-                       ever moved.
-  --derive-volumes     With --from only: the opposite -- switch this project
-                       to mackas-<name>-* going forward. The OLD volumes are
-                       left exactly as they are, not moved or deleted; only a
-                       FUTURE build reads/writes the new ones.
+  --url URL          Git remote; needs --branch. setup clones it.
+  --branch BRANCH    Branch to build; needs --url.
+  --dir DIR          Checkout directory name (default: what 'git clone URL'
+                     picks). --url only.
+  --from <checkout>  Convert the existing checkout at \$MACKAS_WORK_ROOT/<name>/
+                     in place, reading its remote and branch. Excludes --url,
+                     --branch, and --dir. Never renames or moves to match.
+  --keep-volumes     --from only: keep the volumes it already used.
+  --derive-volumes   --from only: use mackas-<name>-* from now on. Old volumes
+                     are left untouched.
 
-  Neither --keep-volumes nor --derive-volumes given, --from used, and this is
-  running interactively: asked as a yes/no question. Non-interactive (no
-  tty, or -y) and neither given: keeps the existing volumes -- the choice
-  that changes nothing and never invalidates a cache is the safe default for
-  an unattended run.
+  --from with neither volume flag asks; without a terminal, or with -y, it
+  keeps. Keeping is refused while another project is selected (--project,
+  \$MACKAS_PROJECT_SELECT, or \$PWD) whose config pins no volume stem: drop
+  the selection or use --derive-volumes.
 
-  "Keep" (asked, defaulted, or --keep-volumes given) is REFUSED outright
-  when a DIFFERENT project's selection is active -- --project/
-  \$MACKAS_PROJECT_SELECT, or one derived from \$PWD -- and that project's own
-  config does not explicitly pin a stem: the current \$MACKAS_VOLUME_NAME
-  would then be only that OTHER project's own derived name, not anything
-  this checkout actually built with -- drop or unset the selector (or run
-  from outside its workspace, for a derived one) and re-run, or pass
-  --derive-volumes (which never looks at the ambient value at all).
+  Without --url or --from, nothing is checked out yet; set
+  MACKAS_PROJECT_URL/_BRANCH later with '--project <name> set'.
 
-  Omitting --url/--branch and --from entirely pins <name> with no checkout
-  configured yet, same as an unconfigured 'setup' -- fill in
-  MACKAS_PROJECT_URL/_BRANCH later with '$SCRIPT_CMD --project <name> set
-  MACKAS_PROJECT_URL ...'.
-
-'project add <name>' refuses outright if \$MACKAS_WORK_ROOT/<name>/ already exists
-and --from was not given -- a plain checkout that happens to share the name
-is not automatically adopted (#72: filesystem shape alone never decides
-anything). An already-pinned <name> is offered for overwrite, exactly like
-'$SCRIPT_CMD adopt' does for its own config file.
-
-A --from conversion of a project pinned before per-project KAS_WORK_DIR
-existed (#80) also offers to move its checkout from the pre-M6
-\$MACKAS_WORK_ROOT/<name>/ into its now-current \$MACKAS_WORK_ROOT/<name>/<name>/
--- refusing outright, never moving anything, the moment that is ambiguous
-(the destination already exists, an earlier move was interrupted, or the
-checkout is reached through a symlink). It never touches whatever kas
-already cloned flat alongside it -- those siblings are yours to keep or
-discard by hand; 'mackas projects' flags a pin still in the old shape.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after 'project add'.
-
-See also: '$SCRIPT_CMD projects' lists what is already pinned; '$SCRIPT_CMD
-adopt' pins a whole FOREIGN root instead of a project inside this one.
+Refuses if \$MACKAS_WORK_ROOT/<name>/ exists without --from; offers to
+overwrite an existing pin. --from on an old flat-layout pin offers to move
+the checkout into <name>/<name>/, and refuses if that is ambiguous.
 EOF
 }
 
@@ -7978,34 +7862,20 @@ print_build_summary() {
 
 smoketest_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD smoketest${C_RST} -- run the validation ladder: parse-only, then
-MACKAS_SMOKETEST_TARGETS (or the kas config's own default target, if unset).
+${C_BLD}$SCRIPT_CMD smoketest${C_RST} -- parse every recipe, then build MACKAS_SMOKETEST_TARGETS
+(or the kas config's own default target, if unset).
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD smoketest
 
-Two rungs. First, parse-only (\`kas shell ... -c "bitbake -p"\`) -- confirms
-every layer fetches and every recipe parses, with no build. Then, one build
-rung per target in MACKAS_SMOKETEST_TARGETS -- or, if that is empty (the
-default), whatever \`bitbake\` builds with no --target, i.e. the project's
-own kas config default. \`auto-fstrim\` reclaims the sparse ext4 volumes
-before and after. Logs land in \$MACKAS_LOGS/smoketest-*.log; host CPU/RSS
-overhead is sampled around each rung. Each build rung that genuinely
-succeeds prints a one-line summary, e.g. '✓ core-image-base built (35.5 min,
-6253 tasks)' -- the task count is omitted, never guessed, if bitbake's own
-Tasks Summary line cannot be found in that rung's log.
-
-If no project is configured at all, smoketest OFFERS the qualcomm-linux/
-meta-ai example for that one run only -- never persisted, never the default,
-removed again (checkout + generated kas fragment) once the ladder finishes.
-Declining exits smoketest without running anything.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+Runs 'bitbake -p', then one build per target, fstrimming the volumes before
+and after. Logs: \$MACKAS_LOGS/smoketest-*.log. With no project configured,
+offers the qualcomm-linux/meta-ai example for this run only, removed again
+afterwards.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. smoketest refuses while
-  another build ($SCRIPT_CMD shell, a second smoketest, or a raw
-  kas-container) still holds any of the three volumes -- stop it first.
+  Refuses while another build (shell, smoketest, or a raw kas-container) holds
+  any of the three volumes.
 EOF
 }
 
@@ -8222,24 +8092,12 @@ ${C_BLD}$SCRIPT_CMD shell${C_RST} -- drop into a kas shell for the project's kas
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD shell
 
-Runs \`kas shell\` with the same volumes, runtime args and kas fragment a real
-build would use, so \`bitbake -e bash | grep ^TUNE_FEATURES\` and similar
-interactive poking see the real, mounted TMPDIR/DL_DIR/SSTATE_DIR -- not a
-bind-mounted host directory. Exits back to macOS when the shell exits.
-
-For a single read-only command instead of an interactive session, prefer
-'$SCRIPT_CMD exec CMD' -- it bakes in the repo-preserving --skip flags;
-'shell' deliberately runs kas's full setup (checkout, patch, config), which
-is what an interactive session should get.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
-though shell has nothing to confirm and nothing --dry-run would print instead
-of doing.
+Uses the same volumes, runtime args, and kas fragment as a build. Runs kas's
+full repo setup (checkout, patch); for one read-only command use
+'$SCRIPT_CMD exec CMD' instead.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. shell refuses while a
-  running build ($SCRIPT_CMD smoketest, another shell, or a raw
-  kas-container) still holds any of the three volumes -- stop it first.
+  Refuses while another build holds any of the three volumes.
 EOF
 }
 
@@ -8259,22 +8117,12 @@ ${C_BLD}$SCRIPT_CMD checkout${C_RST} -- check out every layer the project's kas 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD checkout
 
-Runs \`kas checkout\` with the same volumes, runtime args and kas fragment a
-real build would use, then exits: the layers (bitbake, openembedded-core, the
-meta-* repos) land in the work directory and the build directory's conf/ is
-written, without building anything. A fresh project needs this, or a first
-build, before anything that looks for the checkout's bin/bitbake (the
-progress bridge, claude-container's BitBake monitor) can find it.
-
-Like 'shell', and unlike 'exec', this runs kas's full repo setup: a layer
-already checked out is moved to the revision the kas config pins.
-
-Options: --dry-run and -v/--verbose work here too.
+Runs 'kas checkout' with a build's volumes and kas fragment, writing the
+layers and the build's conf/, then exits. Like 'shell', and unlike 'exec',
+it moves layers already checked out to the revision the kas config pins.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. checkout refuses while a
-  running build ($SCRIPT_CMD smoketest, a shell, or a raw kas-container)
-  still holds any of the three volumes -- stop it first.
+  Refuses while another build holds any of the three volumes.
 EOF
 }
 
@@ -8308,36 +8156,24 @@ checkout, with kas's repo-mutating setup steps always skipped.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD exec CMD [ARGS...]
-  $SCRIPT_CMD exec -- CMD [ARGS...]   (only needed if CMD itself starts with '-',
-                                     or collides with one of exec's own flags)
+  $SCRIPT_CMD exec -- CMD [ARGS...]   (if CMD starts with '-')
 
-Runs \`kas-container shell <files> $KAS_SKIP_REPO_STEPS -c "CMD ARGS..."\` --
-the exact skip set \`bitbake_getvar()\` already uses internally for retrieve/
-buildstats/clean. No flag adds '-k' back or drops a skip: that is the entire
-point. See the '-k' explanation in docs/architecture.md for why dropping
-those steps by hand, even briefly, can reset a layer to its pinned revision
-and wipe local commits.
+Runs 'kas-container shell <files> <skips> -c "CMD ARGS..."', skipping
+setup_dir, finish_setup_repos, repos_checkout, and repos_apply_patches. No
+flag brings them back; see docs/architecture.md. Global options go before
+CMD; everything after CMD is passed to it.
 
 ${C_BLD}WHAT THIS DOES NOT DO${C_RST}
-This protects against KAS's OWN setup steps, not against your command:
-\`$SCRIPT_CMD exec touch openembedded-core/foo\` still creates the file --
-/repo and the volumes are mounted read-write, necessarily. There is no
-sandbox here, only a guarantee that kas itself will not touch a repo.
+  Sandbox CMD: /repo and the volumes are read-write, so
+  '$SCRIPT_CMD exec touch openembedded-core/foo' still creates the file.
 
 ${C_BLD}EXAMPLES${C_RST}
   $SCRIPT_CMD exec du -sh openembedded-core
   $SCRIPT_CMD exec bitbake -e virtual/kernel
   $SCRIPT_CMD exec git -C openembedded-core status
 
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
-but only BEFORE the command starts -- anything after CMD is passed to CMD
-verbatim, never parsed as a mackas flag (so e.g. \`exec du -v\` passes '-v'
-to du, not to mackas).
-
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. exec refuses while a
-  running build (smoketest/shell) still holds any of the three volumes --
-  stop it first.
+  Refuses while another build holds any of the three volumes.
 EOF
 }
 
@@ -8455,23 +8291,11 @@ ${C_BLD}$SCRIPT_CMD lock${C_RST} -- pin every declared repo to its exact current
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD lock
 
-Runs \`kas-container lock\` against the project's kas config -- kas's own
-reproducibility mechanism, writing a resolved lockfile INTO the checkout
-next to the kas config it locked (see kas's own output above for the exact
-path; the name and location are kas's choice, not mackas's). /repo is a
-host bind mount, not an ext4 volume, so the lockfile is immediately visible
-on the Mac, no retrieve needed.
-
-Read-only from mackas's own perspective -- nothing here touches TMPDIR/
-DL_DIR/SSTATE_DIR -- but kas lock itself writes into the checkout, so this
-is NOT wrapped in the repo-preserving --skip flags '$SCRIPT_CMD exec' uses;
-run it when you actually want a fresh lock, not as a casual query.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+Runs 'kas-container lock', which writes a lockfile into the checkout next to
+the kas config (kas picks the name). Not wrapped in exec's --skip flags.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. lock refuses while a
-  running build (smoketest/shell) still holds any of the three volumes.
+  Refuses while another build holds any of the three volumes.
 EOF
 }
 
@@ -8508,23 +8332,13 @@ ${C_BLD}$SCRIPT_CMD dump${C_RST} -- write the fully-resolved kas config next to 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD dump
 
-Runs \`kas-container dump --skip repos_checkout --skip repos_apply_patches
---resolve-env --resolve-local --resolve-refs\` against the project's kas
-config and saves the resolved YAML it prints to
-\$MACKAS_LOGS/dump-<timestamp>.yml -- every env var, every local override
-and every repo ref resolved to its exact value, a reproducibility record
-next to a build's own logs. Purely read-only:
-kas dump writes nothing into the checkout itself -- the two --skip flags are
-load-bearing for that claim, not decorative. Resolving a branch/tag still
-needs kas to know the repo (cloning one that is missing, same as a real
-build), so setup_dir/finish_setup_repos are NOT skipped; only the two steps
-that would force-checkout or patch an EXISTING clone are.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too.
+Runs 'kas-container dump --resolve-env --resolve-local --resolve-refs' and
+saves the YAML to \$MACKAS_LOGS/dump-<timestamp>.yml. Skips repos_checkout
+and repos_apply_patches, so existing clones are untouched; a missing repo is
+still cloned.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. dump refuses while a
-  running build (smoketest/shell) still holds any of the three volumes.
+  Refuses while another build holds any of the three volumes.
 EOF
 }
 
@@ -9332,91 +9146,38 @@ check_buildstats_accumulation() {
 
 retrieve_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD retrieve${C_RST} -- copy build outputs out of the ext4 TMPDIR
-volume, where macOS cannot see them, via a throwaway container.
+${C_BLD}$SCRIPT_CMD retrieve${C_RST} -- copy build outputs out of the ext4 TMPDIR volume.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD retrieve <object> [<object>...] [--dest DIR]
 
-${C_BLD}OBJECTS${C_RST} (at least one required, repeatable, order does not matter)
-  buildstats           tmp/buildstats -- per-task timing (bitbake -m stats).
-                       Each retrieval lands in its OWN timestamped
-                       subdirectory (buildstats/<retrieve-time>/<BUILDNAME>/)
-                       so successive retrievals never merge together.
-  logs                 tmp/log -- cooker.log and friends.
-  deploy               tmp/deploy -- the images and ipks. Can be tens of GB.
-                       EXCLUDES sbom-cve-check/databases: a shared external
-                       CVE/NVD database mirror (two git checkouts plus one
-                       JSON file per CVE) that sbom-cve-check-update-*-native
-                       populate once and never scope to a build or a machine
-                       -- a real retrieve pulled 8.0GB/~750k files where
-                       7.0GB/748,874 files (87%) was this one directory,
-                       versus ~870MB of actual output (ipks, images,
-                       licenses, spdx). Fetch it explicitly with 'deploy
-                       sbom-cve-check' below if you want a copy of it.
+${C_BLD}OBJECTS${C_RST} (at least one, repeatable)
+  buildstats             tmp/buildstats, into a new timestamped subdirectory.
+  logs                   tmp/log.
+  deploy                 tmp/deploy, minus sbom-cve-check/databases (the CVE
+                         database mirror). Can be tens of GB.
   deploy images [MACHINE]
-                       Just DEPLOY_DIR_IMAGE (\${DEPLOY_DIR}/images/\${MACHINE})
-                       -- the boot images for one board, without every
-                       ipk/rpm feed and every MACHINE a multiconfig build has
-                       ever produced. MACHINE defaults to the project's
-                       currently configured one; an explicit override
-                       substitutes only the resolved path's trailing
-                       component, never a blind DEPLOY_DIR/images/MACHINE
-                       guess. Lands at \$dest/deploy/images.
-  deploy sbom-cve-check
-                       SBOM_CVE_CHECK_DEPLOY_DB_DIR (\${DEPLOY_DIR}/sbom-cve-check/
-                       databases) -- the CVE/NVD database mirror bare 'deploy'
-                       excludes (see above). Only exists if the project
-                       enables sbom-cve-check (an OE_FRAGMENTS entry, not
-                       inherited by default); retrieve says so rather than
-                       reporting a missing directory. Lands at
-                       \$dest/deploy/sbom-cve-check.
-  buildhistory         buildhistory/ -- what each build produced: package and
-                       image contents, sizes, dependencies, sysroot listings.
-                       Only exists if the project INHERITs buildhistory; most
-                       do not, and retrieve says so rather than reporting a
-                       missing directory. Note it sits at \${TOPDIR}/buildhistory
-                       -- inside the same volume '$SCRIPT_CMD clean' discards --
-                       so retrieve it before cleaning if you want to keep it.
-  sbom                 DEPLOY_DIR_SPDX (\${DEPLOY_DIR}/spdx/\${SPDX_VERSION})
-                       -- the SPDX SBOM tree create-spdx writes: one
-                       .spdx.json per recipe and per package, under
-                       <arch>/{builds,packages,static}/. OE-core inherits
-                       create-spdx by default, but a distro can drop it and
-                       older releases did not have it, so retrieve says
-                       "no SBOM output" rather than reporting a missing
-                       directory. It lives under DEPLOY_DIR, which
-                       '$SCRIPT_CMD clean' and 'clean tmp+deploy' both
-                       discard -- retrieve it before cleaning. (The single
-                       per-image SBOM, <image>-<machine>.spdx.json, is
-                       deployed alongside the images instead, so
-                       'retrieve deploy images' already brings that one.)
-                       Lands at \$dest/sbom.
+                         DEPLOY_DIR_IMAGE only (default: configured MACHINE).
+  deploy sbom-cve-check  The CVE database mirror that 'deploy' skips.
+  buildhistory           buildhistory/; needs INHERIT += "buildhistory".
+  sbom                   DEPLOY_DIR_SPDX. Per-image SBOMs come with
+                         'deploy images'.
 
 ${C_BLD}OPTIONS${C_RST}
   --dest DIR      Where to copy (default \$MACKAS_BASE/artifacts).
 
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after 'retrieve', e.g. '$SCRIPT_CMD --dry-run retrieve buildstats'.
+'$SCRIPT_CMD clean' discards buildhistory and deploy; retrieve first.
 
 ${C_BLD}A CONSTANT BUILDNAME${C_RST}
-  If the retrieved build_stats shows more than one build's data accumulated
-  in it (this project's BUILDNAME does not vary per build -- bitbake never
-  resets tmp/buildstats itself when that happens), retrieve warns and offers
-  to clear it in the volume so the next build starts clean. See
-  MACKAS_BUILDSTATS_ACCUMULATE (see mackas.conf.example) to manage this
-  yourself instead, and docs/storage.md#buildstats-and-a-constant-buildname.
+  If buildstats holds several builds, retrieve offers to clear it in the
+  volume. See MACKAS_BUILDSTATS_ACCUMULATE and docs/storage.md.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. retrieve refuses while a
-  running build (smoketest/shell) still holds the TMPDIR volume -- stop it first.
+  Refuses while another build holds the TMPDIR volume.
 
 ${C_BLD}TRANSFER SIZE${C_RST}
-  Each object's real size is measured (not guessed) before it is copied, and
-  printed as e.g. 'deploy: 4.2G to transfer to \$dest' -- this also runs under
-  --dry-run. If \$dest's filesystem looks too small for it, retrieve warns
-  (never refuses); a du/df failure never blocks the retrieval either, size
-  reporting is a nicety, not a precondition.
+  Each object's size is printed before copying, also with --dry-run. A \$dest
+  that looks too small gets a warning, not a refusal.
 EOF
 }
 
@@ -9651,39 +9412,25 @@ cmd_retrieve() {
 
 buildstats_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD buildstats${C_RST} -- work with buildstats already retrieved
-from the TMPDIR volume ('$SCRIPT_CMD retrieve buildstats').
+${C_BLD}$SCRIPT_CMD buildstats${C_RST} -- analyze buildstats from '$SCRIPT_CMD retrieve buildstats'.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD buildstats analyze [PATH] [--json] [--top N] [-o FILE] [--chart|--no-chart]
+  $SCRIPT_CMD buildstats analyze [PATH] [--json] [--top N] [-o FILE]
+                               [--chart|--no-chart]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
-  analyze [PATH]   Summarise the NEWEST build in a buildstats directory (wall
-                   time, parallelism, io-bound tasks) via
-                   tools/mackas-buildstats-analyze, then render pybootchartgui's
-                   bootchart SVG for EVERY build under PATH not already charted
-                   -- one <BUILDNAME>.svg per build, next to it. PATH defaults
-                   to \$MACKAS_BASE/artifacts/buildstats -- the default
-                   '$SCRIPT_CMD retrieve buildstats' destination.
+  analyze [PATH]   Summarize the newest build (wall time, parallelism,
+                   io-bound tasks), and render a bootchart SVG next to every
+                   build not yet charted. PATH defaults to
+                   \$MACKAS_BASE/artifacts/buildstats.
 
-    --json         Machine-readable JSON instead of the text digest.
-    --top N        How many entries per top-N table (default 25).
-    -o FILE        Write the summary to FILE instead of stdout.
-    --chart        Render the bootchart SVG and fail the command if that
-                   render fails (the default silently tolerates a chart
-                   failure -- it is a bonus, not something you asked for).
-    --no-chart     Skip the SVG render entirely -- no throwaway container.
+    --json         JSON instead of the text digest.
+    --top N        Entries per top-N table (default 25).
+    -o FILE        Write the summary to FILE.
+    --chart        Fail if the SVG render fails (default: skip quietly).
+    --no-chart     Skip the SVG render.
 
-The SVG needs pycairo, which this Mac's own Python does not have, so it runs
-INSIDE a throwaway kas-image container instead -- best-effort by default:
-silently skipped (not an error) with no checkout yet, or if
-pybootchartgui.py cannot be found under it, or on any other render failure,
-unless --chart asked for it explicitly. A build with a chart already on disk
-is skipped, so re-running 'analyze' after one more build only charts the new
-one.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after the subcommand.
+The SVG renders in a throwaway kas-image container and needs a checkout.
 EOF
 }
 
@@ -10085,45 +9832,28 @@ buildhistory_detail_diff() {
 # the two layers, the defaults, and the BUILDHISTORY_COMMIT requirement.
 buildhistory_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD buildhistory${C_RST} -- work with a buildhistory tree already retrieved
-from the TMPDIR volume ('$SCRIPT_CMD retrieve buildhistory').
+${C_BLD}$SCRIPT_CMD buildhistory${C_RST} -- compare two builds in a tree from '$SCRIPT_CMD retrieve
+buildhistory'.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD buildhistory analyze [PATH] [--from REV] [--to REV] [--detail]
                           [--json] [--top N] [--all]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
-  analyze [PATH]   Summarise what changed between two builds -- recipes
-                   added/removed/upgraded, the biggest PKGSIZE movers, and
-                   per-image size/content deltas -- via
-                   tools/mackas-buildhistory-analyze, a stdlib-only host
-                   Python tool that reads the retrieved git repo directly
-                   (no container, no bitbake). PATH defaults to
-                   \$MACKAS_BASE/artifacts/buildhistory -- the default
-                   '$SCRIPT_CMD retrieve buildhistory' destination.
+  analyze [PATH]   Recipes added, removed, or upgraded, the biggest PKGSIZE
+                   movers, and per-image deltas. Runs on the host. PATH
+                   defaults to \$MACKAS_BASE/artifacts/buildhistory.
 
 Options:
-  --from REV   left side of the comparison (default: build-minus-1, the tag
-               buildhistory.bbclass rotates before each commit)
-  --to REV     right side of the comparison (default: HEAD)
-  --detail     also run upstream openembedded-core's own buildhistory-diff,
-               INSIDE a throwaway kas-image container, and print its
-               per-field output underneath the summary -- best-effort: needs
-               a checkout under \$MACKAS_WORK with bitbake and
-               scripts/buildhistory-diff under it.
-  --json       emit the summary as JSON instead of the text digest. Refuses
-               --detail (its output would corrupt the JSON stream).
-  --top N      how many size movers to list (default 10)
-  --all        disable the summary's own small-change threshold (>1% or
-               >64 KiB) -- every changed package is listed
+  --from REV   Left side (default build-minus-1).
+  --to REV     Right side (default HEAD).
+  --detail     Also run OE-core's buildhistory-diff in a throwaway container;
+               needs a checkout.
+  --json       JSON output. Not with --detail.
+  --top N      Size movers to list (default 10).
+  --all        List every changed package (no >1% or >64 KiB threshold).
 
-BUILDHISTORY_COMMIT must be "1" (in the project's kas config's
-local_conf_header, or conf/local.conf) for there to be any build-to-build
-history to compare -- otherwise this shows the CURRENT state instead
-(snapshot mode), which is still useful but is not a diff.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after the subcommand.
+Needs BUILDHISTORY_COMMIT = "1"; otherwise it shows the current state only.
 EOF
 }
 
@@ -10319,68 +10049,28 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD sstate push [--dest USER@HOST:/PATH] [--full]
 
 ${C_BLD}SUBCOMMANDS${C_RST}
-  prune --older-than N[d]   Delete sstate objects bitbake has not reused in
-                            at least N days. Reports what would go and how
-                            much space it frees first; only deletes after
-                            confirmation (or with -y/--yes).
-  push [--dest ...]         Publish sstate objects to a mirror over rsync/ssh.
+  prune --older-than N[d]   Delete objects bitbake has not reused in N days.
+                            Shows what would go first; deletes after
+                            confirmation or -y.
+  push [--dest ...]         Publish objects to a mirror over rsync/ssh.
                             --dest defaults to MACKAS_SSTATE_PUSH_DEST; --full
-                            ignores the incremental stamp and offers the whole
-                            volume again.
+                            ignores the incremental stamp.
 
 ${C_BLD}PRUNE${C_RST}
-bitbake touches (updates the mtime of) an sstate object every time it finds
-and reuses it -- see sstate.bbclass's sstate_eventhandler and the
-setscene-valid check, both call oe.utils.touch()/os.utime() on a hit. So
-"N days old" here really means "nothing built in N days has needed this",
-not merely "created N days ago".
-
-sstate's own hash-addressing makes this safe to prune conservatively: an
-object pruned here that turns out still to be needed just gets rebuilt, at
-the one-time cost of that task, never a correctness risk.
-
-For more surgical pruning -- keep only what a SPECIFIC checkout's stamps/
-still reference, or drop older duplicates of the same package/arch/task
-signature -- see openembedded-core's own scripts/sstate-cache-management.py,
-run inside a project checkout. '$SCRIPT_CMD sstate prune' does not replace
-it; it solves the coarser "nothing has touched this in months" case.
+  bitbake touches an object on every reuse, so age means "unused". A pruned
+  object that is still needed is rebuilt. For finer pruning use OE-core's
+  scripts/sstate-cache-management.py.
 
 ${C_BLD}PUSH${C_RST}
-Objects newer than this volume+destination's own stamp are copied out of the
-volume into a host staging directory (MACKAS_SSTATE_PUSH_STAGE, default
-\$MACKAS_BASE/sstate-push) and verified there with the same checksum manifest
-'$SCRIPT_CMD retrieve' uses, before anything touches the network. The volume is
-released before the transfer, which then runs as two rsync passes -- every
-object first, the .siginfo files second, so a consumer reading the mirror
-mid-push never finds a signature whose object is missing.
-
-Everything is sent with --ignore-existing and never --inplace: a published
-object is immutable, the first writer wins, and each one appears at the
-destination atomically. Re-running a push is therefore always safe, and a
-lost stamp costs a full rescan rather than a wrong result. So does a scan
-that could not answer: only a scan that provably ran and provably matched
-nothing moves the stamp forward.
-
-The stamp selects on mtime, and bitbake touches an sstate object every time
-it REUSES it -- so a push offers everything recent builds wrote or reused,
-not only what is new. Nothing is missed that way, and --ignore-existing makes
-a re-offer free on the wire, but every re-offered object is still staged and
-checksummed on the host: size MACKAS_SSTATE_PUSH_STAGE for the reuse set.
-
-Push before you prune. Once an object is on the mirror, pruning it locally
-costs an HTTP refetch instead of a rebuild.
-
-The destination is an rsync/ssh target, not an HTTP URL: mackas-mirrord serves
-the read path anonymously and read-only, and that is a property worth keeping
--- so the write path is authenticated out of band, over ssh.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after the subcommand.
+  Objects are staged and checksummed in MACKAS_SSTATE_PUSH_STAGE (default
+  \$MACKAS_BASE/sstate-push), then rsynced, objects before .siginfo files.
+  Everything is sent with --ignore-existing and never --inplace, so
+  re-running is safe.
+  Recently reused objects are offered again, so size the stage for them.
+  Push before you prune.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. Both prune and push
-  refuse while a running build (smoketest/shell) still holds the sstate
-  volume.
+  prune and push refuse while another build holds the sstate volume.
 EOF
 }
 
@@ -10764,113 +10454,47 @@ cmd_sstate() {
 
 monitor_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build
-started with MACKAS_MONITOR=1.
+${C_BLD}$SCRIPT_CMD monitor${C_RST} -- show live bitbake progress from a build started with
+MACKAS_MONITOR=1.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD monitor [--port N] [--once] [--notify] [--wait-for-start SECONDS]
 
-Polls the in-container progress bridge and prints one line per update:
-'[status] done/total  recipe:task'. This only polls an already-published
-port -- it does not start a build. Enable the bridge for the build you
-want to watch first, e.g.:
-
-  $SCRIPT_CMD --set MACKAS_MONITOR=1 smoketest &
-  $SCRIPT_CMD monitor
-
-If you want a completion SIGNAL rather than a progress view -- for a script
-or a Claude workflow that just needs to know when a build finished -- the
-build's own exit code is the more reliable choice; see 'A DONE-SIGNAL
-WITHOUT POLLING' below before reaching for this command.
+Polls the progress bridge and prints '[status] done/total  recipe:task' until
+the build ends. Does not start a build. Exit status: 0 success, 1 build
+failed, 2 no bridge reachable.
 
 ${C_BLD}OPTIONS${C_RST}
   --port N              Poll this port instead of MACKAS_MONITOR_PORT.
-  --once                Print a single snapshot and exit, instead of
-                         following until the build reports success/failed.
-                         Exit status distinguishes success (0), a build
-                         that failed (1) and no bridge reachable at all
-                         (2) -- usable as a scripted probe.
-  --notify              Also post a native macOS notification on exactly
-                         three transitions -- build started, succeeded,
-                         failed -- never per task. MACKAS_MONITOR_NOTIFY=1
-                         turns it on without the flag. Uses
-                         terminal-notifier when it is installed, else
-                         osascript.
+  --once                Print one snapshot and exit.
+  --notify              macOS notification on start, success, and failure
+                        (or MACKAS_MONITOR_NOTIFY=1).
   --wait-for-start SECONDS
-                         Tolerate the bridge not being up yet for up to
-                         SECONDS, instead of failing on the very first
-                         poll (the default: 0, today's behavior). Makes it
-                         possible to launch 'monitor' at the same moment
-                         as the build it watches -- kas's own
-                         checkout/patch/container-start plus reaching
-                         bitbake can take anywhere from seconds to
-                         minutes. Only covers the FIRST connection: once
-                         the bridge has answered even once, a later
-                         failure is still reported immediately -- a bridge
-                         that goes away mid-build is a real problem, not a
-                         startup race.
+                        Wait up to SECONDS for the bridge's first answer
+                        (default 0).
 
-MACKAS_MONITOR_POLL_INTERVAL sets the poll interval in seconds (default 2);
-there is no flag for it, since it is a display-only knob, not a setting
-'mackas set' persists.
+MACKAS_MONITOR_POLL_INTERVAL sets the poll interval (default 2 seconds).
+-y and -v have no effect; --dry-run prints the command instead of polling.
 
 ${C_BLD}A DONE-SIGNAL WITHOUT POLLING${C_RST}
-'monitor' (without --once) already blocks until the build finishes and
-returns a distinct exit code (0 success, 1 the build failed, 2 no bridge
-reachable) -- backgrounding it is a real, non-polling way to be told when
-a build ends. But it only ever sees ONE container's bitbake: it cannot
-tell you a multi-rung 'smoketest' ladder or a hand-typed multi-machine
-batch is fully done, only that the container it happened to be watching
-ended, and it cannot see a failure that happens before bitbake ever
-starts (a bad kas config, a container that never comes up).
-
-For that reason, THE BUILD'S OWN EXIT CODE IS THE MORE RELIABLE SIGNAL --
-background the build itself, not this command:
-
-  $SCRIPT_CMD smoketest -y > smoketest.log 2>&1 &
-  wait \$!   # \$? is the ladder's real result, covering everything
-
-  $SCRIPT_CMD monitor --once   # a cheap progress check meanwhile, if wanted
-
-If you drive kas-container BY HAND instead of through 'smoketest'/'build',
-two things matter for the exit code to stay trustworthy:
-
-- Background it with '> log 2>&1 &' in a shell that has SOURCED env.sh,
-  never by PIPING it ('kas-container ... | tail -3' runs the function in
-  a subshell, so any exports it makes -- including the derived
-  MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG -- vanish the moment the pipe
-  closes, which can silently point a later command at the wrong project).
-- 'nohup'/'env'/an absolute path/anything else that resolves
-  'kas-container' via \$PATH instead of the sourced shell function still
-  reaches the generated protection wrapper (the real volumes and CPU/
-  memory limits apply, and the exit code is genuine) -- but it skips the
-  shell function's own conveniences, the auto-appended tuning fragment
-  and the MACKAS_PROJECT_DIR/MACKAS_KAS_CONFIG derivation. That trade is
-  fine for getting a trustworthy background exit code specifically; it is
-  not fine if the build also depends on either of those being derived for
-  you -- export them yourself first in that case.
+  monitor sees one container only. To know a whole run finished, wait on the
+  build itself:
+    $SCRIPT_CMD smoketest -y > smoketest.log 2>&1 & wait \$!
+  Background a hand-typed kas-container the same way, in a shell that sourced
+  env.sh; do not pipe it.
 
 ${C_BLD}WHEN THE PUBLISHED PORT RESETS${C_RST}
-Apple's 'container' can accept the connection on a published port and then
-reset it instead of answering -- the forward's bug, not the bridge's, which
-answers that same request correctly on the container's own address. When
-that happens the poll asks the runtime which running container publishes
-this port, switches to that container's IP (saying so once), and carries
-on. A working port is never delayed by any of this: nothing is asked of the
-runtime unless a poll has already been reset.
+  If the runtime's port forward resets the connection, monitor switches to
+  the container's own IP and says so.
 
 ${C_BLD}NOTIFICATION PERMISSIONS${C_RST}
-If the terminal app has no Notification Center entry, osascript
-notifications are dropped SILENTLY, with no error and no exit code to
-check -- it looks identical to working. Granting it is a one-time trip
-through System Settings > Notifications that no CLI can do for you.
-Installing terminal-notifier (brew install terminal-notifier) sidesteps it
-by carrying its own bundle identity, and is preferred automatically.
+  osascript notifications are dropped silently if the terminal has no
+  Notification Center entry. terminal-notifier is used instead if installed.
 
--y/--yes (or -f/--force) and -v/--verbose are accepted here for consistency
-with every other command, but have no effect: monitor never mutates
-anything or asks for confirmation. --dry-run prints the mackas-monitor
-invocation it would run instead of polling.
+${C_BLD}EXAMPLES${C_RST}
+  $SCRIPT_CMD --set MACKAS_MONITOR=1 smoketest &
+  $SCRIPT_CMD monitor
+  $SCRIPT_CMD monitor --once     # one snapshot, exit 0/1/2
 EOF
 }
 
@@ -11028,14 +10652,9 @@ ${C_BLD}$SCRIPT_CMD status${C_RST} -- show what is configured and what exists on
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD status
 
-Read-only, like check, but reports state rather than grading it: every
-resolved setting and where it came from, derived paths, whether env.sh/
-kas-container/the project checkout/gitconfig exist, the container runtime's
-own state, the three ext4 volumes (cap vs. real on-disk cost, and a reclaim
-hint when one is near its cap), free disk space, and recent logs/artifacts.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too,
-though status reads only and never prompts, so none of them change anything.
+Read-only. Shows every resolved setting and its source, derived paths, which
+files exist, the container runtime's state, the three volumes (cap vs. real
+size, with a reclaim hint), free disk space, and recent logs and artifacts.
 EOF
 }
 
@@ -11272,156 +10891,72 @@ cmd_status() {
 
 clean_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD clean${C_RST} -- drop the TMPDIR volume (recreated empty), or one
-narrower target at a time. Never touches \$MACKAS_ROOT or the short symlink --
-for that, see '$SCRIPT_CMD destroy'.
+${C_BLD}$SCRIPT_CMD clean${C_RST} -- drop the TMPDIR volume (recreated empty), or one narrower
+target. Never touches \$MACKAS_ROOT; see '$SCRIPT_CMD destroy'.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD clean [TARGET...]
 
-Bare '$SCRIPT_CMD clean' (no target) deletes and recreates the WHOLE TMPDIR
-volume ('$MACKAS_VOL_TMP') and clears \$MACKAS_LOGS. With a project selected
-that is only that project's own logs/<name>, never a sibling's; with none
-selected it is the flat logs/, and clearing that takes every project's
-logs/<name> sitting under it along with it. That drops everything
-under TOPDIR, not just tmp/: deploy, buildhistory (if the project inherits
-it), conf/ and cache/ all go too. DL_DIR and SSTATE_DIR are never touched --
-having them in separate volumes is exactly why this works. Only prompts once
-(no typed confirmation word, unlike '$SCRIPT_CMD destroy').
+Bare 'clean' recreates the whole TMPDIR volume ('$MACKAS_VOL_TMP'): tmp,
+deploy, buildhistory, conf/, and cache/ all go. DL_DIR and SSTATE_DIR are
+kept. It also clears \$MACKAS_LOGS: with a project selected, only its
+logs/<name>, never a sibling's; with none, the flat logs/, taking every
+project's logs/<name> sitting under it along with it. Asks once.
 
-${C_BLD}TARGETS${C_RST} (optional, repeatable, order does not matter)
-  tmp+deploy   Clear TMPDIR and DEPLOY_DIR in place, WITHOUT deleting or
-               recreating the TMPDIR volume -- keeps buildhistory and conf/,
-               which bare '$SCRIPT_CMD clean' drops. TMPDIR and DEPLOY_DIR are
-               always cleared TOGETHER: bitbake's stamps (under TMPDIR) record
-               which tasks already wrote DEPLOY_DIR, so clearing either one
-               alone leaves the other inconsistent with it -- there is no
-               'deploy only' or 'tmp only' target. A multiconfig has its own
-               TMPDIR (and stamps), so every BBMULTICONFIG entry's TMPDIR and
-               DEPLOY_DIR are cleared with them, or its stale stamps would
-               claim output the shared DEPLOY_DIR no longer has. SSTATE_DIR
-               survives, so the next build refills both cheaply -- but largely by
-               RESTORING the same cached artifacts, not recompiling; to force
-               a genuinely fresh rebuild of something, use '$SCRIPT_CMD shell'
-               and e.g. 'bitbake -f -c deploy <recipe>'. Slower than bare
-               clean (an in-place rm, not a volume swap), so it also fstrims
-               TMPDIR afterward to reclaim the freed host disk that an
-               in-place rm alone would not (MACKAS_FSTRIM_AUTO=0 skips this).
-  downloads    Delete and recreate the DL_DIR volume ('$MACKAS_VOL_DL').
-               Independent of tmp/deploy/sstate -- fetched sources have no
-               stamp relationship to them. Cheap to refill if an HTTP/NFS
-               mirror is configured; otherwise everything is re-fetched over
-               the network.
-  sstate       Delete and recreate the SSTATE_DIR volume ('$MACKAS_VOL_SSTATE')
-               -- a full wipe. For age-based partial cleanup instead, see
-               '$SCRIPT_CMD sstate prune --older-than N[d]'.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-put them before or after 'clean', e.g. '$SCRIPT_CMD --dry-run clean downloads'.
+${C_BLD}TARGETS${C_RST} (optional, repeatable)
+  tmp+deploy   Clear TMPDIR and DEPLOY_DIR (every multiconfig's too) in
+               place; keeps buildhistory and conf/. Always both, since the
+               stamps track deploys. Refills largely from sstate. fstrims
+               afterwards (MACKAS_FSTRIM_AUTO=0 skips).
+  downloads    Recreate the DL_DIR volume ('$MACKAS_VOL_DL').
+  sstate       Recreate the SSTATE_DIR volume ('$MACKAS_VOL_SSTATE'). For
+               age-based pruning, '$SCRIPT_CMD sstate prune'.
 
 ${C_BLD}PATH RESOLUTION (tmp+deploy)${C_RST}
-  tmp+deploy resolves the real TMPDIR/DEPLOY_DIR from bitbake instead of
-  assuming the OE-core default layout -- a distro conf may set DEPLOY_DIR to
-  any path, e.g. a sibling of tmp/ rather than inside it. That resolution
-  needs \$MACKAS_PROJECT_DIR and \$MACKAS_KAS_CONFIG set -- in the config
-  file, or exported in this shell:
-    export MACKAS_PROJECT_DIR=<checkout under work/>
-    export MACKAS_KAS_CONFIG=<its kas files>
-  Multiconfigs (BBMULTICONFIG) are resolved the same way, one 'bitbake -e
-  mc:<name>' each -- never by globbing /build/tmp-*. That loads the recipe
-  cache, so it is slower than a getvar, and only runs when BBMULTICONFIG is
-  set.
-  If bitbake-getvar still fails with those set, tmp+deploy REFUSES rather
-  than guessing a path it is about to rm -rf (see '$SCRIPT_CMD status'/
-  'check') -- deliberate: a guessed path can only be right by luck or a
-  silent no-op reported as success. downloads/sstate are unaffected --
-  whole-volume operations, no bitbake variable resolution involved. A
-  sourced env.sh can derive both automatically from a hand-typed
-  'kas-container build/shell <files>', but only for that one shell
-  session, never across a piped invocation.
+  The paths come from bitbake, never a guess, so MACKAS_PROJECT_DIR and
+  MACKAS_KAS_CONFIG must be set (config file or environment). If bitbake
+  cannot resolve them, tmp+deploy refuses.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. Each target refuses while a
-  running build (smoketest/shell) still holds the volume it needs -- stop it
-  first.
+  Each target refuses while another build holds its volume.
 EOF
 }
 
 runtime_args_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD runtime-args${C_RST} -- plumbing. Prints the \`--runtime-args\` string
-a build right now would use (CPU/memory limits, the three ext4 volume
-mounts, mirror mounts if enabled, the live-progress-bridge args if
-MACKAS_MONITOR=1) and nothing else.
+${C_BLD}$SCRIPT_CMD runtime-args${C_RST} -- plumbing for the generated kas-container wrapper.
+Prints the \`--runtime-args\` string a build would use now.
 
 ${C_BLD}USAGE${C_RST}
-  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR] [--kas-files CHAIN] [--emit-dirs]
+  $SCRIPT_CMD runtime-args [--require-volumes-free] [--expect-work DIR]
+                      [--kas-files CHAIN] [--emit-dirs]
 
-Not something you normally run directly: the generated \`kas-container\`
-wrapper calls this itself, once per invocation, so a setting that
-affects the build (MACKAS_MONITOR, a volume-name override, ...) takes
-effect on a hand-typed \`kas-container build/shell <files>\` the same way it
-already does for '$SCRIPT_CMD smoketest'/'shell' -- not just after the next
-'$SCRIPT_CMD setup'. Exists so that fact has one implementation instead of
-being copied into the generated wrapper.
+  --require-volumes-free  Print nothing and refuse if a running container
+                          holds one of the three volumes.
+  --expect-work DIR       Refuse if the config resolves a work root other
+                          than DIR.
+  --kas-files CHAIN       The wrapper's kas file list; used to derive the
+                          project when \$PWD does not.
+  --emit-dirs             Also print KAS_WORK_DIR=<path> and
+                          KAS_REPO_REF_DIR=<path> lines.
 
-${C_BLD}--expect-work DIR${C_RST} refuses when the config in effect resolves a
-different flat work root than DIR. The wrapper passes the MACKAS_WORK_ROOT
-it was generated with: volumes are recomputed live while work dir, image
-and gitconfig stay frozen in it, so a config naming another root would
-mount another project's ext4 volumes under this project's sources.
-Comparing identities rather than freezing the config path keeps an ambient
-\$MACKAS_CONF usable whenever it agrees, and refuses only when it does not.
-
-${C_BLD}--kas-files CHAIN${C_RST} is plumbing too: the generated wrapper's own hint at the
-file list a hand-typed \`kas-container build/shell/checkout <files>\` was just
-called with, forwarded here so tier-3 project selection (#78) can derive a
-project from the chain's own leading path component when \$PWD alone (e.g.
-standing in work/ itself) derives nothing. Only ever consulted as a
-fallback -- \$PWD always wins when it derives anything on its own -- and only
-ever after the same validation any other name gets before it is pasted into
-a path.
-
-${C_BLD}--require-volumes-free${C_RST} applies the one-VM rule first and prints nothing
-if it fails: refuse, naming the volume, when a running container already
-holds one of the three ext4 volumes this string attaches. The wrapper
-passes it on every call, so a hand-typed \`kas-container build\` while a
-build is running is refused exactly as '$SCRIPT_CMD shell' would be.
-
-${C_BLD}--emit-dirs${C_RST} adds two more lines after the runtime-args string itself:
-\`KAS_WORK_DIR=<path>\` and \`KAS_REPO_REF_DIR=<path, possibly empty>\`. The
-generated wrapper passes it so one subprocess answers the work dir, the
-repo-ref store and the volume names together -- they cannot disagree the
-way two separate calls could race to. Without it, output is exactly the
-runtime-args string, byte for byte, as before this flag existed.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose are accepted
-but change nothing here -- there is nothing to confirm and nothing dry-run
-would print differently.
+The wrapper calls this on every run, so settings apply without re-running
+setup.
 EOF
 }
 
 destroy_usage() {
 	cat <<EOF
-${C_BLD}$SCRIPT_CMD destroy${C_RST} -- remove all four volumes (the three active ones
-plus a rarely-present legacy one), \$MACKAS_ROOT and the short symlink.
+${C_BLD}$SCRIPT_CMD destroy${C_RST} -- remove every volume, \$MACKAS_ROOT, and the short symlink.
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD destroy
 
-The widest-blast-radius command mackas has: every ext4 volume, the project
-checkout, logs and artifacts under \$MACKAS_ROOT, and the \$MACKAS_SHORT_LINK
-symlink, all gone. Refuses to remove \$MACKAS_ROOT if any volume survives
-deletion (e.g. still in use), so a partial failure never silently drops the
-checkout while leaving orphaned volumes behind.
+Deletes all ext4 volumes (including a legacy one, if present), and the
+checkout, logs, and artifacts under \$MACKAS_ROOT. Keeps \$MACKAS_ROOT if any
+volume could not be removed. Asks you to type DESTROY unless -y is given.
 
-For a narrower reset, see '$SCRIPT_CMD clean' (the whole TMPDIR volume),
-'$SCRIPT_CMD clean tmp+deploy|downloads|sstate' (one thing at a time), or
-'$SCRIPT_CMD volume destroy --all' (every volume, but not \$MACKAS_ROOT).
-
-Requires typing the word DESTROY to confirm, unless -y/--yes/-f/--force is
-given (required for non-interactive use). --dry-run and -v/--verbose also
-work here.
+Narrower: 'clean', 'clean tmp+deploy|downloads|sstate', 'volume destroy --all'.
 EOF
 }
 
@@ -13596,88 +13131,33 @@ ${C_BLD}USAGE${C_RST}
   $SCRIPT_CMD volume fsck <name> | all | --all [--check-only]
   $SCRIPT_CMD volume recover [<name>]
 
-${C_BLD}SUBCOMMANDS${C_RST}
-  list (ls)            Every volume: role, configured cap, actual on-disk cost
-                       of its volume.img, and whether a running VM holds it.
-  fstrim <name>        Reclaim host disk from a sparse ext4 image. Deleting
-  (trim)               files inside the guest never shrinks volume.img; fstrim
-                       inside the guest issues the discards that hole-punch it
-                       on the host. 'all' (or --all/-a) does the three active
-                       mackas volumes, skipping any that are in use.
-  duplicate <source> <duplicate>  Clone a volume via APFS copy-on-write
-  (dup, clone)         (near-free; the clone shares blocks with its source
-                       until written). <duplicate> is a name you choose.
-  destroy <name>       Remove ONE volume, or ('all'/--all/-a) every mackas-managed
-  (delete, rm)         volume: the three active ones plus the legacy
-                       pre-split leftover, if present -- skipping any that are
-                       missing or in use rather than aborting. Unlike the
-                       top-level '$SCRIPT_NAME destroy' (which ALSO removes
-                       $MACKAS_ROOT and the symlink), this only ever touches
-                       volumes.
-  move <name> <dir>    Relocate one volume's on-disk image to <dir>/<name> and
-  (relocate)           leave a symlink behind so the engine still finds it --
-                       e.g. put a big TMPDIR on a roomier disk. Refuses an
-                       in-use volume (one-VM rule). '$SCRIPT_CMD status' then
-                       reports the new location.
-  resize <name> <size> GROW a volume, keeping its contents, by copying it into
-  (grow)               a new one of the requested size. Sizes are the usual
-                       1T/500G/800M. There is no in-place grow: container
-                       volumes are formatted with sparse_super2, which the
-                       guest kernel cannot resize online, and offline resizing
-                       needs the filesystem unmounted -- which a volume never
-                       is. Copying is therefore a real copy, twice, and
-                       transiently needs about double the used space; a
-                       relocated volume is put back on its own drive. Refuses
-                       an in-use volume (one-VM rule) and reports the growth
-                       against free space on the drive the image really lives
-                       on. SHRINKING IS REFUSED: the same copy would work, but
-                       silently discarding data that no longer fits is not
-                       something mackas will do for you.
-  fsck <name>          Check, and offer to REPAIR, ext4 corruption in a
-                       volume's backing image -- the '[Errno 117] Structure
-                       needs cleaning' a host crash mid-write leaves behind.
-                       Works on a CLONE: mackas copies volume.img first
-                       (APFS copy-on-write, near-free), runs e2fsck against
-                       the copy inside a throwaway container, and only
-                       offers to promote the result once a second, clean
-                       verification pass has confirmed the repair. '<name>'
-                       itself is never written until you say yes to that,
-                       and the pre-repair image is kept alongside it
-                       afterwards -- mackas never deletes it, not even with
-                       -y. --check-only (-n) stops after the check. 'all'
-                       (or --all/-a) does the three mackas volumes,
-                       skipping any that are in use. A repair can move
-                       unrecoverable directory entries into lost+found
-                       rather than restoring them in place; that is normal
-                       fsck behaviour after a crash, not a mackas bug.
-                       Needs e2fsprogs, which the kas image does not ship
-                       -- it is installed into the throwaway container
-                       (needs network); set MACKAS_FSCK_IMAGE to an image
-                       that already has it to skip that.
-  recover [<name>]     When you have moved a volume.img by hand and the runtime
-                       can no longer find it, locate it with Spotlight and
-                       offer to re-point the symlink. With no name, checks all
-                       the mackas volumes, AND the workspace image (if one is
-                       configured but its file has gone missing) -- offering
-                       to move it back to its recorded path instead, since it
-                       has no symlink to re-point. Never changes anything
-                       unprompted.
+${C_BLD}SUBCOMMANDS${C_RST} (aliases in parentheses)
+  list (ls)          Role, cap, on-disk size, and whether a VM holds it.
+  fstrim (trim)      Return space freed inside a volume to the host. 'all'
+                     (--all/-a) does the three active volumes.
+  duplicate (dup, clone)
+                     APFS copy-on-write clone under a name you choose.
+  destroy (delete, rm)
+                     Remove one volume, or ('all', --all/-a) every mackas
+                     volume, legacy included. Unlike the top-level
+                     '$SCRIPT_NAME destroy', never touches \$MACKAS_ROOT.
+  move (relocate)    Move the image to <dir>/<name>, leaving a symlink.
+  resize (grow)      Grow by copying into a new volume (e.g. 1T, 500G). Needs
+                     about twice the used space. Shrinking is refused.
+  fsck               Check a clone of the image and offer to repair it. The
+                     original is replaced only after a clean recheck and your
+                     yes, and kept alongside. --check-only (-n): check only.
+                     'all' does the three volumes. Installs e2fsprogs in a
+                     throwaway container (network) unless MACKAS_FSCK_IMAGE
+                     has it.
+  recover            Find a hand-moved volume.img (or the workspace image)
+                     with Spotlight and offer to re-point it.
 
-  Parenthesized names are accepted aliases -- 'ls'/'rm' etc. match Apple
-  container's own vocabulary (this is a volume manager sitting right next to
-  'container volume ls'); the rest are contractions.
-
-Options: --dry-run, -y/--yes (or -f/--force) and -v/--verbose work here too;
-before or after the subcommand, e.g. '$SCRIPT_CMD --dry-run volume fstrim oe-build-tmp'
-or '$SCRIPT_CMD volume fstrim oe-build-tmp --dry-run' both work.
+--dry-run, -y/--yes (-f/--force), and -v go before or after the subcommand.
 
 ${C_BLD}ONE-VM RULE${C_RST}
-  Only one VM may access an ext4 image at a time. fstrim, duplicate, destroy
-  and fsck all refuse a volume a running container holds -- for duplicate,
-  that guard is on the SOURCE, since a clone of a live (mid-write) image is
-  inconsistent. In --all/-a mode (fstrim, destroy or fsck), a busy volume is
-  skipped with a warning instead of aborting the whole run; naming a volume
-  explicitly still refuses.
+  fstrim, duplicate (the source), destroy, move, resize, and fsck refuse a
+  volume a running container holds. With 'all', busy volumes are skipped.
 EOF
 }
 
@@ -13728,162 +13208,70 @@ usage() {
 	if [ -n "$MACKAS_PROJECT_URL" ]; then
 		project_line="Project: $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH)."
 	else
-		project_line="No project configured yet -- 'setup' still works, just skips the checkout step."
+		project_line="No project configured yet; 'setup' skips the checkout step."
 	fi
 	cat <<EOF
 ${C_BLD}$SCRIPT_NAME${C_RST} v$SCRIPT_VERSION -- run kas-container OpenEmbedded builds on Apple's
-'container' runtime. $project_line Set MACKAS_PROJECT_* to build your own
-layers -- qualcomm-linux/meta-ai is a worked example, see mackas.conf.example.
+'container' runtime. $project_line
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_NAME [OPTIONS] [COMMAND]
 
 ${C_BLD}COMMANDS${C_RST}
-  check      Preflight only. Changes nothing. ${C_BLD}This is the default.${C_RST}
-  setup      Do the full setup. Idempotent -- safe to re-run after a crash.
-  adopt      Bring a MACKAS_ROOT set up by another Mac back to a working
-             build here. '$SCRIPT_CMD adopt --help'.
-  project    Pin a project workspace under THIS root -- 'project add NAME'.
-             The in-root sibling of 'adopt'. '$SCRIPT_CMD project --help'.
-  smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
-  status     Show what is configured and what exists on disk.
-  shell      Drop into a kas shell for the project's kas config.
-  checkout   Check out every layer the kas config names, then exit; no build.
-  exec       Run a one-off read-only command against the checkout, with
-             kas's repo-mutating setup steps always skipped.
-             '$SCRIPT_CMD exec --help'.
-  retrieve   Copy build outputs (buildstats/logs/deploy/buildhistory/sbom)
-             out of the ext4 TMPDIR volume, where macOS cannot see them.
-             '$SCRIPT_CMD retrieve --help'.
-  buildstats Work with buildstats already retrieved (currently: analyze).
-             '$SCRIPT_CMD buildstats --help'.
-  buildhistory  Work with a buildhistory tree already retrieved: analyze
-             what changed between two builds. '$SCRIPT_CMD buildhistory --help'.
-  sstate     Prune sstate objects bitbake hasn't reused in a while, or push
-             new ones to a mirror. '$SCRIPT_CMD sstate --help'.
-  monitor    Show live bitbake progress from a build started with
-             MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
-  clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the
-             checkout. Or one target at a time (tmp+deploy/downloads/sstate);
-             '$SCRIPT_CMD clean --help'.
-  destroy    Remove all four volumes (the three active ones plus a
-             rarely-present legacy one), $MACKAS_ROOT and the short symlink.
-             Makes you type DESTROY.
-  volume     Manage the ext4 volumes: list, fstrim (reclaim disk), duplicate,
-             destroy one, move one to another disk, resize one, fsck a
-             corrupted one, recover a hand-moved one.
-             '$SCRIPT_CMD volume --help'.
-  set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
-  get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.
-  unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
-  projects   List the pinned per-project configs --project selects between.
-             '$SCRIPT_CMD projects --help'.
-  runtime-args  Plumbing: prints the effective --runtime-args string. The
-             env.sh wrapper calls this itself; you don't normally need to.
-  lock       Pin every declared repo to its exact current commit
-             (\`kas lock\`, writes into the checkout). '$SCRIPT_CMD lock --help'.
-  dump       Save the fully-resolved kas config next to the logs
-             (\`kas dump --resolve-*\`). '$SCRIPT_CMD dump --help'.
-  help       This message, or '$SCRIPT_CMD help COMMAND' for one command's own.
+  check         Preflight; changes nothing. ${C_BLD}The default.${C_RST}
+  setup         Full setup. Idempotent.
+  adopt         Make a MACKAS_ROOT from another Mac build here.
+  project       Pin a project under this root ('project add NAME').
+  projects      List pinned projects.
+  smoketest     Parse, then build MACKAS_SMOKETEST_TARGETS.
+  status        Show configuration and what exists on disk.
+  shell         kas shell for the project's config.
+  checkout      Check out the layers; no build.
+  exec          Run a read-only command against the checkout.
+  retrieve      Copy buildstats, logs, deploy, buildhistory, or sbom out of
+                the TMPDIR volume.
+  buildstats    Analyze retrieved buildstats.
+  buildhistory  Compare two builds in a retrieved buildhistory.
+  sstate        Prune or push sstate objects.
+  monitor       Live bitbake progress (MACKAS_MONITOR=1).
+  clean         Drop the TMPDIR volume, or one target (tmp+deploy, downloads,
+                sstate).
+  destroy       Remove all volumes, \$MACKAS_ROOT, and the short symlink.
+  volume        Manage the ext4 volumes (list, fstrim, move, resize, fsck, ...).
+  set           Persist one setting in the config file.
+  get           Print one setting's resolved value.
+  unset         Remove one persisted setting.
+  lock          Pin every repo to its current commit (kas lock).
+  dump          Save the resolved kas config (kas dump).
+  runtime-args  Plumbing for the env.sh wrapper.
+  help          This message; 'help COMMAND' for a command's own.
+
+  Most commands take --help, e.g. '$SCRIPT_CMD retrieve --help'.
 
 ${C_BLD}OPTIONS${C_RST}
-  --config FILE   Use this config file instead of searching.
-  --project NAME  Use the pinned project NAME's config instead of searching:
-                  ~/.config/mackas/projects/NAME.conf. Mutually exclusive
-                  with --config/\$MACKAS_CONF. '$SCRIPT_CMD projects' lists them.
-  --set NAME=VAL  Override one setting for THIS command only; beats config
-                  file and environment. Repeatable. For a PERSISTENT
-                  override, use '$SCRIPT_CMD set NAME VALUE' instead.
-                  '$SCRIPT_CMD status' lists the valid names.
-  --dry-run       Print every mutating command; change nothing.
-  -y, --yes       Assume yes; never prompt (required for non-interactive destroy).
-                  -f/--force is an accepted synonym, for anyone used to
-                  'docker system prune -f'.
+  --config FILE   Use this config file.
+  --project NAME  Use pinned project NAME (~/.config/mackas/projects/NAME.conf).
+                  Exclusive with --config.
+  --set NAME=VAL  Override one setting for this run. Repeatable.
+  --dry-run       Print mutating commands; change nothing.
+  -y, --yes       Never prompt (-f/--force also accepted).
   -v, --verbose   Echo commands as they run.
   -h, --help      This message.
 
 ${C_BLD}CONFIGURATION${C_RST}
-  Precedence, lowest to highest:
-    built-in defaults  ->  config file  ->  environment  ->  command-line flags
-
-  Which file, first match wins:
-    --config FILE  /  \$MACKAS_CONF            (a path, named outright)
-    --project NAME /  \$MACKAS_PROJECT_SELECT  (~/.config/mackas/projects/)
-    derived from \$PWD, or a hand-typed kas chain (same directory, no flag)
-    ~/.config/mackas/config
-    ~/.mackas.conf
-
-  Naming a path and selecting a project are mutually exclusive -- they are two
-  answers to the same question, so mackas refuses rather than ranks them, and
-  says which command drops the one you did not mean. The selector picks WHICH
-  file is sourced; it is not a fifth precedence rung. An empty value is refused
-  either way: --config= behaves like --config \"\", --project= like --project \"\".
-
-  With no explicit selector or path, mackas still tries a pinned project
-  first: if \$PWD (resolved physically, so a ~/oe-style symlink matches either
-  way) sits inside a pinned project's own <MACKAS_ROOT>/work/<name>, that
-  project is selected exactly as --project NAME would select it -- and,
-  standing in work/ itself, a hand-typed 'kas-container build <chain>' gives
-  the wrapper's own file list as the same kind of hint. Zero matches falls
-  straight through to the search path below, unchanged; more than one is
-  refused, listing every candidate, rather than guessed. This is a THIRD
-  SELECTOR TIER, not a fifth precedence rung either: it only ever picks among
-  projects you already pinned by hand, never invents one from what is on
-  disk. '$SCRIPT_CMD status' reports which tier actually fired ('selected
-  via'), and every other command prints a one-line stderr note the first
-  time a derived selection is what put a project in force.
-
-  '$SCRIPT_CMD --project NAME setup' pins NAME into the generated kas-container
-  wrapper, so a hand-typed 'kas-container ...' recomputes --runtime-args
-  against that project's config too, not the default search path.
-
-  It is sourced as shell, so it is only looked for in places that are yours:
-  a searched file, and a --project one, are refused unless you (or root) own
-  the file and its directory and neither is writable by group or other. A
-  --config path is exempt: mackas derives every other candidate itself, and a
-  derived path in a guessable place is an ambush, while a typed one is a
-  request. ./mackas.conf is NOT searched -- name it out loud with
-  --config ./mackas.conf.
-
-  Every setting is also an environment variable of the same name, and can be
-  overridden with --set NAME=VALUE. See mackas.conf.example for the full
-  annotated list.
+  Precedence: defaults < config file < environment < --set.
+  Config file, first match: --config/\$MACKAS_CONF, --project/\$MACKAS_PROJECT_SELECT,
+  the pinned project whose work/ dir contains \$PWD, ~/.config/mackas/config,
+  ~/.mackas.conf. Every setting is also an environment variable; see
+  mackas.conf.example and the README's Configuration section.
 
 ${C_BLD}EXAMPLES${C_RST}
-  # See whether this Mac can do it at all -- touches nothing.
-  $SCRIPT_CMD check
-
-  # See exactly what setup would do, without doing it.
-  $SCRIPT_CMD --dry-run setup
-
-  # Set it up, answering yes to the sudo prompts.
+  $SCRIPT_CMD check                          # can this Mac do it?
+  $SCRIPT_CMD --dry-run setup                # what would setup do?
   $SCRIPT_CMD setup
-
-  # Use the shell afterwards.
-  source $MACKAS_ENV_SH
-  $SCRIPT_CMD smoketest
-
-  # Give the build more RAM, just this once.
-  MACKAS_MEMORY=48g $SCRIPT_CMD setup
-  $SCRIPT_CMD --set MACKAS_MEMORY=48g setup
-
-  # Reuse a mirror host's sstate + downloads caches as read-only mirrors,
-  # over HTTP. Needs mackas-mirrord running there; see mirror-server/.
-  MACKAS_USE_HTTP_MIRRORS=1 $SCRIPT_CMD check
-
-  # The same, over NFS instead (needs sudo to mount, and is unproven).
-  MACKAS_USE_NFS_MIRRORS=1 $SCRIPT_CMD check
-
-  # Build somewhere else entirely.
-  $SCRIPT_CMD --config ~/other.conf setup
-
-  # Or, for a project already pinned by 'adopt':
-  $SCRIPT_CMD projects
+  source $MACKAS_ENV_SH && $SCRIPT_CMD smoketest
+  $SCRIPT_CMD --set MACKAS_MEMORY=48g setup  # more RAM, this run only
   $SCRIPT_CMD --project meta-ai status
-  export MACKAS_PROJECT_SELECT=meta-ai   # for a whole shell
-
-  # Start over.
-  $SCRIPT_CMD destroy
 EOF
 }
 

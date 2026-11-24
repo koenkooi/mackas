@@ -471,7 +471,7 @@ yourself with `type -a kas-container`
 > `kas-container` by hand** (e.g. `mackas exec du -sh openembedded-core`) —
 > it bakes in the repo-preserving `--skip` flags below and cannot be talked
 > out of them, closing this off entirely rather than relying on remembering
-> it. `mackas exec --help` for the full explanation.
+> it. `mackas exec --help` for usage.
 >
 > **`-k` does more than its name suggests, and dropping it is worse.** It
 > skips writing `conf/local.conf`/`conf/bblayers.conf` as well as the repo
