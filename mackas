@@ -13728,162 +13728,68 @@ usage() {
 	if [ -n "$MACKAS_PROJECT_URL" ]; then
 		project_line="Project: $MACKAS_PROJECT_DIR (branch $MACKAS_PROJECT_BRANCH)."
 	else
-		project_line="No project configured yet -- 'setup' still works, just skips the checkout step."
+		project_line="No project configured yet; 'setup' skips the checkout step."
 	fi
 	cat <<EOF
 ${C_BLD}$SCRIPT_NAME${C_RST} v$SCRIPT_VERSION -- run kas-container OpenEmbedded builds on Apple's
-'container' runtime. $project_line Set MACKAS_PROJECT_* to build your own
-layers -- qualcomm-linux/meta-ai is a worked example, see mackas.conf.example.
+'container' runtime. $project_line
 
 ${C_BLD}USAGE${C_RST}
   $SCRIPT_NAME [OPTIONS] [COMMAND]
 
 ${C_BLD}COMMANDS${C_RST}
-  check      Preflight only. Changes nothing. ${C_BLD}This is the default.${C_RST}
-  setup      Do the full setup. Idempotent -- safe to re-run after a crash.
-  adopt      Bring a MACKAS_ROOT set up by another Mac back to a working
-             build here. '$SCRIPT_CMD adopt --help'.
-  project    Pin a project workspace under THIS root -- 'project add NAME'.
-             The in-root sibling of 'adopt'. '$SCRIPT_CMD project --help'.
-  smoketest  Run the validation ladder: parse-only, then MACKAS_SMOKETEST_TARGETS.
-  status     Show what is configured and what exists on disk.
-  shell      Drop into a kas shell for the project's kas config.
-  checkout   Check out every layer the kas config names, then exit; no build.
-  exec       Run a one-off read-only command against the checkout, with
-             kas's repo-mutating setup steps always skipped.
-             '$SCRIPT_CMD exec --help'.
-  retrieve   Copy build outputs (buildstats/logs/deploy/buildhistory/sbom)
-             out of the ext4 TMPDIR volume, where macOS cannot see them.
-             '$SCRIPT_CMD retrieve --help'.
-  buildstats Work with buildstats already retrieved (currently: analyze).
-             '$SCRIPT_CMD buildstats --help'.
-  buildhistory  Work with a buildhistory tree already retrieved: analyze
-             what changed between two builds. '$SCRIPT_CMD buildhistory --help'.
-  sstate     Prune sstate objects bitbake hasn't reused in a while, or push
-             new ones to a mirror. '$SCRIPT_CMD sstate --help'.
-  monitor    Show live bitbake progress from a build started with
-             MACKAS_MONITOR=1. '$SCRIPT_CMD monitor --help'.
-  clean      Drop the TMPDIR volume; keep the downloads/sstate volumes and the
-             checkout. Or one target at a time (tmp+deploy/downloads/sstate);
-             '$SCRIPT_CMD clean --help'.
-  destroy    Remove all four volumes (the three active ones plus a
-             rarely-present legacy one), $MACKAS_ROOT and the short symlink.
-             Makes you type DESTROY.
-  volume     Manage the ext4 volumes: list, fstrim (reclaim disk), duplicate,
-             destroy one, move one to another disk, resize one, fsck a
-             corrupted one, recover a hand-moved one.
-             '$SCRIPT_CMD volume --help'.
-  set        Persist one setting in the config file. '$SCRIPT_CMD set --help'.
-  get        Print one setting's currently resolved value. '$SCRIPT_CMD get --help'.
-  unset      Remove one persisted setting. '$SCRIPT_CMD unset --help'.
-  projects   List the pinned per-project configs --project selects between.
-             '$SCRIPT_CMD projects --help'.
-  runtime-args  Plumbing: prints the effective --runtime-args string. The
-             env.sh wrapper calls this itself; you don't normally need to.
-  lock       Pin every declared repo to its exact current commit
-             (\`kas lock\`, writes into the checkout). '$SCRIPT_CMD lock --help'.
-  dump       Save the fully-resolved kas config next to the logs
-             (\`kas dump --resolve-*\`). '$SCRIPT_CMD dump --help'.
-  help       This message, or '$SCRIPT_CMD help COMMAND' for one command's own.
+  check         Preflight; changes nothing. ${C_BLD}The default.${C_RST}
+  setup         Full setup. Idempotent.
+  adopt         Make a MACKAS_ROOT from another Mac build here.
+  project       Pin a project under this root ('project add NAME').
+  projects      List pinned projects.
+  smoketest     Parse, then build MACKAS_SMOKETEST_TARGETS.
+  status        Show configuration and what exists on disk.
+  shell         kas shell for the project's config.
+  checkout      Check out the layers; no build.
+  exec          Run a read-only command against the checkout.
+  retrieve      Copy buildstats, logs, deploy, buildhistory, or sbom out of
+                the TMPDIR volume.
+  buildstats    Analyze retrieved buildstats.
+  buildhistory  Compare two builds in a retrieved buildhistory.
+  sstate        Prune or push sstate objects.
+  monitor       Live bitbake progress (MACKAS_MONITOR=1).
+  clean         Drop the TMPDIR volume, or one target (tmp+deploy, downloads,
+                sstate).
+  destroy       Remove all volumes, \$MACKAS_ROOT, and the short symlink.
+  volume        Manage the ext4 volumes (list, fstrim, move, resize, fsck, ...).
+  set/get/unset Persist, print, or remove one setting.
+  lock          Pin every repo to its current commit (kas lock).
+  dump          Save the resolved kas config (kas dump).
+  runtime-args  Plumbing for the env.sh wrapper.
+  help          This message; 'help COMMAND' for a command's own.
+
+  Most commands take --help, e.g. '$SCRIPT_CMD retrieve --help'.
 
 ${C_BLD}OPTIONS${C_RST}
-  --config FILE   Use this config file instead of searching.
-  --project NAME  Use the pinned project NAME's config instead of searching:
-                  ~/.config/mackas/projects/NAME.conf. Mutually exclusive
-                  with --config/\$MACKAS_CONF. '$SCRIPT_CMD projects' lists them.
-  --set NAME=VAL  Override one setting for THIS command only; beats config
-                  file and environment. Repeatable. For a PERSISTENT
-                  override, use '$SCRIPT_CMD set NAME VALUE' instead.
-                  '$SCRIPT_CMD status' lists the valid names.
-  --dry-run       Print every mutating command; change nothing.
-  -y, --yes       Assume yes; never prompt (required for non-interactive destroy).
-                  -f/--force is an accepted synonym, for anyone used to
-                  'docker system prune -f'.
+  --config FILE   Use this config file.
+  --project NAME  Use pinned project NAME (~/.config/mackas/projects/NAME.conf).
+                  Exclusive with --config.
+  --set NAME=VAL  Override one setting for this run. Repeatable.
+  --dry-run       Print mutating commands; change nothing.
+  -y, --yes       Never prompt (-f/--force also accepted).
   -v, --verbose   Echo commands as they run.
   -h, --help      This message.
 
 ${C_BLD}CONFIGURATION${C_RST}
-  Precedence, lowest to highest:
-    built-in defaults  ->  config file  ->  environment  ->  command-line flags
-
-  Which file, first match wins:
-    --config FILE  /  \$MACKAS_CONF            (a path, named outright)
-    --project NAME /  \$MACKAS_PROJECT_SELECT  (~/.config/mackas/projects/)
-    derived from \$PWD, or a hand-typed kas chain (same directory, no flag)
-    ~/.config/mackas/config
-    ~/.mackas.conf
-
-  Naming a path and selecting a project are mutually exclusive -- they are two
-  answers to the same question, so mackas refuses rather than ranks them, and
-  says which command drops the one you did not mean. The selector picks WHICH
-  file is sourced; it is not a fifth precedence rung. An empty value is refused
-  either way: --config= behaves like --config \"\", --project= like --project \"\".
-
-  With no explicit selector or path, mackas still tries a pinned project
-  first: if \$PWD (resolved physically, so a ~/oe-style symlink matches either
-  way) sits inside a pinned project's own <MACKAS_ROOT>/work/<name>, that
-  project is selected exactly as --project NAME would select it -- and,
-  standing in work/ itself, a hand-typed 'kas-container build <chain>' gives
-  the wrapper's own file list as the same kind of hint. Zero matches falls
-  straight through to the search path below, unchanged; more than one is
-  refused, listing every candidate, rather than guessed. This is a THIRD
-  SELECTOR TIER, not a fifth precedence rung either: it only ever picks among
-  projects you already pinned by hand, never invents one from what is on
-  disk. '$SCRIPT_CMD status' reports which tier actually fired ('selected
-  via'), and every other command prints a one-line stderr note the first
-  time a derived selection is what put a project in force.
-
-  '$SCRIPT_CMD --project NAME setup' pins NAME into the generated kas-container
-  wrapper, so a hand-typed 'kas-container ...' recomputes --runtime-args
-  against that project's config too, not the default search path.
-
-  It is sourced as shell, so it is only looked for in places that are yours:
-  a searched file, and a --project one, are refused unless you (or root) own
-  the file and its directory and neither is writable by group or other. A
-  --config path is exempt: mackas derives every other candidate itself, and a
-  derived path in a guessable place is an ambush, while a typed one is a
-  request. ./mackas.conf is NOT searched -- name it out loud with
-  --config ./mackas.conf.
-
-  Every setting is also an environment variable of the same name, and can be
-  overridden with --set NAME=VALUE. See mackas.conf.example for the full
-  annotated list.
+  Precedence: defaults < config file < environment < --set.
+  Config file, first match: --config/\$MACKAS_CONF, --project/\$MACKAS_PROJECT_SELECT,
+  the pinned project whose work/ dir contains \$PWD, ~/.config/mackas/config,
+  ~/.mackas.conf. Every setting is also an environment variable; see
+  mackas.conf.example and the README's Configuration section.
 
 ${C_BLD}EXAMPLES${C_RST}
-  # See whether this Mac can do it at all -- touches nothing.
-  $SCRIPT_CMD check
-
-  # See exactly what setup would do, without doing it.
-  $SCRIPT_CMD --dry-run setup
-
-  # Set it up, answering yes to the sudo prompts.
+  $SCRIPT_CMD check                          # can this Mac do it?
+  $SCRIPT_CMD --dry-run setup                # what would setup do?
   $SCRIPT_CMD setup
-
-  # Use the shell afterwards.
-  source $MACKAS_ENV_SH
-  $SCRIPT_CMD smoketest
-
-  # Give the build more RAM, just this once.
-  MACKAS_MEMORY=48g $SCRIPT_CMD setup
-  $SCRIPT_CMD --set MACKAS_MEMORY=48g setup
-
-  # Reuse a mirror host's sstate + downloads caches as read-only mirrors,
-  # over HTTP. Needs mackas-mirrord running there; see mirror-server/.
-  MACKAS_USE_HTTP_MIRRORS=1 $SCRIPT_CMD check
-
-  # The same, over NFS instead (needs sudo to mount, and is unproven).
-  MACKAS_USE_NFS_MIRRORS=1 $SCRIPT_CMD check
-
-  # Build somewhere else entirely.
-  $SCRIPT_CMD --config ~/other.conf setup
-
-  # Or, for a project already pinned by 'adopt':
-  $SCRIPT_CMD projects
+  source $MACKAS_ENV_SH && $SCRIPT_CMD smoketest
+  $SCRIPT_CMD --set MACKAS_MEMORY=48g setup  # more RAM, this run only
   $SCRIPT_CMD --project meta-ai status
-  export MACKAS_PROJECT_SELECT=meta-ai   # for a whole shell
-
-  # Start over.
-  $SCRIPT_CMD destroy
 EOF
 }
 
