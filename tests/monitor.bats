@@ -255,6 +255,45 @@ notifier_calls() {
 	assert_fails grep -qi 'nothing is listening' "$TESTDIR/dryrun.out"
 }
 
+@test "monitor: a bare call forwards neither --port nor --project (#142)" {
+	# The actual bug this guards: cmd_monitor() used to forward MACKAS_MONITOR_PORT
+	# as an always-present --port, which silently defeated follow-everything mode
+	# for every bare 'mackas monitor'.
+	run "$MACKAS" monitor --dry-run
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" > "$TESTDIR/bare.out"
+	assert_fails grep -qF -- '--port' "$TESTDIR/bare.out"
+	assert_fails grep -qF -- '--project' "$TESTDIR/bare.out"
+}
+
+@test "monitor --project NAME is forwarded, not rejected as a global flag (#142)" {
+	run "$MACKAS" monitor --dry-run --project meta-ai
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--project meta-ai'
+}
+
+@test "monitor --list --json is forwarded (#142)" {
+	run "$MACKAS" monitor --dry-run --list --json
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" | grep -qF -- '--list'
+	printf '%s\n' "$output" | grep -qF -- '--json'
+}
+
+@test "monitor: --port and --project together are refused (#142)" {
+	run "$MACKAS" monitor --port 8801 --project meta-ai
+	[ "$status" -ne 0 ]
+	printf '%s\n' "$output" | grep -qi 'mutually exclusive'
+}
+
+@test "monitor --list skips the MACKAS_MONITOR=1 warning (#142)" {
+	# --list only discovers; it never polls, so this shell's own
+	# MACKAS_MONITOR setting is irrelevant to it.
+	MACKAS_MONITOR=0 run "$MACKAS" monitor --dry-run --list
+	[ "$status" -eq 0 ]
+	printf '%s\n' "$output" > "$TESTDIR/list.out"
+	assert_fails grep -qi 'MACKAS_MONITOR is not 1' "$TESTDIR/list.out"
+}
+
 # ---------------------------------------------------------------------------
 # Unreachable bridge
 # ---------------------------------------------------------------------------
